@@ -227,6 +227,8 @@ impl FileSource for VortexSource {
         filters: Vec<Arc<dyn PhysicalExpr>>,
         _config: &ConfigOptions,
     ) -> DFResult<FilterPushdownPropagation<Arc<dyn FileSource>>> {
+        println!("Vortex received filters for pushdown: {:?}", filters);
+
         let Some(schema) = self.arrow_file_schema.as_ref() else {
             return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
                 vec![PushedDown::No; filters.len()],
@@ -254,6 +256,8 @@ impl FileSource for VortexSource {
                 }
             })
             .collect::<Vec<_>>();
+
+        println!("Supported filters for pushdown: {:?}", supported_filters);
 
         if supported_filters
             .iter()
