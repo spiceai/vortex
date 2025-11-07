@@ -27,12 +27,14 @@ impl Display for DisplayTreeExpr<'_> {
                 .zip(child_names)
                 .map(|(child, name)| {
                     let child_tree = make_tree(child)?;
-                    Ok(Tree::new(format!("{}: {}", name, child_tree.root))
-                        .with_leaves(child_tree.leaves))
+                    Ok::<_, std::fmt::Error>(
+                        Tree::new(format!("{}: {}", name, child_tree.root))
+                            .with_leaves(child_tree.leaves),
+                    )
                 })
                 .collect();
 
-            Ok(Tree::new(node_name).with_leaves(child_trees?))
+            Ok::<_, std::fmt::Error>(Tree::new(node_name).with_leaves(child_trees?))
         }
 
         write!(f, "{}", make_tree(self.0)?)
