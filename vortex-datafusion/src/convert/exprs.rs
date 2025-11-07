@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use arrow_schema::{DataType, Schema};
+use datafusion_common::ScalarValue;
 use datafusion_expr::Operator as DFOperator;
 use datafusion_functions::core::getfield::GetFieldFunc;
 use datafusion_physical_expr::{PhysicalExpr, ScalarFunctionExpr};
@@ -29,18 +30,22 @@ pub(crate) fn make_vortex_predicate(
 ) -> VortexResult<Option<Expression>> {
     let exprs = predicate
         .iter()
-        .map(|e| {
+        .filter_map(|e| {
             if let Some(dynamic_expr) = e
                 .as_any()
                 .downcast_ref::<df_expr::DynamicFilterPhysicalExpr>()
             {
                 let current = dynamic_expr.current().unwrap();
-                println!("current dynamic expr: {:?}", current);
+                if let Some(lit) = current.as_any().downcast_ref::<df_expr::Literal>()
+                    && lit.value() == &ScalarValue::Boolean(Some(true))
+                {
+                    return None;
+                }
             }
 
             let expr = Expression::try_from_df(e.as_ref());
 
-            expr
+            Some(expr)
         })
         .collect::<VortexResult<Vec<_>>>()?;
 

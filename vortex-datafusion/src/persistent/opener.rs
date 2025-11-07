@@ -203,6 +203,7 @@ impl FileOpener for VortexOpener {
             if let Some(file_pruner) = &mut file_pruner
                 && file_pruner.should_prune()?
             {
+                println!("Skipping file {}", file_meta.object_meta.location);
                 return Ok(stream::empty().boxed());
             }
 
