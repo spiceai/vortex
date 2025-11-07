@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use arrow_schema::{DataType, Schema};
 use datafusion_expr::Operator as DFOperator;
@@ -28,7 +29,16 @@ pub(crate) fn make_vortex_predicate(
 ) -> VortexResult<Option<Expression>> {
     let exprs = predicate
         .iter()
-        .map(|e| Expression::try_from_df(e.as_ref()))
+        .map(|e| {
+            let start = Instant::now();
+            let expr = Expression::try_from_df(e.as_ref());
+            println!(
+                "Converted DataFusion expression {e:?} to Vortex expression in {:?}",
+                start.elapsed()
+            );
+
+            expr
+        })
         .collect::<VortexResult<Vec<_>>>()?;
 
     Ok(exprs.into_iter().reduce(and))
