@@ -34,8 +34,8 @@ pub(crate) fn make_vortex_predicate(
                 .as_any()
                 .downcast_ref::<df_expr::DynamicFilterPhysicalExpr>()
             {
-                let current = dynamic_expr.current().unwrap();
-                if let Some(lit) = current.as_any().downcast_ref::<df_expr::Literal>()
+                if let Ok(current) = dynamic_expr.current()
+                    && let Some(lit) = current.as_any().downcast_ref::<df_expr::Literal>()
                     && lit.value() == &ScalarValue::Boolean(Some(true))
                 {
                     return None;
@@ -131,9 +131,9 @@ impl TryFromDataFusion<dyn PhysicalExpr> for Expression {
         if let Some(dynamic_expr) = df
             .as_any()
             .downcast_ref::<df_expr::DynamicFilterPhysicalExpr>()
+            && let Ok(current) = dynamic_expr.current()
         {
-            let current_dynamic_expr = dynamic_expr.current().unwrap();
-            let returned_expr = Expression::try_from_df(current_dynamic_expr.as_ref())?;
+            let returned_expr = Expression::try_from_df(current.as_ref())?;
             return Ok(returned_expr);
         }
 
