@@ -2,7 +2,6 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use arrow_schema::{DataType, Schema};
 use datafusion_common::ScalarValue;
