@@ -96,71 +96,70 @@ impl ReadSource for ObjectStoreIoSource {
         self: Arc<Self>,
         requests: BoxStream<'static, IoRequest>,
     ) -> BoxFuture<'static, ()> {
-        let self2 = self.clone();
         requests
-            .map(move |req| {
+            .ready_chunks(1)
+            .map(move |reqs| {
                 let handle = self.handle.clone();
-                let store = self.io.store.clone();
-                let path = self.io.path.clone();
+                let self_cloned = Arc::clone(&self);
+                handle.spawn(async move {
+                    for req in reqs {
+                        let store = self_cloned.io.store.clone();
+                        let path = self_cloned.io.path.clone();
 
-                let len = req.len();
-                let range = req.range();
-                let alignment = req.alignment();
+                        let len = req.len();
+                        let range = req.range();
+                        let alignment = req.alignment();
 
-                let read = async move {
-                    // Instead of calling `ObjectStore::get_range`, we expand the implementation and run it
-                    // ourselves to avoid a second copy to align the buffer. Instead, we can write directly
-                    // into the aligned buffer.
-                    let mut buffer = ByteBufferMut::with_capacity_aligned(len, alignment);
+                        let read = async move {
+                            // Instead of calling `ObjectStore::get_range`, we expand the implementation and run it
+                            // ourselves to avoid a second copy to align the buffer. Instead, we can write directly
+                            // into the aligned buffer.
+                            let mut buffer = ByteBufferMut::with_capacity_aligned(len, alignment);
 
-                    let response = store
-                        .get_opts(
-                            &path,
-                            object_store::GetOptions {
-                                range: Some(object_store::GetRange::Bounded(range.clone())),
-                                ..Default::default()
-                            },
-                        )
-                        .await?;
+                            let response = store
+                                .get_opts(
+                                    &path,
+                                    object_store::GetOptions {
+                                        range: Some(object_store::GetRange::Bounded(range.clone())),
+                                        ..Default::default()
+                                    },
+                                )
+                                .await?;
 
-                    let buffer = match response.payload {
-                        object_store::GetResultPayload::File(file, _) => {
-                            // SAFETY: We're setting the length to the exact size we're about to read.
-                            // The read_exact_at call will either fill the entire buffer or return an error,
-                            // ensuring no uninitialized memory is exposed.
-                            unsafe { buffer.set_len(len) };
-                            handle
-                                .spawn_blocking(move || {
-                                    file.read_exact_at(&mut buffer, range.start)?;
-                                    Ok::<_, io::Error>(buffer)
-                                })
-                                .await
-                                .map_err(io::Error::other)?
+                            let buffer = match response.payload {
+                                object_store::GetResultPayload::File(file, _) => {
+                                    // SAFETY: We're setting the length to the exact size we're about to read.
+                                    // The read_exact_at call will either fill the entire buffer or return an error,
+                                    // ensuring no uninitialized memory is exposed.
+                                    unsafe { buffer.set_len(len) };
+                                    file.read_exact_at(&mut buffer, range.start).map_err(io::Error::other)?;
+                                    buffer
+                                }
+                                object_store::GetResultPayload::Stream(mut byte_stream) => {
+                                    while let Some(bytes) = byte_stream.next().await {
+                                        buffer.extend_from_slice(&bytes?);
+                                    }
+
+                                    vortex_ensure!(
+                                        buffer.len() == len,
+                                        "Object store stream returned {} bytes but expected {} bytes (range: {:?})",
+                                        buffer.len(),
+                                        len,
+                                        range
+                                    );
+
+                                    buffer
+                                }
+                            };
+
+                            Ok(buffer.freeze())
                         }
-                        object_store::GetResultPayload::Stream(mut byte_stream) => {
-                            while let Some(bytes) = byte_stream.next().await {
-                                buffer.extend_from_slice(&bytes?);
-                            }
+                        .in_current_span();
 
-                            vortex_ensure!(
-                                buffer.len() == len,
-                                "Object store stream returned {} bytes but expected {} bytes (range: {:?})",
-                                buffer.len(),
-                                len,
-                                range
-                            );
-
-                            buffer
-                        }
-                    };
-
-                    Ok(buffer.freeze())
-                }
-                .in_current_span();
-
-                async move { req.resolve(Compat::new(read).await) }
+                        req.resolve(Compat::new(read).await);
+                    }
+                })
             })
-            .map(move |f| self2.handle.spawn(f))
             .buffer_unordered(CONCURRENCY)
             .collect::<()>()
             .boxed()
