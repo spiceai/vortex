@@ -100,9 +100,11 @@ impl ReadSource for ObjectStoreIoSource {
             .ready_chunks(1)
             .map(move |reqs| {
                 let handle = self.handle.clone();
+                let handle2 = self.handle.clone();
                 let self_cloned = Arc::clone(&self);
                 handle.spawn(async move {
                     for req in reqs {
+                        let handle = handle2.clone();
                         let store = self_cloned.io.store.clone();
                         let path = self_cloned.io.path.clone();
 
@@ -132,8 +134,13 @@ impl ReadSource for ObjectStoreIoSource {
                                     // The read_exact_at call will either fill the entire buffer or return an error,
                                     // ensuring no uninitialized memory is exposed.
                                     unsafe { buffer.set_len(len) };
-                                    file.read_exact_at(&mut buffer, range.start).map_err(io::Error::other)?;
-                                    buffer
+                                    handle
+                                    .spawn_blocking(move || {
+                                        file.read_exact_at(&mut buffer, range.start)?;
+                                        Ok::<_, io::Error>(buffer)
+                                    })
+                                    .await
+                                    .map_err(io::Error::other)?
                                 }
                                 object_store::GetResultPayload::Stream(mut byte_stream) => {
                                     while let Some(bytes) = byte_stream.next().await {
