@@ -30,12 +30,15 @@ pub(crate) fn make_vortex_predicate(
     let exprs = predicate
         .iter()
         .map(|e| {
-            let start = Instant::now();
+            if let Some(dynamic_expr) = e
+                .as_any()
+                .downcast_ref::<df_expr::DynamicFilterPhysicalExpr>()
+            {
+                let current = dynamic_expr.current().unwrap();
+                println!("current dynamic expr: {:?}", current);
+            }
+
             let expr = Expression::try_from_df(e.as_ref());
-            println!(
-                "Converted DataFusion expression {e:?} to Vortex expression in {:?}",
-                start.elapsed()
-            );
 
             expr
         })
