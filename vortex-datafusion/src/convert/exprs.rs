@@ -33,13 +33,11 @@ pub(crate) fn make_vortex_predicate(
             if let Some(dynamic_expr) = e
                 .as_any()
                 .downcast_ref::<df_expr::DynamicFilterPhysicalExpr>()
+                && let Ok(current) = dynamic_expr.current()
+                && let Some(lit) = current.as_any().downcast_ref::<df_expr::Literal>()
+                && lit.value() == &ScalarValue::Boolean(Some(true))
             {
-                if let Ok(current) = dynamic_expr.current()
-                    && let Some(lit) = current.as_any().downcast_ref::<df_expr::Literal>()
-                    && lit.value() == &ScalarValue::Boolean(Some(true))
-                {
-                    return None;
-                }
+                return None;
             }
 
             let expr = Expression::try_from_df(e.as_ref());
