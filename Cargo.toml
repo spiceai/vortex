@@ -105,6 +105,7 @@ datafusion-catalog = { version = "50.3" }
 datafusion-common = { version = "50.3" }
 datafusion-common-runtime = { version = "50.3" }
 datafusion-datasource = { version = "50.3", default-features = false }
+datafusion-datasource-parquet = { version = "50.3" }
 datafusion-execution = { version = "50.3" }
 datafusion-expr = { version = "50.3" }
 datafusion-functions = { version = "50.3" }
@@ -348,3 +349,19 @@ lto = false
 [profile.bench_assert]
 debug-assertions = true
 inherits = "bench"
+
+[patch.crates-io]
+datafusion = { git = "https://github.com/spiceai/datafusion", rev = "3b535a2b365c4357547e6ce0e9c21069df6d1f6f" }
+datafusion-catalog = { git = "https://github.com/spiceai/datafusion", rev = "3b535a2b365c4357547e6ce0e9c21069df6d1f6f" }
+datafusion-common = { git = "https://github.com/spiceai/datafusion", rev = "3b535a2b365c4357547e6ce0e9c21069df6d1f6f" }
+datafusion-common-runtime = { git = "https://github.com/spiceai/datafusion", rev = "3b535a2b365c4357547e6ce0e9c21069df6d1f6f" }
+datafusion-datasource = { git = "https://github.com/spiceai/datafusion", rev = "3b535a2b365c4357547e6ce0e9c21069df6d1f6f" }
+datafusion-datasource-parquet = { git = "https://github.com/spiceai/datafusion", rev = "3b535a2b365c4357547e6ce0e9c21069df6d1f6f" }
+datafusion-execution = { git = "https://github.com/spiceai/datafusion", rev = "3b535a2b365c4357547e6ce0e9c21069df6d1f6f" }
+datafusion-expr = { git = "https://github.com/spiceai/datafusion", rev = "3b535a2b365c4357547e6ce0e9c21069df6d1f6f" }
+datafusion-functions = { git = "https://github.com/spiceai/datafusion", rev = "3b535a2b365c4357547e6ce0e9c21069df6d1f6f" }
+datafusion-physical-expr = { git = "https://github.com/spiceai/datafusion", rev = "3b535a2b365c4357547e6ce0e9c21069df6d1f6f" }
+datafusion-physical-expr-adapter = { git = "https://github.com/spiceai/datafusion", rev = "3b535a2b365c4357547e6ce0e9c21069df6d1f6f" }
+datafusion-physical-expr-common = { git = "https://github.com/spiceai/datafusion", rev = "3b535a2b365c4357547e6ce0e9c21069df6d1f6f" }
+datafusion-physical-plan = { git = "https://github.com/spiceai/datafusion", rev = "3b535a2b365c4357547e6ce0e9c21069df6d1f6f" }
+datafusion-pruning = { git = "https://github.com/spiceai/datafusion", rev = "3b535a2b365c4357547e6ce0e9c21069df6d1f6f" }

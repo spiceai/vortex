@@ -11,6 +11,7 @@ use datafusion_datasource::file_meta::FileMeta;
 use datafusion_datasource::file_stream::{FileOpenFuture, FileOpener};
 use datafusion_datasource::schema_adapter::SchemaAdapterFactory;
 use datafusion_datasource::{FileRange, PartitionedFile};
+use datafusion_datasource_parquet::EarlyStoppingStream;
 use datafusion_physical_expr::simplifier::PhysicalExprSimplifier;
 use datafusion_physical_expr::{PhysicalExprRef, split_conjunction};
 use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
@@ -353,7 +354,15 @@ impl FileOpener for VortexOpener {
                 .map(move |batch| batch.and_then(|b| schema_mapping.map_batch(b)))
                 .boxed();
 
-            Ok(stream)
+            if let Some(file_pruner) = file_pruner {
+                Ok(Box::pin(EarlyStoppingStream::new(
+                    stream,
+                    file_pruner,
+                    Count::new(),
+                )))
+            } else {
+                Ok(Box::pin(stream))
+            }
         }
         .in_current_span()
         .boxed())
