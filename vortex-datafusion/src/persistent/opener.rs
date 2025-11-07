@@ -198,8 +198,6 @@ impl FileOpener for VortexOpener {
                 .transpose()?
                 .flatten();
 
-            println!("Pruner is some: {}", file_pruner.is_some());
-
             // Check if this file should be pruned based on statistics/partition values.
             // Returns empty stream if file can be skipped entirely.
             if let Some(file_pruner) = &mut file_pruner

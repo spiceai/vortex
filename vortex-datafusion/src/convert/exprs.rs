@@ -116,16 +116,7 @@ impl TryFromDataFusion<dyn PhysicalExpr> for Expression {
             .downcast_ref::<df_expr::DynamicFilterPhysicalExpr>()
         {
             let current_dynamic_expr = dynamic_expr.current().unwrap();
-            println!(
-                "Converting DynamicFilterPhysicalExpr with current expression: {:?}",
-                current_dynamic_expr
-            );
-
             let returned_expr = Expression::try_from_df(current_dynamic_expr.as_ref())?;
-            println!(
-                "Converted DynamicFilterPhysicalExpr to vortex expression: {:?}",
-                returned_expr
-            );
             return Ok(returned_expr);
         }
 
