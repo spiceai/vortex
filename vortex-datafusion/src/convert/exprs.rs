@@ -4,10 +4,11 @@
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Schema};
+use datafusion_common::ScalarValue;
 use datafusion_expr::Operator as DFOperator;
 use datafusion_functions::core::getfield::GetFieldFunc;
 use datafusion_physical_expr::{PhysicalExpr, ScalarFunctionExpr};
-use datafusion_physical_expr_common::physical_expr::{PhysicalExprRef, is_dynamic_physical_expr};
+use datafusion_physical_expr_common::physical_expr::PhysicalExprRef;
 use datafusion_physical_plan::expressions as df_expr;
 use itertools::Itertools;
 use vortex::compute::LikeOptions;
@@ -28,7 +29,21 @@ pub(crate) fn make_vortex_predicate(
 ) -> VortexResult<Option<Expression>> {
     let exprs = predicate
         .iter()
-        .map(|e| Expression::try_from_df(e.as_ref()))
+        .filter_map(|e| {
+            if let Some(dynamic_expr) = e
+                .as_any()
+                .downcast_ref::<df_expr::DynamicFilterPhysicalExpr>()
+                && let Ok(current) = dynamic_expr.current()
+                && let Some(lit) = current.as_any().downcast_ref::<df_expr::Literal>()
+                && lit.value() == &ScalarValue::Boolean(Some(true))
+            {
+                return None;
+            }
+
+            let expr = Expression::try_from_df(e.as_ref());
+
+            Some(expr)
+        })
         .collect::<VortexResult<Vec<_>>>()?;
 
     Ok(exprs.into_iter().reduce(and))
@@ -109,6 +124,15 @@ impl TryFromDataFusion<dyn PhysicalExpr> for Expression {
 
         if let Some(scalar_fn) = df.as_any().downcast_ref::<ScalarFunctionExpr>() {
             return try_convert_scalar_function(scalar_fn);
+        }
+
+        if let Some(dynamic_expr) = df
+            .as_any()
+            .downcast_ref::<df_expr::DynamicFilterPhysicalExpr>()
+            && let Ok(current) = dynamic_expr.current()
+        {
+            let returned_expr = Expression::try_from_df(current.as_ref())?;
+            return Ok(returned_expr);
         }
 
         vortex_bail!("Couldn't convert DataFusion physical {df} expression to a vortex expression")
@@ -201,12 +225,6 @@ impl TryFromDataFusion<DFOperator> for Operator {
 }
 
 pub(crate) fn can_be_pushed_down(df_expr: &PhysicalExprRef, schema: &Schema) -> bool {
-    // We currently do not support pushdown of dynamic expressions in DF.
-    // See issue: https://github.com/vortex-data/vortex/issues/4034
-    if is_dynamic_physical_expr(df_expr) {
-        return false;
-    }
-
     let expr = df_expr.as_any();
     if let Some(binary) = expr.downcast_ref::<df_expr::BinaryExpr>() {
         can_binary_be_pushed_down(binary, schema)
@@ -231,6 +249,12 @@ pub(crate) fn can_be_pushed_down(df_expr: &PhysicalExprRef, schema: &Schema) -> 
     } else if let Some(scalar_fn) = expr.downcast_ref::<ScalarFunctionExpr>() {
         // Only get_field pushdown is supported.
         ScalarFunctionExpr::try_downcast_func::<GetFieldFunc>(scalar_fn).is_some()
+    } else if expr
+        .downcast_ref::<df_expr::DynamicFilterPhysicalExpr>()
+        .is_some()
+    {
+        // assume dynamic filters can be pushed down - the child won't be specified until execution time
+        true
     } else {
         tracing::debug!(%df_expr, "DataFusion expression can't be pushed down");
         false
