@@ -66,6 +66,15 @@ impl BitBufferMut {
         }
     }
 
+    /// Creates a `BitBufferMut` from a [`BitBuffer`] by copying all of the data over.
+    pub fn copy_from(bit_buffer: &BitBuffer) -> Self {
+        Self {
+            buffer: ByteBufferMut::copy_from(bit_buffer.inner()),
+            offset: bit_buffer.offset(),
+            len: bit_buffer.len(),
+        }
+    }
+
     /// Create a new empty mutable bit buffer with requested capacity (in bits).
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
@@ -258,6 +267,8 @@ impl BitBufferMut {
     }
 
     /// Truncate the buffer to the given length.
+    ///
+    /// If the given length is greater than the current length, this is a no-op.
     pub fn truncate(&mut self, len: usize) {
         if len > self.len {
             return;

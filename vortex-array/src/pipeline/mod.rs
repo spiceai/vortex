@@ -1,129 +1,173 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Vortex crate containing vectorized operator processing.
-//!
-//! This module contains experiments into pipelined data processing within Vortex.
-//!
-//! Arrays (and eventually Layouts) will be convertible into a [`Kernel`] that can then be
-//! exported into a [`ViewMut`] one chunk of [`N`] elements at a time. This allows us to keep
-//! compute largely within the L1 cache, as well as to write out canonical data into externally
-//! provided buffers.
-//!
-//! Each chunk is represented in a canonical physical form, as determined by the logical
-//! [`vortex_dtype::DType`] of the array. This provides a predicate base on which to perform
-//! compute. Unlike DuckDB and other vectorized systems, we force a single canonical representation
-//! instead of supporting multiple encodings because compute push-down is applied a priori to the
-//! logical representation.
-//!
-//! It is a work-in-progress and is not yet used in production.
+pub mod bit_view;
+pub mod driver;
 
-pub mod bits;
-pub(crate) mod operator;
-pub mod row_selection;
-mod types;
-pub mod vec;
-pub mod view;
+use vortex_error::{VortexExpect, VortexResult};
+use vortex_vector::{Vector, VectorMut};
 
-use std::cell::RefCell;
-
-pub use row_selection::*;
-pub use types::*;
-use vec::VectorRef;
-use vortex_error::VortexResult;
-
-use self::vec::Vector;
-use self::view::ViewMut;
-use crate::Canonical;
-use crate::operator::Operator;
-use crate::pipeline::bits::BitView;
+use crate::pipeline::bit_view::BitView;
 
 /// The number of elements in each step of a Vortex evaluation operator.
 pub const N: usize = 1024;
 
-// Number of usize words needed to store N bits
+/// Number of bytes needed to store N bits
+pub const N_BYTES: usize = N / 8;
+
+/// Number of usize words needed to store N bits
 pub const N_WORDS: usize = N / usize::BITS as usize;
 
-pub trait PipelinedOperator: Operator {
-    /// Defines the row selection of this pipeline operator.
-    fn row_selection(&self) -> RowSelection;
+/// A pipeline node is a trait that enables an array to participate in pipelined execution.
+pub trait PipelinedNode {
+    /// Returns information about the children of this node and how the node should participate
+    /// in pipelined execution.
+    fn inputs(&self) -> PipelineInputs;
 
-    // Whether this operator works by mutating its first child in-place.
-    //
-    // If `true`, the operator is invoked with the first child's input data passed via the
-    // mutable output view. The node is expected to mutate this data in-place.
-    // TODO(ngates): enable this
-    // fn in_place(&self) -> bool {
-    //     false
-    // }
-
-    /// Bind the operator into a [`Kernel`] for pipelined execution.
+    /// Bind the node into a [`Kernel`] for pipelined execution.
     fn bind(&self, ctx: &dyn BindContext) -> VortexResult<Box<dyn Kernel>>;
+}
 
-    /// Returns the child indices of this operator that are passed to the kernel as input vectors.
-    fn vector_children(&self) -> Vec<usize>;
+/// Describes the type of pipeline node and its input information.
+pub enum PipelineInputs {
+    /// This node acts as a pipeline source.
+    ///
+    /// All array inputs will be available as pre-computed batch inputs in the [`BindContext`].
+    Source,
 
-    /// Returns the child indices of this operator that are passed to the kernel as batch inputs.
-    fn batch_children(&self) -> Vec<usize>;
+    /// This node acts as a transform node.
+    ///
+    /// Each listed index indicates a child that should be provided as a pipelined input. Each
+    /// pipelined input should be bound to a [`VectorId`] via the [`BindContext`] and then
+    /// accessed within the kernel by passing the [`VectorId`] to the [`KernelCtx`].
+    ///
+    /// All other children will be available as pre-computed batch inputs in the [`BindContext`].
+    Transform { pipelined_inputs: Vec<usize> },
+    // TODO(ngates): we may want a Chain variant in the future to support pipelining chunked arrays
 }
 
 /// The context used when binding an operator for execution.
 pub trait BindContext {
-    fn children(&self) -> &[VectorId];
+    /// Returns the [`VectorId`] for the given child that can be passed to the
+    /// [`KernelCtx`] within each step to access the given input.
+    ///
+    /// Note that this child index references the pipelined inputs only, not all children of the
+    /// array.
+    fn pipelined_input(&self, pipelined_child_idx: usize) -> VectorId;
 
-    fn batch_inputs(&self) -> &[BatchId];
+    /// Returns the batch input vector for the given child.
+    ///
+    /// Note that this child index references the batch inputs only, not all children of the
+    /// array.
+    fn batch_input(&self, batch_child_idx: usize) -> Vector;
 }
 
-/// The ID of the vector to use.
-pub type VectorId = usize;
-/// The ID of the batch input to use.
-pub type BatchId = usize;
-
-/// A operator provides a push-based way to emit a stream of canonical data.
+/// A pipeline kernel is a stateful object that performs steps of a pipeline.
 ///
-/// By passing multiple vector computations through the same operator, we can amortize
-/// the setup costs (such as DType validation, stats short-circuiting, etc.), and to make better
-/// use of CPU caches by performing all operations while the data is hot.
+/// Each step of the kernel takes and returns vectors (depending on the type of kernel) of `N`
+/// elements. Input vectors are provided via the [`KernelCtx`] and indicate the position of their
+/// elements as either [`PipelineVector::Sparse`] or [`PipelineVector::Compact`] based on whether
+/// the selected elements are in their original positions or compacted at the start of the vector
+/// respectively.
+///
+/// The provided mutable output vector is guaranteed to have at least `N` elements of capacity.
+/// The kernel **must** return a vector of exactly `N` elements in each step, and indicate with
+/// the returned [`ElementPosition`] enum whether the output elements are in their original
+/// positions or compacted at the start of the output vector.
 pub trait Kernel: Send {
-    /// Attempts to perform a single step of the operator, writing data to the output vector.
-    ///
-    /// The kernel step should be stateless and is passed the chunk index as well as the selection
-    /// mask for this chunk.
-    ///
-    /// Input and output vectors have a `Selection` enum indicating which elements of the vector
-    /// are valid for processing. This is one of:
-    /// * Full - all N elements are valid.
-    /// * Prefix - the first n elements are valid, where n is the true count of the selection mask.
-    /// * Mask - only the elements indicated by the selection mask are valid.
-    ///
-    /// Kernel should inspect the selection enum of the input and iterate the values accordingly.
-    /// They may choose to write the output vector in any selection mode, but should choose the most
-    /// efficient mode possible - not forgetting to update the output vector's selection enum.
+    /// Perform a single step of the kernel.
     fn step(
-        &self,
-        ctx: &KernelContext,
-        chunk_idx: usize,
+        &mut self,
+        ctx: &KernelCtx,
         selection: &BitView,
-        out: &mut ViewMut,
-    ) -> VortexResult<()>;
+        out: &mut VectorMut,
+    ) -> VortexResult<ElementPosition>;
 }
 
-/// Context passed to kernels during execution, providing access to vectors.
-pub struct KernelContext {
-    /// The allocated vectors for intermediate results.
-    pub(crate) vectors: Vec<RefCell<Vector>>,
-    /// The computed batch inputs.
-    pub(crate) batch_inputs: Vec<Canonical>,
+/// Defines where the elements produced by a kernel are written in the output vector.
+pub enum ElementPosition {
+    /// Elements are written to the output vector in their original selected positions.
+    Sparse,
+    /// Elements are compacted at the start of the output vector.
+    Compact,
 }
 
-impl KernelContext {
-    /// Get a vector by its ID.
-    pub fn vector(&self, vector_id: VectorId) -> VectorRef<'_> {
-        VectorRef::new(self.vectors[vector_id].borrow())
+/// The context provided to kernels during execution to access input vectors.
+pub struct KernelCtx {
+    vectors: Vec<Option<PipelineVector>>,
+}
+
+impl KernelCtx {
+    fn new(vectors: Vec<PipelineVector>) -> Self {
+        Self {
+            vectors: vectors.into_iter().map(Some).collect(),
+        }
     }
 
-    /// Get a batch input by its ID.
-    pub fn batch_input(&self, batch_id: BatchId) -> &Canonical {
-        &self.batch_inputs[batch_id]
+    /// Returns the input vector at the given index.
+    ///
+    /// Note that a [`VectorMut`] is returned here, indicating that this is the only instance of
+    /// the data. It does not imply that the caller is able to mutate the data (it is returned
+    /// as an immutable reference).
+    ///
+    /// # Panics
+    ///
+    /// If the input vector at the given index is not available (typically because the vector
+    /// happens to be currently borrowed as an output vector!).
+    pub fn input(&mut self, id: VectorId) -> &PipelineVector {
+        self.vectors[id.0]
+            .as_ref()
+            .vortex_expect("Input vector at index is not available")
+    }
+
+    #[inline]
+    fn take_output(&mut self, id: &VectorId) -> PipelineVector {
+        self.vectors[id.0]
+            .take()
+            .vortex_expect("Output vector at index is not available")
+    }
+
+    #[inline]
+    fn replace_output(&mut self, id: &VectorId, vec: PipelineVector) {
+        self.vectors[id.0] = Some(vec);
+    }
+}
+
+/// A unique identifier for a vector in the pipeline execution context.
+#[derive(Debug, Clone, Copy)]
+pub struct VectorId(usize);
+impl VectorId {
+    // Non-public constructor to keep the type opaque to end users.
+    fn new(idx: usize) -> Self {
+        VectorId(idx)
+    }
+}
+
+/// A pipeline vector passed into and out of pipeline kernels.
+#[derive(Debug)]
+pub enum PipelineVector {
+    /// Sparse indicates that the elements indicated by the selection mask are in their original
+    /// sparse positions within the vector.
+    Sparse(VectorMut),
+    /// Compact indicates that the selected elements are compacted at the start of the vector in
+    /// positions `0..true_count`.
+    Compact(VectorMut),
+}
+
+impl PipelineVector {
+    pub fn from_position(position: ElementPosition, vec: VectorMut) -> PipelineVector {
+        match position {
+            ElementPosition::Sparse => PipelineVector::Sparse(vec),
+            ElementPosition::Compact => PipelineVector::Compact(vec),
+        }
+    }
+}
+
+impl From<PipelineVector> for VectorMut {
+    fn from(value: PipelineVector) -> Self {
+        match value {
+            PipelineVector::Sparse(vec) => vec,
+            PipelineVector::Compact(vec) => vec,
+        }
     }
 }

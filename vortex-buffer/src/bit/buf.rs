@@ -12,8 +12,12 @@ use crate::{Alignment, BitBufferMut, Buffer, BufferMut, ByteBuffer, buffer};
 
 /// An immutable bitset stored as a packed byte buffer.
 #[derive(Debug, Clone, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct BitBuffer {
     buffer: ByteBuffer,
+    /// Represents the offset of the bit buffer into the first byte.
+    ///
+    /// This is always less than 8 (for when the bit buffer is not aligned to a byte).
     offset: usize,
     len: usize,
 }

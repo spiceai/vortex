@@ -119,6 +119,16 @@ impl<D: NativeDecimalType> DVector<D> {
         self.ps
     }
 
+    /// Returns the precision of the decimal vector.
+    pub fn precision(&self) -> u8 {
+        self.ps.precision()
+    }
+
+    /// Returns the scale of the decimal vector.
+    pub fn scale(&self) -> i8 {
+        self.ps.scale()
+    }
+
     /// Returns a reference to the underlying elements buffer containing the decimal data.
     pub fn elements(&self) -> &Buffer<D> {
         &self.elements
@@ -201,6 +211,14 @@ impl<D: NativeDecimalType> VectorOps for DVector<D> {
                 elements: elements.freeze(),
                 validity,
             }),
+        }
+    }
+
+    fn into_mut(self) -> DVectorMut<D> {
+        DVectorMut {
+            ps: self.ps,
+            elements: self.elements.into_mut(),
+            validity: self.validity.into_mut(),
         }
     }
 }

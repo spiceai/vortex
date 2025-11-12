@@ -40,11 +40,11 @@ pub mod compute;
 mod context;
 mod encoding;
 pub mod execution;
+pub mod expr;
 mod hash;
 pub mod iter;
 mod mask_future;
 mod metadata;
-pub mod operator;
 pub mod optimizer;
 mod partial_ord;
 pub mod patches;
@@ -57,6 +57,7 @@ pub mod stream;
 pub mod test_harness;
 pub mod validity;
 pub mod variants;
+pub mod vectors;
 pub mod vtable;
 
 pub mod flatbuffers {

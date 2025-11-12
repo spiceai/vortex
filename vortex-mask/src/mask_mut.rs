@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::ops::Sub;
 use std::sync::Arc;
 
 use vortex_buffer::BitBufferMut;
@@ -92,6 +91,39 @@ impl MaskMut {
             Inner::Builder(bits) => {
                 bits.reserve(additional);
             }
+        }
+    }
+
+    /// Set the length of the mask.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `new_len` is less than the capacity of the mask.
+    pub unsafe fn set_len(&mut self, new_len: usize) {
+        debug_assert!(new_len < self.capacity());
+        match &mut self.0 {
+            Inner::Empty { capacity, .. } => {
+                self.0 = Inner::Constant {
+                    value: false, // Pick any value
+                    len: new_len,
+                    capacity: *capacity,
+                }
+            }
+            Inner::Constant { len, .. } => {
+                *len = new_len;
+            }
+            Inner::Builder(bits) => {
+                unsafe { bits.set_len(new_len) };
+            }
+        }
+    }
+
+    /// Returns the capacity of the mask.
+    pub fn capacity(&self) -> usize {
+        match &self.0 {
+            Inner::Empty { capacity } => *capacity,
+            Inner::Constant { capacity, .. } => *capacity,
+            Inner::Builder(bits) => bits.capacity(),
         }
     }
 
@@ -207,10 +239,11 @@ impl MaskMut {
     /// values from `at` to the end, and leaving `self` with the values from
     /// the start to `at`.
     pub fn split_off(&mut self, at: usize) -> Self {
-        assert!(at <= self.len(), "split_off index out of bounds");
+        assert!(at <= self.capacity(), "split_off index out of bounds");
         match &mut self.0 {
             Inner::Empty { capacity } => {
-                let new_capacity = (*capacity).saturating_sub(at);
+                let new_capacity = *capacity - at;
+                *capacity = at;
                 Self(Inner::Empty {
                     capacity: new_capacity,
                 })
@@ -220,9 +253,12 @@ impl MaskMut {
                 len,
                 capacity,
             } => {
-                let new_len = len.sub(at);
-                *len = at;
-                let new_capacity = (*capacity).saturating_sub(at);
+                // Adjust the lengths, given that length may be < at
+                let new_len = len.saturating_sub(at);
+                let new_capacity = *capacity - at;
+                *len = (*len).min(at);
+                *capacity = at;
+
                 Self(Inner::Constant {
                     value: *value,
                     len: new_len,
@@ -300,7 +336,8 @@ impl MaskMut {
 }
 
 impl Mask {
-    /// Attempts to convert an immutable mask into a mutable one.
+    /// Attempts to convert an immutable mask into a mutable one, returning an error of `Self` if
+    /// the underlying [`BitBuffer`](crate::BitBuffer) data if there are any other references.
     pub fn try_into_mut(self) -> Result<MaskMut, Self> {
         match self {
             Mask::AllTrue(len) => Ok(MaskMut::new_true(len)),
@@ -313,6 +350,29 @@ impl Mask {
                 let mut_buffer = bit_buffer.try_into_mut().map_err(Mask::from_buffer)?;
 
                 Ok(MaskMut(Inner::Builder(mut_buffer)))
+            }
+        }
+    }
+
+    /// Convert an immutable mask into a mutable one, cloning the underlying
+    /// [`BitBuffer`](crate::BitBuffer) data if there are any other references.
+    pub fn into_mut(self) -> MaskMut {
+        match self {
+            Mask::AllTrue(len) => MaskMut::new_true(len),
+            Mask::AllFalse(len) => MaskMut::new_false(len),
+            Mask::Values(values) => {
+                let bit_buffer_mut = match Arc::try_unwrap(values) {
+                    Ok(mask_values) => {
+                        let bit_buffer = mask_values.into_buffer();
+                        bit_buffer.into_mut()
+                    }
+                    Err(arc_mask_values) => {
+                        let bit_buffer = arc_mask_values.bit_buffer();
+                        BitBufferMut::copy_from(bit_buffer)
+                    }
+                };
+
+                MaskMut(Inner::Builder(bit_buffer_mut))
             }
         }
     }

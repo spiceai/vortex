@@ -32,6 +32,11 @@ pub trait VectorOps: private::Sealed + Into<Vector> + Sized {
     /// add nullable data to a vector they want to keep as non-nullable.
     fn validity(&self) -> &Mask;
 
+    /// Returns the null count of the vector.
+    fn null_count(&self) -> usize {
+        self.validity().false_count()
+    }
+
     /// Return the scalar at the given index.
     ///
     /// # Panics
@@ -52,6 +57,19 @@ pub trait VectorOps: private::Sealed + Into<Vector> + Sized {
     ///
     /// If `self` is not unique, this will fail and return `self` back to the caller.
     fn try_into_mut(self) -> Result<Self::Mutable, Self>;
+
+    /// Converts `self` into a mutable vector (implementing [`VectorMutOps`]).
+    ///
+    /// This method uses "clone-on-write" semantics, meaning it will clone any underlying data that
+    /// has multiple references (preventing mutable access). `into_mut` can be more efficient than
+    /// [`try_into_mut()`] when mutations are infrequent.
+    ///
+    /// The semantics of `into_mut` are somewhat similar to that of [`Arc::make_mut()`], but instead
+    /// of working with references, this works with owned immutable / mutable types.
+    ///
+    /// [`try_into_mut()`]: Self::try_into_mut
+    /// [`Arc::make_mut()`]: std::sync::Arc::make_mut
+    fn into_mut(self) -> Self::Mutable;
 }
 
 /// Common operations for mutable vectors (all the variants of [`VectorMut`]).
@@ -86,6 +104,16 @@ pub trait VectorMutOps: private::Sealed + Into<VectorMut> + Sized {
     ///
     /// Please let us know if you need `reserve_exact` functionality!
     fn reserve(&mut self, additional: usize);
+
+    /// Clears the buffer, removing all data. Existing capacity is preserved.
+    fn clear(&mut self);
+
+    /// Shortens the buffer, keeping the first len bytes and dropping the rest.
+    ///
+    /// If len is greater than the buffer’s current length, this has no effect.
+    ///
+    /// Existing underlying capacity is preserved.
+    fn truncate(&mut self, len: usize);
 
     /// Extends the vector by appending elements from another vector.
     ///
