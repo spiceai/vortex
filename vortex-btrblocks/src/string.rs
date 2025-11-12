@@ -95,7 +95,7 @@ impl Compressor for StringCompressor {
         &[
             &UncompressedScheme,
             &DictScheme,
-            &FSSTScheme,
+            // &FSSTScheme,
             &ConstantScheme,
             &NullDominated,
         ]
