@@ -254,7 +254,7 @@ pub(crate) fn can_be_pushed_down(df_expr: &PhysicalExprRef, schema: &Schema) -> 
         .is_some()
     {
         // assume dynamic filters can be pushed down - the child won't be specified until execution time
-        true
+        false
     } else {
         tracing::debug!(%df_expr, "DataFusion expression can't be pushed down");
         false
