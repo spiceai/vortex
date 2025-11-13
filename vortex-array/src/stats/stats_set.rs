@@ -116,6 +116,10 @@ impl StatsSet {
         self.get(stat).map(|v| {
             v.map(|v| {
                 T::try_from(&Scalar::new(dtype.clone(), v)).unwrap_or_else(|err| {
+                    println!(
+                        "Failed to get stat {stat} as {} - {err}",
+                        std::any::type_name::<T>()
+                    );
                     vortex_panic!(
                         err,
                         "Failed to get stat {} as {}",
