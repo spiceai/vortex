@@ -38,6 +38,7 @@ pub const PRUNING_STATS: &[Stat] = &[
     Stat::Sum,
     Stat::NullCount,
     Stat::NaNCount,
+    Stat::UncompressedSizeInBytes,
 ];
 
 #[derive(

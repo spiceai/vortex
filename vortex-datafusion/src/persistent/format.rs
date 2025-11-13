@@ -35,7 +35,7 @@ use vortex::error::{VortexExpect, VortexResult, vortex_err};
 use vortex::file::VORTEX_FILE_EXTENSION;
 use vortex::scalar::Scalar;
 use vortex::session::VortexSession;
-use vortex::stats::{Stat, StatsSet};
+use vortex::stats::{ArrayStats, Stat, StatsSet};
 use vortex::{VortexSessionDefault, stats};
 
 use super::cache::VortexFileCache;
