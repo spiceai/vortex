@@ -38,11 +38,11 @@ impl Compressor for FloatCompressor {
     fn schemes() -> &'static [&'static Self::SchemeType] {
         &[
             &UncompressedScheme,
-            &ConstantScheme,
-            &ALPScheme,
-            &ALPRDScheme,
-            &DictScheme,
-            &RLE_FLOAT_SCHEME,
+            // &ConstantScheme,
+            // &ALPScheme,
+            // &ALPRDScheme,
+            // &DictScheme,
+            // &RLE_FLOAT_SCHEME,
         ]
     }
 

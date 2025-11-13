@@ -42,15 +42,16 @@ impl Compressor for IntCompressor {
 
     fn schemes() -> &'static [&'static dyn IntegerScheme] {
         &[
-            &ConstantScheme,
-            &FORScheme,
-            &ZigZagScheme,
-            &BitPackingScheme,
-            &SparseScheme,
-            &DictScheme,
-            &RunEndScheme,
-            &SequenceScheme,
-            &RLE_INTEGER_SCHEME,
+            &UncompressedScheme,
+            // &ConstantScheme,
+            // &FORScheme,
+            // &ZigZagScheme,
+            // &BitPackingScheme,
+            // &SparseScheme,
+            // &DictScheme,
+            // &RunEndScheme,
+            // &SequenceScheme,
+            // &RLE_INTEGER_SCHEME,
         ]
     }
 
