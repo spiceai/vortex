@@ -293,8 +293,6 @@ impl FileFormat for VortexFormat {
                     acc.zip(stats_set).map(|(acc, stats_set)| acc + stats_set)
                 });
 
-            println!("Found total byte size: {:?}", total_byte_size);
-
             // Sum up the total byte size across all the columns.
             let total_byte_size = total_byte_size.to_df();
 
