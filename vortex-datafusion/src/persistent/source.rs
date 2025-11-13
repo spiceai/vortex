@@ -197,8 +197,6 @@ impl FileSource for VortexSource {
             .clone()
             .vortex_expect("projected_statistics must be set");
 
-        println!("Statistics for source: {:?}", statistics);
-
         if self.vortex_predicate.is_some() {
             Ok(statistics.to_inexact())
         } else {
