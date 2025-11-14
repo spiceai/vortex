@@ -162,6 +162,12 @@ impl FileOpener for VortexOpener {
         let metrics = self.metrics.clone();
         let layout_reader = self.layout_readers.clone();
         let has_output_ordering = self.has_output_ordering;
+        let is_lineitem = file_meta
+            .object_meta
+            .location
+            .to_string()
+            .to_lowercase()
+            .contains("lineitem");
 
         let projected_schema = match projection.as_ref() {
             None => logical_schema.clone(),
@@ -353,9 +359,9 @@ impl FileOpener for VortexOpener {
                 })
                 .try_flatten()
                 .map(move |batch| batch.and_then(|b| schema_mapping.map_batch(b)))
-                .map(|batch| {
-                    if let Ok(batch) = &batch {
-                        batch.columns().iter().for_each(|arr| {
+                .map(move |batch| {
+                    if is_lineitem && let Ok(batch) = &batch {
+                        batch.column_by_name("l_orderkey").and_then(|arr| {
                             if !arr.is_empty() {
                                 let min = min_batch(arr);
                                 let max = max_batch(arr);
@@ -368,7 +374,9 @@ impl FileOpener for VortexOpener {
                                     );
                                 }
                             }
-                        })
+
+                            Some(arr)
+                        });
                     }
 
                     batch
