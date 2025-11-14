@@ -12,6 +12,7 @@ use datafusion_datasource::file_stream::{FileOpenFuture, FileOpener};
 use datafusion_datasource::schema_adapter::SchemaAdapterFactory;
 use datafusion_datasource::{FileRange, PartitionedFile};
 use datafusion_datasource_parquet::EarlyStoppingStream;
+use datafusion_functions_aggregate_common::min_max::{max_batch, min_batch};
 use datafusion_physical_expr::simplifier::PhysicalExprSimplifier;
 use datafusion_physical_expr::{PhysicalExprRef, split_conjunction};
 use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
@@ -352,6 +353,26 @@ impl FileOpener for VortexOpener {
                 })
                 .try_flatten()
                 .map(move |batch| batch.and_then(|b| schema_mapping.map_batch(b)))
+                .map(|batch| {
+                    if let Ok(batch) = &batch {
+                        batch.columns().iter().for_each(|arr| {
+                            if !arr.is_empty() {
+                                let min = min_batch(arr);
+                                let max = max_batch(arr);
+
+                                if let Ok(min) = min
+                                    && let Ok(max) = max
+                                {
+                                    println!(
+                                        "Vortex returned batch with - min: {min:?}, max: {max:?}"
+                                    );
+                                }
+                            }
+                        })
+                    }
+
+                    batch
+                })
                 .boxed();
 
             if let Some(file_pruner) = file_pruner {

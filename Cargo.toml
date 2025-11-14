@@ -109,6 +109,7 @@ datafusion-datasource-parquet = { version = "50.3" }
 datafusion-execution = { version = "50.3" }
 datafusion-expr = { version = "50.3" }
 datafusion-functions = { version = "50.3" }
+datafusion-functions-aggregate-common = { version = "50.3" }
 datafusion-physical-expr = { version = "50.3" }
 datafusion-physical-expr-adapter = { version = "50.3" }
 datafusion-physical-expr-common = { version = "50.3" }
@@ -360,6 +361,7 @@ datafusion-datasource-parquet = { git = "https://github.com/spiceai/datafusion",
 datafusion-execution = { git = "https://github.com/spiceai/datafusion", rev = "57f98a66ca116620a8dde3d93f943fd521195ec4" }
 datafusion-expr = { git = "https://github.com/spiceai/datafusion", rev = "57f98a66ca116620a8dde3d93f943fd521195ec4" }
 datafusion-functions = { git = "https://github.com/spiceai/datafusion", rev = "57f98a66ca116620a8dde3d93f943fd521195ec4" }
+datafusion-functions-aggregate-common = { git = "https://github.com/spiceai/datafusion", rev = "57f98a66ca116620a8dde3d93f943fd521195ec4" }
 datafusion-physical-expr = { git = "https://github.com/spiceai/datafusion", rev = "57f98a66ca116620a8dde3d93f943fd521195ec4" }
 datafusion-physical-expr-adapter = { git = "https://github.com/spiceai/datafusion", rev = "57f98a66ca116620a8dde3d93f943fd521195ec4" }
 datafusion-physical-expr-common = { git = "https://github.com/spiceai/datafusion", rev = "57f98a66ca116620a8dde3d93f943fd521195ec4" }
