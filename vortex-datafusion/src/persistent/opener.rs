@@ -359,28 +359,6 @@ impl FileOpener for VortexOpener {
                 })
                 .try_flatten()
                 .map(move |batch| batch.and_then(|b| schema_mapping.map_batch(b)))
-                .map(move |batch| {
-                    if is_lineitem && let Ok(batch) = &batch {
-                        batch.column_by_name("l_orderkey").and_then(|arr| {
-                            if !arr.is_empty() {
-                                let min = min_batch(arr);
-                                let max = max_batch(arr);
-
-                                if let Ok(min) = min
-                                    && let Ok(max) = max
-                                {
-                                    println!(
-                                        "Vortex returned batch with - min: {min:?}, max: {max:?}"
-                                    );
-                                }
-                            }
-
-                            Some(arr)
-                        });
-                    }
-
-                    batch
-                })
                 .boxed();
 
             if let Some(file_pruner) = file_pruner {
