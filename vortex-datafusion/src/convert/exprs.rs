@@ -10,6 +10,7 @@ use datafusion_functions::core::getfield::GetFieldFunc;
 use datafusion_physical_expr::{PhysicalExpr, ScalarFunctionExpr};
 use datafusion_physical_expr_common::physical_expr::PhysicalExprRef;
 use datafusion_physical_plan::expressions as df_expr;
+use datafusion_physical_plan::joins::CompactInListExpr;
 use itertools::Itertools;
 use vortex::compute::LikeOptions;
 use vortex::dtype::arrow::FromArrowType;
@@ -99,6 +100,31 @@ impl TryFromDataFusion<dyn PhysicalExpr> for Expression {
         }
 
         if let Some(in_list) = df.as_any().downcast_ref::<df_expr::InListExpr>() {
+            let value = Expression::try_from_df(in_list.expr().as_ref())?;
+            let list_elements: Vec<_> = in_list
+                .list()
+                .iter()
+                .map(|e| {
+                    if let Some(lit) = e.as_any().downcast_ref::<df_expr::Literal>() {
+                        Ok(Scalar::from_df(lit.value()))
+                    } else {
+                        Err(vortex_err!("Failed to cast sub-expression"))
+                    }
+                })
+                .try_collect()?;
+
+            let list = Scalar::list(
+                list_elements[0].dtype().clone(),
+                list_elements,
+                Nullability::Nullable,
+            );
+            let expr = list_contains(lit(list), value);
+
+            return Ok(if in_list.negated() { not(expr) } else { expr });
+        }
+
+        if let Some(compact_list) = df.as_any().downcast_ref::<CompactInListExpr>() {
+            let in_list = compact_list.inner.clone();
             let value = Expression::try_from_df(in_list.expr().as_ref())?;
             let list_elements: Vec<_> = in_list
                 .list()
@@ -244,6 +270,10 @@ pub(crate) fn can_be_pushed_down(df_expr: &PhysicalExprRef, schema: &Schema) -> 
     } else if let Some(is_not_null) = expr.downcast_ref::<df_expr::IsNotNullExpr>() {
         can_be_pushed_down(is_not_null.arg(), schema)
     } else if let Some(in_list) = expr.downcast_ref::<df_expr::InListExpr>() {
+        can_be_pushed_down(in_list.expr(), schema)
+            && in_list.list().iter().all(|e| can_be_pushed_down(e, schema))
+    } else if let Some(compact_list) = expr.downcast_ref::<CompactInListExpr>() {
+        let in_list = compact_list.inner.clone();
         can_be_pushed_down(in_list.expr(), schema)
             && in_list.list().iter().all(|e| can_be_pushed_down(e, schema))
     } else if let Some(scalar_fn) = expr.downcast_ref::<ScalarFunctionExpr>() {
