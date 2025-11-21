@@ -7,16 +7,14 @@ use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
 
 use arrow_schema::{ArrowError, DataType, Field, SchemaRef};
-use datafusion_common::arrow::array::AsArray;
 use datafusion_common::arrow::array::RecordBatch;
 use datafusion_common::pruning::PrunableStatistics;
-use datafusion_common::{DataFusionError, Result as DFResult, ScalarValue, Statistics};
+use datafusion_common::{DataFusionError, Result as DFResult, Statistics};
 use datafusion_datasource::file_meta::FileMeta;
 use datafusion_datasource::file_stream::{FileOpenFuture, FileOpener};
 use datafusion_datasource::schema_adapter::SchemaAdapterFactory;
 use datafusion_datasource::{FileRange, PartitionedFile};
 use datafusion_datasource_parquet::EarlyStoppingStream;
-use datafusion_expr::ColumnarValue;
 use datafusion_physical_expr::simplifier::PhysicalExprSimplifier;
 use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr::{PhysicalExpr, PhysicalExprRef, split_conjunction};
@@ -490,33 +488,7 @@ where
                     self.done = true;
                     Poll::Ready(None)
                 } else {
-                    let schema = batch.schema();
-                    let mut mask = Vec::new();
-
-                    let dynamic_batch_evaluation =
-                        self.dynamic_filter_expr.evaluate(&batch).unwrap();
-
-                    match dynamic_batch_evaluation {
-                        ColumnarValue::Array(array) => {
-                            for e in array.as_boolean().iter() {
-                                if let Some(e) = e {
-                                    mask.push(e);
-                                }
-                            }
-                        }
-                        ColumnarValue::Scalar(ScalarValue::Boolean(Some(false))) => {
-                            // False means all containers can not pass the predicate
-                            mask = vec![false];
-                        }
-                        _ => {}
-                    };
-
-                    if mask.is_empty() || mask.iter().any(|v| *v) {
-                        return Poll::Ready(Some(Ok(batch)));
-                    }
-
-                    let empty_batch = RecordBatch::new_empty(schema);
-                    Poll::Ready(Some(Ok(empty_batch)))
+                    Poll::Ready(Some(Ok(batch)))
                 }
             }
         }
