@@ -2,23 +2,29 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::ops::Range;
+use std::pin::Pin;
 use std::sync::{Arc, Weak};
+use std::task::{Context, Poll};
 
 use arrow_schema::{ArrowError, DataType, Field, SchemaRef};
 use datafusion_common::arrow::array::RecordBatch;
-use datafusion_common::{DataFusionError, Result as DFResult};
+use datafusion_common::pruning::PrunableStatistics;
+use datafusion_common::{DataFusionError, Result as DFResult, Statistics};
 use datafusion_datasource::file_meta::FileMeta;
 use datafusion_datasource::file_stream::{FileOpenFuture, FileOpener};
 use datafusion_datasource::schema_adapter::SchemaAdapterFactory;
 use datafusion_datasource::{FileRange, PartitionedFile};
 use datafusion_datasource_parquet::EarlyStoppingStream;
 use datafusion_physical_expr::simplifier::PhysicalExprSimplifier;
-use datafusion_physical_expr::{PhysicalExprRef, split_conjunction};
+use datafusion_physical_expr::utils::collect_columns;
+use datafusion_physical_expr::{PhysicalExpr, PhysicalExprRef, split_conjunction};
 use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
 use datafusion_physical_expr_common::physical_expr::is_dynamic_physical_expr;
 use datafusion_physical_plan::metrics::Count;
-use datafusion_pruning::FilePruner;
-use futures::{FutureExt, StreamExt, TryStreamExt, stream};
+use datafusion_pruning::{
+    BoolVecBuilder, FilePruner, PruningStatistics, RequiredColumns, build_statistics_record_batch,
+};
+use futures::{FutureExt, Stream, StreamExt, TryStreamExt, ready, stream};
 use object_store::ObjectStore;
 use object_store::path::Path;
 use tracing::Instrument;
@@ -162,6 +168,8 @@ impl FileOpener for VortexOpener {
         let layout_reader = self.layout_readers.clone();
         let has_output_ordering = self.has_output_ordering;
 
+        let statistics = file.statistics.clone();
+
         let projected_schema = match projection.as_ref() {
             None => logical_schema.clone(),
             Some(indices) => Arc::new(logical_schema.project(indices)?),
@@ -201,6 +209,8 @@ impl FileOpener for VortexOpener {
 
             let dynamic_filter_expr = file_pruning_predicate
                 .and_then(|predicate| is_dynamic_physical_expr(&predicate).then_some(predicate));
+
+            let statistics = statistics;
 
             // Check if this file should be pruned based on statistics/partition values.
             // Returns empty stream if file can be skipped entirely.
@@ -328,8 +338,6 @@ impl FileOpener for VortexOpener {
                     DataFusionError::Execution(format!("Failed to create Vortex stream: {e}"))
                 })?
                 .map_ok(move |rb| {
-                    println!("File pruning predicate: {:?}", dynamic_filter_expr);
-
                     // We try and slice the stream into respecting datafusion's configured batch size.
                     stream::iter(
                         (0..rb.num_rows().div_ceil(batch_size * 2))
@@ -360,18 +368,114 @@ impl FileOpener for VortexOpener {
                 .map(move |batch| batch.and_then(|b| schema_mapping.map_batch(b)))
                 .boxed();
 
-            if let Some(file_pruner) = file_pruner {
-                Ok(Box::pin(EarlyStoppingStream::new(
+            if let Some(dynamic_filter_expr) = dynamic_filter_expr
+                && let Some(statistics) = statistics
+            {
+                println!("Has file pruner");
+                Ok(Box::pin(VortexStoppingStream::new(
                     stream,
-                    file_pruner,
-                    Count::new(),
+                    dynamic_filter_expr,
+                    statistics,
                 )))
             } else {
+                println!("Does not have file pruner");
                 Ok(Box::pin(stream))
             }
         }
         .in_current_span()
         .boxed())
+    }
+}
+
+struct VortexStoppingStream<S> {
+    inner: S,
+    dynamic_filter_expr: Arc<dyn PhysicalExpr>,
+    statistics: Arc<Statistics>,
+    done: bool,
+}
+
+impl<S> VortexStoppingStream<S>
+where
+    S: Stream<Item = DFResult<RecordBatch>> + Unpin,
+{
+    pub fn new(
+        inner: S,
+        dynamic_filter_expr: Arc<dyn PhysicalExpr>,
+        statistics: Arc<Statistics>,
+    ) -> Self {
+        Self {
+            inner,
+            dynamic_filter_expr,
+            statistics,
+            done: false,
+        }
+    }
+
+    fn should_prune(&self, batch: &RecordBatch) -> bool {
+        let mut required_columns: Vec<(
+            datafusion_physical_expr::expressions::Column,
+            datafusion_pruning::StatisticsType,
+            Field,
+        )> = Vec::new();
+        let columns = collect_columns(&self.dynamic_filter_expr);
+        let schema = batch.schema();
+        for col in columns {
+            let field = schema.field_with_name(col.name()).unwrap();
+            required_columns.push((
+                col.clone(),
+                datafusion_pruning::StatisticsType::Min,
+                field.clone(),
+            ));
+            required_columns.push((col, datafusion_pruning::StatisticsType::Max, field.clone()));
+        }
+
+        let prunable_statistics = Box::new(PrunableStatistics::new(
+            vec![Arc::clone(&self.statistics)],
+            Arc::clone(&schema),
+        ));
+
+        let mut builder = BoolVecBuilder::new(prunable_statistics.num_containers());
+        let required_columns = RequiredColumns::from(required_columns);
+        let statistics_batch =
+            build_statistics_record_batch(prunable_statistics.as_ref(), &required_columns).unwrap();
+
+        builder.combine_value(
+            self.dynamic_filter_expr
+                .evaluate(&statistics_batch)
+                .unwrap(),
+        );
+
+        let mask = builder.build();
+        mask.into_iter().all(|v| !v)
+    }
+}
+
+impl<S> Stream for VortexStoppingStream<S>
+where
+    S: Stream<Item = DFResult<RecordBatch>> + Unpin,
+{
+    type Item = DFResult<RecordBatch>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.done {
+            return Poll::Ready(None);
+        }
+
+        match ready!(self.inner.poll_next_unpin(cx)) {
+            None => {
+                self.done = true;
+                Poll::Ready(None)
+            }
+            Some(batch) => {
+                let batch = batch.unwrap();
+                if self.should_prune(&batch) {
+                    self.done = true;
+                    Poll::Ready(None)
+                } else {
+                    Poll::Ready(Some(Ok(batch)))
+                }
+            }
+        }
     }
 }
 
