@@ -180,6 +180,7 @@ impl FileOpener for VortexOpener {
             // - Partition column values (e.g., date=2024-01-01)
             // - File-level statistics (min/max values per column)
             let mut file_pruner = file_pruning_predicate
+                .clone()
                 .map(|predicate| {
                     // Only create pruner if we have dynamic expressions or file statistics
                     // to work with. Static predicates without stats won't benefit from pruning.
@@ -197,6 +198,9 @@ impl FileOpener for VortexOpener {
                 })
                 .transpose()?
                 .flatten();
+
+            let dynamic_filter_expr = file_pruning_predicate
+                .and_then(|predicate| is_dynamic_physical_expr(&predicate).then_some(predicate));
 
             // Check if this file should be pruned based on statistics/partition values.
             // Returns empty stream if file can be skipped entirely.
@@ -324,6 +328,8 @@ impl FileOpener for VortexOpener {
                     DataFusionError::Execution(format!("Failed to create Vortex stream: {e}"))
                 })?
                 .map_ok(move |rb| {
+                    println!("File pruning predicate: {:?}", dynamic_filter_expr);
+
                     // We try and slice the stream into respecting datafusion's configured batch size.
                     stream::iter(
                         (0..rb.num_rows().div_ceil(batch_size * 2))
