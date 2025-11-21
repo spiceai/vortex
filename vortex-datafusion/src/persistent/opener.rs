@@ -453,6 +453,8 @@ where
         let statistics_batch =
             build_statistics_record_batch(prunable_statistics.as_ref(), &required_columns).unwrap();
 
+        println!("Prunable statistics: {:?}", statistics_batch);
+
         builder.combine_value(
             self.dynamic_filter_expr
                 .evaluate(&statistics_batch)
