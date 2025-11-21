@@ -19,7 +19,9 @@ use datafusion_physical_expr::simplifier::PhysicalExprSimplifier;
 use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr::{PhysicalExpr, PhysicalExprRef, split_conjunction};
 use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
-use datafusion_physical_expr_common::physical_expr::is_dynamic_physical_expr;
+use datafusion_physical_expr_common::physical_expr::{
+    is_dynamic_physical_expr, snapshot_generation,
+};
 use datafusion_physical_plan::metrics::Count;
 use datafusion_pruning::{
     BoolVecBuilder, FilePruner, PruningStatistics, RequiredColumns, build_statistics_record_batch,
@@ -392,6 +394,7 @@ struct VortexStoppingStream<S> {
     dynamic_filter_expr: Arc<dyn PhysicalExpr>,
     statistics: Arc<Statistics>,
     done: bool,
+    dynamic_filter_generation: Option<u64>,
 }
 
 impl<S> VortexStoppingStream<S>
@@ -408,10 +411,21 @@ where
             dynamic_filter_expr,
             statistics,
             done: false,
+            dynamic_filter_generation: None,
         }
     }
 
-    fn should_prune(&self, batch: &RecordBatch) -> bool {
+    fn should_prune(&mut self, batch: &RecordBatch) -> bool {
+        let new_generation = snapshot_generation(&self.dynamic_filter_expr);
+        if let Some(current_generation) = self.dynamic_filter_generation.as_mut() {
+            if *current_generation == new_generation {
+                return false;
+            }
+            *current_generation = new_generation;
+        } else {
+            self.dynamic_filter_generation = Some(new_generation);
+        }
+
         let mut required_columns: Vec<(
             datafusion_physical_expr::expressions::Column,
             datafusion_pruning::StatisticsType,
