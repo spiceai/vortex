@@ -9,8 +9,8 @@ use vortex_dtype::DType;
 use vortex_error::{VortexExpect, VortexResult, vortex_ensure};
 use vortex_mask::MaskMut;
 
-use crate::fixed_size_list::FixedSizeListVector;
-use crate::{VectorMut, VectorMutOps, match_vector_pair};
+use crate::fixed_size_list::{FixedSizeListScalar, FixedSizeListVector};
+use crate::{ScalarOps, VectorMut, VectorMutOps, match_vector_pair};
 
 /// A mutable vector of fixed-size lists.
 ///
@@ -189,6 +189,19 @@ impl VectorMutOps for FixedSizeListVectorMut {
         self.elements.reserve(additional * self.list_size as usize);
     }
 
+    fn clear(&mut self) {
+        self.elements.clear();
+        self.validity.clear();
+        self.len = 0;
+    }
+
+    fn truncate(&mut self, len: usize) {
+        let new_len = len.min(self.len);
+        self.elements.truncate(new_len * self.list_size as usize);
+        self.validity.truncate(new_len);
+        self.len = new_len;
+    }
+
     fn extend_from_vector(&mut self, other: &FixedSizeListVector) {
         match_vector_pair!(
             self.elements.as_mut(),
@@ -207,6 +220,22 @@ impl VectorMutOps for FixedSizeListVectorMut {
     fn append_nulls(&mut self, n: usize) {
         self.elements.append_nulls(n * self.list_size as usize);
         self.validity.append_n(false, n);
+        self.len += n;
+        debug_assert_eq!(self.len, self.validity.len());
+    }
+
+    fn append_zeros(&mut self, n: usize) {
+        self.elements.append_zeros(n * self.list_size as usize);
+        self.validity.append_n(true, n);
+        self.len += n;
+        debug_assert_eq!(self.len, self.validity.len());
+    }
+
+    fn append_scalars(&mut self, scalar: &FixedSizeListScalar, n: usize) {
+        for _ in 0..n {
+            self.elements.extend_from_vector(scalar.value().elements())
+        }
+        self.validity.append_n(scalar.is_valid(), n);
         self.len += n;
         debug_assert_eq!(self.len, self.validity.len());
     }
@@ -246,6 +275,11 @@ impl VectorMutOps for FixedSizeListVectorMut {
 
     fn unsplit(&mut self, other: Self) {
         assert_eq!(self.list_size, other.list_size);
+
+        if self.is_empty() {
+            *self = other;
+            return;
+        }
 
         self.elements.unsplit(*other.elements);
         self.validity.unsplit(other.validity);

@@ -4,11 +4,10 @@
 //! Float-specific dictionary encoding implementation.
 
 use vortex_array::IntoArray;
-use vortex_array::arrays::PrimitiveArray;
+use vortex_array::arrays::{DictArray, PrimitiveArray};
 use vortex_array::validity::Validity;
 use vortex_array::vtable::ValidityHelper;
 use vortex_buffer::Buffer;
-use vortex_dict::DictArray;
 use vortex_dtype::half::f16;
 
 use crate::float::stats::{ErasedDistinctValues, FloatStats};
@@ -39,7 +38,7 @@ macro_rules! typed_encode {
         let values = PrimitiveArray::new(values, values_validity).into_array();
 
         // SAFETY: enforced by the DictEncoder
-        unsafe { DictArray::new_unchecked(codes, values) }
+        unsafe { DictArray::new_unchecked(codes, values).set_all_values_referenced(true) }
     }};
 }
 

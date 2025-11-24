@@ -8,7 +8,7 @@ use vortex_dtype::NativePType;
 use vortex_error::{VortexExpect, VortexResult, vortex_ensure};
 use vortex_mask::MaskMut;
 
-use crate::primitive::PVector;
+use crate::primitive::{PScalar, PVector};
 use crate::{VectorMutOps, VectorOps};
 
 /// A mutable vector of generic primitive values.
@@ -73,6 +73,41 @@ impl<T> PVectorMut<T> {
         }
     }
 
+    /// Set the length of the vector.
+    ///
+    /// # Safety
+    ///
+    /// - `new_len` must be less than or equal to [`capacity()`].
+    /// - The elements at `old_len..new_len` must be initialized.
+    ///
+    /// [`capacity()`]: Self::capacity
+    pub unsafe fn set_len(&mut self, new_len: usize) {
+        debug_assert!(new_len < self.elements.capacity());
+        debug_assert!(new_len < self.validity.capacity());
+        unsafe { self.elements.set_len(new_len) };
+        unsafe { self.validity.set_len(new_len) };
+    }
+
+    /// Returns a mutable reference to the elements buffer.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that any mutations to the elements do not violate the
+    /// invariants of the vector (e.g., the length must remain consistent with the elements buffer).
+    pub unsafe fn elements_mut(&mut self) -> &mut BufferMut<T> {
+        &mut self.elements
+    }
+
+    /// Returns a mutable reference to the validity mask.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that any mutations to the validity mask do not violate the
+    /// invariants of the vector (e.g., the length must remain consistent with the elements buffer).
+    pub unsafe fn validity_mut(&mut self) -> &mut MaskMut {
+        &mut self.validity
+    }
+
     /// Decomposes the primitive vector into its constituent parts (buffer and validity).
     pub fn into_parts(self) -> (BufferMut<T>, MaskMut) {
         (self.elements, self.validity)
@@ -108,6 +143,16 @@ impl<T: NativePType> VectorMutOps for PVectorMut<T> {
         self.validity.reserve(additional);
     }
 
+    fn clear(&mut self) {
+        self.elements.clear();
+        self.validity.clear();
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.elements.truncate(len);
+        self.validity.truncate(len);
+    }
+
     /// Extends the vector by appending elements from another vector.
     fn extend_from_vector(&mut self, other: &PVector<T>) {
         self.elements.extend_from_slice(other.elements.as_slice());
@@ -117,6 +162,22 @@ impl<T: NativePType> VectorMutOps for PVectorMut<T> {
     fn append_nulls(&mut self, n: usize) {
         self.elements.push_n(T::zero(), n); // Note that the value we push doesn't actually matter.
         self.validity.append_n(false, n);
+    }
+
+    fn append_zeros(&mut self, n: usize) {
+        self.elements.push_n(T::zero(), n);
+        self.validity.append_n(true, n);
+    }
+
+    fn append_scalars(&mut self, scalar: &PScalar<T>, n: usize) {
+        match scalar.value() {
+            None => {
+                self.append_nulls(n);
+            }
+            Some(v) => {
+                self.append_values(v, n);
+            }
+        }
     }
 
     /// Freeze the vector into an immutable one.
@@ -135,6 +196,10 @@ impl<T: NativePType> VectorMutOps for PVectorMut<T> {
     }
 
     fn unsplit(&mut self, other: Self) {
+        if self.is_empty() {
+            *self = other;
+            return;
+        }
         self.elements.unsplit(other.elements);
         self.validity.unsplit(other.validity);
     }

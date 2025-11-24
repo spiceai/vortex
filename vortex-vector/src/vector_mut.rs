@@ -18,7 +18,7 @@ use crate::listview::ListViewVectorMut;
 use crate::null::NullVectorMut;
 use crate::primitive::PrimitiveVectorMut;
 use crate::struct_::StructVectorMut;
-use crate::{Vector, VectorMutOps, match_each_vector_mut, match_vector_pair};
+use crate::{Vector, VectorMutOps, VectorOps, match_each_vector_mut, match_vector_pair};
 
 /// An enum over all kinds of mutable vectors, which represent fully decompressed (canonical) array
 /// data.
@@ -106,6 +106,14 @@ impl VectorMutOps for VectorMut {
         match_each_vector_mut!(self, |v| { v.reserve(additional) })
     }
 
+    fn clear(&mut self) {
+        match_each_vector_mut!(self, |v| { v.clear() })
+    }
+
+    fn truncate(&mut self, len: usize) {
+        match_each_vector_mut!(self, |v| { v.truncate(len) })
+    }
+
     fn extend_from_vector(&mut self, other: &Vector) {
         match_vector_pair!(self, other, |a: VectorMut, b: Vector| {
             a.extend_from_vector(b)
@@ -114,6 +122,16 @@ impl VectorMutOps for VectorMut {
 
     fn append_nulls(&mut self, n: usize) {
         match_each_vector_mut!(self, |v| { v.append_nulls(n) })
+    }
+
+    fn append_zeros(&mut self, n: usize) {
+        match_each_vector_mut!(self, |v| { v.append_zeros(n) })
+    }
+
+    fn append_scalars(&mut self, scalar: &<Self::Immutable as VectorOps>::Scalar, n: usize) {
+        match_vector_pair!(self, scalar, |a: VectorMut, b: Scalar| {
+            a.append_scalars(b, n)
+        })
     }
 
     fn freeze(self) -> Vector {
@@ -131,7 +149,7 @@ impl VectorMutOps for VectorMut {
 
 impl VectorMut {
     /// Returns a reference to the inner [`NullVectorMut`] if `self` is of that variant.
-    pub fn as_null(&self) -> &NullVectorMut {
+    pub fn as_null_mut(&mut self) -> &mut NullVectorMut {
         if let VectorMut::Null(v) = self {
             return v;
         }
@@ -139,7 +157,7 @@ impl VectorMut {
     }
 
     /// Returns a reference to the inner [`BoolVectorMut`] if `self` is of that variant.
-    pub fn as_bool(&self) -> &BoolVectorMut {
+    pub fn as_bool_mut(&mut self) -> &mut BoolVectorMut {
         if let VectorMut::Bool(v) = self {
             return v;
         }
@@ -147,7 +165,7 @@ impl VectorMut {
     }
 
     /// Returns a reference to the inner [`PrimitiveVectorMut`] if `self` is of that variant.
-    pub fn as_primitive(&self) -> &PrimitiveVectorMut {
+    pub fn as_primitive_mut(&mut self) -> &mut PrimitiveVectorMut {
         if let VectorMut::Primitive(v) = self {
             return v;
         }
@@ -155,7 +173,7 @@ impl VectorMut {
     }
 
     /// Returns a reference to the inner [`StringVectorMut`] if `self` is of that variant.
-    pub fn as_string(&self) -> &StringVectorMut {
+    pub fn as_string_mut(&mut self) -> &mut StringVectorMut {
         if let VectorMut::String(v) = self {
             return v;
         }
@@ -163,7 +181,7 @@ impl VectorMut {
     }
 
     /// Returns a reference to the inner [`BinaryVectorMut`] if `self` is of that variant.
-    pub fn as_binary(&self) -> &BinaryVectorMut {
+    pub fn as_binary_mut(&mut self) -> &mut BinaryVectorMut {
         if let VectorMut::Binary(v) = self {
             return v;
         }
@@ -171,7 +189,7 @@ impl VectorMut {
     }
 
     /// Returns a reference to the inner [`ListViewVectorMut`] if `self` is of that variant.
-    pub fn as_list(&self) -> &ListViewVectorMut {
+    pub fn as_list_mut(&mut self) -> &mut ListViewVectorMut {
         if let VectorMut::List(v) = self {
             return v;
         }
@@ -179,7 +197,7 @@ impl VectorMut {
     }
 
     /// Returns a reference to the inner [`FixedSizeListVectorMut`] if `self` is of that variant.
-    pub fn as_fixed_size_list(&self) -> &FixedSizeListVectorMut {
+    pub fn as_fixed_size_list_mut(&mut self) -> &mut FixedSizeListVectorMut {
         if let VectorMut::FixedSizeList(v) = self {
             return v;
         }
@@ -187,7 +205,7 @@ impl VectorMut {
     }
 
     /// Returns a reference to the inner [`StructVectorMut`] if `self` is of that variant.
-    pub fn as_struct(&self) -> &StructVectorMut {
+    pub fn as_struct_mut(&mut self) -> &mut StructVectorMut {
         if let VectorMut::Struct(v) = self {
             return v;
         }

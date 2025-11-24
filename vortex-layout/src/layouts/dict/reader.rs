@@ -7,13 +7,14 @@ use std::sync::{Arc, OnceLock};
 
 use futures::future::BoxFuture;
 use futures::{FutureExt, TryFutureExt, try_join};
+use vortex_array::arrays::DictArray;
 use vortex_array::compute::{MinMaxResult, min_max, take};
+use vortex_array::expr::{Expression, root};
 use vortex_array::{Array, ArrayRef, IntoArray, MaskFuture};
-use vortex_dict::DictArray;
 use vortex_dtype::{DType, FieldMask};
 use vortex_error::{VortexError, VortexExpect, VortexResult};
-use vortex_expr::{Expression, root};
 use vortex_mask::Mask;
+use vortex_session::VortexSession;
 use vortex_utils::aliases::dash_map::DashMap;
 
 use super::DictLayout;
@@ -42,14 +43,18 @@ impl DictReader {
         layout: DictLayout,
         name: Arc<str>,
         segment_source: Arc<dyn SegmentSource>,
+        session: &VortexSession,
     ) -> VortexResult<Self> {
         let values_len = usize::try_from(layout.values.row_count())?;
-        let values = layout
-            .values
-            .new_reader(format!("{name}.values").into(), segment_source.clone())?;
-        let codes = layout
-            .codes
-            .new_reader(format!("{name}.codes").into(), segment_source)?;
+        let values = layout.values.new_reader(
+            format!("{name}.values").into(),
+            segment_source.clone(),
+            session,
+        )?;
+        let codes =
+            layout
+                .codes
+                .new_reader(format!("{name}.codes").into(), segment_source, session)?;
 
         Ok(Self {
             layout,
@@ -185,14 +190,26 @@ impl LayoutReader for DictReader {
         mask: MaskFuture,
     ) -> VortexResult<BoxFuture<'static, VortexResult<ArrayRef>>> {
         let values_eval = self.values_eval(root());
-        let codes_eval = self.codes.projection_evaluation(row_range, &root(), mask)?;
+        let codes_eval = self
+            .codes
+            .projection_evaluation(row_range, &root(), mask)
+            .map_err(|err| err.with_context("While evaluating projection on codes"))?;
         let expr = expr.clone();
 
+        let all_values_referenced = self.layout.has_all_values_referenced();
         Ok(async move {
             let (values, codes) = try_join!(values_eval.map_err(VortexError::from), codes_eval)?;
 
-            // Validate that codes are valid for the values
-            let array = DictArray::try_new(codes, values)?.to_array();
+            // SAFETY: Layout was validated at write time.
+            //  * The codes dtype is guaranteed to be an unsigned integer type from the layout
+            //  * The codes child reader ensures the correct dtype.
+            //  * The layout stores `all_values_referenced` and if this is malicious then it must
+            //    only affect correctness not memory safety.
+            let array = unsafe {
+                DictArray::new_unchecked(codes, values)
+                    .set_all_values_referenced(all_values_referenced)
+            }
+            .to_array();
             expr.evaluate(&array)
         }
         .boxed())
@@ -205,10 +222,10 @@ mod tests {
 
     use rstest::rstest;
     use vortex_array::arrays::{StructArray, VarBinArray};
+    use vortex_array::expr::{eq, is_null, lit, not, pack, root};
     use vortex_array::validity::Validity;
     use vortex_array::{ArrayContext, IntoArray as _, MaskFuture, assert_arrays_eq};
     use vortex_dtype::{DType, FieldName, FieldNames, Nullability};
-    use vortex_expr::{is_null, not, pack, root};
     use vortex_io::runtime::single::block_on;
 
     use crate::layouts::dict::writer::{DictLayoutOptions, DictStrategy};
@@ -217,6 +234,7 @@ mod tests {
     use crate::sequence::{
         SequenceId, SequentialArrayStreamExt, SequentialStreamAdapter, SequentialStreamExt,
     };
+    use crate::test::SESSION;
     use crate::{LayoutId, LayoutRef, LayoutStrategy};
 
     #[test]
@@ -272,7 +290,7 @@ mod tests {
             );
             assert!(layout.encoding_id() == LayoutId::new_ref("vortex.dict"));
             let actual = layout
-                .new_reader("".into(), segments)
+                .new_reader("".into(), segments, &SESSION)
                 .unwrap()
                 .projection_evaluation(
                     &(0..layout.row_count()),
@@ -328,7 +346,6 @@ mod tests {
             );
 
             let array = VarBinArray::from_iter(data, DType::Utf8(Nullability::Nullable)).to_array();
-
             let ctx = ArrayContext::empty();
             let segments = Arc::new(TestSegments::default());
             let (ptr, eof) = SequenceId::root().split();
@@ -347,15 +364,15 @@ mod tests {
                 .await
                 .unwrap();
 
-            let filter = vortex_expr::eq(
+            let filter = eq(
                 root(),
-                vortex_expr::lit(vortex_scalar::Scalar::utf8(
+                lit(vortex_scalar::Scalar::utf8(
                     filter_value,
                     Nullability::Nullable,
                 )),
             );
             let mask = layout
-                .new_reader("".into(), segments)
+                .new_reader("".into(), segments, &SESSION)
                 .unwrap()
                 .filter_evaluation(&(0..3), &filter, MaskFuture::new_true(3))
                 .unwrap()
@@ -393,6 +410,7 @@ mod tests {
             .to_array();
             let array_to_write = array.clone();
             let ctx = ArrayContext::empty();
+
             let segments = Arc::new(TestSegments::default());
             let (ptr, eof) = SequenceId::root().split();
             let layout: LayoutRef = strategy
@@ -413,7 +431,7 @@ mod tests {
             let expression = not(is_null(root())); // easier to test not_is_null b/c that's the validity array
             assert!(layout.encoding_id() == LayoutId::new_ref("vortex.dict"));
             let actual = layout
-                .new_reader("".into(), segments)
+                .new_reader("".into(), segments, &SESSION)
                 .unwrap()
                 .projection_evaluation(
                     &(0..layout.row_count()),

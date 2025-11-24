@@ -25,7 +25,6 @@ vortex-array = { workspace = true }
 vortex-buffer = { workspace = true }
 vortex-datetime-parts = { workspace = true }
 vortex-decimal-byte-parts = { workspace = true }
-vortex-dict = { workspace = true }
 vortex-dtype = { workspace = true }
 vortex-error = { workspace = true }
 vortex-fastlanes = { workspace = true }
@@ -41,6 +40,7 @@ vortex-zigzag = { workspace = true }
 [dev-dependencies]
 divan = { workspace = true }
 env_logger = "0.11"
+rstest = { workspace = true }
 vortex-array = { workspace = true, features = ["test-harness"] }
 
 [features]

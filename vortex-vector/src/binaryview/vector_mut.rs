@@ -9,9 +9,9 @@ use vortex_buffer::{BufferMut, ByteBuffer, ByteBufferMut};
 use vortex_error::{VortexExpect, VortexResult, vortex_ensure};
 use vortex_mask::MaskMut;
 
-use crate::binaryview::BinaryViewType;
 use crate::binaryview::vector::BinaryViewVector;
 use crate::binaryview::view::{BinaryView, validate_views};
+use crate::binaryview::{BinaryViewScalar, BinaryViewType};
 use crate::{VectorMutOps, VectorOps};
 
 // Default capacity for new string data buffers of 2MiB.
@@ -112,6 +112,31 @@ impl<T: BinaryViewType> BinaryViewVectorMut<T> {
         }
     }
 
+    /// Get a mutable handle to the buffer holding the [views][BinaryView] of the vector.
+    ///
+    /// # Safety
+    ///
+    /// Caller must make sure that length of the views always matches
+    /// length of the validity mask.
+    pub unsafe fn views_mut(&mut self) -> &mut BufferMut<BinaryView> {
+        &mut self.views
+    }
+
+    /// Get a mutable handle to the validity mask of the vector.
+    ///
+    /// # Safety
+    ///
+    /// Caller must make sure that the length of the validity mask
+    /// always matches the length of the views
+    pub unsafe fn validity_mut(&mut self) -> &mut MaskMut {
+        &mut self.validity
+    }
+
+    /// Get a mutable handle to the vector of buffers backing the string data of the vector.
+    pub fn buffers(&mut self) -> &mut Vec<ByteBuffer> {
+        &mut self.buffers
+    }
+
     /// Append a repeated sequence of binary data to a vector.
     ///
     /// ```
@@ -200,6 +225,18 @@ impl<T: BinaryViewType> VectorMutOps for BinaryViewVectorMut<T> {
         self.validity.reserve(additional);
     }
 
+    fn clear(&mut self) {
+        self.views.clear();
+        self.validity.clear();
+        self.buffers.clear();
+        self.open_buffer = None;
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.views.truncate(len);
+        self.validity.truncate(len);
+    }
+
     fn extend_from_vector(&mut self, other: &BinaryViewVector<T>) {
         // Close any existing views into a new buffer
         self.flush_open_buffer();
@@ -227,6 +264,20 @@ impl<T: BinaryViewType> VectorMutOps for BinaryViewVectorMut<T> {
         self.validity.append_n(false, n);
     }
 
+    fn append_zeros(&mut self, n: usize) {
+        self.views.push_n(BinaryView::empty_view(), n);
+        self.validity.append_n(true, n);
+    }
+
+    fn append_scalars(&mut self, scalar: &BinaryViewScalar<T>, n: usize) {
+        match scalar.value() {
+            None => self.append_nulls(n),
+            Some(v) => {
+                self.append_owned_values(v.clone(), n);
+            }
+        }
+    }
+
     fn freeze(mut self) -> BinaryViewVector<T> {
         // Freeze all components, close any in-progress views
         self.flush_open_buffer();
@@ -244,7 +295,12 @@ impl<T: BinaryViewType> VectorMutOps for BinaryViewVectorMut<T> {
         todo!()
     }
 
-    fn unsplit(&mut self, _other: Self) {
+    fn unsplit(&mut self, other: Self) {
+        if self.is_empty() {
+            *self = other;
+            return;
+        }
+
         todo!()
     }
 }

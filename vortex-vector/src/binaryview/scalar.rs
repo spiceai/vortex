@@ -7,10 +7,12 @@ use crate::binaryview::{
 use crate::{Scalar, ScalarOps, VectorMutOps};
 
 /// A scalar value for types that implement [`BinaryViewType`].
+#[derive(Debug)]
 pub struct BinaryViewScalar<T: BinaryViewType>(Option<T::Scalar>);
 
-impl<T: BinaryViewType> From<Option<T::Scalar>> for BinaryViewScalar<T> {
-    fn from(value: Option<T::Scalar>) -> Self {
+impl<T: BinaryViewType> BinaryViewScalar<T> {
+    /// Creates a new binary view scalar with the given value.
+    pub fn new(value: Option<T::Scalar>) -> Self {
         Self(value)
     }
 }

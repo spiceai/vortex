@@ -7,7 +7,7 @@ use std::fmt::{Display, Formatter};
 use std::sync::LazyLock;
 
 use arcref::ArcRef;
-use arrow_array::{BooleanArray, Datum as ArrowDatum};
+use arrow_array::BooleanArray;
 use arrow_buffer::NullBuffer;
 use arrow_ord::cmp;
 use arrow_ord::ord::make_comparator;
@@ -18,7 +18,7 @@ use vortex_error::{VortexError, VortexExpect, VortexResult, vortex_bail, vortex_
 use vortex_scalar::Scalar;
 
 use crate::arrays::ConstantArray;
-use crate::arrow::{Datum, from_arrow_array_with_len};
+use crate::arrow::{Datum, IntoArrowArray, from_arrow_array_with_len};
 use crate::compute::{ComputeFn, ComputeFnVTable, InvocationArgs, Kernel, Options, Output};
 use crate::vtable::VTable;
 use crate::{Array, ArrayRef, Canonical, IntoArray};
@@ -206,6 +206,20 @@ impl ComputeFnVTable for Compare {
         let CompareArgs { lhs, rhs, .. } = CompareArgs::try_from(args)?;
 
         if !lhs.dtype().eq_ignore_nullability(rhs.dtype()) {
+            if lhs.dtype().is_float() && rhs.dtype().is_float() {
+                vortex_bail!(
+                    "Cannot compare different floating-point types ({}, {}). Consider using cast.",
+                    lhs.dtype(),
+                    rhs.dtype(),
+                );
+            }
+            if lhs.dtype().is_int() && rhs.dtype().is_int() {
+                vortex_bail!(
+                    "Cannot compare different fixed-width types ({}, {}). Consider using cast.",
+                    lhs.dtype(),
+                    rhs.dtype()
+                );
+            }
             vortex_bail!(
                 "Cannot compare different DTypes {} and {}",
                 lhs.dtype(),
@@ -294,15 +308,13 @@ fn arrow_compare(
     right: &dyn Array,
     operator: Operator,
 ) -> VortexResult<ArrayRef> {
+    assert_eq!(left.len(), right.len());
+
     let nullable = left.dtype().is_nullable() || right.dtype().is_nullable();
 
     let array = if left.dtype().is_nested() || right.dtype().is_nested() {
-        let rhs = Datum::try_new_array(&right.to_canonical().into_array())?;
-        let (rhs, _) = rhs.get();
-
-        // prefer the rhs data type since this is usually used in assert_eq!(actual, expect).
-        let lhs = Datum::with_target_datatype(&left.to_canonical().into_array(), rhs.data_type())?;
-        let (lhs, _) = lhs.get();
+        let rhs = right.to_array().into_arrow_preferred()?;
+        let lhs = left.to_array().into_arrow(rhs.data_type())?;
 
         assert!(
             lhs.data_type().equals_datatype(rhs.data_type()),
@@ -311,9 +323,8 @@ fn arrow_compare(
             rhs.data_type()
         );
 
-        let cmp = make_comparator(lhs, rhs, SortOptions::default())?;
-        assert_eq!(lhs.len(), rhs.len());
-        let len = lhs.len();
+        let cmp = make_comparator(lhs.as_ref(), rhs.as_ref(), SortOptions::default())?;
+        let len = left.len();
         let values = (0..len)
             .map(|i| {
                 let cmp = cmp(i, i);
@@ -331,7 +342,7 @@ fn arrow_compare(
         BooleanArray::new(values, nulls)
     } else {
         let lhs = Datum::try_new(left)?;
-        let rhs = Datum::try_new(right)?;
+        let rhs = Datum::try_new_with_target_datatype(right, lhs.data_type())?;
 
         match operator {
             Operator::Eq => cmp::eq(&lhs, &rhs)?,
@@ -365,13 +376,16 @@ pub fn scalar_cmp(lhs: &Scalar, rhs: &Scalar, operator: Operator) -> Scalar {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use vortex_buffer::buffer;
+    use vortex_dtype::{FieldName, FieldNames};
 
     use super::*;
     use crate::ToCanonical;
     use crate::arrays::{
-        BoolArray, ConstantArray, ListArray, PrimitiveArray, StructArray, VarBinArray,
-        VarBinViewArray,
+        BoolArray, ConstantArray, ListArray, ListViewArray, PrimitiveArray, StructArray,
+        VarBinArray, VarBinViewArray,
     };
+    use crate::expr::{get_item, lt, root};
     use crate::test_harness::to_int_indices;
     use crate::validity::Validity;
 
@@ -571,5 +585,101 @@ mod tests {
         assert!(!bool_result.bit_buffer().value(0)); // {true, 1} > {true, 1} = false
         assert!(!bool_result.bit_buffer().value(1)); // {false, 2} > {false, 2} = false
         assert!(bool_result.bit_buffer().value(2)); // {true, 3} > {false, 4} = true (bool field takes precedence)
+    }
+
+    #[test]
+    fn test_empty_struct_compare() {
+        let empty1 = StructArray::try_new(
+            FieldNames::from(Vec::<FieldName>::new()),
+            Vec::new(),
+            5,
+            Validity::NonNullable,
+        )
+        .unwrap();
+
+        let empty2 = StructArray::try_new(
+            FieldNames::from(Vec::<FieldName>::new()),
+            Vec::new(),
+            5,
+            Validity::NonNullable,
+        )
+        .unwrap();
+
+        let result = compare(empty1.as_ref(), empty2.as_ref(), Operator::Eq).unwrap();
+        let result = result.to_bool();
+
+        for idx in 0..5 {
+            assert!(result.bit_buffer().value(idx));
+        }
+    }
+
+    #[test]
+    fn test_empty_list() {
+        let list = ListViewArray::new(
+            BoolArray::from_iter(Vec::<bool>::new()).into_array(),
+            buffer![0i32, 0i32, 0i32].into_array(),
+            buffer![0i32, 0i32, 0i32].into_array(),
+            Validity::AllValid,
+        );
+
+        // Compare two lists together
+        let result = compare(list.as_ref(), list.as_ref(), Operator::Eq).unwrap();
+        assert!(result.scalar_at(0).is_valid());
+        assert!(result.scalar_at(1).is_valid());
+        assert!(result.scalar_at(2).is_valid());
+    }
+
+    #[test]
+    fn test_different_floats_error_messages() {
+        let result = compare(
+            &buffer![0.0f32].into_array(),
+            &buffer![0.0f64].into_array(),
+            Operator::Lt,
+        );
+        assert!(result.as_ref().is_err_and(|err| {
+            err.to_string()
+                .contains("Cannot compare different floating-point types")
+        }));
+
+        let expr = lt(get_item("l", root()), get_item("r", root()));
+        let result = expr.evaluate(
+            &StructArray::from_fields(&[
+                ("l", buffer![0.0f32].into_array()),
+                ("r", buffer![0.0f64].into_array()),
+            ])
+            .unwrap()
+            .into_array(),
+        );
+        assert!(result.as_ref().is_err_and(|err| {
+            err.to_string()
+                .contains("Cannot compare different floating-point types")
+        }));
+    }
+
+    #[test]
+    fn test_different_ints_error_messages() {
+        let result = compare(
+            &buffer![0u8].into_array(),
+            &buffer![0u16].into_array(),
+            Operator::Lt,
+        );
+        assert!(result.as_ref().is_err_and(|err| {
+            err.to_string()
+                .contains("Cannot compare different fixed-width types")
+        }));
+
+        let expr = lt(get_item("l", root()), get_item("r", root()));
+        let result = expr.evaluate(
+            &StructArray::from_fields(&[
+                ("l", buffer![0u8].into_array()),
+                ("r", buffer![0u16].into_array()),
+            ])
+            .unwrap()
+            .into_array(),
+        );
+        assert!(result.as_ref().is_err_and(|err| {
+            err.to_string()
+                .contains("Cannot compare different fixed-width types")
+        }));
     }
 }

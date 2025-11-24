@@ -26,6 +26,7 @@ log = { workspace = true }
 num-traits = { workspace = true }
 prost = { workspace = true }
 rand = { workspace = true, optional = true }
+static_assertions = { workspace = true }
 vortex-array = { workspace = true }
 vortex-buffer = { workspace = true }
 vortex-compute = { workspace = true }
@@ -44,7 +45,6 @@ rand = { workspace = true }
 rstest = { workspace = true }
 vortex-alp = { path = "../alp" }
 vortex-array = { workspace = true, features = ["test-harness"] }
-vortex-expr = { workspace = true }
 vortex-fastlanes = { path = ".", features = ["test-harness"] }
 
 [features]
@@ -84,11 +84,11 @@ harness = false
 test = false
 
 [[bench]]
-name = "pipeline_bitpacking_kernel"
+name = "pipeline_rle"
 harness = false
 test = false
 
 [[bench]]
-name = "pipeline_rle"
+name = "pipeline_v2_bitpacking_basic"
 harness = false
 test = false

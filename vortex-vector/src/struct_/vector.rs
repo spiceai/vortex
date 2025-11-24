@@ -11,7 +11,7 @@ use vortex_error::{VortexExpect, VortexResult, vortex_ensure};
 use vortex_mask::Mask;
 
 use crate::struct_::{StructScalar, StructVectorMut};
-use crate::{Scalar, Vector, VectorMutOps, VectorOps};
+use crate::{Vector, VectorMutOps, VectorOps};
 
 /// An immutable vector of struct values.
 ///
@@ -124,6 +124,7 @@ impl StructVector {
 
 impl VectorOps for StructVector {
     type Mutable = StructVectorMut;
+    type Scalar = StructScalar;
 
     fn len(&self) -> usize {
         self.len
@@ -133,13 +134,21 @@ impl VectorOps for StructVector {
         &self.validity
     }
 
-    fn scalar_at(&self, index: usize) -> Scalar {
+    fn scalar_at(&self, index: usize) -> StructScalar {
         assert!(index < self.len());
-        StructScalar::new(self.slice(index..index + 1)).into()
+        StructScalar::new(self.slice(index..index + 1))
     }
 
     fn slice(&self, _range: impl RangeBounds<usize> + Clone + Debug) -> Self {
         todo!()
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+        self.validity.clear();
+        Arc::make_mut(&mut self.fields)
+            .iter_mut()
+            .for_each(|f| f.clear());
     }
 
     fn try_into_mut(self) -> Result<StructVectorMut, Self> {
@@ -196,5 +205,26 @@ impl VectorOps for StructVector {
             len: self.len,
             validity,
         })
+    }
+
+    fn into_mut(self) -> StructVectorMut {
+        let len = self.len;
+        let validity = self.validity.into_mut();
+
+        // If someone else has a strong reference to the `Arc`, clone the underlying data (which is
+        // just a **different** reference count increment).
+        let fields = Arc::try_unwrap(self.fields).unwrap_or_else(|arc| (*arc).clone());
+
+        let mutable_fields: Box<[_]> = fields
+            .into_vec()
+            .into_iter()
+            .map(|field| field.into_mut())
+            .collect();
+
+        StructVectorMut {
+            fields: mutable_fields,
+            len,
+            validity,
+        }
     }
 }

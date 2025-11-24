@@ -13,7 +13,7 @@ use vortex_mask::Mask;
 use super::{ListViewScalar, ListViewVectorMut};
 use crate::primitive::PrimitiveVector;
 use crate::vector_ops::{VectorMutOps, VectorOps};
-use crate::{Scalar, Vector, match_each_integer_pvector};
+use crate::{Vector, match_each_integer_pvector};
 
 /// A vector of variable-width lists.
 ///
@@ -183,7 +183,7 @@ impl ListViewVector {
 
     /// Returns a reference to the `elements` vector.
     #[inline]
-    pub fn elements(&self) -> &Vector {
+    pub fn elements(&self) -> &Arc<Vector> {
         &self.elements
     }
 
@@ -202,6 +202,7 @@ impl ListViewVector {
 
 impl VectorOps for ListViewVector {
     type Mutable = ListViewVectorMut;
+    type Scalar = ListViewScalar;
 
     fn len(&self) -> usize {
         self.len
@@ -211,13 +212,21 @@ impl VectorOps for ListViewVector {
         &self.validity
     }
 
-    fn scalar_at(&self, index: usize) -> Scalar {
+    fn scalar_at(&self, index: usize) -> ListViewScalar {
         assert!(index < self.len());
-        ListViewScalar::new(self.slice(index..index + 1)).into()
+        ListViewScalar::new(self.slice(index..index + 1))
     }
 
     fn slice(&self, _range: impl RangeBounds<usize> + Clone + Debug) -> Self {
         todo!()
+    }
+
+    fn clear(&mut self) {
+        self.offsets.clear();
+        self.sizes.clear();
+        Arc::make_mut(&mut self.elements).clear();
+        self.validity.clear();
+        self.len = 0;
     }
 
     fn try_into_mut(self) -> Result<ListViewVectorMut, Self> {
@@ -283,6 +292,25 @@ impl VectorOps for ListViewVector {
                 validity: validity.freeze(),
                 len: self.len,
             }),
+        }
+    }
+
+    fn into_mut(self) -> ListViewVectorMut {
+        let len = self.len;
+        let validity = self.validity.into_mut();
+        let offsets = self.offsets.into_mut();
+        let sizes = self.sizes.into_mut();
+
+        // If someone else has a strong reference to the `Arc`, clone the underlying data (which is
+        // just a **different** reference count increment).
+        let elements = Arc::try_unwrap(self.elements).unwrap_or_else(|arc| (*arc).clone());
+
+        ListViewVectorMut {
+            offsets,
+            sizes,
+            elements: Box::new(elements.into_mut()),
+            validity,
+            len,
         }
     }
 }

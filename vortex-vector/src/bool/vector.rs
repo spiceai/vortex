@@ -10,8 +10,8 @@ use vortex_buffer::BitBuffer;
 use vortex_error::{VortexExpect, VortexResult, vortex_ensure};
 use vortex_mask::Mask;
 
-use crate::bool::BoolVectorMut;
-use crate::{Scalar, VectorOps};
+use crate::VectorOps;
+use crate::bool::{BoolScalar, BoolVectorMut};
 
 /// An immutable vector of boolean values.
 ///
@@ -74,6 +74,7 @@ impl BoolVector {
 
 impl VectorOps for BoolVector {
     type Mutable = BoolVectorMut;
+    type Scalar = BoolScalar;
 
     fn len(&self) -> usize {
         debug_assert!(self.validity.len() == self.bits.len());
@@ -84,19 +85,24 @@ impl VectorOps for BoolVector {
         &self.validity
     }
 
-    fn scalar_at(&self, index: usize) -> Scalar {
+    fn scalar_at(&self, index: usize) -> BoolScalar {
         assert!(index < self.len());
 
         let is_valid = self.validity.value(index);
         let value = is_valid.then(|| self.bits.value(index));
 
-        Scalar::Bool(value.into())
+        BoolScalar::new(value)
     }
 
     fn slice(&self, range: impl RangeBounds<usize> + Clone + Debug) -> Self {
         let bits = self.bits.slice(range.clone());
         let validity = self.validity.slice(range);
         Self { bits, validity }
+    }
+
+    fn clear(&mut self) {
+        self.bits.clear();
+        self.validity.clear();
     }
 
     fn try_into_mut(self) -> Result<BoolVectorMut, Self> {
@@ -119,6 +125,13 @@ impl VectorOps for BoolVector {
                 bits: bits.freeze(),
                 validity,
             }),
+        }
+    }
+
+    fn into_mut(self) -> BoolVectorMut {
+        BoolVectorMut {
+            bits: self.bits.into_mut(),
+            validity: self.validity.into_mut(),
         }
     }
 }

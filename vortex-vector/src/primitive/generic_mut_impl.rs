@@ -3,6 +3,8 @@
 
 //! Helper methods for [`PVectorMut<T>`] that mimic the behavior of [`std::vec::Vec`].
 
+use std::mem::MaybeUninit;
+
 use vortex_buffer::BufferMut;
 use vortex_dtype::NativePType;
 
@@ -27,15 +29,17 @@ impl<T: NativePType> PVectorMut<T> {
         self.validity.value(index).then(|| self.elements[index])
     }
 
-    /// Appends an element to the back of the vector.
+    /// Pushes an element to the back of the vector.
     ///
-    /// The element is treated as valid.
+    /// The element is treated as non-null.
     pub fn push(&mut self, value: T) {
         self.elements.push(value);
         self.validity.append_n(true, 1);
     }
 
-    /// Pushes a value without bounds checking or validity updates.
+    /// Pushes an element without bounds checking.
+    ///
+    /// The element is treated as non-null.
     ///
     /// # Safety
     ///
@@ -132,16 +136,20 @@ impl<T: NativePType> PVectorMut<T> {
         }
     }
 
-    /// Clear the vector, removing all elements.
-    pub fn clear(&mut self) {
-        self.elements.clear();
-        self.validity.clear();
-    }
-
-    /// Shortens the vector, keeping the first `len` elements.
-    pub fn truncate(&mut self, len: usize) {
-        self.elements.truncate(len);
-        self.validity.truncate(len);
+    /// Returns the remaining spare capacity of the vector as a slice of [`MaybeUninit<T>`].
+    ///
+    /// The returned slice can be used to fill the buffer with data before marking the data as
+    /// initialized using unsafe methods like [`set_len`].
+    ///
+    /// Note that this only provides access to the spare capacity of the **elements** buffer.
+    ///
+    /// After writing to the spare capacity and calling [`set_len`], the caller must also ensure the
+    /// validity mask is updated accordingly to maintain consistency.
+    ///
+    /// [`set_len`]: Self::set_len
+    #[inline]
+    pub fn spare_capacity_mut(&mut self) -> &mut [MaybeUninit<T>] {
+        self.elements.spare_capacity_mut()
     }
 }
 

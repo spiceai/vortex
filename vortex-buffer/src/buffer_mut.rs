@@ -241,10 +241,17 @@ impl<T> BufferMut<T> {
         }
     }
 
+    /// Sets the length of the buffer.
+    ///
     /// # Safety
-    /// The caller must ensure that the buffer was properly initialized up to `len`.
+    ///
+    /// - `new_len` must be less than or equal to [`capacity()`].
+    /// - The elements at `old_len..new_len` must be initialized.
+    ///
+    /// [`capacity()`]: Self::capacity
     #[inline]
     pub unsafe fn set_len(&mut self, len: usize) {
+        debug_assert!(len <= self.capacity());
         unsafe { self.bytes.set_len(len * size_of::<T>()) };
         self.length = len;
     }
@@ -338,8 +345,8 @@ impl<T> BufferMut<T> {
     ///
     /// Panics if either half would have a length that is not a multiple of the alignment.
     pub fn split_off(&mut self, at: usize) -> Self {
-        if at > self.len() {
-            vortex_panic!("Cannot split buffer of length {} at {}", self.len(), at);
+        if at > self.capacity() {
+            vortex_panic!("Cannot split buffer of capacity {} at {}", self.len(), at);
         }
 
         let bytes_at = at * size_of::<T>();
@@ -352,8 +359,10 @@ impl<T> BufferMut<T> {
         }
 
         let new_bytes = self.bytes.split_off(bytes_at);
-        let new_length = self.length - at;
-        self.length = at;
+
+        // Adjust the lengths, given that length may be < at
+        let new_length = self.length.saturating_sub(at);
+        self.length = self.length.min(at);
 
         BufferMut {
             bytes: new_bytes,
@@ -380,6 +389,16 @@ impl<T> BufferMut<T> {
         }
         self.bytes.unsplit(other.bytes);
         self.length += other.length;
+    }
+
+    /// Return the [`ByteBufferMut`] for this [`BufferMut`].
+    pub fn into_byte_buffer(self) -> ByteBufferMut {
+        ByteBufferMut {
+            bytes: self.bytes,
+            length: self.length * size_of::<T>(),
+            alignment: self.alignment,
+            _marker: Default::default(),
+        }
     }
 
     /// Freeze the `BufferMut` into a `Buffer`.

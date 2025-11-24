@@ -8,7 +8,7 @@ use vortex_dtype::{NativePType, PType, PTypeDowncast, PTypeUpcast};
 use vortex_error::vortex_panic;
 use vortex_mask::MaskMut;
 
-use crate::primitive::{PVectorMut, PrimitiveVector};
+use crate::primitive::{PVectorMut, PrimitiveScalar, PrimitiveVector};
 use crate::{VectorMutOps, match_each_pvector_mut};
 
 /// A mutable vector of primitive values.
@@ -100,6 +100,14 @@ impl VectorMutOps for PrimitiveVectorMut {
         match_each_pvector_mut!(self, |v| { v.reserve(additional) })
     }
 
+    fn clear(&mut self) {
+        match_each_pvector_mut!(self, |v| { v.clear() })
+    }
+
+    fn truncate(&mut self, len: usize) {
+        match_each_pvector_mut!(self, |v| { v.truncate(len) })
+    }
+
     fn extend_from_vector(&mut self, other: &PrimitiveVector) {
         match (self, other) {
             (Self::U8(a), PrimitiveVector::U8(b)) => a.extend_from_vector(b),
@@ -119,6 +127,28 @@ impl VectorMutOps for PrimitiveVectorMut {
 
     fn append_nulls(&mut self, n: usize) {
         match_each_pvector_mut!(self, |v| { v.append_nulls(n) })
+    }
+
+    fn append_zeros(&mut self, n: usize) {
+        match_each_pvector_mut!(self, |v| { v.append_zeros(n) })
+    }
+
+    #[allow(clippy::many_single_char_names)]
+    fn append_scalars(&mut self, scalar: &PrimitiveScalar, n: usize) {
+        match (self, scalar) {
+            (Self::U8(a), PrimitiveScalar::U8(b)) => a.append_scalars(b, n),
+            (Self::U16(a), PrimitiveScalar::U16(b)) => a.append_scalars(b, n),
+            (Self::U32(a), PrimitiveScalar::U32(b)) => a.append_scalars(b, n),
+            (Self::U64(a), PrimitiveScalar::U64(b)) => a.append_scalars(b, n),
+            (Self::I8(a), PrimitiveScalar::I8(b)) => a.append_scalars(b, n),
+            (Self::I16(a), PrimitiveScalar::I16(b)) => a.append_scalars(b, n),
+            (Self::I32(a), PrimitiveScalar::I32(b)) => a.append_scalars(b, n),
+            (Self::I64(a), PrimitiveScalar::I64(b)) => a.append_scalars(b, n),
+            (Self::F16(a), PrimitiveScalar::F16(b)) => a.append_scalars(b, n),
+            (Self::F32(a), PrimitiveScalar::F32(b)) => a.append_scalars(b, n),
+            (Self::F64(a), PrimitiveScalar::F64(b)) => a.append_scalars(b, n),
+            _ => vortex_panic!("Mismatched primitive vector and scalar types"),
+        }
     }
 
     fn freeze(self) -> PrimitiveVector {
@@ -142,7 +172,7 @@ impl VectorMutOps for PrimitiveVectorMut {
             (Self::F16(a), Self::F16(b)) => a.unsplit(b),
             (Self::F32(a), Self::F32(b)) => a.unsplit(b),
             (Self::F64(a), Self::F64(b)) => a.unsplit(b),
-            _ => ::vortex_error::vortex_panic!("Mismatched primitive vector types"),
+            _ => vortex_panic!("Mismatched primitive vector types"),
         }
     }
 }
@@ -273,6 +303,87 @@ impl PTypeDowncast for PrimitiveVectorMut {
             return v;
         }
         vortex_panic!("Expected PrimitiveVectorMut::F64, got {self:?}");
+    }
+}
+
+impl<'a> PTypeDowncast for &'a mut PrimitiveVectorMut {
+    type Output<T: NativePType> = &'a mut PVectorMut<T>;
+
+    fn into_u8(self) -> Self::Output<u8> {
+        match self {
+            PrimitiveVectorMut::U8(v) => v,
+            _ => vortex_panic!("Expected PrimitiveVectorMut::U8, got {self:?}"),
+        }
+    }
+
+    fn into_u16(self) -> Self::Output<u16> {
+        match self {
+            PrimitiveVectorMut::U16(v) => v,
+            _ => vortex_panic!("Expected PrimitiveVectorMut::U16, got {self:?}"),
+        }
+    }
+
+    fn into_u32(self) -> Self::Output<u32> {
+        match self {
+            PrimitiveVectorMut::U32(v) => v,
+            _ => vortex_panic!("Expected PrimitiveVectorMut::U32, got {self:?}"),
+        }
+    }
+
+    fn into_u64(self) -> Self::Output<u64> {
+        match self {
+            PrimitiveVectorMut::U64(v) => v,
+            _ => vortex_panic!("Expected PrimitiveVectorMut::U64, got {self:?}"),
+        }
+    }
+
+    fn into_i8(self) -> Self::Output<i8> {
+        match self {
+            PrimitiveVectorMut::I8(v) => v,
+            _ => vortex_panic!("Expected PrimitiveVectorMut::I8, got {self:?}"),
+        }
+    }
+
+    fn into_i16(self) -> Self::Output<i16> {
+        match self {
+            PrimitiveVectorMut::I16(v) => v,
+            _ => vortex_panic!("Expected PrimitiveVectorMut::I16, got {self:?}"),
+        }
+    }
+
+    fn into_i32(self) -> Self::Output<i32> {
+        match self {
+            PrimitiveVectorMut::I32(v) => v,
+            _ => vortex_panic!("Expected PrimitiveVectorMut::I32, got {self:?}"),
+        }
+    }
+
+    fn into_i64(self) -> Self::Output<i64> {
+        match self {
+            PrimitiveVectorMut::I64(v) => v,
+            _ => vortex_panic!("Expected PrimitiveVectorMut::I64, got {self:?}"),
+        }
+    }
+
+    fn into_f16(self) -> Self::Output<f16> {
+        match self {
+            PrimitiveVectorMut::F16(v) => v,
+            _ => vortex_panic!("Expected PrimitiveVectorMut::F16, got {self:?}"),
+        }
+    }
+
+    fn into_f32(self) -> Self::Output<f32> {
+        match self {
+            PrimitiveVectorMut::F32(v) => v,
+            _ => vortex_panic!("Expected PrimitiveVectorMut::F32, got {self:?}"),
+        }
+    }
+
+    fn into_f64(self) -> Self::Output<f64> {
+        match self {
+            PrimitiveVectorMut::F64(v) => v,
+            _ => vortex_panic!("Expected PrimitiveVectorMut::F64, got {self:?}"),
+        }
     }
 }
 

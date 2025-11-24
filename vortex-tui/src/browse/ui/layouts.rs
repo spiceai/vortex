@@ -20,6 +20,7 @@ use vortex::layout::layouts::flat::FlatVTable;
 use vortex::layout::layouts::zoned::ZonedVTable;
 use vortex::{Array, ArrayRef, MaskFuture, ToCanonical};
 
+use crate::SESSION;
 use crate::browse::app::{AppState, LayoutCursor};
 
 /// Render the Layouts tab.
@@ -101,7 +102,7 @@ fn render_array(app: &AppState<'_>, area: Rect, buf: &mut Buffer, is_stats_table
     let reader = app
         .cursor
         .layout()
-        .new_reader("".into(), app.vxf.segment_source())
+        .new_reader("".into(), app.vxf.segment_source(), &SESSION)
         .vortex_expect("Failed to create reader");
 
     // FIXME(ngates): our TUI app should never perform I/O in the render loop...
@@ -237,25 +238,22 @@ fn render_children_list(app: &mut AppState, area: Rect, buf: &mut Buffer) {
             // Use fuzzy matching to rank and filter results
             let matcher = SkimMatcherV2::default();
 
-            // Collect scored matches
-            let mut scored_matches = layout
+            // Collect matches
+            let matches = layout
                 .child_names()
                 .enumerate()
                 .filter_map(|(idx, name)| {
                     matcher
                         .fuzzy_match(&name, &search_filter)
-                        .map(|score| (idx, name.to_string(), score))
+                        .map(|_| (idx, name.to_string()))
                 })
                 .collect_vec();
 
-            // Sort by score (higher is better)
-            scored_matches.sort_by(|a, b| b.2.cmp(&a.2));
-
             // Create filter based on fuzzy matches
             let mut filter = vec![false; layout.nchildren()];
-            let list_items = scored_matches
+            let list_items = matches
                 .iter()
-                .map(|(idx, name, _score)| {
+                .map(|(idx, name)| {
                     filter[*idx] = true;
                     name.clone()
                 })

@@ -7,8 +7,11 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::*;
 use vortex::dtype::{DType, Nullability, PType};
+use vortex::expr;
 use vortex::expr::{Binary, Expression, GetItem, Operator, VTableExt, and, lit, not};
 
+use crate::arrays::PyArrayRef;
+use crate::arrays::into_array::PyIntoArray;
 use crate::dtype::PyDType;
 use crate::install_module;
 use crate::scalar::factory::scalar_helper;
@@ -23,6 +26,7 @@ pub(crate) fn init(py: Python, parent: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(literal, &m)?)?;
     m.add_function(wrap_pyfunction!(not_, &m)?)?;
     m.add_function(wrap_pyfunction!(and_, &m)?)?;
+    m.add_function(wrap_pyfunction!(cast, &m)?)?;
     m.add_class::<PyExpr>()?;
 
     Ok(())
@@ -78,17 +82,17 @@ fn py_binary_operator<'py>(
 
 fn coerce_expr<'py>(value: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyExpr>> {
     let nonnull = Nullability::NonNullable;
-    if let Ok(value) = value.downcast::<PyExpr>() {
+    if let Ok(value) = value.cast::<PyExpr>() {
         Ok(value.clone())
-    } else if let Ok(value) = value.downcast::<PyNone>() {
+    } else if let Ok(value) = value.cast::<PyNone>() {
         scalar(DType::Null, value)
-    } else if let Ok(value) = value.downcast::<PyInt>() {
+    } else if let Ok(value) = value.cast::<PyInt>() {
         scalar(DType::Primitive(PType::I64, nonnull), value)
-    } else if let Ok(value) = value.downcast::<PyFloat>() {
+    } else if let Ok(value) = value.cast::<PyFloat>() {
         scalar(DType::Primitive(PType::F64, nonnull), value)
-    } else if let Ok(value) = value.downcast::<PyString>() {
+    } else if let Ok(value) = value.cast::<PyString>() {
         scalar(DType::Utf8(nonnull), value)
-    } else if let Ok(value) = value.downcast::<PyBytes>() {
+    } else if let Ok(value) = value.cast::<PyBytes>() {
         scalar(DType::Binary(nonnull), value)
     } else {
         Err(PyValueError::new_err(format!(
@@ -159,8 +163,49 @@ impl PyExpr {
         py_binary_operator(self_, Operator::Or, coerce_expr(right)?)
     }
 
+    // Special methods docstrings cannot be defined in Rust. Write a docstring in the corresponding
+    // rST file. https://github.com/PyO3/pyo3/issues/4326
     fn __getitem__(self_: PyRef<'_, Self>, field: String) -> PyResult<PyExpr> {
         get_item(field, self_.clone())
+    }
+
+    /// Evaluate this expression on an in-memory array.
+    ///
+    /// Examples
+    /// --------
+    ///
+    /// Extract one column from a Vortex array:
+    ///
+    /// ```python
+    /// >>> import vortex.expr as ve
+    /// >>> import vortex as vx
+    /// >>> array = ve.column("a").evaluate(vx.array([{"a": 0, "b": "hello"}, {"a": 1, "b": "goodbye"}]))
+    /// >>> array.to_arrow_array()
+    /// <pyarrow.lib.Int64Array object at ...>
+    /// [
+    ///  0,
+    ///  1
+    /// ]
+    /// ```
+    ///
+    /// Evaluating an expression on an Arrow array or table implicitly converts it to a Vortex
+    /// array:
+    ///
+    /// >>> import pyarrow as pa
+    /// >>> array = ve.column("a").evaluate(pa.Table.from_arrays(
+    /// ...     [[0, 1, 2, 3]],
+    /// ...     names=['a'],
+    /// ... ))
+    /// >>> array
+    /// <vortex.PrimitiveArray object at ...>
+    ///
+    /// See also
+    /// --------
+    /// vortex.open : Open an on-disk Vortex array for scanning with an expression.
+    /// vortex.VortexFile : An on-disk Vortex array ready to scan with an expression.
+    /// vortex.VortexFile.scan : Scan an on-disk Vortex array with an expression.
+    fn evaluate(self_: PyRef<'_, Self>, array: PyIntoArray) -> PyResult<PyArrayRef> {
+        Ok(PyArrayRef::from(self_.evaluate(array.inner())?))
     }
 }
 
@@ -213,7 +258,7 @@ pub fn literal<'py>(
 #[pyfunction]
 pub fn root() -> PyExpr {
     PyExpr {
-        inner: vortex::expr::root(),
+        inner: expr::root(),
     }
 }
 
@@ -236,6 +281,10 @@ pub fn root() -> PyExpr {
 /// >>> ve.column("age")
 /// <vortex.Expr object at ...>
 /// ```
+///
+/// .. seealso::
+///
+///    Use :meth:`.vortex.expr.Expr.__getitem__` to retrieve a field of a struct array.
 #[pyfunction]
 pub fn column<'py>(name: &Bound<'py, PyString>) -> PyResult<Bound<'py, PyExpr>> {
     let py = name.py();
@@ -243,7 +292,7 @@ pub fn column<'py>(name: &Bound<'py, PyString>) -> PyResult<Bound<'py, PyExpr>> 
     Bound::new(
         py,
         PyExpr {
-            inner: vortex::expr::get_item(name, vortex::expr::root()),
+            inner: expr::get_item(name, expr::root()),
         },
     )
 }
@@ -295,7 +344,10 @@ pub fn not_(child: PyExpr) -> PyResult<PyExpr> {
 ///
 /// Parameters
 /// ----------
-/// child : :class:`Any`
+/// left : :class:`Expr`
+///     A boolean expression.
+///
+/// right : :class:`Expr`
 ///     A boolean expression.
 ///
 /// Returns
@@ -315,5 +367,43 @@ pub fn not_(child: PyExpr) -> PyResult<PyExpr> {
 pub fn and_(left: PyExpr, right: PyExpr) -> PyResult<PyExpr> {
     Ok(PyExpr {
         inner: and(left.inner, right.inner),
+    })
+}
+
+/// Cast an expression to a compatible type.
+///
+/// Parameters
+/// ----------
+/// child : :class:`Expr`
+///     The expression to cast.
+///
+/// Returns
+/// -------
+/// :class:`vortex.Expr`
+///
+/// Examples
+/// --------
+///
+/// Cast to a wider integer type:
+///
+/// ```python
+/// >>> import vortex.expr as ve
+/// >>> import vortex as vx
+/// >>> ve.cast(ve.literal(vx.int_(8), 1), vx.int_(16))
+/// <vortex.Expr object at ...>
+/// ```
+///
+/// Cast to a wider floating-point type:
+///
+/// ```python
+/// >>> import vortex.expr as ve
+/// >>> import vortex as vx
+/// >>> ve.cast(ve.literal(vx.float_(16), 3.145), vx.float_(64))
+/// <vortex.Expr object at ...>
+/// ```
+#[pyfunction]
+pub fn cast(child: PyExpr, dtype: PyDType) -> PyResult<PyExpr> {
+    Ok(PyExpr {
+        inner: expr::cast(child.into_inner(), dtype.into_inner()),
     })
 }

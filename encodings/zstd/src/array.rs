@@ -7,27 +7,31 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use itertools::Itertools as _;
+use prost::Message as _;
 use vortex_array::accessor::ArrayAccessor;
 use vortex_array::arrays::{ConstantArray, PrimitiveArray, VarBinViewArray};
 use vortex_array::compute::filter;
+use vortex_array::serde::ArrayChildren;
 use vortex_array::stats::{ArrayStats, StatsSetRef};
 use vortex_array::validity::Validity;
 use vortex_array::vtable::{
-    ArrayVTable, CanonicalVTable, NotSupported, OperationsVTable, VTable, ValidityHelper,
-    ValiditySliceHelper, ValidityVTableFromValiditySliceHelper,
+    ArrayVTable, CanonicalVTable, EncodeVTable, NotSupported, OperationsVTable, VTable,
+    ValidityHelper, ValiditySliceHelper, ValidityVTableFromValiditySliceHelper, VisitorVTable,
 };
 use vortex_array::{
-    ArrayEq, ArrayHash, ArrayRef, Canonical, EncodingId, EncodingRef, IntoArray, Precision,
-    ToCanonical, vtable,
+    ArrayBufferVisitor, ArrayChildVisitor, ArrayEq, ArrayHash, ArrayRef, Canonical, EncodingId,
+    EncodingRef, IntoArray, Precision, ProstMetadata, ToCanonical, vtable,
 };
 use vortex_buffer::{Alignment, Buffer, BufferMut, ByteBuffer, ByteBufferMut};
 use vortex_dtype::DType;
-use vortex_error::{VortexError, VortexExpect, VortexResult, vortex_err, vortex_panic};
+use vortex_error::{
+    VortexError, VortexExpect, VortexResult, vortex_bail, vortex_err, vortex_panic,
+};
 use vortex_mask::AllOr;
 use vortex_scalar::Scalar;
 use vortex_vector::binaryview::BinaryView;
 
-use crate::serde::{ZstdFrameMetadata, ZstdMetadata};
+use crate::{ZstdFrameMetadata, ZstdMetadata};
 
 // Zstd doesn't support training dictionaries on very few samples.
 const MIN_SAMPLES_FOR_DICTIONARY: usize = 8;
@@ -56,6 +60,7 @@ vtable!(Zstd);
 impl VTable for ZstdVTable {
     type Array = ZstdArray;
     type Encoding = ZstdEncoding;
+    type Metadata = ProstMetadata<ZstdMetadata>;
 
     type ArrayVTable = Self;
     type CanonicalVTable = Self;
@@ -64,7 +69,6 @@ impl VTable for ZstdVTable {
     type VisitorVTable = Self;
     type ComputeVTable = NotSupported;
     type EncodeVTable = Self;
-    type SerdeVTable = Self;
     type OperatorVTable = NotSupported;
 
     fn id(_encoding: &Self::Encoding) -> EncodingId {
@@ -73,6 +77,53 @@ impl VTable for ZstdVTable {
 
     fn encoding(_array: &Self::Array) -> EncodingRef {
         EncodingRef::new_ref(ZstdEncoding.as_ref())
+    }
+
+    fn metadata(array: &ZstdArray) -> VortexResult<Self::Metadata> {
+        Ok(ProstMetadata(array.metadata.clone()))
+    }
+
+    fn serialize(metadata: Self::Metadata) -> VortexResult<Option<Vec<u8>>> {
+        Ok(Some(metadata.0.encode_to_vec()))
+    }
+
+    fn deserialize(buffer: &[u8]) -> VortexResult<Self::Metadata> {
+        Ok(ProstMetadata(ZstdMetadata::decode(buffer)?))
+    }
+
+    fn build(
+        _encoding: &ZstdEncoding,
+        dtype: &DType,
+        len: usize,
+        metadata: &Self::Metadata,
+        buffers: &[ByteBuffer],
+        children: &dyn ArrayChildren,
+    ) -> VortexResult<ZstdArray> {
+        let validity = if children.is_empty() {
+            Validity::from(dtype.nullability())
+        } else if children.len() == 1 {
+            let validity = children.get(0, &Validity::DTYPE, len)?;
+            Validity::Array(validity)
+        } else {
+            vortex_bail!("ZstdArray expected 0 or 1 child, got {}", children.len());
+        };
+
+        let (dictionary_buffer, compressed_buffers) = if metadata.0.dictionary_size == 0 {
+            // no dictionary
+            (None, buffers.to_vec())
+        } else {
+            // with dictionary
+            (Some(buffers[0].clone()), buffers[1..].to_vec())
+        };
+
+        Ok(ZstdArray::new(
+            dictionary_buffer,
+            compressed_buffers,
+            dtype.clone(),
+            metadata.0.clone(),
+            len,
+            validity,
+        ))
     }
 }
 
@@ -131,7 +182,7 @@ fn collect_valid_vbv(vbv: &VarBinViewArray) -> VortexResult<(ByteBuffer, Vec<usi
                     buffer.extend_from_slice(value);
                 }
                 Ok::<_, VortexError>(())
-            })??;
+            })?;
             (buffer.freeze(), value_byte_indices)
         }
     };
@@ -454,9 +505,31 @@ impl ZstdArray {
 
         let decompressed = decompressed.freeze();
         // Last, we slice the exact values requested out of the decompressed data.
-        let slice_validity = self
+        let mut slice_validity = self
             .unsliced_validity
             .slice(self.slice_start..self.slice_stop);
+
+        // NOTE: this block handles setting the output type when the validity and DType disagree.
+        //
+        // ZSTD is a compact block compressor, meaning that null values are not stored inline in
+        // the data frames. A ZSTD Array that was initialized must always hold onto its full
+        // validity bitmap, even if sliced to only include non-null values.
+        //
+        // We ensure that the validity of the decompressed array ALWAYS matches the validity
+        // implied by the DType.
+        if !self.dtype().is_nullable() && slice_validity != Validity::NonNullable {
+            assert!(
+                slice_validity.all_valid(slice_n_rows),
+                "ZSTD array expects to be non-nullable but there are nulls after decompression"
+            );
+
+            slice_validity = Validity::NonNullable;
+        } else if self.dtype.is_nullable() && slice_validity == Validity::NonNullable {
+            slice_validity = Validity::AllValid;
+        }
+        //
+        // END OF IMPORTANT BLOCK
+        //
 
         match &self.dtype {
             DType::Primitive(..) => {
@@ -531,6 +604,21 @@ impl ZstdArray {
     }
 
     pub(crate) fn _slice(&self, start: usize, stop: usize) -> ZstdArray {
+        let new_start = self.slice_start + start;
+        let new_stop = self.slice_start + stop;
+
+        assert!(
+            new_start <= self.slice_stop,
+            "new slice start {new_start} exceeds end {}",
+            self.slice_stop
+        );
+
+        assert!(
+            new_stop <= self.slice_stop,
+            "new slice stop {new_stop} exceeds end {}",
+            self.slice_stop
+        );
+
         ZstdArray {
             slice_start: self.slice_start + start,
             slice_stop: self.slice_start + stop,
@@ -634,5 +722,30 @@ impl OperationsVTable<ZstdVTable> for ZstdVTable {
 
     fn scalar_at(array: &ZstdArray, index: usize) -> Scalar {
         array._slice(index, index + 1).decompress().scalar_at(0)
+    }
+}
+
+impl EncodeVTable<ZstdVTable> for ZstdVTable {
+    fn encode(
+        _encoding: &<ZstdVTable as VTable>::Encoding,
+        canonical: &Canonical,
+        _like: Option<&ZstdArray>,
+    ) -> VortexResult<Option<ZstdArray>> {
+        ZstdArray::from_canonical(canonical, 3, 0)
+    }
+}
+
+impl VisitorVTable<ZstdVTable> for ZstdVTable {
+    fn visit_buffers(array: &ZstdArray, visitor: &mut dyn ArrayBufferVisitor) {
+        if let Some(buffer) = &array.dictionary {
+            visitor.visit_buffer(buffer);
+        }
+        for buffer in &array.frames {
+            visitor.visit_buffer(buffer);
+        }
+    }
+
+    fn visit_children(array: &ZstdArray, visitor: &mut dyn ArrayChildVisitor) {
+        visitor.visit_validity(&array.unsliced_validity, array.unsliced_n_rows());
     }
 }
