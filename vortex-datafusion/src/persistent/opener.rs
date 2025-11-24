@@ -373,7 +373,6 @@ impl FileOpener for VortexOpener {
             if let Some(dynamic_filter_expr) = dynamic_filter_expr
                 && let Some(statistics) = statistics
             {
-                println!("Has file pruner");
                 Ok(Box::pin(VortexStoppingStream::new(
                     stream,
                     dynamic_filter_expr,
