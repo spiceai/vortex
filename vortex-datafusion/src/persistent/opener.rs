@@ -379,7 +379,6 @@ impl FileOpener for VortexOpener {
                     statistics,
                 )))
             } else {
-                println!("Does not have file pruner");
                 Ok(Box::pin(stream))
             }
         }
