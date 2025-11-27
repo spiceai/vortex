@@ -98,6 +98,7 @@ impl<T> Eq for AllOr<T> where T: Eq {}
 /// A [`Mask`] can be constructed from various representations, and converted to various
 /// others. Internally, these are cached.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(::serde::Serialize, ::serde::Deserialize))]
 pub enum Mask {
     /// All values are included.
     AllTrue(usize),
@@ -107,14 +108,23 @@ pub enum Mask {
     Values(Arc<MaskValues>),
 }
 
+impl Default for Mask {
+    fn default() -> Self {
+        Self::new_true(0)
+    }
+}
+
 /// Represents the values of a [`Mask`] that contains some true and some false elements.
 #[derive(Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MaskValues {
     buffer: BitBuffer,
 
     // We cached the indices and slices representations, since it can be faster than iterating
     // the bit-mask over and over again.
+    #[cfg_attr(feature = "serde", serde(skip))]
     indices: OnceLock<Vec<usize>>,
+    #[cfg_attr(feature = "serde", serde(skip))]
     slices: OnceLock<Vec<(usize, usize)>>,
 
     // Pre-computed values.
@@ -293,6 +303,11 @@ impl Mask {
         Self::from_indices(len, intersection)
     }
 
+    /// Clears the mask of all data. Drops any allocated capacity.
+    pub fn clear(&mut self) {
+        *self = Self::new_false(0);
+    }
+
     /// Returns the length of the mask (not the number of true values).
     #[inline]
     pub fn len(&self) -> usize {
@@ -434,6 +449,19 @@ impl Mask {
             Self::AllTrue(l) => BitBuffer::new_set(*l),
             Self::AllFalse(l) => BitBuffer::new_unset(*l),
             Self::Values(values) => values.bit_buffer().clone(),
+        }
+    }
+
+    /// Return a boolean buffer representation of the mask, allocating new buffers for all-true
+    /// and all-false variants.
+    #[inline]
+    pub fn into_bit_buffer(self) -> BitBuffer {
+        match self {
+            Self::AllTrue(l) => BitBuffer::new_set(l),
+            Self::AllFalse(l) => BitBuffer::new_unset(l),
+            Self::Values(values) => Arc::try_unwrap(values)
+                .map(|v| v.into_bit_buffer())
+                .unwrap_or_else(|v| v.bit_buffer().clone()),
         }
     }
 
@@ -592,6 +620,12 @@ impl MaskValues {
     #[inline]
     pub fn bit_buffer(&self) -> &BitBuffer {
         &self.buffer
+    }
+
+    /// Returns the boolean buffer representation of the mask.
+    #[inline]
+    pub fn into_bit_buffer(self) -> BitBuffer {
+        self.buffer
     }
 
     /// Returns the boolean value at a given index.

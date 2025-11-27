@@ -153,13 +153,13 @@ mod tests {
 
     use vortex_array::arrays::{BoolArray, PrimitiveArray, StructArray};
     use vortex_array::builders::{ArrayBuilder, VarBinViewBuilder};
+    use vortex_array::expr::root;
     use vortex_array::stats::{Precision, Stat, StatsProviderExt};
     use vortex_array::validity::Validity;
     use vortex_array::{Array, ArrayContext, ArrayRef, IntoArray, MaskFuture, ToCanonical};
     use vortex_buffer::{BitBufferMut, buffer};
     use vortex_dtype::{DType, FieldName, FieldNames, Nullability};
     use vortex_error::VortexUnwrap;
-    use vortex_expr::root;
     use vortex_io::runtime::single::block_on;
     use vortex_mask::AllOr;
 
@@ -167,6 +167,7 @@ mod tests {
     use crate::layouts::flat::writer::FlatLayoutStrategy;
     use crate::segments::TestSegments;
     use crate::sequence::{SequenceId, SequentialArrayStreamExt};
+    use crate::test::SESSION;
 
     // Currently, flat layouts do not force compute stats during write, they only retain
     // pre-computed stats.
@@ -190,7 +191,7 @@ mod tests {
                 .unwrap();
 
             let result = layout
-                .new_reader("".into(), segments)
+                .new_reader("".into(), segments, &SESSION)
                 .unwrap()
                 .projection_evaluation(
                     &(0..layout.row_count()),
@@ -239,7 +240,7 @@ mod tests {
                 .unwrap();
 
             let result = layout
-                .new_reader("".into(), segments)
+                .new_reader("".into(), segments, &SESSION)
                 .unwrap()
                 .projection_evaluation(
                     &(0..layout.row_count()),
@@ -311,7 +312,7 @@ mod tests {
 
             // We should be able to read the array we just wrote.
             let result: ArrayRef = layout
-                .new_reader("".into(), segments)
+                .new_reader("".into(), segments, &SESSION)
                 .unwrap()
                 .projection_evaluation(
                     &(0..layout.row_count()),

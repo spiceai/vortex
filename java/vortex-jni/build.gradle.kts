@@ -29,7 +29,7 @@ dependencies {
 
     // Logging
     implementation("org.slf4j:slf4j-api:2.0.17")
-    testRuntimeOnly("ch.qos.logback:logback-classic:1.5.20")
+    testRuntimeOnly("ch.qos.logback:logback-classic:1.5.21")
 }
 
 testing {
@@ -90,7 +90,7 @@ tasks.withType<Test>().all {
 
 protobuf {
     protoc {
-        artifact = "com.google.protobuf:protoc:4.32.1"
+        artifact = "com.google.protobuf:protoc:4.33.1"
     }
 }
 

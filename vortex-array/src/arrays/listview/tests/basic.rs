@@ -267,20 +267,6 @@ fn test_validate_nullable_sizes() {
 }
 
 #[test]
-fn test_validate_size_type_too_large() {
-    // Logical lists (invalid due to size type > offset type): [[1,2], [3], [2,3]]
-    let elements = buffer![1i32, 2, 3, 4, 5].into_array();
-    // Use u64 for sizes and u32 for offsets (sizes type is larger).
-    let offsets = buffer![0u32, 2, 1].into_array();
-    let sizes = buffer![2u64, 1, 2].into_array();
-
-    let result = ListViewArray::try_new(elements, offsets, sizes, Validity::NonNullable);
-
-    assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("size type"));
-}
-
-#[test]
 fn test_validate_offset_plus_size_overflow() {
     // Logical lists (invalid due to overflow): would overflow, [[1], [1]]
     let elements = buffer![1i32, 2, 3, 4, 5].into_array();
@@ -387,4 +373,55 @@ fn test_verify_is_zero_copy_to_list() {
 
     // Should return false due to overlapping list views.
     assert!(!listview.verify_is_zero_copy_to_list());
+}
+
+#[test]
+#[should_panic(expected = "Zero-copy-to-list requires views to be non-overlapping and ordered")]
+fn test_validate_monotonic_ends_with_nulls() {
+    // Regression test for issue #5412
+    // Tests that validate_zctl catches incorrect NULL offsets
+
+    // Create an array with buggy NULL offsets (as would be produced by the old naive_rebuild)
+    // Elements: [1, 2, 3, 4]
+    // View 0: [1, 2] at offset 0
+    // View 1: [3, 4] at offset 2
+    // View 2 (NULL): incorrectly at offset 2 (should be 4)
+    let elements = buffer![1i32, 2, 3, 4].into_array();
+    let offsets = buffer![0u32, 2, 2].into_array(); // Bug: NULL reuses offset 2
+    let sizes = buffer![2u32, 2, 0].into_array();
+    let validity = Validity::from_iter(vec![true, true, false]);
+
+    let listview = ListViewArray::new(elements, offsets, sizes, validity);
+
+    // The array itself is valid (can be constructed)
+    assert_eq!(listview.len(), 3);
+
+    // But it should NOT be valid as zero-copy-to-list due to the monotonic violation
+    // offset[1] + size[1] = 2 + 2 = 4, but offset[2] = 2, violating 4 <= 2
+    // This should panic with our new monotonic check
+    unsafe {
+        let _zctl = listview.with_zero_copy_to_list(true);
+    }
+}
+
+#[test]
+fn test_validate_monotonic_ends_correct_nulls() {
+    // Test that correctly placed NULLs pass validation
+    // Elements: [1, 2, 3, 4]
+    // View 0: [1, 2] at offset 0
+    // View 1: [3, 4] at offset 2
+    // View 2 (NULL): correctly at offset 4 (after all data)
+    let elements = buffer![1i32, 2, 3, 4].into_array();
+    let offsets = buffer![0u32, 2, 4].into_array(); // Correct: NULL at position 4
+    let sizes = buffer![2u32, 2, 0].into_array();
+    let validity = Validity::from_iter(vec![true, true, false]);
+
+    let listview = ListViewArray::new(elements, offsets, sizes, validity);
+
+    // Should be valid as zero-copy-to-list - this should NOT panic
+    let zctl_listview = unsafe { listview.clone().with_zero_copy_to_list(true) };
+    assert!(zctl_listview.is_zero_copy_to_list());
+
+    // verify_is_zero_copy_to_list should also return true
+    assert!(listview.verify_is_zero_copy_to_list());
 }

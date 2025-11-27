@@ -10,6 +10,7 @@ use itertools::Itertools;
 use vortex_array::SerializeMetadata;
 use vortex_dtype::{DType, FieldName};
 use vortex_error::{VortexExpect, VortexResult, vortex_err};
+use vortex_session::VortexSession;
 
 use crate::display::DisplayLayoutTree;
 use crate::segments::{SegmentId, SegmentSource};
@@ -51,7 +52,7 @@ pub trait Layout: 'static + Send + Sync + Debug + private::Sealed {
     /// Get the segment IDs for this layout.
     fn segment_ids(&self) -> Vec<SegmentId>;
 
-    #[cfg(feature = "gpu")]
+    #[cfg(gpu_unstable)]
     fn new_gpu_reader(
         &self,
         name: Arc<str>,
@@ -63,6 +64,7 @@ pub trait Layout: 'static + Send + Sync + Debug + private::Sealed {
         &self,
         name: Arc<str>,
         segment_source: Arc<dyn SegmentSource>,
+        session: &VortexSession,
     ) -> VortexResult<LayoutReaderRef>;
 }
 
@@ -259,7 +261,7 @@ impl<V: VTable> Layout for LayoutAdapter<V> {
         V::segment_ids(&self.0)
     }
 
-    #[cfg(feature = "gpu")]
+    #[cfg(gpu_unstable)]
     fn new_gpu_reader(
         &self,
         name: Arc<str>,
@@ -273,8 +275,9 @@ impl<V: VTable> Layout for LayoutAdapter<V> {
         &self,
         name: Arc<str>,
         segment_source: Arc<dyn SegmentSource>,
+        session: &VortexSession,
     ) -> VortexResult<LayoutReaderRef> {
-        V::new_reader(&self.0, name, segment_source)
+        V::new_reader(&self.0, name, segment_source, session)
     }
 }
 

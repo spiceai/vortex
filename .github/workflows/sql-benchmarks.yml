@@ -35,7 +35,7 @@ on:
               "subcommand": "tpch",
               "name": "TPC-H SF=1 on S3",
               "local_dir": "bench-vortex/data/tpch/1.0",
-              "remote_storage": "s3://vortex-bench-dev-eu/${{github.ref_name}}/tpch/1.0/",
+              "remote_storage": "s3://vortex-bench-dev-eu/${{github.ref_name}}/${{github.run_id}}/tpch/1.0/",
               "targets": "datafusion:parquet,datafusion:vortex,datafusion:vortex-compact,duckdb:parquet,duckdb:vortex,duckdb:vortex-compact",
               "scale_factor": "--scale-factor 1.0"
             },
@@ -51,7 +51,7 @@ on:
               "subcommand": "tpch",
               "name": "TPC-H SF=10 on S3",
               "local_dir": "bench-vortex/data/tpch/10.0",
-              "remote_storage": "s3://vortex-bench-dev-eu/${{github.ref_name}}/tpch/10.0/",
+              "remote_storage": "s3://vortex-bench-dev-eu/${{github.ref_name}}/${{github.run_id}}/tpch/10.0/",
               "targets": "datafusion:parquet,datafusion:vortex,datafusion:vortex-compact,duckdb:parquet,duckdb:vortex,duckdb:vortex-compact",
               "scale_factor": "--scale-factor 10.0"
             },
@@ -81,7 +81,7 @@ on:
               "subcommand": "fineweb",
               "name": "FineWeb S3",
               "local_dir": "bench-vortex/data/fineweb",
-              "remote_storage": "s3://vortex-bench-dev-eu/${{github.ref_name}}/fineweb/",
+              "remote_storage": "s3://vortex-bench-dev-eu/${{github.ref_name}}/${{github.run_id}}/fineweb/",
               "targets": "datafusion:parquet,datafusion:vortex,datafusion:vortex-compact,duckdb:parquet,duckdb:vortex,duckdb:vortex-compact",
               "scale_factor": "--scale-factor 100"
             },
@@ -97,7 +97,7 @@ on:
               "subcommand": "gharchive",
               "name": "GitHub Archive (S3)",
               "local_dir": "bench-vortex/data/gharchive",
-              "remote_storage": "s3://vortex-bench-dev-eu/${{github.ref_name}}/gharchive/",
+              "remote_storage": "s3://vortex-bench-dev-eu/${{github.ref_name}}/${{github.run_id}}/gharchive/",
               "targets": "datafusion:parquet,datafusion:vortex,datafusion:vortex-compact,duckdb:parquet,duckdb:vortex,duckdb:vortex-compact",
               "scale_factor": "--scale-factor 100"
             },
@@ -123,12 +123,12 @@ jobs:
         if: inputs.mode != 'pr' || github.event.pull_request.head.repo.fork == false
         with:
           sccache: s3
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         if: inputs.mode == 'pr'
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         if: inputs.mode != 'pr'
       - uses: ./.github/actions/setup-rust
         with:
@@ -136,9 +136,10 @@ jobs:
 
       - name: Install DuckDB
         run: |
-          wget -qO- https://github.com/duckdb/duckdb/releases/download/v1.3.2/duckdb_cli-linux-amd64.zip | funzip > duckdb
+          wget -qO- https://github.com/duckdb/duckdb/releases/download/v1.4.2/duckdb_cli-linux-amd64.zip | funzip > duckdb
           chmod +x duckdb
           echo "$PWD" >> $GITHUB_PATH
+
       - name: Build binary
         shell: bash
         env:
@@ -222,7 +223,7 @@ jobs:
 
       - name: Install uv
         if: inputs.mode == 'pr'
-        uses: spiraldb/actions/.github/actions/setup-uv@0.18.2
+        uses: spiraldb/actions/.github/actions/setup-uv@0.18.5
         with:
           sync: false
       - name: Compare results

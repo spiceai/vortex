@@ -7,6 +7,7 @@ use crate::{Scalar, ScalarOps, VectorMut, VectorOps};
 /// A scalar value for list view types.
 ///
 /// The inner value is a ListViewVector with length 1.
+#[derive(Debug)]
 pub struct ListViewScalar(ListViewVector);
 
 impl ListViewScalar {
@@ -18,6 +19,11 @@ impl ListViewScalar {
     pub fn new(vector: ListViewVector) -> Self {
         assert_eq!(vector.len(), 1);
         Self(vector)
+    }
+
+    /// Returns the inner length-1 vector representing the list view scalar.
+    pub fn value(&self) -> &ListViewVector {
+        &self.0
     }
 }
 

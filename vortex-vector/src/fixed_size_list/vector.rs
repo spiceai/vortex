@@ -11,7 +11,7 @@ use vortex_error::{VortexExpect, VortexResult, vortex_ensure};
 use vortex_mask::Mask;
 
 use crate::fixed_size_list::{FixedSizeListScalar, FixedSizeListVectorMut};
-use crate::{Scalar, Vector, VectorOps};
+use crate::{Vector, VectorOps};
 
 /// An immutable vector of fixed-size lists.
 ///
@@ -128,6 +128,11 @@ impl FixedSizeListVector {
         (self.elements, self.list_size, self.validity)
     }
 
+    /// Returns the element size of every list in the vector.
+    pub fn element_size(&self) -> u32 {
+        self.list_size
+    }
+
     /// Returns the child vector of elements, which represents the contiguous fixed-size lists of
     /// the `FixedSizeListVector`.
     pub fn elements(&self) -> &Arc<Vector> {
@@ -142,6 +147,7 @@ impl FixedSizeListVector {
 
 impl VectorOps for FixedSizeListVector {
     type Mutable = FixedSizeListVectorMut;
+    type Scalar = FixedSizeListScalar;
 
     fn len(&self) -> usize {
         self.len
@@ -151,13 +157,19 @@ impl VectorOps for FixedSizeListVector {
         &self.validity
     }
 
-    fn scalar_at(&self, index: usize) -> Scalar {
+    fn scalar_at(&self, index: usize) -> FixedSizeListScalar {
         assert!(index < self.len());
-        FixedSizeListScalar::new(self.slice(index..index + 1)).into()
+        FixedSizeListScalar::new(self.slice(index..index + 1))
     }
 
     fn slice(&self, _range: impl RangeBounds<usize> + Clone + Debug) -> Self {
         todo!()
+    }
+
+    fn clear(&mut self) {
+        Arc::make_mut(&mut self.elements).clear();
+        self.validity.clear();
+        self.len = 0;
     }
 
     fn try_into_mut(self) -> Result<FixedSizeListVectorMut, Self> {
@@ -197,6 +209,23 @@ impl VectorOps for FixedSizeListVector {
                 validity: validity.freeze(),
                 len,
             }),
+        }
+    }
+
+    fn into_mut(self) -> FixedSizeListVectorMut {
+        let len = self.len;
+        let list_size = self.list_size;
+        let validity = self.validity.into_mut();
+
+        // If someone else has a strong reference to the `Arc`, clone the underlying data (which is
+        // just a **different** reference count increment).
+        let elements = Arc::try_unwrap(self.elements).unwrap_or_else(|arc| (*arc).clone());
+
+        FixedSizeListVectorMut {
+            elements: Box::new(elements.into_mut()),
+            list_size,
+            validity,
+            len,
         }
     }
 }

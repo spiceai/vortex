@@ -3,6 +3,8 @@
 
 pub mod display;
 mod operator;
+pub mod session;
+pub mod transform;
 mod visitor;
 
 use std::any::Any;
@@ -15,7 +17,7 @@ pub use operator::*;
 pub use visitor::*;
 use vortex_buffer::ByteBuffer;
 use vortex_dtype::{DType, Nullability};
-use vortex_error::{VortexExpect, VortexResult, vortex_bail, vortex_err, vortex_panic};
+use vortex_error::{VortexExpect, VortexResult, vortex_bail, vortex_panic};
 use vortex_mask::Mask;
 use vortex_scalar::Scalar;
 
@@ -26,16 +28,14 @@ use crate::arrays::{
 };
 use crate::builders::ArrayBuilder;
 use crate::compute::{ComputeFn, Cost, InvocationArgs, IsConstantOpts, Output, is_constant_opts};
-use crate::operator::OperatorRef;
 use crate::serde::ArrayChildren;
 use crate::stats::{Precision, Stat, StatsProviderExt, StatsSetRef};
 use crate::vtable::{
-    ArrayVTable, CanonicalVTable, ComputeVTable, OperationsVTable, OperatorVTable, SerdeVTable,
-    VTable, ValidityVTable, VisitorVTable,
+    ArrayVTable, CanonicalVTable, ComputeVTable, OperationsVTable, VTable, ValidityVTable,
+    VisitorVTable,
 };
 use crate::{
-    ArrayEq, ArrayHash, Canonical, DynArrayEq, DynArrayHash, EncodingId, EncodingRef,
-    SerializeMetadata, hash,
+    ArrayEq, ArrayHash, Canonical, DynArrayEq, DynArrayHash, EncodingId, EncodingRef, hash,
 };
 
 /// The public API trait for all Vortex arrays.
@@ -168,11 +168,6 @@ pub trait Array:
     /// call.
     fn invoke(&self, compute_fn: &ComputeFn, args: &InvocationArgs)
     -> VortexResult<Option<Output>>;
-
-    /// Convert the array to an operator if supported by the encoding.
-    ///
-    /// Returns `None` if the encoding does not support operator operations.
-    fn to_operator(&self) -> VortexResult<Option<OperatorRef>>;
 }
 
 impl Array for Arc<dyn Array> {
@@ -274,10 +269,6 @@ impl Array for Arc<dyn Array> {
         args: &InvocationArgs,
     ) -> VortexResult<Option<Output>> {
         self.as_ref().invoke(compute_fn, args)
-    }
-
-    fn to_operator(&self) -> VortexResult<Option<OperatorRef>> {
-        self.as_ref().to_operator()
     }
 }
 
@@ -628,18 +619,9 @@ impl<V: VTable> Array for ArrayAdapter<V> {
             }
         }
 
-        let metadata = self.metadata()?.ok_or_else(|| {
-            vortex_err!("Cannot replace children for arrays that do not support serialization")
-        })?;
-
         // Replace the children of the array by re-building the array from parts.
-        self.encoding().build(
-            self.dtype(),
-            self.len(),
-            &metadata,
-            &self.buffers(),
-            &ReplacementChildren { children },
-        )
+        self.encoding()
+            .with_children(self, &ReplacementChildren { children })
     }
 
     fn invoke(
@@ -648,10 +630,6 @@ impl<V: VTable> Array for ArrayAdapter<V> {
         args: &InvocationArgs,
     ) -> VortexResult<Option<Output>> {
         <V::ComputeVTable as ComputeVTable<V>>::invoke(&self.0, compute_fn, args)
-    }
-
-    fn to_operator(&self) -> VortexResult<Option<OperatorRef>> {
-        <V::OperatorVTable as OperatorVTable<V>>::to_operator(&self.0)
     }
 }
 
@@ -749,14 +727,13 @@ impl<V: VTable> ArrayVisitor for ArrayAdapter<V> {
     }
 
     fn metadata(&self) -> VortexResult<Option<Vec<u8>>> {
-        Ok(<V::SerdeVTable as SerdeVTable<V>>::metadata(&self.0)?.map(|m| m.serialize()))
+        V::serialize(V::metadata(&self.0)?)
     }
 
     fn metadata_fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match <V::SerdeVTable as SerdeVTable<V>>::metadata(&self.0) {
+        match V::metadata(&self.0) {
             Err(e) => write!(f, "<serde error: {e}>"),
-            Ok(None) => write!(f, "<serde not supported>"),
-            Ok(Some(metadata)) => Debug::fmt(&metadata, f),
+            Ok(metadata) => Debug::fmt(&metadata, f),
         }
     }
 }

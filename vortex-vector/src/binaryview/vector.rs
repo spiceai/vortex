@@ -11,10 +11,10 @@ use vortex_buffer::{Alignment, Buffer, ByteBuffer};
 use vortex_error::{VortexExpect, VortexResult, vortex_ensure};
 use vortex_mask::Mask;
 
+use crate::VectorOps;
 use crate::binaryview::vector_mut::BinaryViewVectorMut;
 use crate::binaryview::view::{BinaryView, validate_views};
 use crate::binaryview::{BinaryViewScalar, BinaryViewType};
-use crate::{Scalar, VectorOps};
 
 /// A variable-length binary vector.
 ///
@@ -193,6 +193,7 @@ impl<T: BinaryViewType> BinaryViewVector<T> {
 
 impl<T: BinaryViewType> VectorOps for BinaryViewVector<T> {
     type Mutable = BinaryViewVectorMut<T>;
+    type Scalar = BinaryViewScalar<T>;
 
     fn len(&self) -> usize {
         self.views.len()
@@ -202,13 +203,19 @@ impl<T: BinaryViewType> VectorOps for BinaryViewVector<T> {
         &self.validity
     }
 
-    fn scalar_at(&self, index: usize) -> Scalar {
+    fn scalar_at(&self, index: usize) -> BinaryViewScalar<T> {
         assert!(index < self.len());
-        BinaryViewScalar::<T>::from(self.get(index)).into()
+        BinaryViewScalar::<T>::new(self.get(index))
     }
 
     fn slice(&self, _range: impl RangeBounds<usize> + Clone + Debug) -> Self {
         todo!()
+    }
+
+    fn clear(&mut self) {
+        self.views.clear();
+        self.validity = Mask::new_true(0);
+        self.buffers = Arc::new(Box::new([]));
     }
 
     fn try_into_mut(self) -> Result<BinaryViewVectorMut<T>, Self> {
@@ -253,6 +260,21 @@ impl<T: BinaryViewType> VectorOps for BinaryViewVector<T> {
                 buffers_mut,
             ))
         }
+    }
+
+    fn into_mut(self) -> BinaryViewVectorMut<T> {
+        let views_mut = self.views.into_mut();
+        let validity_mut = self.validity.into_mut();
+
+        // If someone else has a strong reference to the `Arc`, clone the underlying data (which is
+        // just a **different** reference count increment).
+        let buffers_mut = Arc::try_unwrap(self.buffers)
+            .unwrap_or_else(|arc| (*arc).clone())
+            .into_vec();
+
+        // SAFETY: The BinaryViewVector maintains the exact same invariants as the immutable
+        // version, so all invariants are still upheld.
+        unsafe { BinaryViewVectorMut::new_unchecked(views_mut, validity_mut, buffers_mut) }
     }
 }
 

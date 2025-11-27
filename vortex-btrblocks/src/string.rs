@@ -2,15 +2,15 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use vortex_array::arrays::{
-    ConstantArray, MaskedArray, VarBinArray, VarBinViewArray, VarBinViewVTable,
+    ConstantArray, DictArray, MaskedArray, VarBinArray, VarBinViewArray, VarBinViewVTable,
 };
+use vortex_array::builders::dict::dict_encode;
 use vortex_array::vtable::ValidityHelper;
 use vortex_array::{ArrayRef, IntoArray, ToCanonical};
-use vortex_dict::DictArray;
-use vortex_dict::builders::dict_encode;
 use vortex_error::{VortexExpect, VortexResult};
 use vortex_fsst::{FSSTArray, fsst_compress, fsst_train_compressor};
 use vortex_scalar::Scalar;
+use vortex_sparse::{SparseArray, SparseVTable};
 use vortex_utils::aliases::hash_set::HashSet;
 
 use crate::integer::IntCompressor;
@@ -26,6 +26,7 @@ pub struct StringStats {
     src: VarBinViewArray,
     estimated_distinct_count: u32,
     value_count: u32,
+    null_count: u32,
 }
 
 /// Estimate the number of distinct strings in the var bin view array.
@@ -65,6 +66,7 @@ impl CompressorStats for StringStats {
         Self {
             src: input.clone(),
             value_count: value_count.try_into().vortex_expect("value_count"),
+            null_count: null_count.try_into().vortex_expect("null_count"),
             estimated_distinct_count: estimated_distinct,
         }
     }
@@ -94,6 +96,7 @@ impl Compressor for StringCompressor {
             &DictScheme,
             &FSSTScheme,
             &ConstantScheme,
+            &NullDominated,
         ]
     }
 
@@ -122,6 +125,9 @@ pub struct FSSTScheme;
 #[derive(Debug, Copy, Clone)]
 pub struct ConstantScheme;
 
+#[derive(Debug, Copy, Clone)]
+pub struct NullDominated;
+
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub struct StringCode(u8);
 
@@ -129,6 +135,8 @@ const UNCOMPRESSED_SCHEME: StringCode = StringCode(0);
 const DICT_SCHEME: StringCode = StringCode(1);
 const FSST_SCHEME: StringCode = StringCode(2);
 const CONSTANT_SCHEME: StringCode = StringCode(3);
+
+const SPARSE_SCHEME: StringCode = StringCode(4);
 
 impl Scheme for UncompressedScheme {
     type StatsType = StringStats;
@@ -225,7 +233,13 @@ impl Scheme for DictScheme {
         )?;
 
         // SAFETY: compressing codes or values does not alter the invariants
-        unsafe { Ok(DictArray::new_unchecked(compressed_codes, compressed_values).into_array()) }
+        unsafe {
+            Ok(
+                DictArray::new_unchecked(compressed_codes, compressed_values)
+                    .set_all_values_referenced(dict.has_all_values_referenced())
+                    .into_array(),
+            )
+        }
     }
 }
 
@@ -244,8 +258,8 @@ impl Scheme for FSSTScheme {
         allowed_cascading: usize,
         _excludes: &[StringCode],
     ) -> VortexResult<ArrayRef> {
-        let compressor = fsst_train_compressor(&stats.src.clone().into_array())?;
-        let fsst = fsst_compress(&stats.src.clone().into_array(), &compressor)?;
+        let compressor = fsst_train_compressor(&stats.src);
+        let fsst = fsst_compress(&stats.src, &compressor);
 
         let compressed_original_lengths = IntCompressor::compress(
             &fsst.uncompressed_lengths().to_primitive().narrow()?,
@@ -338,13 +352,87 @@ impl Scheme for ConstantScheme {
     }
 }
 
+impl Scheme for NullDominated {
+    type StatsType = StringStats;
+    type CodeType = StringCode;
+
+    fn code(&self) -> Self::CodeType {
+        SPARSE_SCHEME
+    }
+
+    fn expected_compression_ratio(
+        &self,
+        stats: &Self::StatsType,
+        _is_sample: bool,
+        allowed_cascading: usize,
+        _excludes: &[Self::CodeType],
+    ) -> VortexResult<f64> {
+        // Only use `SparseScheme` if we can cascade.
+        if allowed_cascading == 0 {
+            return Ok(0.0);
+        }
+
+        if stats.value_count == 0 {
+            // All nulls should use ConstantScheme
+            return Ok(0.0);
+        }
+
+        // If the majority is null, will compress well.
+        if stats.null_count as f64 / stats.src.len() as f64 > 0.9 {
+            return Ok(stats.src.len() as f64 / stats.value_count as f64);
+        }
+
+        // Otherwise we don't go this route
+        Ok(0.0)
+    }
+
+    fn compress(
+        &self,
+        stats: &Self::StatsType,
+        is_sample: bool,
+        allowed_cascading: usize,
+        _excludes: &[Self::CodeType],
+    ) -> VortexResult<ArrayRef> {
+        assert!(allowed_cascading > 0);
+
+        // We pass None as we only run this pathway for NULL-dominated float arrays
+        let sparse_encoded = SparseArray::encode(stats.src.as_ref(), None)?;
+
+        if let Some(sparse) = sparse_encoded.as_opt::<SparseVTable>() {
+            // Compress the values
+            let new_excludes = vec![integer::SparseScheme.code()];
+
+            // Don't attempt to compress the non-null values
+            let indices = sparse.patches().indices().to_primitive().narrow()?;
+            let compressed_indices = IntCompressor::compress_no_dict(
+                &indices,
+                is_sample,
+                allowed_cascading - 1,
+                &new_excludes,
+            )?;
+
+            SparseArray::try_new(
+                compressed_indices,
+                sparse.patches().values().clone(),
+                sparse.len(),
+                sparse.fill_scalar().clone(),
+            )
+            .map(|a| a.into_array())
+        } else {
+            Ok(sparse_encoded)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use vortex_array::arrays::VarBinViewArray;
+    use vortex_array::builders::{ArrayBuilder, VarBinViewBuilder};
     use vortex_dtype::{DType, Nullability};
+    use vortex_sparse::SparseEncoding;
 
-    use crate::Compressor;
     use crate::string::StringCompressor;
+    use crate::{Compressor, MAX_CASCADE};
 
     #[test]
     fn test_strings() {
@@ -362,5 +450,18 @@ mod tests {
         let compressed = StringCompressor::compress(&strings, false, 3, &[]).unwrap();
 
         println!("compression tree: {}", compressed.display_tree());
+    }
+
+    #[test]
+    fn test_sparse_nulls() {
+        let mut strings = VarBinViewBuilder::with_capacity(DType::Utf8(Nullability::Nullable), 100);
+        strings.append_nulls(99);
+
+        strings.append_value("one little string");
+
+        let strings = strings.finish_into_varbinview();
+
+        let compressed = StringCompressor::compress(&strings, false, MAX_CASCADE, &[]).unwrap();
+        assert_eq!(compressed.encoding_id(), SparseEncoding.id());
     }
 }

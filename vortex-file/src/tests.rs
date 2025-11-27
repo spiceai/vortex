@@ -10,21 +10,22 @@ use futures::{StreamExt, TryStreamExt, pin_mut};
 use itertools::Itertools;
 use vortex_array::accessor::ArrayAccessor;
 use vortex_array::arrays::{
-    ChunkedArray, ConstantArray, DecimalArray, ListArray, PrimitiveArray, StructArray, VarBinArray,
-    VarBinViewArray,
+    ChunkedArray, ConstantArray, DecimalArray, DictEncoding, DictVTable, ListArray, PrimitiveArray,
+    StructArray, VarBinArray, VarBinViewArray,
+};
+use vortex_array::expr::session::ExprSession;
+use vortex_array::expr::{
+    Pack, PackOptions, VTableExt, and, cast, eq, get_item, gt, gt_eq, lit, lt, lt_eq, or, root,
+    select,
 };
 use vortex_array::stats::PRUNING_STATS;
 use vortex_array::stream::{ArrayStreamAdapter, ArrayStreamExt};
 use vortex_array::validity::Validity;
 use vortex_array::{Array, ArrayRef, ArraySession, IntoArray, ToCanonical, assert_arrays_eq};
 use vortex_buffer::{Buffer, ByteBufferMut, buffer};
-use vortex_dict::{DictEncoding, DictVTable};
 use vortex_dtype::PType::I32;
 use vortex_dtype::{DType, DecimalDType, Nullability, PType, StructFields};
 use vortex_error::VortexResult;
-use vortex_expr::{
-    Pack, PackOptions, VTableExt, and, eq, get_item, gt, gt_eq, lit, lt, lt_eq, or, root, select,
-};
 use vortex_io::session::RuntimeSession;
 use vortex_layout::session::LayoutSession;
 use vortex_metrics::VortexMetrics;
@@ -41,6 +42,7 @@ static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
         .with::<VortexMetrics>()
         .with::<ArraySession>()
         .with::<LayoutSession>()
+        .with::<ExprSession>()
         .with::<RuntimeSession>();
 
     crate::register_default_encodings(&session);
@@ -424,6 +426,45 @@ async fn test_empty_varbin_array_roundtrip() {
 
 #[tokio::test]
 #[cfg_attr(miri, ignore)]
+async fn issue_5385_filter_casted_column() {
+    let array = StructArray::try_from_iter([("x", buffer![1u8, 2, 3, 4, 5])])
+        .unwrap()
+        .into_array();
+
+    let mut buf = ByteBufferMut::empty();
+    SESSION
+        .write_options()
+        .write(&mut buf, array.to_array_stream())
+        .await
+        .unwrap();
+
+    let result = SESSION
+        .open_options()
+        .open_buffer(buf)
+        .unwrap()
+        .scan()
+        .unwrap()
+        .with_filter(eq(
+            cast(
+                get_item("x", root()),
+                DType::Primitive(PType::U16, Nullability::NonNullable),
+            ),
+            lit(1u16),
+        ))
+        .into_array_stream()
+        .unwrap()
+        .read_all()
+        .await
+        .unwrap();
+
+    assert_arrays_eq!(
+        result,
+        StructArray::try_from_iter([("x", buffer![1u8])]).unwrap()
+    );
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
 async fn filter_string() {
     let names_orig = VarBinArray::from_iter(
         vec![Some("Joseph"), None, Some("Angela"), Some("Mikhail"), None],
@@ -518,20 +559,16 @@ async fn filter_or() {
     assert_eq!(result.len(), 1);
     let names = result[0].to_struct().fields()[0].clone();
     assert_eq!(
-        names
-            .to_varbinview()
-            .with_iterator(|iter| iter
-                .flatten()
-                .map(|s| unsafe { String::from_utf8_unchecked(s.to_vec()) })
-                .collect::<Vec<_>>())
-            .unwrap(),
+        names.to_varbinview().with_iterator(|iter| iter
+            .flatten()
+            .map(|s| unsafe { String::from_utf8_unchecked(s.to_vec()) })
+            .collect::<Vec<_>>()),
         vec!["Joseph".to_string(), "Angela".to_string()]
     );
     let ages = result[0].to_struct().fields()[1].clone();
     assert_eq!(
         ages.to_primitive()
-            .with_iterator(|iter| iter.map(|x| x.cloned()).collect::<Vec<_>>())
-            .unwrap(),
+            .with_iterator(|iter| iter.map(|x| x.cloned()).collect::<Vec<_>>()),
         vec![Some(25), None]
     );
 }
@@ -1488,7 +1525,7 @@ async fn test_writer_with_complex_types() -> VortexResult<()> {
     let strings = strings_field.to_varbinview().with_iterator(|iter| {
         iter.map(|s| s.map(|st| unsafe { String::from_utf8_unchecked(st.to_vec()) }))
             .collect::<Vec<_>>()
-    })?;
+    });
     assert_eq!(
         strings,
         vec![

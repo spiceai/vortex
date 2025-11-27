@@ -7,7 +7,7 @@ use vortex_buffer::BitBufferMut;
 use vortex_error::{VortexExpect, VortexResult, vortex_ensure};
 use vortex_mask::MaskMut;
 
-use crate::bool::BoolVector;
+use crate::bool::{BoolScalar, BoolVector};
 use crate::{VectorMutOps, VectorOps};
 
 /// A mutable vector of boolean values.
@@ -79,6 +79,30 @@ impl BoolVectorMut {
         self.bits.append_n(value, n);
         self.validity.append_n(true, n);
     }
+
+    /// Returns a readonly handle to the bits backing the vector.
+    pub fn bits(&self) -> &BitBufferMut {
+        &self.bits
+    }
+
+    /// Returns a mutable handle to the bits backing the vector.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure that bits and validity always have same length.
+    pub unsafe fn bits_mut(&mut self) -> &mut BitBufferMut {
+        &mut self.bits
+    }
+
+    /// Get a mutable handle to the validity mask of the vector.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure that length of the validity always matches
+    /// length of the bits.
+    pub unsafe fn validity_mut(&mut self) -> &mut MaskMut {
+        &mut self.validity
+    }
 }
 
 impl VectorMutOps for BoolVectorMut {
@@ -103,6 +127,16 @@ impl VectorMutOps for BoolVectorMut {
         self.validity.reserve(additional);
     }
 
+    fn clear(&mut self) {
+        self.bits.clear();
+        self.validity.clear();
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.bits.truncate(len);
+        self.validity.truncate(len);
+    }
+
     fn extend_from_vector(&mut self, other: &BoolVector) {
         self.bits.append_buffer(&other.bits);
         self.validity.append_mask(other.validity());
@@ -111,6 +145,18 @@ impl VectorMutOps for BoolVectorMut {
     fn append_nulls(&mut self, n: usize) {
         self.bits.append_n(false, n); // Note that the value we push doesn't actually matter.
         self.validity.append_n(false, n);
+    }
+
+    fn append_zeros(&mut self, n: usize) {
+        self.bits.append_n(false, n);
+        self.validity.append_n(true, n);
+    }
+
+    fn append_scalars(&mut self, scalar: &BoolScalar, n: usize) {
+        match scalar.value() {
+            None => self.append_nulls(n),
+            Some(value) => self.append_values(value, n),
+        }
     }
 
     fn freeze(self) -> BoolVector {
@@ -128,6 +174,10 @@ impl VectorMutOps for BoolVectorMut {
     }
 
     fn unsplit(&mut self, other: Self) {
+        if self.is_empty() {
+            *self = other;
+            return;
+        }
         self.bits.unsplit(other.bits);
         self.validity.unsplit(other.validity);
     }

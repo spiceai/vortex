@@ -38,7 +38,7 @@ com.google.guava:listenablefuture:9999.0-empty-to-avoid-conflict-with-guava (2 c
 
 com.google.j2objc:j2objc-annotations:3.1 (1 constraints: b809f1a0)
 
-com.google.protobuf:protobuf-java:4.32.1 (2 constraints: a3119f02)
+com.google.protobuf:protobuf-java:4.33.1 (2 constraints: a411c702)
 
 com.jakewharton.nopen:nopen-annotations:1.0.1 (1 constraints: 0405f135)
 
@@ -258,7 +258,7 @@ org.glassfish.jersey.core:jersey-server:2.40 (3 constraints: 363eb427)
 
 org.glassfish.jersey.inject:jersey-hk2:2.40 (1 constraints: ea0cbc29)
 
-org.immutables:value:2.11.6 (1 constraints: 3c05383b)
+org.immutables:value:2.11.7 (1 constraints: 3d05393b)
 
 org.javassist:javassist:3.29.2-GA (1 constraints: 30112ef1)
 
@@ -312,13 +312,13 @@ oro:oro:2.0.8 (1 constraints: 1c0dce36)
 
 [Test dependencies]
 
-ch.qos.logback:logback-classic:1.5.20 (1 constraints: 3a053b3b)
+ch.qos.logback:logback-classic:1.5.21 (1 constraints: 3b053c3b)
 
-ch.qos.logback:logback-core:1.5.20 (1 constraints: 390d402a)
+ch.qos.logback:logback-core:1.5.21 (1 constraints: 3a0d412a)
 
 org.junit:junit-bom:5.14.1 (7 constraints: d475ef0e)
 
-org.junit.jupiter:junit-jupiter:5.14.1 (2 constraints: bd10f0ee)
+org.junit.jupiter:junit-jupiter:5.14.1 (2 constraints: e8100bfb)
 
 org.junit.jupiter:junit-jupiter-api:5.14.1 (4 constraints: 3b39b5e5)
 

@@ -23,8 +23,6 @@ vortex-array = { workspace = true }
 vortex-buffer = { workspace = true }
 vortex-dtype = { workspace = true }
 vortex-error = { workspace = true }
-vortex-expr = { workspace = true }
-vortex-gpu = { workspace = true, optional = true }
 vortex-io = { workspace = true }
 vortex-layout = { workspace = true }
 vortex-mask = { workspace = true }
@@ -32,7 +30,6 @@ vortex-metrics = { workspace = true }
 vortex-session = { workspace = true }
 
 bit-vec = { workspace = true }
-cudarc = { workspace = true, optional = true }
 futures = { workspace = true }
 itertools = { workspace = true }
 log = { workspace = true }
@@ -48,8 +45,6 @@ vortex-layout = { workspace = true, features = ["test-harness"] }
 default = []
 roaring = ["dep:roaring"]
 tokio = ["dep:tokio"]
-gpu = ["cuda", "dep:vortex-gpu", "vortex-layout/gpu"]
-cuda = ["dep:cudarc", "vortex-gpu/cuda"]
 
 [lints]
 workspace = true

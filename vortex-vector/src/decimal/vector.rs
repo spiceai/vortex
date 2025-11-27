@@ -10,8 +10,8 @@ use vortex_dtype::{DecimalType, DecimalTypeDowncast, DecimalTypeUpcast, NativeDe
 use vortex_error::vortex_panic;
 use vortex_mask::Mask;
 
-use crate::decimal::{DVector, DecimalVectorMut};
-use crate::{Scalar, VectorOps, match_each_dvector};
+use crate::decimal::{DVector, DecimalScalar, DecimalVectorMut};
+use crate::{VectorOps, match_each_dvector};
 
 /// An enum over all supported decimal mutable vector types.
 #[derive(Clone, Debug)]
@@ -31,7 +31,17 @@ pub enum DecimalVector {
 }
 
 impl DecimalVector {
-    /// Returns the [`DecimalType`] of the decimal vector.
+    /// Returns the precision of the decimal vector.
+    pub fn precision(&self) -> u8 {
+        match_each_dvector!(self, |v| { v.precision() })
+    }
+
+    /// Returns the scale of the decimal vector.
+    pub fn scale(&self) -> i8 {
+        match_each_dvector!(self, |v| { v.scale() })
+    }
+
+    /// Returns the physical [`DecimalType`] of the decimal vector.
     pub fn decimal_type(&self) -> DecimalType {
         match self {
             Self::D8(_) => DecimalType::I8,
@@ -46,6 +56,7 @@ impl DecimalVector {
 
 impl VectorOps for DecimalVector {
     type Mutable = DecimalVectorMut;
+    type Scalar = DecimalScalar;
 
     fn len(&self) -> usize {
         match_each_dvector!(self, |v| { v.len() })
@@ -55,12 +66,16 @@ impl VectorOps for DecimalVector {
         match_each_dvector!(self, |v| { v.validity() })
     }
 
-    fn scalar_at(&self, index: usize) -> Scalar {
-        match_each_dvector!(self, |v| { v.scalar_at(index) })
+    fn scalar_at(&self, index: usize) -> DecimalScalar {
+        match_each_dvector!(self, |v| { v.scalar_at(index).into() })
     }
 
     fn slice(&self, range: impl RangeBounds<usize> + Clone + Debug) -> Self {
         match_each_dvector!(self, |v| { DecimalVector::from(v.slice(range)) })
+    }
+
+    fn clear(&mut self) {
+        match_each_dvector!(self, |v| { v.clear() })
     }
 
     fn try_into_mut(self) -> Result<DecimalVectorMut, Self> {
@@ -69,6 +84,10 @@ impl VectorOps for DecimalVector {
                 .map(DecimalVectorMut::from)
                 .map_err(Self::from)
         })
+    }
+
+    fn into_mut(self) -> DecimalVectorMut {
+        match_each_dvector!(self, |v| { DecimalVectorMut::from(v.into_mut()) })
     }
 }
 

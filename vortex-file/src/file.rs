@@ -11,11 +11,11 @@ use std::sync::Arc;
 
 use itertools::Itertools;
 use vortex_array::ArrayRef;
+use vortex_array::expr::Expression;
+use vortex_array::expr::pruning::checked_pruning_expr;
 use vortex_array::stats::StatsSet;
 use vortex_dtype::{DType, Field, FieldMask, FieldPath, FieldPathSet};
 use vortex_error::VortexResult;
-use vortex_expr::Expression;
-use vortex_expr::pruning::checked_pruning_expr;
 use vortex_layout::LayoutReader;
 use vortex_layout::segments::SegmentSource;
 use vortex_metrics::VortexMetrics;
@@ -85,7 +85,7 @@ impl VortexFile {
         self.footer
             .layout()
             // TODO(ngates): we may want to allow the user pass in a name here?
-            .new_reader("".into(), segment_source)
+            .new_reader("".into(), segment_source, &self.session)
     }
 
     /// Initiate a scan of the file, returning a builder for configuring the scan.
@@ -96,7 +96,7 @@ impl VortexFile {
         )
     }
 
-    #[cfg(feature = "gpu")]
+    #[cfg(gpu_unstable)]
     pub fn gpu_scan(
         &self,
         ctx: Arc<cudarc::driver::CudaContext>,

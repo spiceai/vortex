@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::ops::Sub;
 use std::sync::Arc;
 
 use vortex_buffer::BitBufferMut;
@@ -12,6 +11,12 @@ use crate::Mask;
 /// A mutable mask, used for lazily allocating the bit buffer as required.
 #[derive(Debug, Clone)]
 pub struct MaskMut(Inner);
+
+impl Default for MaskMut {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
 
 #[derive(Debug, Clone)]
 enum Inner {
@@ -57,6 +62,11 @@ impl MaskMut {
         })
     }
 
+    /// Creates a new mask from an existing bit buffer.
+    pub fn from_buffer(bit_buffer: BitBufferMut) -> Self {
+        Self(Inner::Builder(bit_buffer))
+    }
+
     /// Returns the boolean value at a given index.
     ///
     /// # Panics
@@ -92,6 +102,42 @@ impl MaskMut {
             Inner::Builder(bits) => {
                 bits.reserve(additional);
             }
+        }
+    }
+
+    /// Set the length of the mask.
+    ///
+    /// # Safety
+    ///
+    /// - `new_len` must be less than or equal to [`capacity()`].
+    /// - The elements at `old_len..new_len` must be initialized.
+    ///
+    /// [`capacity()`]: Self::capacity
+    pub unsafe fn set_len(&mut self, new_len: usize) {
+        debug_assert!(new_len < self.capacity());
+        match &mut self.0 {
+            Inner::Empty { capacity, .. } => {
+                self.0 = Inner::Constant {
+                    value: false, // Pick any value
+                    len: new_len,
+                    capacity: *capacity,
+                }
+            }
+            Inner::Constant { len, .. } => {
+                *len = new_len;
+            }
+            Inner::Builder(bits) => {
+                unsafe { bits.set_len(new_len) };
+            }
+        }
+    }
+
+    /// Returns the capacity of the mask.
+    pub fn capacity(&self) -> usize {
+        match &self.0 {
+            Inner::Empty { capacity } => *capacity,
+            Inner::Constant { capacity, .. } => *capacity,
+            Inner::Builder(bits) => bits.capacity(),
         }
     }
 
@@ -207,10 +253,11 @@ impl MaskMut {
     /// values from `at` to the end, and leaving `self` with the values from
     /// the start to `at`.
     pub fn split_off(&mut self, at: usize) -> Self {
-        assert!(at <= self.len(), "split_off index out of bounds");
+        assert!(at <= self.capacity(), "split_off index out of bounds");
         match &mut self.0 {
             Inner::Empty { capacity } => {
-                let new_capacity = (*capacity).saturating_sub(at);
+                let new_capacity = *capacity - at;
+                *capacity = at;
                 Self(Inner::Empty {
                     capacity: new_capacity,
                 })
@@ -220,9 +267,12 @@ impl MaskMut {
                 len,
                 capacity,
             } => {
-                let new_len = len.sub(at);
-                *len = at;
-                let new_capacity = (*capacity).saturating_sub(at);
+                // Adjust the lengths, given that length may be < at
+                let new_len = len.saturating_sub(at);
+                let new_capacity = *capacity - at;
+                *len = (*len).min(at);
+                *capacity = at;
+
                 Self(Inner::Constant {
                     value: *value,
                     len: new_len,
@@ -297,10 +347,124 @@ impl MaskMut {
             Inner::Builder(bits) => !bits.is_empty() && bits.true_count() == 0,
         }
     }
+
+    /// Returns the internal bit buffer if it exists.
+    pub fn as_bit_buffer_mut(&mut self) -> Option<&mut BitBufferMut> {
+        match &mut self.0 {
+            Inner::Builder(bits) => Some(bits),
+            _ => None,
+        }
+    }
+
+    /// Set the value at the given index to true.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the index is out of bounds.
+    pub fn set(&mut self, index: usize) {
+        self.set_to(index, true);
+    }
+
+    /// Set the value at the given index to false.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the index is out of bounds.
+    pub fn unset(&mut self, index: usize) {
+        self.set_to(index, false);
+    }
+
+    /// Set the value at the given index to the specified boolean value.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the index is out of bounds.
+    pub fn set_to(&mut self, index: usize, value: bool) {
+        match &mut self.0 {
+            Inner::Empty { .. } => {
+                vortex_panic!("index out of bounds: the length is 0 but the index is {index}")
+            }
+            Inner::Constant {
+                value: current_value,
+                len,
+                ..
+            } => {
+                assert!(
+                    index < *len,
+                    "index out of bounds: the length is {} but the index is {index}",
+                    *len
+                );
+
+                if *current_value != value {
+                    // Need to materialize the buffer since we're changing from constant.
+                    self.materialize().set_to(index, value);
+                }
+                // If the value is the same as the constant, no action needed.
+            }
+            Inner::Builder(bit_buffer) => {
+                bit_buffer.set_to(index, value);
+            }
+        }
+    }
+
+    /// Set the value at the given index to true without bounds checking.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `index < self.len()`.
+    pub unsafe fn set_unchecked(&mut self, index: usize) {
+        unsafe { self.set_to_unchecked(index, true) }
+    }
+
+    /// Set the value at the given index to false without bounds checking.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `index < self.len()`.
+    pub unsafe fn unset_unchecked(&mut self, index: usize) {
+        unsafe { self.set_to_unchecked(index, false) }
+    }
+
+    /// Set the value at the given index to the specified boolean value without bounds checking.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `index < self.len()`.
+    pub unsafe fn set_to_unchecked(&mut self, index: usize, value: bool) {
+        unsafe {
+            match &mut self.0 {
+                Inner::Empty { .. } => {
+                    // In debug mode, we still want to catch this error.
+                    debug_assert!(false, "cannot set value in empty mask");
+                }
+                Inner::Constant {
+                    value: current_value,
+                    len,
+                    ..
+                } => {
+                    debug_assert!(
+                        index < *len,
+                        "index out of bounds: the length is {} but the index is {index}",
+                        *len
+                    );
+
+                    if *current_value != value {
+                        // Need to materialize the buffer since we're changing from constant.
+                        self.materialize().set_to_unchecked(index, value);
+                    }
+                    // If the value is the same as the constant, no action needed.
+                }
+                Inner::Builder(bit_buffer) => {
+                    bit_buffer.set_to_unchecked(index, value);
+                }
+            }
+        }
+    }
 }
 
 impl Mask {
-    /// Attempts to convert an immutable mask into a mutable one.
+    /// Attempts to convert an immutable mask into a mutable one, returning an error of `Self` if
+    /// the underlying [`BitBuffer`](crate::BitBuffer) data if there are any other references.
     pub fn try_into_mut(self) -> Result<MaskMut, Self> {
         match self {
             Mask::AllTrue(len) => Ok(MaskMut::new_true(len)),
@@ -313,6 +477,29 @@ impl Mask {
                 let mut_buffer = bit_buffer.try_into_mut().map_err(Mask::from_buffer)?;
 
                 Ok(MaskMut(Inner::Builder(mut_buffer)))
+            }
+        }
+    }
+
+    /// Convert an immutable mask into a mutable one, cloning the underlying
+    /// [`BitBuffer`](crate::BitBuffer) data if there are any other references.
+    pub fn into_mut(self) -> MaskMut {
+        match self {
+            Mask::AllTrue(len) => MaskMut::new_true(len),
+            Mask::AllFalse(len) => MaskMut::new_false(len),
+            Mask::Values(values) => {
+                let bit_buffer_mut = match Arc::try_unwrap(values) {
+                    Ok(mask_values) => {
+                        let bit_buffer = mask_values.into_buffer();
+                        bit_buffer.into_mut()
+                    }
+                    Err(arc_mask_values) => {
+                        let bit_buffer = arc_mask_values.bit_buffer();
+                        BitBufferMut::copy_from(bit_buffer)
+                    }
+                };
+
+                MaskMut(Inner::Builder(bit_buffer_mut))
             }
         }
     }

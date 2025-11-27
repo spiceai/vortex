@@ -8,7 +8,7 @@ use vortex_dtype::{NativeDecimalType, PrecisionScale};
 use vortex_error::{VortexExpect, VortexResult, vortex_bail};
 use vortex_mask::MaskMut;
 
-use crate::decimal::DVector;
+use crate::decimal::{DScalar, DVector};
 use crate::{VectorMutOps, VectorOps};
 
 /// A mutable vector of decimal values with fixed precision and scale.
@@ -146,6 +146,16 @@ impl<D: NativeDecimalType> DVectorMut<D> {
         &mut self.elements
     }
 
+    /// Returns a mutable reference to the underlying validity mask of the vector.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that when the length of the validity changes, the length
+    /// of the elements is changed to match it.
+    pub unsafe fn validity_mut(&mut self) -> &mut MaskMut {
+        &mut self.validity
+    }
+
     /// Gets a nullable element at the given index, panicking on out-of-bounds.
     ///
     /// If the element at the given index is null, returns `None`. Otherwise, returns `Some(x)`,
@@ -213,6 +223,16 @@ impl<D: NativeDecimalType> VectorMutOps for DVectorMut<D> {
         self.validity.reserve(additional);
     }
 
+    fn clear(&mut self) {
+        self.elements.clear();
+        self.validity.clear();
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.elements.truncate(len);
+        self.validity.truncate(len);
+    }
+
     fn extend_from_vector(&mut self, other: &DVector<D>) {
         self.elements.extend_from_slice(&other.elements);
         self.validity.append_mask(other.validity());
@@ -221,6 +241,18 @@ impl<D: NativeDecimalType> VectorMutOps for DVectorMut<D> {
     fn append_nulls(&mut self, n: usize) {
         self.elements.extend((0..n).map(|_| D::default()));
         self.validity.append_n(false, n);
+    }
+
+    fn append_zeros(&mut self, n: usize) {
+        self.elements.extend((0..n).map(|_| D::default()));
+        self.validity.append_n(true, n);
+    }
+
+    fn append_scalars(&mut self, scalar: &DScalar<D>, n: usize) {
+        match scalar.value() {
+            None => self.append_nulls(n),
+            Some(value) => self.try_append_n(value, n).vortex_expect("known to fit"),
+        }
     }
 
     fn freeze(self) -> DVector<D> {
@@ -240,6 +272,10 @@ impl<D: NativeDecimalType> VectorMutOps for DVectorMut<D> {
     }
 
     fn unsplit(&mut self, other: Self) {
+        if self.is_empty() {
+            *self = other;
+            return;
+        }
         self.elements.unsplit(other.elements);
         self.validity.unsplit(other.validity);
     }

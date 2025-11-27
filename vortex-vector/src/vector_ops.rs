@@ -9,12 +9,14 @@ use std::ops::RangeBounds;
 
 use vortex_mask::{Mask, MaskMut};
 
-use crate::{Scalar, Vector, VectorMut, private};
+use crate::{ScalarOps, Vector, VectorMut, private};
 
 /// Common operations for immutable vectors (all the variants of [`Vector`]).
 pub trait VectorOps: private::Sealed + Into<Vector> + Sized {
     /// The mutable equivalent of this immutable vector.
     type Mutable: VectorMutOps<Immutable = Self>;
+    /// The scalar type for this vector.
+    type Scalar: ScalarOps;
 
     /// Returns the number of elements in the vector, also referred to as its "length".
     fn len(&self) -> usize;
@@ -32,15 +34,23 @@ pub trait VectorOps: private::Sealed + Into<Vector> + Sized {
     /// add nullable data to a vector they want to keep as non-nullable.
     fn validity(&self) -> &Mask;
 
+    /// Returns the null count of the vector.
+    fn null_count(&self) -> usize {
+        self.validity().false_count()
+    }
+
     /// Return the scalar at the given index.
     ///
     /// # Panics
     ///
     /// Panics if the index is out of bounds.
-    fn scalar_at(&self, index: usize) -> Scalar;
+    fn scalar_at(&self, index: usize) -> Self::Scalar;
 
     /// Slice the vector from `start` to `end` (exclusive).
     fn slice(&self, range: impl RangeBounds<usize> + Clone + Debug) -> Self;
+
+    /// Clears the vector of data, preserving any existing capacity where possible.
+    fn clear(&mut self);
 
     /// Tries to convert `self` into a mutable vector (implementing [`VectorMutOps`]).
     ///
@@ -52,6 +62,19 @@ pub trait VectorOps: private::Sealed + Into<Vector> + Sized {
     ///
     /// If `self` is not unique, this will fail and return `self` back to the caller.
     fn try_into_mut(self) -> Result<Self::Mutable, Self>;
+
+    /// Converts `self` into a mutable vector (implementing [`VectorMutOps`]).
+    ///
+    /// This method uses "clone-on-write" semantics, meaning it will clone any underlying data that
+    /// has multiple references (preventing mutable access). `into_mut` can be more efficient than
+    /// [`try_into_mut()`] when mutations are infrequent.
+    ///
+    /// The semantics of `into_mut` are somewhat similar to that of [`Arc::make_mut()`], but instead
+    /// of working with references, this works with owned immutable / mutable types.
+    ///
+    /// [`try_into_mut()`]: Self::try_into_mut
+    /// [`Arc::make_mut()`]: std::sync::Arc::make_mut
+    fn into_mut(self) -> Self::Mutable;
 }
 
 /// Common operations for mutable vectors (all the variants of [`VectorMut`]).
@@ -87,6 +110,16 @@ pub trait VectorMutOps: private::Sealed + Into<VectorMut> + Sized {
     /// Please let us know if you need `reserve_exact` functionality!
     fn reserve(&mut self, additional: usize);
 
+    /// Clears the buffer, removing all data. Existing capacity is preserved.
+    fn clear(&mut self);
+
+    /// Shortens the buffer, keeping the first len bytes and dropping the rest.
+    ///
+    /// If len is greater than the buffer’s current length, this has no effect.
+    ///
+    /// Existing underlying capacity is preserved.
+    fn truncate(&mut self, len: usize);
+
     /// Extends the vector by appending elements from another vector.
     ///
     /// # Panics
@@ -100,6 +133,15 @@ pub trait VectorMutOps: private::Sealed + Into<VectorMut> + Sized {
     /// Implementors should ensure that they correctly append "null" or garbage values to their
     /// elements in addition to adding nulls to their validity mask.
     fn append_nulls(&mut self, n: usize);
+
+    /// Appends `n` zero elements to the vector.
+    fn append_zeros(&mut self, n: usize);
+
+    /// Appends `n` scalar values to the vector.
+    ///
+    /// **Warning**: This method has terrible performance. You should prefer to use a typed
+    /// API for building vectors by downcasting into a specific type.
+    fn append_scalars(&mut self, scalar: &<Self::Immutable as VectorOps>::Scalar, n: usize);
 
     /// Converts `self` into an immutable vector.
     fn freeze(self) -> Self::Immutable;

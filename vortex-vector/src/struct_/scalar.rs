@@ -7,6 +7,7 @@ use crate::{Scalar, ScalarOps, VectorMut, VectorOps};
 /// Represents a struct scalar value.
 ///
 /// The inner value is a StructVector with length 1.
+#[derive(Debug)]
 pub struct StructScalar(StructVector);
 
 impl StructScalar {
@@ -18,6 +19,11 @@ impl StructScalar {
     pub fn new(vector: StructVector) -> Self {
         assert_eq!(vector.len(), 1);
         Self(vector)
+    }
+
+    /// Returns the inner length-1 vector representing the struct scalar.
+    pub fn value(&self) -> &StructVector {
+        &self.0
     }
 }
 
