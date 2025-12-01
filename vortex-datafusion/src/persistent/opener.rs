@@ -6,19 +6,23 @@ use std::sync::{Arc, Weak};
 
 use arrow_schema::{ArrowError, DataType, Field, SchemaRef};
 use datafusion_common::arrow::array::RecordBatch;
-use datafusion_common::{DataFusionError, Result as DFResult};
+use datafusion_common::pruning::PrunableStatistics;
+use datafusion_common::{DataFusionError, Result as DFResult, Statistics};
 use datafusion_datasource::file_meta::FileMeta;
 use datafusion_datasource::file_stream::{FileOpenFuture, FileOpener};
 use datafusion_datasource::schema_adapter::SchemaAdapterFactory;
 use datafusion_datasource::{FileRange, PartitionedFile};
 use datafusion_datasource_parquet::EarlyStoppingStream;
 use datafusion_physical_expr::simplifier::PhysicalExprSimplifier;
-use datafusion_physical_expr::{PhysicalExprRef, split_conjunction};
+use datafusion_physical_expr::utils::collect_columns;
+use datafusion_physical_expr::{PhysicalExpr, PhysicalExprRef, split_conjunction};
 use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
-use datafusion_physical_expr_common::physical_expr::is_dynamic_physical_expr;
+use datafusion_physical_expr_common::physical_expr::{
+    is_dynamic_physical_expr, snapshot_generation,
+};
 use datafusion_physical_plan::metrics::Count;
-use datafusion_pruning::FilePruner;
-use futures::{FutureExt, StreamExt, TryStreamExt, stream};
+use datafusion_pruning::{FilePruner, PruningStatistics, RequiredColumns};
+use futures::{FutureExt, Stream, StreamExt, TryStreamExt, stream};
 use object_store::ObjectStore;
 use object_store::path::Path;
 use tracing::Instrument;
@@ -355,9 +359,9 @@ impl FileOpener for VortexOpener {
                 .boxed();
 
             if let Some(file_pruner) = file_pruner {
-                Ok(Box::pin(EarlyStoppingStream::new(
+                Ok(Box::pin(VortexStoppingStream::new(
                     stream,
-                    file_pruner,
+                    todo!(),
                     Count::new(),
                 )))
             } else {
@@ -366,6 +370,85 @@ impl FileOpener for VortexOpener {
         }
         .in_current_span()
         .boxed())
+    }
+}
+
+struct VortexStoppingStream<S> {
+    inner: S,
+    dynamic_filter_expr: Arc<dyn PhysicalExpr>,
+    statistics: Arc<Statistics>,
+    done: bool,
+    dynamic_filter_generation: Option<u64>,
+}
+
+impl<S> VortexStoppingStream<S>
+where
+    S: Stream<Item = DFResult<RecordBatch>> + Unpin,
+{
+    pub fn new(
+        inner: S,
+        dynamic_filter_expr: Arc<dyn PhysicalExpr>,
+        statistics: Arc<Statistics>,
+    ) -> Self {
+        Self {
+            inner,
+            dynamic_filter_expr,
+            statistics,
+            done: false,
+            dynamic_filter_generation: None,
+        }
+    }
+
+    fn should_prune(&mut self, batch: &RecordBatch) -> bool {
+        let new_generation = snapshot_generation(&self.dynamic_filter_expr);
+        if let Some(current_generation) = self.dynamic_filter_generation.as_mut() {
+            if *current_generation == new_generation {
+                return false;
+            }
+            *current_generation = new_generation;
+        } else {
+            self.dynamic_filter_generation = Some(new_generation);
+        }
+
+        println!("Updating dynamic filter generation to {:?}", new_generation);
+
+        let mut required_columns: Vec<(
+            datafusion_physical_expr::expressions::Column,
+            datafusion_pruning::StatisticsType,
+            Field,
+        )> = Vec::new();
+        let columns = collect_columns(&self.dynamic_filter_expr);
+        let schema = batch.schema();
+        for col in columns {
+            let field = schema.field_with_name(col.name()).unwrap();
+            required_columns.push((
+                col.clone(),
+                datafusion_pruning::StatisticsType::Min,
+                field.clone(),
+            ));
+            required_columns.push((col, datafusion_pruning::StatisticsType::Max, field.clone()));
+        }
+
+        let prunable_statistics = Box::new(PrunableStatistics::new(
+            vec![Arc::clone(&self.statistics)],
+            Arc::clone(&schema),
+        ));
+
+        let mut builder = BoolVecBuilder::new(prunable_statistics.num_containers());
+        let required_columns = RequiredColumns::from(required_columns);
+        let statistics_batch =
+            build_statistics_record_batch(prunable_statistics.as_ref(), &required_columns).unwrap();
+
+        println!("Prunable statistics: {:?}", statistics_batch);
+
+        builder.combine_value(
+            self.dynamic_filter_expr
+                .evaluate(&statistics_batch)
+                .unwrap(),
+        );
+
+        let mask = builder.build();
+        mask.into_iter().all(|v| !v)
     }
 }
 
