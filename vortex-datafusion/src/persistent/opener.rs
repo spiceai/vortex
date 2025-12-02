@@ -15,7 +15,7 @@ use datafusion_datasource::file_stream::{FileOpenFuture, FileOpener};
 use datafusion_datasource::schema_adapter::SchemaAdapterFactory;
 use datafusion_datasource::{FileRange, PartitionedFile};
 use datafusion_datasource_parquet::EarlyStoppingStream;
-use datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr;
+use datafusion_physical_expr::expressions::{BinaryExpr, DynamicFilterPhysicalExpr, InListExpr};
 use datafusion_physical_expr::simplifier::PhysicalExprSimplifier;
 use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr::{PhysicalExpr, PhysicalExprRef, split_conjunction};
@@ -428,60 +428,71 @@ where
             .simplify(self.dynamic_filter_expr.clone())
             .expect("Should simplify dynamic filter expression");
 
-        println!("Expr: {:?}", expr);
+        let dynamic_expr = if let Some(binary_expr) = expr.as_any().downcast_ref::<BinaryExpr>()
+            && let Some(dynamic_expr) = binary_expr
+                .right()
+                .as_any()
+                .downcast_ref::<DynamicFilterPhysicalExpr>()
+        {
+            dynamic_expr
+        } else if let Some(dynamic_expr) = expr.as_any().downcast_ref::<DynamicFilterPhysicalExpr>()
+        {
+            dynamic_expr
+        } else {
+            println!("No dynamic filter expression found - not applying file filtering");
+            return false;
+        };
 
         println!("Updating dynamic filter generation to {:?}", new_generation);
+        println!("Expr: {:?}", dynamic_expr);
 
-        let columns = collect_columns(&expr);
-        println!("Required columns for pruning: {:?}", columns);
-
-        let schema = batch.schema();
-        println!("Batch schema for pruning: {:?}", schema);
-
-        let mut required_columns = RequiredColumns::default();
-
-        for col in columns {
-            let field = schema
-                .field_with_name(col.name())
-                .expect("Field should exist in schema");
-            required_columns
-                .stat_column(&col, field, datafusion_pruning::StatisticsType::Min)
-                .expect("should get stat column");
-            required_columns
-                .stat_column(&col, field, datafusion_pruning::StatisticsType::Max)
-                .expect("should get stat column");
+        let current_inner_expr = dynamic_expr.current().expect("Should have current expr");
+        if let Some(in_list_expr) = current_inner_expr.as_any().downcast_ref::<InListExpr>() {
+            println!("Current dynamic filter is InListExpr: {:?}", in_list_expr);
         }
 
-        let prunable_statistics = Box::new(PrunableStatistics::new(
-            vec![Arc::clone(&self.statistics)],
-            Arc::clone(&schema),
-        ));
+        // let columns = collect_columns(&expr);
+        // println!("Required columns for pruning: {:?}", columns);
 
-        println!("Required columns for pruning: {:?}", required_columns);
+        // let schema = batch.schema();
+        // println!("Batch schema for pruning: {:?}", schema);
 
-        let mut builder = BoolVecBuilder::new(prunable_statistics.num_containers());
-        let statistics_batch =
-            build_statistics_record_batch(prunable_statistics.as_ref(), &required_columns)
-                .expect("Should build statistics record batch");
+        // let mut required_columns = RequiredColumns::default();
 
-        println!("Prunable statistics: {:?}", statistics_batch);
-
-        // When dynamic filter expr is `IN (1, 2, 5, 6, 8, 9)`, rewrite the expression like:
-        // `SELECT 1 FROM (VALUES (1), (2), (5), (6), (8), (9)) AS t(x) WHERE x BETWEEN min_col AND max_col`
-        // if let Some(dynamic_expr) = expr.as_any().downcast_ref::<DynamicFilterPhysicalExpr>() {
-        //     // let current = dynamic_expr.current().unwrap();
-        //     // println!("Current expr: {:?}", current);
-
+        // for col in columns {
+        //     let field = schema
+        //         .field_with_name(col.name())
+        //         .expect("Field should exist in schema");
+        //     required_columns
+        //         .stat_column(&col, field, datafusion_pruning::StatisticsType::Min)
+        //         .expect("should get stat column");
+        //     required_columns
+        //         .stat_column(&col, field, datafusion_pruning::StatisticsType::Max)
+        //         .expect("should get stat column");
         // }
+
+        // let prunable_statistics = Box::new(PrunableStatistics::new(
+        //     vec![Arc::clone(&self.statistics)],
+        //     Arc::clone(&schema),
+        // ));
+
+        // println!("Required columns for pruning: {:?}", required_columns);
+
+        // let mut builder = BoolVecBuilder::new(prunable_statistics.num_containers());
+        // let statistics_batch =
+        //     build_statistics_record_batch(prunable_statistics.as_ref(), &required_columns)
+        //         .expect("Should build statistics record batch");
+
+        // println!("Prunable statistics: {:?}", statistics_batch);
 
         return false;
 
-        builder.combine_value(
-            expr.evaluate(&statistics_batch)
-                .expect("Should evaluate expression"),
-        );
-        let mask = builder.build();
-        mask.into_iter().all(|v| !v)
+        // builder.combine_value(
+        //     expr.evaluate(&statistics_batch)
+        //         .expect("Should evaluate expression"),
+        // );
+        // let mask = builder.build();
+        // mask.into_iter().all(|v| !v)
     }
 }
 
@@ -897,4 +908,232 @@ mod tests {
 
         Ok(())
     }
+
+    /// Creates file statistics for testing with the given min/max values for column "a"
+    fn make_file_statistics(min_value: i32, max_value: i32) -> Arc<Statistics> {
+        Arc::new(Statistics {
+            num_rows: datafusion_common::stats::Precision::Exact(100),
+            total_byte_size: datafusion_common::stats::Precision::Absent,
+            column_statistics: vec![datafusion_common::ColumnStatistics {
+                null_count: datafusion_common::stats::Precision::Exact(0),
+                min_value: datafusion_common::stats::Precision::Exact(ScalarValue::Int32(Some(
+                    min_value,
+                ))),
+                max_value: datafusion_common::stats::Precision::Exact(ScalarValue::Int32(Some(
+                    max_value,
+                ))),
+                sum_value: datafusion_common::stats::Precision::Absent,
+                distinct_count: datafusion_common::stats::Precision::Absent,
+            }],
+        })
+    }
+
+    #[tokio::test]
+    async fn test_vortex_stopping_stream_continues_without_update() {
+        // Setup: Create a schema and some test batches
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+
+        // Create test batches with values 1-10
+        let batch1 = record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3)])).unwrap();
+        let batch2 = record_batch!(("a", Int32, vec![Some(4), Some(5), Some(6)])).unwrap();
+        let batch3 = record_batch!(("a", Int32, vec![Some(7), Some(8), Some(9)])).unwrap();
+
+        // Create a stream from the batches
+        let inner_stream = stream::iter(vec![Ok(batch1), Ok(batch2), Ok(batch3)]);
+
+        // Create a dynamic filter expression: a > 0 (should always pass)
+        // This starts with a simple predicate that doesn't prune anything
+        let col_a =
+            datafusion_physical_expr::expressions::col("a", &schema).expect("should create column");
+        let lit_0 = datafusion_physical_expr::expressions::lit(ScalarValue::Int32(Some(0)));
+        let initial_expr = Arc::new(BinaryExpr::new(
+            col_a.clone(),
+            datafusion_expr::Operator::Gt,
+            lit_0,
+        )) as Arc<dyn PhysicalExpr>;
+
+        let dynamic_filter = Arc::new(DynamicFilterPhysicalExpr::new(vec![col_a], initial_expr));
+        let statistics = make_file_statistics(1, 10);
+
+        // Create the stopping stream
+        let stopping_stream =
+            VortexStoppingStream::new(inner_stream, dynamic_filter.clone(), statistics);
+        futures::pin_mut!(stopping_stream);
+
+        // Without updating the filter, all batches should pass through
+        let results: Vec<_> = stopping_stream.try_collect().await.unwrap();
+        assert_eq!(results.len(), 3, "All batches should pass through");
+    }
+
+    #[tokio::test]
+    async fn test_vortex_stopping_stream_stops_after_update() {
+        // Setup: Create a schema and some test batches
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+
+        // Create test batches with values 1-10
+        let batch1 = record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3)])).unwrap();
+        let batch2 = record_batch!(("a", Int32, vec![Some(4), Some(5), Some(6)])).unwrap();
+        let batch3 = record_batch!(("a", Int32, vec![Some(7), Some(8), Some(9)])).unwrap();
+
+        // Create a stream from the batches
+        let inner_stream = stream::iter(vec![Ok(batch1), Ok(batch2), Ok(batch3)]);
+
+        // default to lit true
+        let col_a =
+            datafusion_physical_expr::expressions::col("a", &schema).expect("should create column");
+        let lit_true = datafusion_physical_expr::expressions::lit(ScalarValue::Boolean(Some(true)));
+
+        let dynamic_filter = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![col_a.clone()],
+            lit_true,
+        ));
+
+        let statistics = make_file_statistics(1, 10);
+
+        // Create the stopping stream
+        let stopping_stream =
+            VortexStoppingStream::new(inner_stream, dynamic_filter.clone(), statistics);
+        futures::pin_mut!(stopping_stream);
+
+        // Read the first batch
+        let first_batch = stopping_stream.next().await.unwrap().unwrap();
+        assert_eq!(first_batch.num_rows(), 3, "First batch should pass through");
+
+        // Update the dynamic filter to prune all remaining batches: a > 1000
+        let col_a =
+            datafusion_physical_expr::expressions::col("a", &schema).expect("should create column");
+        let lit_1000 = datafusion_physical_expr::expressions::lit(ScalarValue::Int32(Some(1000)));
+        let new_expr = Arc::new(BinaryExpr::new(
+            col_a,
+            datafusion_expr::Operator::Gt,
+            lit_1000,
+        )) as Arc<dyn PhysicalExpr>;
+        dynamic_filter
+            .update(new_expr)
+            .expect("should update filter");
+
+        // The stream should now stop
+        let second_batch = stopping_stream.next().await;
+        assert!(second_batch.is_none(), "Stream should have stopped");
+    }
+
+    // #[tokio::test]
+    // async fn test_vortex_stopping_stream_prunes_after_update() {
+    //     // Setup: Create a schema and some test batches
+    //     let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+
+    //     // Create test batches
+    //     let batch1 = record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3)])).unwrap();
+    //     let batch2 = record_batch!(("a", Int32, vec![Some(4), Some(5), Some(6)])).unwrap();
+    //     let batch3 = record_batch!(("a", Int32, vec![Some(7), Some(8), Some(9)])).unwrap();
+
+    //     // Create a dynamic filter expression that initially passes everything
+    //     let col_a =
+    //         datafusion_physical_expr::expressions::col("a", &schema).expect("should create column");
+    //     let lit_true = datafusion_physical_expr::expressions::lit(ScalarValue::Boolean(Some(true)));
+
+    //     let dynamic_filter = Arc::new(DynamicFilterPhysicalExpr::new(
+    //         vec![col_a.clone()],
+    //         lit_true,
+    //     ));
+
+    //     // Statistics indicate file has values 1-10 (this is what would be pruned against)
+    //     let statistics = make_file_statistics(1, 10);
+
+    //     // Create the inner stream with an interleaved update to the dynamic filter
+    //     // After the first batch is yielded, we update the filter to prune remaining batches
+    //     let dynamic_filter_clone = dynamic_filter.clone();
+    //     let schema_clone = schema.clone();
+    //     let batches = vec![batch1, batch2, batch3];
+    //     let mut batch_iter = batches.into_iter();
+
+    //     let inner_stream = stream::unfold(
+    //         (batch_iter, dynamic_filter_clone, schema_clone, 0usize),
+    //         |(mut iter, filter, schema, count)| async move {
+    //             let batch = iter.next()?;
+
+    //             // After yielding the first batch, update the filter to prune
+    //             // The new filter is `a > 1000` which should not match file stats (1-10)
+    //             if count == 0 {
+    //                 let col_a = datafusion_physical_expr::expressions::col("a", &schema)
+    //                     .expect("should create column");
+    //                 let lit_1000 =
+    //                     datafusion_physical_expr::expressions::lit(ScalarValue::Int32(Some(1000)));
+    //                 let new_expr = Arc::new(BinaryExpr::new(
+    //                     col_a,
+    //                     datafusion_expr::Operator::Gt,
+    //                     lit_1000,
+    //                 )) as Arc<dyn PhysicalExpr>;
+    //                 filter.update(new_expr).expect("should update filter");
+    //             }
+
+    //             Some((
+    //                 Ok::<_, DataFusionError>(batch),
+    //                 (iter, filter, schema, count + 1),
+    //             ))
+    //         },
+    //     );
+
+    //     // Create the stopping stream
+    //     let stopping_stream =
+    //         VortexStoppingStream::new(inner_stream, dynamic_filter.clone(), statistics);
+    //     futures::pin_mut!(stopping_stream);
+
+    //     // The stream should stop after the filter update causes pruning
+    //     let results: Vec<_> = stopping_stream.try_collect().await.unwrap();
+
+    //     // We expect to get batch1 (before update), then batch2 should trigger pruning check
+    //     // Since the new filter `a > 1000` doesn't overlap with stats min=1, max=10, it should prune
+    //     println!("Got {} batches", results.len());
+    //     for (i, batch) in results.iter().enumerate() {
+    //         println!("Batch {}: {} rows", i, batch.num_rows());
+    //     }
+    //     // TODO: Once should_prune is fully implemented, this should be:
+    //     // assert!(results.len() < 3, "Stream should have been pruned");
+    // }
+
+    // #[tokio::test]
+    // async fn test_vortex_stopping_stream_generation_tracking() {
+    //     // Test that the stream correctly tracks generation changes
+    //     let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+
+    //     let batch = record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3)])).unwrap();
+
+    //     let col_a =
+    //         datafusion_physical_expr::expressions::col("a", &schema).expect("should create column");
+    //     let lit_true = datafusion_physical_expr::expressions::lit(ScalarValue::Boolean(Some(true)));
+
+    //     let dynamic_filter = Arc::new(DynamicFilterPhysicalExpr::new(
+    //         vec![col_a.clone()],
+    //         lit_true,
+    //     ));
+
+    //     // Verify initial generation
+    //     let initial_gen =
+    //         datafusion_physical_expr_common::physical_expr::snapshot_generation(&dynamic_filter);
+    //     assert_eq!(initial_gen, 1, "Initial generation should be 1");
+
+    //     // Update the filter
+    //     let new_lit = datafusion_physical_expr::expressions::lit(ScalarValue::Boolean(Some(false)));
+    //     dynamic_filter
+    //         .update(new_lit)
+    //         .expect("should update filter");
+
+    //     // Verify generation changed
+    //     let new_gen =
+    //         datafusion_physical_expr_common::physical_expr::snapshot_generation(&dynamic_filter);
+    //     assert_eq!(new_gen, 2, "Generation should increment after update");
+
+    //     // Create a stopping stream and verify it tracks generations
+    //     let statistics = make_file_statistics(1, 10);
+    //     let inner_stream = stream::iter(vec![Ok(batch)]);
+    //     let mut stopping_stream =
+    //         VortexStoppingStream::new(inner_stream, dynamic_filter.clone(), statistics);
+
+    //     // Initially no generation tracked
+    //     assert!(
+    //         stopping_stream.dynamic_filter_generation.is_none(),
+    //         "No generation tracked initially"
+    //     );
+    // }
 }
