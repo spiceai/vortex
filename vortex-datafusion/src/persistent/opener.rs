@@ -21,7 +21,9 @@ use datafusion_physical_expr_common::physical_expr::{
     is_dynamic_physical_expr, snapshot_generation,
 };
 use datafusion_physical_plan::metrics::Count;
-use datafusion_pruning::{FilePruner, PruningStatistics, RequiredColumns};
+use datafusion_pruning::{
+    BoolVecBuilder, FilePruner, PruningStatistics, RequiredColumns, build_statistics_record_batch,
+};
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt, stream};
 use object_store::ObjectStore;
 use object_store::path::Path;
@@ -184,6 +186,7 @@ impl FileOpener for VortexOpener {
             // - Partition column values (e.g., date=2024-01-01)
             // - File-level statistics (min/max values per column)
             let mut file_pruner = file_pruning_predicate
+                .clone()
                 .map(|predicate| {
                     // Only create pruner if we have dynamic expressions or file statistics
                     // to work with. Static predicates without stats won't benefit from pruning.
@@ -201,6 +204,9 @@ impl FileOpener for VortexOpener {
                 })
                 .transpose()?
                 .flatten();
+
+            let dynamic_filter_expr =
+                file_pruning_predicate.filter(|expr| is_dynamic_physical_expr(expr));
 
             // Check if this file should be pruned based on statistics/partition values.
             // Returns empty stream if file can be skipped entirely.
@@ -358,10 +364,10 @@ impl FileOpener for VortexOpener {
                 .map(move |batch| batch.and_then(|b| schema_mapping.map_batch(b)))
                 .boxed();
 
-            if let Some(file_pruner) = file_pruner {
+            if let Some(dynamic_filter_expr) = dynamic_filter_expr {
                 Ok(Box::pin(VortexStoppingStream::new(
                     stream,
-                    todo!(),
+                    dynamic_filter_expr,
                     Count::new(),
                 )))
             } else {
