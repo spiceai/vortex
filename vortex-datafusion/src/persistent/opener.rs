@@ -2,7 +2,9 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::ops::Range;
+use std::pin::Pin;
 use std::sync::{Arc, Weak};
+use std::task::{Context, Poll};
 
 use arrow_schema::{ArrowError, DataType, Field, SchemaRef};
 use datafusion_common::arrow::array::RecordBatch;
@@ -12,7 +14,6 @@ use datafusion_datasource::file_meta::FileMeta;
 use datafusion_datasource::file_stream::{FileOpenFuture, FileOpener};
 use datafusion_datasource::schema_adapter::SchemaAdapterFactory;
 use datafusion_datasource::{FileRange, PartitionedFile};
-use datafusion_datasource_parquet::EarlyStoppingStream;
 use datafusion_physical_expr::simplifier::PhysicalExprSimplifier;
 use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr::{PhysicalExpr, PhysicalExprRef, split_conjunction};
@@ -24,7 +25,7 @@ use datafusion_physical_plan::metrics::Count;
 use datafusion_pruning::{
     BoolVecBuilder, FilePruner, PruningStatistics, RequiredColumns, build_statistics_record_batch,
 };
-use futures::{FutureExt, Stream, StreamExt, TryStreamExt, stream};
+use futures::{FutureExt, Stream, StreamExt, TryStreamExt, ready, stream};
 use object_store::ObjectStore;
 use object_store::path::Path;
 use tracing::Instrument;
@@ -429,7 +430,11 @@ where
             Field,
         )> = Vec::new();
         let columns = collect_columns(&self.dynamic_filter_expr);
+        println!("Required columns for pruning: {:?}", columns);
+
         let schema = batch.schema();
+        println!("Batch schema for pruning: {:?}", schema);
+
         for col in columns {
             let field = schema.field_with_name(col.name()).unwrap();
             required_columns.push((
@@ -460,6 +465,35 @@ where
 
         let mask = builder.build();
         mask.into_iter().all(|v| !v)
+    }
+}
+
+impl<S> Stream for VortexStoppingStream<S>
+where
+    S: Stream<Item = DFResult<RecordBatch>> + Unpin,
+{
+    type Item = DFResult<RecordBatch>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.done {
+            return Poll::Ready(None);
+        }
+
+        match ready!(self.inner.poll_next_unpin(cx)) {
+            None => {
+                self.done = true;
+                Poll::Ready(None)
+            }
+            Some(batch) => {
+                let batch = batch.unwrap();
+                if self.should_prune(&batch) {
+                    self.done = true;
+                    Poll::Ready(None)
+                } else {
+                    Poll::Ready(Some(Ok(batch)))
+                }
+            }
+        }
     }
 }
 
