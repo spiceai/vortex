@@ -428,6 +428,8 @@ where
             .simplify(self.dynamic_filter_expr.clone())
             .expect("Should simplify dynamic filter expression");
 
+        println!("Expr: {:?}", expr);
+
         println!("Updating dynamic filter generation to {:?}", new_generation);
 
         let columns = collect_columns(&expr);
@@ -466,11 +468,11 @@ where
 
         // When dynamic filter expr is `IN (1, 2, 5, 6, 8, 9)`, rewrite the expression like:
         // `SELECT 1 FROM (VALUES (1), (2), (5), (6), (8), (9)) AS t(x) WHERE x BETWEEN min_col AND max_col`
-        if let Some(dynamic_expr) = expr.as_any().downcast_ref::<DynamicFilterPhysicalExpr>() {
-            // let current = dynamic_expr.current().unwrap();
-            // println!("Current expr: {:?}", current);
-            println!("Dynamic expr: {:?}", dynamic_expr);
-        }
+        // if let Some(dynamic_expr) = expr.as_any().downcast_ref::<DynamicFilterPhysicalExpr>() {
+        //     // let current = dynamic_expr.current().unwrap();
+        //     // println!("Current expr: {:?}", current);
+
+        // }
 
         return false;
 
