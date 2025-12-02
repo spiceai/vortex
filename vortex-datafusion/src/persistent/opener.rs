@@ -14,6 +14,8 @@ use datafusion_datasource::file_meta::FileMeta;
 use datafusion_datasource::file_stream::{FileOpenFuture, FileOpener};
 use datafusion_datasource::schema_adapter::SchemaAdapterFactory;
 use datafusion_datasource::{FileRange, PartitionedFile};
+use datafusion_datasource_parquet::EarlyStoppingStream;
+use datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr;
 use datafusion_physical_expr::simplifier::PhysicalExprSimplifier;
 use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr::{PhysicalExpr, PhysicalExprRef, split_conjunction};
@@ -422,27 +424,30 @@ where
             self.dynamic_filter_generation = Some(new_generation);
         }
 
+        let expr = PhysicalExprSimplifier::new(&batch.schema())
+            .simplify(self.dynamic_filter_expr.clone())
+            .expect("Should simplify dynamic filter expression");
+
         println!("Updating dynamic filter generation to {:?}", new_generation);
 
-        let mut required_columns: Vec<(
-            datafusion_physical_expr::expressions::Column,
-            datafusion_pruning::StatisticsType,
-            Field,
-        )> = Vec::new();
-        let columns = collect_columns(&self.dynamic_filter_expr);
+        let columns = collect_columns(&expr);
         println!("Required columns for pruning: {:?}", columns);
 
         let schema = batch.schema();
         println!("Batch schema for pruning: {:?}", schema);
 
+        let mut required_columns = RequiredColumns::default();
+
         for col in columns {
-            let field = schema.field_with_name(col.name()).unwrap();
-            required_columns.push((
-                col.clone(),
-                datafusion_pruning::StatisticsType::Min,
-                field.clone(),
-            ));
-            required_columns.push((col, datafusion_pruning::StatisticsType::Max, field.clone()));
+            let field = schema
+                .field_with_name(col.name())
+                .expect("Field should exist in schema");
+            required_columns
+                .stat_column(&col, field, datafusion_pruning::StatisticsType::Min)
+                .expect("should get stat column");
+            required_columns
+                .stat_column(&col, field, datafusion_pruning::StatisticsType::Max)
+                .expect("should get stat column");
         }
 
         let prunable_statistics = Box::new(PrunableStatistics::new(
@@ -450,19 +455,25 @@ where
             Arc::clone(&schema),
         ));
 
+        println!("Required columns for pruning: {:?}", required_columns);
+
         let mut builder = BoolVecBuilder::new(prunable_statistics.num_containers());
-        let required_columns = RequiredColumns::from(required_columns);
         let statistics_batch =
-            build_statistics_record_batch(prunable_statistics.as_ref(), &required_columns).unwrap();
+            build_statistics_record_batch(prunable_statistics.as_ref(), &required_columns)
+                .expect("Should build statistics record batch");
 
         println!("Prunable statistics: {:?}", statistics_batch);
 
-        builder.combine_value(
-            self.dynamic_filter_expr
-                .evaluate(&statistics_batch)
-                .unwrap(),
-        );
+        // When dynamic filter expr is `IN (1, 2, 5, 6, 8, 9)`, rewrite the expression like:
+        // `SELECT 1 FROM (VALUES (1), (2), (5), (6), (8), (9)) AS t(x) WHERE x BETWEEN min_col AND max_col`
+        if let Some(dynamic_expr) = expr.as_any().downcast_ref::<DynamicFilterPhysicalExpr>() {
+            let current = dynamic_expr.current().unwrap();
+        }
 
+        builder.combine_value(
+            expr.evaluate(&statistics_batch)
+                .expect("Should evaluate expression"),
+        );
         let mask = builder.build();
         mask.into_iter().all(|v| !v)
     }
