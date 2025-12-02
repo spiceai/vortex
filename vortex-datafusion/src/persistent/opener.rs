@@ -168,6 +168,8 @@ impl FileOpener for VortexOpener {
         let layout_reader = self.layout_readers.clone();
         let has_output_ordering = self.has_output_ordering;
 
+        let statistics = file.statistics.clone();
+
         let projected_schema = match projection.as_ref() {
             None => logical_schema.clone(),
             Some(indices) => Arc::new(logical_schema.project(indices)?),
@@ -207,6 +209,7 @@ impl FileOpener for VortexOpener {
 
             let dynamic_filter_expr =
                 file_pruning_predicate.filter(|expr| is_dynamic_physical_expr(expr));
+            let statistics = statistics; // re-scope for move
 
             // Check if this file should be pruned based on statistics/partition values.
             // Returns empty stream if file can be skipped entirely.
@@ -364,11 +367,13 @@ impl FileOpener for VortexOpener {
                 .map(move |batch| batch.and_then(|b| schema_mapping.map_batch(b)))
                 .boxed();
 
-            if let Some(dynamic_filter_expr) = dynamic_filter_expr {
+            if let Some(dynamic_filter_expr) = dynamic_filter_expr
+                && let Some(statistics) = statistics
+            {
                 Ok(Box::pin(VortexStoppingStream::new(
                     stream,
                     dynamic_filter_expr,
-                    Count::new(),
+                    statistics,
                 )))
             } else {
                 Ok(Box::pin(stream))
