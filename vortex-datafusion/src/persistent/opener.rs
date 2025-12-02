@@ -468,6 +468,7 @@ where
         // `SELECT 1 FROM (VALUES (1), (2), (5), (6), (8), (9)) AS t(x) WHERE x BETWEEN min_col AND max_col`
         if let Some(dynamic_expr) = expr.as_any().downcast_ref::<DynamicFilterPhysicalExpr>() {
             let current = dynamic_expr.current().unwrap();
+            println!("Current expr: {:?}", current);
         }
 
         builder.combine_value(
