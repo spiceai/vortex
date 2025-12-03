@@ -745,6 +745,7 @@ where
 
     fn should_prune(&mut self, batch: &RecordBatch) -> bool {
         let new_generation = snapshot_generation(&self.dynamic_filter_expr);
+        println!("========== NEW GENERATION: {:?}", new_generation);
         if let Some(current_generation) = self.dynamic_filter_generation.as_mut() {
             if *current_generation == new_generation {
                 return false;
@@ -753,6 +754,8 @@ where
         } else {
             self.dynamic_filter_generation = Some(new_generation);
         }
+
+        println!("========== PROCESSING GENERATION ========== ");
 
         let dynamic_expr = if let Some(binary_expr) = self
             .dynamic_filter_expr
