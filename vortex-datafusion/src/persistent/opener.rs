@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
@@ -744,7 +745,11 @@ where
     }
 
     fn should_prune(&mut self, batch: &RecordBatch) -> bool {
-        let new_generation = snapshot_generation(&self.dynamic_filter_expr);
+        let mut hasher = DefaultHasher::default();
+        self.dynamic_filter_expr.hash(&mut hasher);
+        let new_generation = hasher.finish();
+
+        // let new_generation = snapshot_generation(&self.dynamic_filter_expr);
         println!("========== NEW GENERATION: {:?}", self.dynamic_filter_expr);
         if let Some(current_generation) = self.dynamic_filter_generation.as_mut() {
             if *current_generation == new_generation {
