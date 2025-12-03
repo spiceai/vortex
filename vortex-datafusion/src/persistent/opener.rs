@@ -418,7 +418,7 @@ fn contiguous_in_list_ranges(in_list_expr: &InListExpr, overlap: usize) -> Vec<B
         {
             // get the individual values out of the list
             let inner = list.value(0);
-            match (inner) {
+            match inner {
                 v if v.as_any().downcast_ref::<Int32Array>().is_some() => {
                     let inner_i32 = v.as_any().downcast_ref::<Int32Array>().unwrap();
                     for i in 0..inner_i32.len() {
@@ -443,10 +443,20 @@ fn contiguous_in_list_ranges(in_list_expr: &InListExpr, overlap: usize) -> Vec<B
                         literals.push(ScalarValue::UInt64(Some(inner_u64.value(i))));
                     }
                 }
-                _ => return vec![],
+                _ => {
+                    println!(
+                        "Data Type not supported for contiguous range calculation: {}",
+                        inner.data_type()
+                    );
+                    return vec![];
+                }
             };
         } else {
             // non-literal found, cannot process
+            println!(
+                "Found non-literal in InListExpr, cannot compute contiguous ranges: {:?}",
+                value
+            );
             return vec![];
         }
     }
