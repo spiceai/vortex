@@ -486,6 +486,7 @@ fn contiguous_in_list_ranges(in_list_expr: &InListExpr, overlap: usize) -> Vec<B
 
     // sort the scalars
     literals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    println!("Sorted literals: {:?}", literals);
 
     // group into contiguous ranges
     let mut ranges = vec![];
