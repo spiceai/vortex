@@ -679,6 +679,44 @@ fn min_max_within_in_list(in_list_expr: &InListExpr, min_max: (ScalarValue, Scal
     }
 }
 
+// compacts a BinaryExpr which contains several `OR`ed `InListExpr`s into a single `InListExpr`
+fn in_list_expr_compactor(binary_expr: BinaryExpr) -> Option<InListExpr> {
+    if binary_expr.op() != &Operator::Or {
+        return None;
+    }
+
+    let mut in_list_values = vec![];
+    let mut target_left_expr = None;
+    if let Some(left_in_list) = binary_expr.left().as_any().downcast_ref::<InListExpr>() {
+        in_list_values.extend_from_slice(left_in_list.list());
+        target_left_expr = Some(left_in_list.expr().clone());
+    } else if let Some(left_binary) = binary_expr.left().as_any().downcast_ref::<BinaryExpr>() {
+        if let Some(compacted_left) = in_list_expr_compactor(left_binary.clone()) {
+            in_list_values.extend_from_slice(compacted_left.list());
+        }
+    } else {
+        return None;
+    }
+
+    if let Some(right_in_list) = binary_expr.right().as_any().downcast_ref::<InListExpr>() {
+        in_list_values.extend_from_slice(right_in_list.list());
+    } else if let Some(right_binary) = binary_expr.right().as_any().downcast_ref::<BinaryExpr>() {
+        if let Some(compacted_right) = in_list_expr_compactor(right_binary.clone()) {
+            in_list_values.extend_from_slice(compacted_right.list());
+        }
+    } else {
+        return None;
+    }
+
+    if !in_list_values.is_empty()
+        && let Some(left_expr) = target_left_expr
+    {
+        Some(InListExpr::new(left_expr, in_list_values, false, None))
+    } else {
+        None
+    }
+}
+
 struct VortexStoppingStream<S> {
     inner: S,
     dynamic_filter_expr: Arc<dyn PhysicalExpr>,
@@ -742,13 +780,23 @@ where
 
         let current_inner_expr = dynamic_expr.current().expect("Should have current expr");
 
-        let in_list_expr =
-            if let Some(in_list_expr) = current_inner_expr.as_any().downcast_ref::<InListExpr>() {
-                println!("Current dynamic filter is InListExpr: {:?}", in_list_expr);
-                in_list_expr
-            } else {
-                return false;
-            };
+        let in_list_expr = if let Some(in_list_expr) =
+            current_inner_expr.as_any().downcast_ref::<InListExpr>()
+        {
+            println!("Current dynamic filter is InListExpr: {:?}", in_list_expr);
+            InListExpr::new(
+                in_list_expr.expr().clone(),
+                in_list_expr.list().to_vec(),
+                in_list_expr.negated(),
+                None,
+            )
+        } else if let Some(binary_expr) = current_inner_expr.as_any().downcast_ref::<BinaryExpr>()
+            && let Some(compacted_in_list) = in_list_expr_compactor(binary_expr.clone())
+        {
+            compacted_in_list
+        } else {
+            return false;
+        };
 
         let columns = collect_columns(&self.dynamic_filter_expr);
         println!("Required columns for pruning: {:?}", columns);
@@ -800,7 +848,10 @@ where
                 max_value
             );
 
-            column_results.push(min_max_within_in_list(in_list_expr, (min_value, max_value)));
+            column_results.push(min_max_within_in_list(
+                &in_list_expr,
+                (min_value, max_value),
+            ));
         }
 
         if column_results.iter().all(|&r| r) {
