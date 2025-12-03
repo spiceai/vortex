@@ -414,43 +414,66 @@ fn contiguous_in_list_ranges(in_list_expr: &InListExpr, overlap: usize) -> Vec<B
         if let Some(literal) = value
             .as_any()
             .downcast_ref::<datafusion_physical_expr::expressions::Literal>()
-            && let ScalarValue::List(list) = literal.value()
         {
-            // get the individual values out of the list
-            let inner = list.value(0);
-            match inner {
-                v if v.as_any().downcast_ref::<Int32Array>().is_some() => {
-                    let inner_i32 = v.as_any().downcast_ref::<Int32Array>().unwrap();
-                    for i in 0..inner_i32.len() {
-                        literals.push(ScalarValue::Int32(Some(inner_i32.value(i))));
-                    }
+            match literal.value() {
+                ScalarValue::List(list) => {
+                    // get the individual values out of the list
+                    let inner = list.value(0);
+                    match inner {
+                        v if v.as_any().downcast_ref::<Int32Array>().is_some() => {
+                            let inner_i32 = v.as_any().downcast_ref::<Int32Array>().unwrap();
+                            for i in 0..inner_i32.len() {
+                                literals.push(ScalarValue::Int32(Some(inner_i32.value(i))));
+                            }
+                        }
+                        v if v.as_any().downcast_ref::<Int64Array>().is_some() => {
+                            let inner_i64 = v.as_any().downcast_ref::<Int64Array>().unwrap();
+                            for i in 0..inner_i64.len() {
+                                literals.push(ScalarValue::Int64(Some(inner_i64.value(i))));
+                            }
+                        }
+                        v if v.as_any().downcast_ref::<UInt32Array>().is_some() => {
+                            let inner_u32 = v.as_any().downcast_ref::<UInt32Array>().unwrap();
+                            for i in 0..inner_u32.len() {
+                                literals.push(ScalarValue::UInt32(Some(inner_u32.value(i))));
+                            }
+                        }
+                        v if v.as_any().downcast_ref::<UInt64Array>().is_some() => {
+                            let inner_u64 = v.as_any().downcast_ref::<UInt64Array>().unwrap();
+                            for i in 0..inner_u64.len() {
+                                literals.push(ScalarValue::UInt64(Some(inner_u64.value(i))));
+                            }
+                        }
+                        _ => {
+                            println!(
+                                "Data Type not supported for contiguous range calculation: {}",
+                                inner.data_type()
+                            );
+                            return vec![];
+                        }
+                    };
                 }
-                v if v.as_any().downcast_ref::<Int64Array>().is_some() => {
-                    let inner_i64 = v.as_any().downcast_ref::<Int64Array>().unwrap();
-                    for i in 0..inner_i64.len() {
-                        literals.push(ScalarValue::Int64(Some(inner_i64.value(i))));
-                    }
+                ScalarValue::Int32(Some(v)) => {
+                    literals.push(ScalarValue::Int32(Some(*v)));
                 }
-                v if v.as_any().downcast_ref::<UInt32Array>().is_some() => {
-                    let inner_u32 = v.as_any().downcast_ref::<UInt32Array>().unwrap();
-                    for i in 0..inner_u32.len() {
-                        literals.push(ScalarValue::UInt32(Some(inner_u32.value(i))));
-                    }
+                ScalarValue::Int64(Some(v)) => {
+                    literals.push(ScalarValue::Int64(Some(*v)));
                 }
-                v if v.as_any().downcast_ref::<UInt64Array>().is_some() => {
-                    let inner_u64 = v.as_any().downcast_ref::<UInt64Array>().unwrap();
-                    for i in 0..inner_u64.len() {
-                        literals.push(ScalarValue::UInt64(Some(inner_u64.value(i))));
-                    }
+                ScalarValue::UInt32(Some(v)) => {
+                    literals.push(ScalarValue::UInt32(Some(*v)));
+                }
+                ScalarValue::UInt64(Some(v)) => {
+                    literals.push(ScalarValue::UInt64(Some(*v)));
                 }
                 _ => {
+                    // non-literal found, cannot process
                     println!(
-                        "Data Type not supported for contiguous range calculation: {}",
-                        inner.data_type()
+                        "cannot compute contiguous ranges from scalar value: {:?}",
+                        literal.value()
                     );
                     return vec![];
                 }
-            };
+            }
         } else {
             // non-literal found, cannot process
             println!(
