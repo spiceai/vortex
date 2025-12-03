@@ -549,6 +549,140 @@ fn contiguous_in_list_ranges(in_list_expr: &InListExpr, overlap: usize) -> Vec<B
     ranges
 }
 
+fn min_max_within_in_list(in_list_expr: &InListExpr, min_max: (ScalarValue, ScalarValue)) -> bool {
+    let list = in_list_expr.list();
+
+    // only literals are supported
+    let mut literals = vec![];
+    for value in list.iter() {
+        if let Some(literal) = value
+            .as_any()
+            .downcast_ref::<datafusion_physical_expr::expressions::Literal>()
+        {
+            match literal.value() {
+                ScalarValue::List(list) => {
+                    // get the individual values out of the list
+                    let inner = list.value(0);
+                    match inner {
+                        v if v.as_any().downcast_ref::<Int32Array>().is_some() => {
+                            let inner_i32 = v.as_any().downcast_ref::<Int32Array>().unwrap();
+                            for i in 0..inner_i32.len() {
+                                literals.push(ScalarValue::Int32(Some(inner_i32.value(i))));
+                            }
+                        }
+                        v if v.as_any().downcast_ref::<Int64Array>().is_some() => {
+                            let inner_i64 = v.as_any().downcast_ref::<Int64Array>().unwrap();
+                            for i in 0..inner_i64.len() {
+                                literals.push(ScalarValue::Int64(Some(inner_i64.value(i))));
+                            }
+                        }
+                        v if v.as_any().downcast_ref::<UInt32Array>().is_some() => {
+                            let inner_u32 = v.as_any().downcast_ref::<UInt32Array>().unwrap();
+                            for i in 0..inner_u32.len() {
+                                literals.push(ScalarValue::UInt32(Some(inner_u32.value(i))));
+                            }
+                        }
+                        v if v.as_any().downcast_ref::<UInt64Array>().is_some() => {
+                            let inner_u64 = v.as_any().downcast_ref::<UInt64Array>().unwrap();
+                            for i in 0..inner_u64.len() {
+                                literals.push(ScalarValue::UInt64(Some(inner_u64.value(i))));
+                            }
+                        }
+                        _ => {
+                            println!(
+                                "Data Type not supported for contiguous range calculation: {}",
+                                inner.data_type()
+                            );
+                            return true;
+                        }
+                    };
+                }
+                ScalarValue::Int32(Some(v)) => {
+                    literals.push(ScalarValue::Int32(Some(*v)));
+                }
+                ScalarValue::Int64(Some(v)) => {
+                    literals.push(ScalarValue::Int64(Some(*v)));
+                }
+                ScalarValue::UInt32(Some(v)) => {
+                    literals.push(ScalarValue::UInt32(Some(*v)));
+                }
+                ScalarValue::UInt64(Some(v)) => {
+                    literals.push(ScalarValue::UInt64(Some(*v)));
+                }
+                _ => {
+                    // non-literal found, cannot process
+                    println!(
+                        "cannot compute contiguous ranges from scalar value: {:?}",
+                        literal.value()
+                    );
+                    return true;
+                }
+            }
+        } else {
+            // non-literal found, cannot process
+            println!(
+                "Found non-literal in InListExpr, cannot compute contiguous ranges: {:?}",
+                value
+            );
+            return true;
+        }
+    }
+
+    let Some(first) = literals.first() else {
+        return true;
+    };
+
+    if min_max.0.data_type() != first.data_type() {
+        return true; // cannot compare different data types
+    }
+
+    match min_max {
+        (ScalarValue::Int32(Some(min)), ScalarValue::Int32(Some(max))) => {
+            let search_in_range = min..=max;
+            return literals.iter().any(|literal| {
+                if let ScalarValue::Int32(Some(v)) = literal {
+                    search_in_range.contains(v)
+                } else {
+                    false
+                }
+            });
+        }
+        (ScalarValue::Int64(Some(min)), ScalarValue::Int64(Some(max))) => {
+            let search_in_range = min..=max;
+            return literals.iter().any(|literal| {
+                if let ScalarValue::Int64(Some(v)) = literal {
+                    search_in_range.contains(v)
+                } else {
+                    false
+                }
+            });
+        }
+        (ScalarValue::UInt32(Some(min)), ScalarValue::UInt32(Some(max))) => {
+            let search_in_range = min..=max;
+            return literals.iter().any(|literal| {
+                if let ScalarValue::UInt32(Some(v)) = literal {
+                    search_in_range.contains(v)
+                } else {
+                    false
+                }
+            });
+        }
+        (ScalarValue::UInt64(Some(min)), ScalarValue::UInt64(Some(max))) => {
+            let search_in_range = min..=max;
+            return literals.iter().any(|literal| {
+                if let ScalarValue::UInt64(Some(v)) = literal {
+                    search_in_range.contains(v)
+                } else {
+                    false
+                }
+            });
+        }
+        _ => {
+            return true;
+        }
+    }
+}
+
 struct VortexStoppingStream<S> {
     inner: S,
     dynamic_filter_expr: Arc<dyn PhysicalExpr>,
@@ -621,85 +755,90 @@ where
         println!("Expr: {:?}", dynamic_expr);
 
         let current_inner_expr = dynamic_expr.current().expect("Should have current expr");
-        let pruner_expr =
+
+        let in_list_expr =
             if let Some(in_list_expr) = current_inner_expr.as_any().downcast_ref::<InListExpr>() {
                 println!("Current dynamic filter is InListExpr: {:?}", in_list_expr);
-                let contiguous_ranges = contiguous_in_list_ranges(in_list_expr, 100);
-                if contiguous_ranges.is_empty() {
+                in_list_expr
+            } else {
+                let mut pruner = FilePruner::new(
+                    current_inner_expr.clone(),
+                    &self.logical_schema,
+                    self.partition_fields.clone(),
+                    self.file.clone(),
+                    self.count.clone(),
+                )
+                .unwrap();
+
+                if pruner.should_prune().unwrap() {
+                    println!("Pruning file based on dynamic filter");
+                    return true;
+                } else {
+                    println!("Not pruning file based on dynamic filter");
                     return false;
                 }
-
-                Arc::new(
-                    contiguous_ranges
-                        .into_iter()
-                        .reduce(|acc, expr| {
-                            BinaryExpr::new(Arc::new(acc), Operator::Or, Arc::new(expr))
-                        })
-                        .expect("Should have at least one range expression"),
-                )
-            } else {
-                current_inner_expr
             };
 
-        let mut pruner = FilePruner::new(
-            pruner_expr,
-            &self.logical_schema,
-            self.partition_fields.clone(),
-            self.file.clone(),
-            self.count.clone(),
-        )
-        .unwrap();
+        let columns = collect_columns(&expr);
+        println!("Required columns for pruning: {:?}", columns);
 
-        if pruner.should_prune().unwrap() {
-            println!("Pruning file based on dynamic filter");
-            return true;
-        } else {
-            println!("Not pruning file based on dynamic filter");
-            return false;
+        let schema = batch.schema();
+        println!("Batch schema for pruning: {:?}", schema);
+
+        let mut column_results = vec![];
+        for col in columns {
+            let prunable_statistics = Box::new(PrunableStatistics::new(
+                vec![Arc::clone(&self.statistics)],
+                Arc::clone(&schema),
+            ));
+
+            let mut required_columns = RequiredColumns::default();
+            let field = schema
+                .field_with_name(col.name())
+                .expect("Field should exist in schema");
+            let min_column = required_columns
+                .stat_column(&col, field, datafusion_pruning::StatisticsType::Min)
+                .expect("should get stat column");
+            let max_column = required_columns
+                .stat_column(&col, field, datafusion_pruning::StatisticsType::Max)
+                .expect("should get stat column");
+
+            println!("Required columns for pruning: {:?}", required_columns);
+
+            let statistics_batch =
+                build_statistics_record_batch(prunable_statistics.as_ref(), &required_columns)
+                    .expect("Should build statistics record batch");
+
+            // pull the min/max values from the statistics batch
+            let min_array = statistics_batch
+                .column_by_name(min_column.name())
+                .expect("Should get min column");
+            let max_array = statistics_batch
+                .column_by_name(max_column.name())
+                .expect("Should get max column");
+
+            let min_value =
+                ScalarValue::try_from_array(min_array, 0).expect("Should get min scalar value");
+            let max_value =
+                ScalarValue::try_from_array(max_array, 0).expect("Should get max scalar value");
+
+            println!(
+                "Column: {}, Min: {:?}, Max: {:?}",
+                col.name(),
+                min_value,
+                max_value
+            );
+
+            column_results.push(min_max_within_in_list(in_list_expr, (min_value, max_value)));
         }
 
-        // let columns = collect_columns(&expr);
-        // println!("Required columns for pruning: {:?}", columns);
-
-        // let schema = batch.schema();
-        // println!("Batch schema for pruning: {:?}", schema);
-
-        // let mut required_columns = RequiredColumns::default();
-
-        // for col in columns {
-        //     let field = schema
-        //         .field_with_name(col.name())
-        //         .expect("Field should exist in schema");
-        //     required_columns
-        //         .stat_column(&col, field, datafusion_pruning::StatisticsType::Min)
-        //         .expect("should get stat column");
-        //     required_columns
-        //         .stat_column(&col, field, datafusion_pruning::StatisticsType::Max)
-        //         .expect("should get stat column");
-        // }
-
-        // let prunable_statistics = Box::new(PrunableStatistics::new(
-        //     vec![Arc::clone(&self.statistics)],
-        //     Arc::clone(&schema),
-        // ));
-
-        // println!("Required columns for pruning: {:?}", required_columns);
-
-        // let mut builder = BoolVecBuilder::new(prunable_statistics.num_containers());
-        // let statistics_batch =
-        //     build_statistics_record_batch(prunable_statistics.as_ref(), &required_columns)
-        //         .expect("Should build statistics record batch");
-
-        // println!("Prunable statistics: {:?}", statistics_batch);
-
-        return false;
-
-        // builder.combine_value(
-        //     expr.evaluate(&statistics_batch)
-        //         .expect("Should evaluate expression"),
-        // );
-        // let mask = builder.build();
-        // mask.into_iter().all(|v| !v)
+        if column_results.iter().all(|&r| r) {
+            println!("Not pruning file based on dynamic filter");
+            false
+        } else {
+            println!("Pruning file based on dynamic filter");
+            true
+        }
     }
 }
 
@@ -1176,6 +1315,66 @@ mod tests {
         );
 
         assert_eq!(ranges[0].to_string(), "a@0 >= 1 AND a@0 <= 8");
+    }
+
+    #[test]
+    fn test_min_max_within_in_list() {
+        let list_array = ScalarValue::new_list(
+            &vec![
+                ScalarValue::Int32(Some(1)),
+                ScalarValue::Int32(Some(2)),
+                ScalarValue::Int32(Some(3)),
+                ScalarValue::Int32(Some(5)),
+                ScalarValue::Int32(Some(6)),
+                ScalarValue::Int32(Some(8)),
+            ],
+            &DataType::Int32,
+            false,
+        );
+
+        let scalar_list = ScalarValue::List(list_array);
+
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+
+        let in_list_expr = InListExpr::new(
+            datafusion_physical_expr::expressions::col("a", &schema).unwrap(),
+            vec![Arc::new(Literal::new(scalar_list))],
+            false,
+            None,
+        );
+
+        assert!(min_max_within_in_list(
+            &in_list_expr,
+            (ScalarValue::Int32(Some(1)), ScalarValue::Int32(Some(3)))
+        ));
+        assert!(!min_max_within_in_list(
+            &in_list_expr,
+            (ScalarValue::Int32(Some(4)), ScalarValue::Int32(Some(4)))
+        ));
+        assert!(min_max_within_in_list(
+            &in_list_expr,
+            (ScalarValue::Int32(Some(5)), ScalarValue::Int32(Some(6)))
+        ));
+        assert!(!min_max_within_in_list(
+            &in_list_expr,
+            (ScalarValue::Int32(Some(7)), ScalarValue::Int32(Some(7)))
+        ));
+        assert!(min_max_within_in_list(
+            &in_list_expr,
+            (ScalarValue::Int32(Some(8)), ScalarValue::Int32(Some(8)))
+        ));
+        assert!(min_max_within_in_list(
+            &in_list_expr,
+            (ScalarValue::Int32(Some(0)), ScalarValue::Int32(Some(8)))
+        ));
+        assert!(min_max_within_in_list(
+            &in_list_expr,
+            (ScalarValue::Int32(Some(4)), ScalarValue::Int32(Some(8)))
+        ));
+        assert!(!min_max_within_in_list(
+            &in_list_expr,
+            (ScalarValue::Int32(Some(10)), ScalarValue::Int32(Some(14)))
+        ));
     }
 
     // #[tokio::test]
