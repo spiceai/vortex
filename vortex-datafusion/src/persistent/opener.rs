@@ -381,10 +381,6 @@ impl FileOpener for VortexOpener {
                     stream,
                     dynamic_filter_expr,
                     statistics,
-                    logical_schema,
-                    partition_fields.clone(),
-                    cloned_file,
-                    Count::default(),
                 )))
             } else {
                 Ok(Box::pin(stream))
@@ -689,10 +685,6 @@ struct VortexStoppingStream<S> {
     statistics: Arc<Statistics>,
     done: bool,
     dynamic_filter_generation: Option<u64>,
-    logical_schema: SchemaRef,
-    partition_fields: Vec<Arc<Field>>,
-    file: PartitionedFile,
-    count: Count,
 }
 
 impl<S> VortexStoppingStream<S>
@@ -703,10 +695,6 @@ where
         inner: S,
         dynamic_filter_expr: Arc<dyn PhysicalExpr>,
         statistics: Arc<Statistics>,
-        logical_schema: SchemaRef,
-        partition_fields: Vec<Arc<Field>>,
-        file: PartitionedFile,
-        count: Count,
     ) -> Self {
         Self {
             inner,
@@ -714,10 +702,6 @@ where
             statistics,
             done: false,
             dynamic_filter_generation: None,
-            logical_schema,
-            partition_fields,
-            file,
-            count,
         }
     }
 
@@ -732,18 +716,20 @@ where
             self.dynamic_filter_generation = Some(new_generation);
         }
 
-        let expr = PhysicalExprSimplifier::new(&batch.schema())
-            .simplify(self.dynamic_filter_expr.clone())
-            .expect("Should simplify dynamic filter expression");
-
-        let dynamic_expr = if let Some(binary_expr) = expr.as_any().downcast_ref::<BinaryExpr>()
+        let dynamic_expr = if let Some(binary_expr) = self
+            .dynamic_filter_expr
+            .as_any()
+            .downcast_ref::<BinaryExpr>()
             && let Some(dynamic_expr) = binary_expr
                 .right()
                 .as_any()
                 .downcast_ref::<DynamicFilterPhysicalExpr>()
         {
             dynamic_expr
-        } else if let Some(dynamic_expr) = expr.as_any().downcast_ref::<DynamicFilterPhysicalExpr>()
+        } else if let Some(dynamic_expr) = self
+            .dynamic_filter_expr
+            .as_any()
+            .downcast_ref::<DynamicFilterPhysicalExpr>()
         {
             dynamic_expr
         } else {
@@ -761,25 +747,10 @@ where
                 println!("Current dynamic filter is InListExpr: {:?}", in_list_expr);
                 in_list_expr
             } else {
-                let mut pruner = FilePruner::new(
-                    current_inner_expr.clone(),
-                    &self.logical_schema,
-                    self.partition_fields.clone(),
-                    self.file.clone(),
-                    self.count.clone(),
-                )
-                .unwrap();
-
-                if pruner.should_prune().unwrap() {
-                    println!("Pruning file based on dynamic filter");
-                    return true;
-                } else {
-                    println!("Not pruning file based on dynamic filter");
-                    return false;
-                }
+                return false;
             };
 
-        let columns = collect_columns(&expr);
+        let columns = collect_columns(&self.dynamic_filter_expr);
         println!("Required columns for pruning: {:?}", columns);
 
         let schema = batch.schema();
@@ -1377,88 +1348,218 @@ mod tests {
         ));
     }
 
-    // #[tokio::test]
-    // async fn test_vortex_stopping_stream_continues_without_update() {
-    //     // Setup: Create a schema and some test batches
-    //     let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+    #[tokio::test]
+    async fn test_vortex_stopping_stream_continues_without_update() {
+        // Setup: Create a schema and some test batches
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
 
-    //     // Create test batches with values 1-10
-    //     let batch1 = record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3)])).unwrap();
-    //     let batch2 = record_batch!(("a", Int32, vec![Some(4), Some(5), Some(6)])).unwrap();
-    //     let batch3 = record_batch!(("a", Int32, vec![Some(7), Some(8), Some(9)])).unwrap();
+        // Create test batches with values 1-10
+        let batch1 = record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3)])).unwrap();
+        let batch2 = record_batch!(("a", Int32, vec![Some(4), Some(5), Some(6)])).unwrap();
+        let batch3 = record_batch!(("a", Int32, vec![Some(7), Some(8), Some(9)])).unwrap();
 
-    //     // Create a stream from the batches
-    //     let inner_stream = stream::iter(vec![Ok(batch1), Ok(batch2), Ok(batch3)]);
+        // Create a stream from the batches
+        let inner_stream = stream::iter(vec![Ok(batch1), Ok(batch2), Ok(batch3)]);
 
-    //     // Create a dynamic filter expression: a > 0 (should always pass)
-    //     // This starts with a simple predicate that doesn't prune anything
-    //     let col_a =
-    //         datafusion_physical_expr::expressions::col("a", &schema).expect("should create column");
-    //     let lit_0 = datafusion_physical_expr::expressions::lit(ScalarValue::Int32(Some(0)));
-    //     let initial_expr =
-    //         Arc::new(BinaryExpr::new(col_a.clone(), Operator::Gt, lit_0)) as Arc<dyn PhysicalExpr>;
+        // Create a dynamic filter expression: a > 0 (should always pass)
+        // This starts with a simple predicate that doesn't prune anything
+        let col_a =
+            datafusion_physical_expr::expressions::col("a", &schema).expect("should create column");
+        let lit_0 = datafusion_physical_expr::expressions::lit(ScalarValue::Int32(Some(0)));
+        let initial_expr =
+            Arc::new(BinaryExpr::new(col_a.clone(), Operator::Gt, lit_0)) as Arc<dyn PhysicalExpr>;
 
-    //     let dynamic_filter = Arc::new(DynamicFilterPhysicalExpr::new(vec![col_a], initial_expr));
-    //     let statistics = make_file_statistics(1, 10);
+        let dynamic_filter = Arc::new(DynamicFilterPhysicalExpr::new(vec![col_a], initial_expr));
+        let statistics = make_file_statistics(1, 10);
 
-    //     // Create the stopping stream
-    //     let stopping_stream =
-    //         VortexStoppingStream::new(inner_stream, dynamic_filter.clone(), statistics);
-    //     futures::pin_mut!(stopping_stream);
+        // Create the stopping stream
+        let stopping_stream =
+            VortexStoppingStream::new(inner_stream, dynamic_filter.clone(), statistics);
+        futures::pin_mut!(stopping_stream);
 
-    //     // Without updating the filter, all batches should pass through
-    //     let results: Vec<_> = stopping_stream.try_collect().await.unwrap();
-    //     assert_eq!(results.len(), 3, "All batches should pass through");
-    // }
+        // Without updating the filter, all batches should pass through
+        let results: Vec<_> = stopping_stream.try_collect().await.unwrap();
+        assert_eq!(results.len(), 3, "All batches should pass through");
+    }
 
-    // #[tokio::test]
-    // async fn test_vortex_stopping_stream_stops_after_update() {
-    //     // Setup: Create a schema and some test batches
-    //     let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+    #[tokio::test]
+    async fn test_vortex_stopping_stream_stops_after_update() {
+        // Setup: Create a schema and some test batches
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
 
-    //     // Create test batches with values 1-10
-    //     let batch1 = record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3)])).unwrap();
-    //     let batch2 = record_batch!(("a", Int32, vec![Some(4), Some(5), Some(6)])).unwrap();
-    //     let batch3 = record_batch!(("a", Int32, vec![Some(7), Some(8), Some(9)])).unwrap();
+        // Create test batches with values 1-10
+        let batch1 = record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3)])).unwrap();
+        let batch2 = record_batch!(("a", Int32, vec![Some(4), Some(5), Some(6)])).unwrap();
+        let batch3 = record_batch!(("a", Int32, vec![Some(7), Some(8), Some(9)])).unwrap();
 
-    //     // Create a stream from the batches
-    //     let inner_stream = stream::iter(vec![Ok(batch1), Ok(batch2), Ok(batch3)]);
+        // Create a stream from the batches
+        let inner_stream = stream::iter(vec![Ok(batch1), Ok(batch2), Ok(batch3)]);
 
-    //     // default to lit true
-    //     let col_a =
-    //         datafusion_physical_expr::expressions::col("a", &schema).expect("should create column");
-    //     let lit_true = datafusion_physical_expr::expressions::lit(ScalarValue::Boolean(Some(true)));
+        // default to lit true
+        let col_a =
+            datafusion_physical_expr::expressions::col("a", &schema).expect("should create column");
+        let lit_true = datafusion_physical_expr::expressions::lit(ScalarValue::Boolean(Some(true)));
 
-    //     let dynamic_filter = Arc::new(DynamicFilterPhysicalExpr::new(
-    //         vec![col_a.clone()],
-    //         lit_true,
-    //     ));
+        let dynamic_filter = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![col_a.clone()],
+            lit_true,
+        ));
 
-    //     let statistics = make_file_statistics(1, 10);
+        let statistics = make_file_statistics(1, 10);
 
-    //     // Create the stopping stream
-    //     let stopping_stream =
-    //         VortexStoppingStream::new(inner_stream, dynamic_filter.clone(), statistics);
-    //     futures::pin_mut!(stopping_stream);
+        // Create the stopping stream
+        let stopping_stream =
+            VortexStoppingStream::new(inner_stream, dynamic_filter.clone(), statistics);
+        futures::pin_mut!(stopping_stream);
 
-    //     // Read the first batch
-    //     let first_batch = stopping_stream.next().await.unwrap().unwrap();
-    //     assert_eq!(first_batch.num_rows(), 3, "First batch should pass through");
+        // Read the first batch
+        let first_batch = stopping_stream.next().await.unwrap().unwrap();
+        assert_eq!(first_batch.num_rows(), 3, "First batch should pass through");
 
-    //     // Update the dynamic filter to prune all remaining batches: a > 1000
-    //     let col_a =
-    //         datafusion_physical_expr::expressions::col("a", &schema).expect("should create column");
-    //     let lit_1000 = datafusion_physical_expr::expressions::lit(ScalarValue::Int32(Some(1000)));
-    //     let new_expr =
-    //         Arc::new(BinaryExpr::new(col_a, Operator::Gt, lit_1000)) as Arc<dyn PhysicalExpr>;
-    //     dynamic_filter
-    //         .update(new_expr)
-    //         .expect("should update filter");
+        let col_a =
+            datafusion_physical_expr::expressions::col("a", &schema).expect("should create column");
 
-    //     // The stream should now stop
-    //     let second_batch = stopping_stream.next().await;
-    //     assert!(second_batch.is_none(), "Stream should have stopped");
-    // }
+        let list_array = ScalarValue::new_list(
+            &vec![
+                ScalarValue::Int32(Some(10)),
+                ScalarValue::Int32(Some(13)),
+                ScalarValue::Int32(Some(14)),
+            ],
+            &DataType::Int32,
+            false,
+        );
+
+        let in_expr = InListExpr::new(
+            col_a.clone(),
+            vec![Arc::new(Literal::new(ScalarValue::List(list_array)))],
+            false,
+            None,
+        );
+        dynamic_filter
+            .update(Arc::new(in_expr))
+            .expect("should update filter");
+
+        // stream will still continue as 10 is within the max of the file
+        let second_batch = stopping_stream.next().await;
+        assert!(second_batch.is_some(), "Stream should continue");
+
+        let list_array = ScalarValue::new_list(
+            &vec![
+                ScalarValue::Int32(Some(12)),
+                ScalarValue::Int32(Some(13)),
+                ScalarValue::Int32(Some(14)),
+            ],
+            &DataType::Int32,
+            false,
+        );
+
+        let in_expr = InListExpr::new(
+            col_a.clone(),
+            vec![Arc::new(Literal::new(ScalarValue::List(list_array)))],
+            false,
+            None,
+        );
+        dynamic_filter
+            .update(Arc::new(in_expr))
+            .expect("should update filter");
+
+        // stream should stop now as no values overlap with file stats
+        let third_batch = stopping_stream.next().await;
+        assert!(third_batch.is_none(), "Stream should have stopped");
+    }
+
+    fn random_values_in_list(range: Range<i32>, count: usize) -> Vec<ScalarValue> {
+        use rand::prelude::*;
+        let mut rng = rand::rng();
+        let mut values = Vec::with_capacity(count);
+        for _ in 0..count {
+            let value = rng.random_range(range.clone());
+            values.push(ScalarValue::Int32(Some(value)));
+        }
+        values
+    }
+
+    #[tokio::test]
+    async fn test_vortex_stopping_stream_over_wide_range() {
+        // Setup: Create a schema and some test batches
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+
+        // Create test batches with values 1-10
+        let batch1 = record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3)])).unwrap();
+        let batch2 = record_batch!(("a", Int32, vec![Some(4), Some(5), Some(6)])).unwrap();
+        let batch3 = record_batch!(("a", Int32, vec![Some(7), Some(8), Some(9)])).unwrap();
+
+        // Create a stream from the batches
+        let inner_stream = stream::iter(vec![Ok(batch1), Ok(batch2), Ok(batch3)]);
+
+        let col_a =
+            datafusion_physical_expr::expressions::col("a", &schema).expect("should create column");
+        // generate a large number of values within the file statistics
+        let values = random_values_in_list(1..50000, 30000);
+
+        let list_array = ScalarValue::new_list(&values, &DataType::Int32, false);
+
+        let in_expr = InListExpr::new(
+            col_a.clone(),
+            vec![Arc::new(Literal::new(ScalarValue::List(list_array)))],
+            false,
+            None,
+        );
+
+        let dynamic_filter = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![col_a.clone()],
+            Arc::new(in_expr),
+        ));
+
+        let statistics = make_file_statistics(1, 50000);
+
+        // Create the stopping stream
+        let stopping_stream =
+            VortexStoppingStream::new(inner_stream, dynamic_filter.clone(), statistics);
+        futures::pin_mut!(stopping_stream);
+
+        // Read the first batch
+        let first_batch = stopping_stream.next().await.unwrap().unwrap();
+        assert_eq!(first_batch.num_rows(), 3, "First batch should pass through");
+
+        // generate a large number of values with some overlap outside of the file statistics
+        let values = random_values_in_list(25000..75000, 30000);
+
+        let list_array = ScalarValue::new_list(&values, &DataType::Int32, false);
+
+        let in_expr = InListExpr::new(
+            col_a.clone(),
+            vec![Arc::new(Literal::new(ScalarValue::List(list_array)))],
+            false,
+            None,
+        );
+        dynamic_filter
+            .update(Arc::new(in_expr))
+            .expect("should update filter");
+
+        // stream will still continue as values should overlap with the file stats
+        let second_batch = stopping_stream.next().await;
+        assert!(second_batch.is_some(), "Stream should continue");
+
+        // all generated values are outside of the file statistics now
+        let values = random_values_in_list(55000..100000, 30000);
+
+        let list_array = ScalarValue::new_list(&values, &DataType::Int32, false);
+
+        let in_expr = InListExpr::new(
+            col_a.clone(),
+            vec![Arc::new(Literal::new(ScalarValue::List(list_array)))],
+            false,
+            None,
+        );
+        dynamic_filter
+            .update(Arc::new(in_expr))
+            .expect("should update filter");
+
+        // stream should stop now as no values overlap with file stats
+        let third_batch = stopping_stream.next().await;
+        assert!(third_batch.is_none(), "Stream should have stopped");
+    }
 
     // #[tokio::test]
     // async fn test_vortex_stopping_stream_prunes_after_update() {
