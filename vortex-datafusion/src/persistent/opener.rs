@@ -762,14 +762,14 @@ where
 
         if self.print_count < 20 {
             // limit dynamic filter expr debug output to 200 characters
-            // println!(
-            //     "Dynamic filter expr: {}",
-            //     format!("{:?}", self.dynamic_filter_expr)
-            //         .chars()
-            //         .take(500)
-            //         .collect::<String>()
-            // );
-            // println!("========== NEW GENERATION: {:?}", new_generation);
+            println!(
+                "Dynamic filter expr: {}",
+                format!("{:?}", self.dynamic_filter_expr)
+                    .chars()
+                    .take(400)
+                    .collect::<String>()
+            );
+            println!("========== NEW GENERATION: {:?}", new_generation);
 
             self.print_count += 1;
         }
@@ -782,7 +782,7 @@ where
             self.dynamic_filter_generation = Some(new_generation);
         }
 
-        // println!("========== PROCESSING GENERATION ========== ");
+        println!("========== PROCESSING GENERATION ========== ");
 
         let dynamic_expr = if let Some(binary_expr) = self
             .dynamic_filter_expr
