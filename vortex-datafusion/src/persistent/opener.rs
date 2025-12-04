@@ -751,13 +751,13 @@ where
         self.dynamic_filter_expr.hash(&mut hasher);
         let new_generation = hasher.finish();
 
-        if self.print_count < 10 {
+        if self.print_count < 20 {
             // limit dynamic filter expr debug output to 200 characters
             println!(
                 "Dynamic filter expr: {}",
                 format!("{:?}", self.dynamic_filter_expr)
                     .chars()
-                    .take(200)
+                    .take(500)
                     .collect::<String>()
             );
             println!("========== NEW GENERATION: {:?}", new_generation);
