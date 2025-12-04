@@ -766,7 +766,7 @@ where
                 "Dynamic filter expr: {}",
                 format!("{:?}", self.dynamic_filter_expr)
                     .chars()
-                    .take(400)
+                    .take(500)
                     .collect::<String>()
             );
             println!("========== NEW GENERATION: {:?}", new_generation);
