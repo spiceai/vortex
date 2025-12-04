@@ -19,7 +19,9 @@ use datafusion_datasource::schema_adapter::SchemaAdapterFactory;
 use datafusion_datasource::{FileRange, PartitionedFile};
 use datafusion_datasource_parquet::EarlyStoppingStream;
 use datafusion_expr::Operator;
-use datafusion_physical_expr::expressions::{BinaryExpr, DynamicFilterPhysicalExpr, InListExpr};
+use datafusion_physical_expr::expressions::{
+    BinaryExpr, DynamicFilterPhysicalExpr, InListExpr, Literal,
+};
 use datafusion_physical_expr::simplifier::PhysicalExprSimplifier;
 use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr::{PhysicalExpr, PhysicalExprRef, split_conjunction};
@@ -408,10 +410,7 @@ fn contiguous_in_list_ranges(in_list_expr: &InListExpr, overlap: usize) -> Vec<B
     // only literals are supported
     let mut literals = vec![];
     for value in list.iter() {
-        if let Some(literal) = value
-            .as_any()
-            .downcast_ref::<datafusion_physical_expr::expressions::Literal>()
-        {
+        if let Some(literal) = value.as_any().downcast_ref::<Literal>() {
             match literal.value() {
                 ScalarValue::List(list) => {
                     // get the individual values out of the list
@@ -520,8 +519,8 @@ fn contiguous_in_list_ranges(in_list_expr: &InListExpr, overlap: usize) -> Vec<B
             end = Some(literal.clone());
         } else {
             // finalize current range
-            let start_expr = datafusion_physical_expr::expressions::Literal::new(start.unwrap());
-            let end_expr = datafusion_physical_expr::expressions::Literal::new(end.unwrap());
+            let start_expr = Literal::new(start.unwrap());
+            let end_expr = Literal::new(end.unwrap());
             let ge_expr = BinaryExpr::new(input_expr.clone(), Operator::GtEq, Arc::new(start_expr));
             let le_expr = BinaryExpr::new(input_expr.clone(), Operator::LtEq, Arc::new(end_expr));
             let range_expr = BinaryExpr::new(Arc::new(ge_expr), Operator::And, Arc::new(le_expr));
@@ -534,8 +533,8 @@ fn contiguous_in_list_ranges(in_list_expr: &InListExpr, overlap: usize) -> Vec<B
     }
 
     ranges.push({
-        let start_expr = datafusion_physical_expr::expressions::Literal::new(start.unwrap());
-        let end_expr = datafusion_physical_expr::expressions::Literal::new(end.unwrap());
+        let start_expr = Literal::new(start.unwrap());
+        let end_expr = Literal::new(end.unwrap());
         let ge_expr = BinaryExpr::new(input_expr.clone(), Operator::GtEq, Arc::new(start_expr));
         let le_expr = BinaryExpr::new(input_expr.clone(), Operator::LtEq, Arc::new(end_expr));
         BinaryExpr::new(Arc::new(ge_expr), Operator::And, Arc::new(le_expr))
@@ -552,10 +551,7 @@ fn min_max_within_in_list(in_list_expr: &InListExpr, min_max: (ScalarValue, Scal
     // only literals are supported
     let mut literals = vec![];
     for value in list.iter() {
-        if let Some(literal) = value
-            .as_any()
-            .downcast_ref::<datafusion_physical_expr::expressions::Literal>()
-        {
+        if let Some(literal) = value.as_any().downcast_ref::<Literal>() {
             match literal.value() {
                 ScalarValue::List(list) => {
                     // get the individual values out of the list
@@ -755,35 +751,7 @@ where
         }
     }
 
-    fn should_prune(&mut self, batch: &RecordBatch) -> bool {
-        let mut hasher = DefaultHasher::default();
-        self.dynamic_filter_expr.hash(&mut hasher);
-        let new_generation = hasher.finish();
-
-        if self.print_count < 20 {
-            // limit dynamic filter expr debug output to 200 characters
-            println!(
-                "Dynamic filter expr: {}",
-                format!("{:?}", self.dynamic_filter_expr)
-                    .chars()
-                    .take(500)
-                    .collect::<String>()
-            );
-            println!("========== NEW GENERATION: {:?}", new_generation);
-
-            self.print_count += 1;
-        }
-        if let Some(current_generation) = self.dynamic_filter_generation.as_mut() {
-            if *current_generation == new_generation {
-                return false;
-            }
-            *current_generation = new_generation;
-        } else {
-            self.dynamic_filter_generation = Some(new_generation);
-        }
-
-        println!("========== PROCESSING GENERATION ========== ");
-
+    fn should_prune(&mut self, batch: &RecordBatch) -> (bool, bool) {
         let dynamic_expr = if let Some(binary_expr) = self
             .dynamic_filter_expr
             .as_any()
@@ -802,8 +770,42 @@ where
             dynamic_expr
         } else {
             // println!("No dynamic filter expression found - not applying file filtering");
-            return false;
+            return (false, false);
         };
+
+        let current = dynamic_expr.current().expect("Should have current expr");
+        if current.as_any().is::<Literal>() {
+            // return a polling wait
+            return (false, true);
+        }
+
+        let mut hasher = DefaultHasher::default();
+        dynamic_expr.hash(&mut hasher);
+        let new_generation = hasher.finish();
+
+        if self.print_count < 20 {
+            // limit dynamic filter expr debug output to 200 characters
+            println!(
+                "Dynamic filter expr: {}",
+                format!("{:?}", dynamic_expr)
+                    .chars()
+                    .take(500)
+                    .collect::<String>()
+            );
+            println!("========== NEW GENERATION: {:?}", new_generation);
+
+            self.print_count += 1;
+        }
+        if let Some(current_generation) = self.dynamic_filter_generation.as_mut() {
+            if *current_generation == new_generation {
+                return (false, false);
+            }
+            *current_generation = new_generation;
+        } else {
+            self.dynamic_filter_generation = Some(new_generation);
+        }
+
+        println!("========== PROCESSING GENERATION ========== ");
 
         println!("Updating dynamic filter generation to {:?}", new_generation);
         println!("Expr: {:?}", dynamic_expr);
@@ -826,7 +828,7 @@ where
             compacted_in_list
         } else {
             // println!("Not InListExpr or BinaryExpr: {:?}", current_inner_expr);
-            return false;
+            return (false, false);
         };
 
         let columns = collect_columns(&self.dynamic_filter_expr);
@@ -887,10 +889,10 @@ where
 
         if column_results.iter().all(|&r| r) {
             println!("Not pruning file based on dynamic filter");
-            false
+            (false, false)
         } else {
             println!("Pruning file based on dynamic filter");
-            true
+            (true, false)
         }
     }
 }
@@ -913,7 +915,14 @@ where
             }
             Some(batch) => {
                 let batch = batch.unwrap();
-                if self.should_prune(&batch) {
+                let (should_prune, should_pending) = self.should_prune(&batch);
+                if should_pending {
+                    println!("Pending on dynamic filter generation");
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+
+                if should_prune {
                     self.done = true;
                     Poll::Ready(None)
                 } else {
