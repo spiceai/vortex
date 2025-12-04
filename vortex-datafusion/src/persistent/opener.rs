@@ -691,7 +691,9 @@ fn in_list_expr_compactor(binary_expr: BinaryExpr) -> Option<InListExpr> {
     let mut target_left_expr = None;
     if let Some(left_in_list) = binary_expr.left().as_any().downcast_ref::<InListExpr>() {
         in_list_values.extend_from_slice(left_in_list.list());
-        target_left_expr = Some(left_in_list.expr().clone());
+        if target_left_expr.is_none() {
+            target_left_expr = Some(left_in_list.expr().clone());
+        }
     } else if let Some(left_binary) = binary_expr.left().as_any().downcast_ref::<BinaryExpr>() {
         if let Some(compacted_left) = in_list_expr_compactor(left_binary.clone()) {
             in_list_values.extend_from_slice(compacted_left.list());
@@ -703,6 +705,9 @@ fn in_list_expr_compactor(binary_expr: BinaryExpr) -> Option<InListExpr> {
 
     if let Some(right_in_list) = binary_expr.right().as_any().downcast_ref::<InListExpr>() {
         in_list_values.extend_from_slice(right_in_list.list());
+        if target_left_expr.is_none() {
+            target_left_expr = Some(right_in_list.expr().clone());
+        }
     } else if let Some(right_binary) = binary_expr.right().as_any().downcast_ref::<BinaryExpr>() {
         if let Some(compacted_right) = in_list_expr_compactor(right_binary.clone()) {
             in_list_values.extend_from_slice(compacted_right.list());
@@ -1636,6 +1641,52 @@ mod tests {
         // stream should stop now as no values overlap with file stats
         let third_batch = stopping_stream.next().await;
         assert!(third_batch.is_none(), "Stream should have stopped");
+    }
+
+    #[test]
+    fn test_binary_expr_in_list_compaction() {
+        // build a nested binary expression with many ORed InList expressions
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let col_a =
+            datafusion_physical_expr::expressions::col("a", &schema).expect("should create column");
+        let mut in_list_exprs = Vec::new();
+        for i in 0..10 {
+            let list_array = ScalarValue::new_list(
+                &vec![
+                    ScalarValue::Int32(Some(i * 10 + 1)),
+                    ScalarValue::Int32(Some(i * 10 + 2)),
+                    ScalarValue::Int32(Some(i * 10 + 3)),
+                ],
+                &DataType::Int32,
+                false,
+            );
+
+            let in_expr = InListExpr::new(
+                col_a.clone(),
+                vec![Arc::new(Literal::new(ScalarValue::List(list_array)))],
+                false,
+                None,
+            );
+
+            in_list_exprs.push(Arc::new(in_expr) as Arc<dyn PhysicalExpr>);
+        }
+
+        let mut expr: BinaryExpr = BinaryExpr::new(
+            in_list_exprs[0].clone(),
+            Operator::Or,
+            in_list_exprs[1].clone(),
+        );
+
+        for in_list_expr in in_list_exprs.iter().skip(2) {
+            expr = BinaryExpr::new(Arc::new(expr), Operator::Or, in_list_expr.clone());
+        }
+
+        let compacted = in_list_expr_compactor(expr).expect("should compact expression");
+        // The compacted expression should be a single InList expression
+        assert!(
+            compacted.as_any().downcast_ref::<InListExpr>().is_some(),
+            "Compacted expression should be InListExpr"
+        );
     }
 
     // #[tokio::test]
