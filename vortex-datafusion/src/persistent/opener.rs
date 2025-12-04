@@ -683,6 +683,7 @@ fn min_max_within_in_list(in_list_expr: &InListExpr, min_max: (ScalarValue, Scal
 // compacts a BinaryExpr which contains several `OR`ed `InListExpr`s into a single `InListExpr`
 fn in_list_expr_compactor(binary_expr: BinaryExpr) -> Option<InListExpr> {
     if binary_expr.op() != &Operator::Or {
+        println!("BinaryExpr is not an OR expression");
         return None;
     }
 
@@ -696,6 +697,7 @@ fn in_list_expr_compactor(binary_expr: BinaryExpr) -> Option<InListExpr> {
             in_list_values.extend_from_slice(compacted_left.list());
         }
     } else {
+        println!("Left expression is neither InListExpr nor BinaryExpr");
         return None;
     }
 
@@ -706,6 +708,7 @@ fn in_list_expr_compactor(binary_expr: BinaryExpr) -> Option<InListExpr> {
             in_list_values.extend_from_slice(compacted_right.list());
         }
     } else {
+        println!("Right expression is neither InListExpr nor BinaryExpr");
         return None;
     }
 
@@ -714,6 +717,7 @@ fn in_list_expr_compactor(binary_expr: BinaryExpr) -> Option<InListExpr> {
     {
         Some(InListExpr::new(left_expr, in_list_values, false, None))
     } else {
+        println!("Could not compact InListExpr from BinaryExpr");
         None
     }
 }
@@ -816,6 +820,7 @@ where
         {
             compacted_in_list
         } else {
+            println!("Not InListExpr or BinaryExpr: {:?}", current_inner_expr);
             return false;
         };
 
