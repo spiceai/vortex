@@ -683,7 +683,7 @@ fn min_max_within_in_list(in_list_expr: &InListExpr, min_max: (ScalarValue, Scal
 // compacts a BinaryExpr which contains several `OR`ed `InListExpr`s into a single `InListExpr`
 fn in_list_expr_compactor(binary_expr: BinaryExpr) -> Option<InListExpr> {
     if binary_expr.op() != &Operator::Or {
-        println!("BinaryExpr is not an OR expression");
+        // println!("BinaryExpr is not an OR expression");
         return None;
     }
 
@@ -699,7 +699,7 @@ fn in_list_expr_compactor(binary_expr: BinaryExpr) -> Option<InListExpr> {
             in_list_values.extend_from_slice(compacted_left.list());
         }
     } else {
-        println!("Left expression is neither InListExpr nor BinaryExpr");
+        // println!("Left expression is neither InListExpr nor BinaryExpr");
         return None;
     }
 
@@ -713,7 +713,7 @@ fn in_list_expr_compactor(binary_expr: BinaryExpr) -> Option<InListExpr> {
             in_list_values.extend_from_slice(compacted_right.list());
         }
     } else {
-        println!("Right expression is neither InListExpr nor BinaryExpr");
+        // println!("Right expression is neither InListExpr nor BinaryExpr");
         return None;
     }
 
@@ -722,7 +722,7 @@ fn in_list_expr_compactor(binary_expr: BinaryExpr) -> Option<InListExpr> {
     {
         Some(InListExpr::new(left_expr, in_list_values, false, None))
     } else {
-        println!("Could not compact InListExpr from BinaryExpr");
+        // println!("Could not compact InListExpr from BinaryExpr");
         None
     }
 }
@@ -762,14 +762,14 @@ where
 
         if self.print_count < 20 {
             // limit dynamic filter expr debug output to 200 characters
-            println!(
-                "Dynamic filter expr: {}",
-                format!("{:?}", self.dynamic_filter_expr)
-                    .chars()
-                    .take(500)
-                    .collect::<String>()
-            );
-            println!("========== NEW GENERATION: {:?}", new_generation);
+            // println!(
+            //     "Dynamic filter expr: {}",
+            //     format!("{:?}", self.dynamic_filter_expr)
+            //         .chars()
+            //         .take(500)
+            //         .collect::<String>()
+            // );
+            // println!("========== NEW GENERATION: {:?}", new_generation);
 
             self.print_count += 1;
         }
@@ -782,7 +782,7 @@ where
             self.dynamic_filter_generation = Some(new_generation);
         }
 
-        println!("========== PROCESSING GENERATION ========== ");
+        // println!("========== PROCESSING GENERATION ========== ");
 
         let dynamic_expr = if let Some(binary_expr) = self
             .dynamic_filter_expr
@@ -801,19 +801,19 @@ where
         {
             dynamic_expr
         } else {
-            println!("No dynamic filter expression found - not applying file filtering");
+            // println!("No dynamic filter expression found - not applying file filtering");
             return false;
         };
 
-        println!("Updating dynamic filter generation to {:?}", new_generation);
-        println!("Expr: {:?}", dynamic_expr);
+        // println!("Updating dynamic filter generation to {:?}", new_generation);
+        // println!("Expr: {:?}", dynamic_expr);
 
         let current_inner_expr = dynamic_expr.current().expect("Should have current expr");
 
         let in_list_expr = if let Some(in_list_expr) =
             current_inner_expr.as_any().downcast_ref::<InListExpr>()
         {
-            println!("Current dynamic filter is InListExpr: {:?}", in_list_expr);
+            // println!("Current dynamic filter is InListExpr: {:?}", in_list_expr);
             InListExpr::new(
                 in_list_expr.expr().clone(),
                 in_list_expr.list().to_vec(),
@@ -825,15 +825,15 @@ where
         {
             compacted_in_list
         } else {
-            println!("Not InListExpr or BinaryExpr: {:?}", current_inner_expr);
+            // println!("Not InListExpr or BinaryExpr: {:?}", current_inner_expr);
             return false;
         };
 
         let columns = collect_columns(&self.dynamic_filter_expr);
-        println!("Required columns for pruning: {:?}", columns);
+        // println!("Required columns for pruning: {:?}", columns);
 
         let schema = batch.schema();
-        println!("Batch schema for pruning: {:?}", schema);
+        // println!("Batch schema for pruning: {:?}", schema);
 
         let mut column_results = vec![];
         for col in columns {
@@ -853,7 +853,7 @@ where
                 .stat_column(&col, field, datafusion_pruning::StatisticsType::Max)
                 .expect("should get stat column");
 
-            println!("Required columns for pruning: {:?}", required_columns);
+            // println!("Required columns for pruning: {:?}", required_columns);
 
             let statistics_batch =
                 build_statistics_record_batch(prunable_statistics.as_ref(), &required_columns)
@@ -872,7 +872,7 @@ where
             let max_value =
                 ScalarValue::try_from_array(max_array, 0).expect("Should get max scalar value");
 
-            println!(
+            tracing::debug!(
                 "Column: {}, Min: {:?}, Max: {:?}",
                 col.name(),
                 min_value,
@@ -886,10 +886,10 @@ where
         }
 
         if column_results.iter().all(|&r| r) {
-            println!("Not pruning file based on dynamic filter");
+            tracing::debug!("Not pruning file based on dynamic filter");
             false
         } else {
-            println!("Pruning file based on dynamic filter");
+            tracing::debug!("Pruning file based on dynamic filter");
             true
         }
     }
