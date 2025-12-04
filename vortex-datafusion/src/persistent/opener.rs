@@ -724,6 +724,7 @@ struct VortexStoppingStream<S> {
     statistics: Arc<Statistics>,
     done: bool,
     dynamic_filter_generation: Option<u64>,
+    print_count: usize,
 }
 
 impl<S> VortexStoppingStream<S>
@@ -741,6 +742,7 @@ where
             statistics,
             done: false,
             dynamic_filter_generation: None,
+            print_count: 0,
         }
     }
 
@@ -749,16 +751,19 @@ where
         self.dynamic_filter_expr.hash(&mut hasher);
         let new_generation = hasher.finish();
 
-        // let new_generation = snapshot_generation(&self.dynamic_filter_expr);
-        // limit dynamic filter expr debug output to 200 characters
-        println!(
-            "Dynamic filter expr: {}",
-            format!("{:?}", self.dynamic_filter_expr)
-                .chars()
-                .take(200)
-                .collect::<String>()
-        );
-        println!("========== NEW GENERATION: {:?}", new_generation);
+        if self.print_count < 10 {
+            // limit dynamic filter expr debug output to 200 characters
+            println!(
+                "Dynamic filter expr: {}",
+                format!("{:?}", self.dynamic_filter_expr)
+                    .chars()
+                    .take(200)
+                    .collect::<String>()
+            );
+            println!("========== NEW GENERATION: {:?}", new_generation);
+
+            self.print_count += 1;
+        }
         if let Some(current_generation) = self.dynamic_filter_generation.as_mut() {
             if *current_generation == new_generation {
                 return false;
