@@ -805,8 +805,8 @@ where
             return false;
         };
 
-        // println!("Updating dynamic filter generation to {:?}", new_generation);
-        // println!("Expr: {:?}", dynamic_expr);
+        println!("Updating dynamic filter generation to {:?}", new_generation);
+        println!("Expr: {:?}", dynamic_expr);
 
         let current_inner_expr = dynamic_expr.current().expect("Should have current expr");
 
