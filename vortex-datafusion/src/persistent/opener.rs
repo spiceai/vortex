@@ -750,6 +750,14 @@ where
         let new_generation = hasher.finish();
 
         // let new_generation = snapshot_generation(&self.dynamic_filter_expr);
+        // limit dynamic filter expr debug output to 200 characters
+        println!(
+            "Dynamic filter expr: {}",
+            format!("{:?}", self.dynamic_filter_expr)
+                .chars()
+                .take(200)
+                .collect::<String>()
+        );
         println!("========== NEW GENERATION: {:?}", new_generation);
         if let Some(current_generation) = self.dynamic_filter_generation.as_mut() {
             if *current_generation == new_generation {
