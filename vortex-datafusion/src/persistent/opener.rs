@@ -872,7 +872,7 @@ where
             let max_value =
                 ScalarValue::try_from_array(max_array, 0).expect("Should get max scalar value");
 
-            tracing::debug!(
+            println!(
                 "Column: {}, Min: {:?}, Max: {:?}",
                 col.name(),
                 min_value,
@@ -886,10 +886,10 @@ where
         }
 
         if column_results.iter().all(|&r| r) {
-            tracing::debug!("Not pruning file based on dynamic filter");
+            println!("Not pruning file based on dynamic filter");
             false
         } else {
-            tracing::debug!("Pruning file based on dynamic filter");
+            println!("Pruning file based on dynamic filter");
             true
         }
     }
