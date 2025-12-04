@@ -750,7 +750,7 @@ where
         let new_generation = hasher.finish();
 
         // let new_generation = snapshot_generation(&self.dynamic_filter_expr);
-        println!("========== NEW GENERATION: {:?}", self.dynamic_filter_expr);
+        println!("========== NEW GENERATION: {:?}", new_generation);
         if let Some(current_generation) = self.dynamic_filter_generation.as_mut() {
             if *current_generation == new_generation {
                 return false;
