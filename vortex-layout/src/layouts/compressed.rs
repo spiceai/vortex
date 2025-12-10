@@ -27,7 +27,7 @@ use crate::sequence::SequentialStreamExt;
 /// meet this interface.
 ///
 /// API consumers are also free to implement this trait to provide new plugin compressors.
-pub trait CompressorPlugin: Send + Sync + 'static {
+pub trait CompressorPlugin: std::fmt::Debug + Send + Sync + 'static {
     fn compress_chunk(&self, chunk: &dyn Array) -> VortexResult<ArrayRef>;
 }
 
@@ -39,7 +39,7 @@ impl CompressorPlugin for Arc<dyn CompressorPlugin> {
 
 impl<F> CompressorPlugin for F
 where
-    F: Fn(&dyn Array) -> VortexResult<ArrayRef> + Send + Sync + 'static,
+    F: Fn(&dyn Array) -> VortexResult<ArrayRef> + Send + Sync + 'static + std::fmt::Debug,
 {
     fn compress_chunk(&self, chunk: &dyn Array) -> VortexResult<ArrayRef> {
         self(chunk)

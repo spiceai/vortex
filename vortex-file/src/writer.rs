@@ -68,9 +68,14 @@ pub struct VortexWriteOptions {
 pub trait WriteOptionsSessionExt: SessionExt {
     /// Create [`VortexWriteOptions`] for writing to a Vortex file.
     fn write_options(&self) -> VortexWriteOptions {
+        let maybe_write_strategy_builder = self.get_opt::<WriteStrategyBuilder>();
+        let strategy = maybe_write_strategy_builder
+            .map(|opt| opt.clone().build())
+            .unwrap_or_else(|| WriteStrategyBuilder::new().build());
+
         VortexWriteOptions {
             session: self.session(),
-            strategy: WriteStrategyBuilder::new().build(),
+            strategy,
             exclude_dtype: false,
             file_statistics: PRUNING_STATS.to_vec(),
             max_variable_length_statistics_size: 64,
@@ -456,5 +461,22 @@ impl WriteSummary {
     /// The footer of the written Vortex file.
     pub fn row_count(&self) -> u64 {
         self.footer.row_count()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_write_options_from_session_vars() {
+        let session = VortexSession::empty();
+        let fetched_write_strategy = session.get_opt::<WriteStrategyBuilder>();
+        assert!(fetched_write_strategy.is_none());
+        drop(fetched_write_strategy);
+
+        let session = session.set(WriteStrategyBuilder::new());
+        let fetched_write_strategy = session.get_opt::<WriteStrategyBuilder>();
+        assert!(fetched_write_strategy.is_some());
     }
 }

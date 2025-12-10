@@ -3,20 +3,14 @@
 
 pub mod registry;
 
-use std::any::Any;
-use std::any::TypeId;
-use std::any::type_name;
+use std::any::{Any, TypeId, type_name};
 use std::fmt::Debug;
-use std::hash::BuildHasherDefault;
-use std::hash::Hasher;
-use std::ops::Deref;
-use std::ops::DerefMut;
+use std::hash::{BuildHasherDefault, Hasher};
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
-use dashmap::DashMap;
-use dashmap::Entry;
-use vortex_error::VortexExpect;
-use vortex_error::vortex_panic;
+use dashmap::{DashMap, Entry};
+use vortex_error::{VortexExpect, vortex_panic};
 
 /// A Vortex session encapsulates the set of extensible arrays, layouts, compute functions, dtypes,
 /// etc. that are available for use in a given context.
@@ -48,6 +42,26 @@ impl VortexSession {
             }
             Entry::Vacant(e) => {
                 e.insert(Box::new(V::default()));
+            }
+        }
+        self
+    }
+
+    /// Inserts a new session variable of type `V` with the supplied value.
+    ///
+    /// # Panics
+    ///
+    /// If a variable of that type already exists.
+    pub fn set<V: SessionVar>(self, val: V) -> Self {
+        match self.0.entry(TypeId::of::<V>()) {
+            Entry::Occupied(_) => {
+                vortex_panic!(
+                    "Session variable of type {} already exists",
+                    type_name::<V>()
+                );
+            }
+            Entry::Vacant(e) => {
+                e.insert(Box::new(val));
             }
         }
         self
@@ -88,18 +102,6 @@ impl SessionExt for VortexSession {
 
     /// Returns the scope variable of type `V`, or inserts a default one if it does not exist.
     fn get<V: SessionVar + Default>(&self) -> Ref<'_, V> {
-        // NOTE(ngates): we don't use `entry().or_insert_with_key()` here because the DashMap
-        //  would immediately acquire an exclusive write lock.
-        if let Some(v) = self.0.get(&TypeId::of::<V>()) {
-            return Ref(v.map(|v| {
-                (**v)
-                    .as_any()
-                    .downcast_ref::<V>()
-                    .vortex_expect("Type mismatch - this is a bug")
-            }));
-        }
-
-        // If we get here, the value was not present, so we insert the default with a write lock.
         Ref(self
             .0
             .entry(TypeId::of::<V>())

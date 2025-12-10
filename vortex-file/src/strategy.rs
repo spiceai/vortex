@@ -28,6 +28,7 @@ const ONE_MEG: u64 = 1 << 20;
 /// Vortex provides an out-of-the-box file writer that optimizes the layout of chunks on-disk,
 /// repartitioning and compressing them to strike a balance between size on-disk,
 /// bulk decoding performance, and IOPS required to perform an indexed read.
+#[derive(Debug, Clone)]
 pub struct WriteStrategyBuilder {
     compressor: Option<Arc<dyn CompressorPlugin>>,
     row_block_size: usize,
