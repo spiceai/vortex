@@ -70,7 +70,6 @@ use crate::convert::TryToDataFusion;
 
 const DEFAULT_FOOTER_INITIAL_READ_SIZE_BYTES: usize = MAX_POSTSCRIPT_SIZE as usize + EOF_SIZE;
 const DEFAULT_TARGET_FILE_SIZE_MB: usize = 128;
-
 /// Vortex implementation of a DataFusion [`FileFormat`].
 pub struct VortexFormat {
     session: VortexSession,
@@ -135,10 +134,7 @@ impl GetExt for VortexFormatFactory {
 
 impl VortexFormatFactory {
     /// Creates a new instance with a default [`VortexSession`] and default options.
-    #[expect(
-        clippy::new_without_default,
-        reason = "FormatFactory defines `default` method, so having `Default` implementation is confusing"
-    )]
+    #[allow(clippy::new_without_default)] // FormatFactory defines `default` method, so having `Default` implementation is confusing.
     pub fn new() -> Self {
         Self {
             session: VortexSession::default(),
@@ -171,7 +167,7 @@ impl VortexFormatFactory {
 }
 
 impl FileFormatFactory for VortexFormatFactory {
-    #[expect(clippy::disallowed_types, reason = "required by trait signature")]
+    #[allow(clippy::disallowed_types)]
     fn create(
         &self,
         _state: &dyn Session,
