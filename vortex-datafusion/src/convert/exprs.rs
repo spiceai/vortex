@@ -3,113 +3,57 @@
 
 use std::sync::Arc;
 
-use arrow_schema::DataType;
-use arrow_schema::Schema;
+use arrow_schema::{DataType, Schema};
+use datafusion_common::ScalarValue;
 use datafusion_expr::Operator as DFOperator;
 use datafusion_functions::core::getfield::GetFieldFunc;
-use datafusion_physical_expr::PhysicalExpr;
-use datafusion_physical_expr::ScalarFunctionExpr;
-use datafusion_physical_expr_common::physical_expr::is_dynamic_physical_expr;
+use datafusion_physical_expr::{PhysicalExpr, ScalarFunctionExpr};
+use datafusion_physical_expr_common::physical_expr::PhysicalExprRef;
 use datafusion_physical_plan::expressions as df_expr;
 use itertools::Itertools;
 use vortex::compute::LikeOptions;
-use vortex::dtype::DType;
-use vortex::dtype::Nullability;
 use vortex::dtype::arrow::FromArrowType;
-use vortex::error::VortexResult;
-use vortex::error::vortex_bail;
-use vortex::error::vortex_err;
-use vortex::expr::Binary;
-use vortex::expr::Expression;
-use vortex::expr::Like;
-use vortex::expr::Operator;
-use vortex::expr::VTableExt;
-use vortex::expr::and;
-use vortex::expr::cast;
-use vortex::expr::get_item;
-use vortex::expr::is_null;
-use vortex::expr::list_contains;
-use vortex::expr::lit;
-use vortex::expr::not;
-use vortex::expr::root;
+use vortex::dtype::{DType, Nullability};
+use vortex::error::{VortexResult, vortex_bail, vortex_err};
+use vortex::expr::{
+    Binary, Expression, Like, Operator, VTableExt, and, cast, get_item, is_null, list_contains,
+    lit, not, root,
+};
 use vortex::scalar::Scalar;
 
-use crate::convert::FromDataFusion;
+use crate::convert::{FromDataFusion, TryFromDataFusion};
 
 /// Tries to convert the expressions into a vortex conjunction. Will return Ok(None) iff the input conjunction is empty.
 pub(crate) fn make_vortex_predicate(
-    expr_convertor: &dyn ExpressionConvertor,
-    predicate: &[Arc<dyn PhysicalExpr>],
+    predicate: &[&Arc<dyn PhysicalExpr>],
 ) -> VortexResult<Option<Expression>> {
     let exprs = predicate
         .iter()
-        .map(|e| expr_convertor.convert(e.as_ref()))
-        .collect::<VortexResult<Vec<_>>>()?;
+        .filter_map(|e| {
+            if let Some(dynamic_expr) = e
+                .as_any()
+                .downcast_ref::<df_expr::DynamicFilterPhysicalExpr>()
+                && let Ok(current) = dynamic_expr.current()
+                && let Some(lit) = current.as_any().downcast_ref::<df_expr::Literal>()
+                && lit.value() == &ScalarValue::Boolean(Some(true))
+            {
+                return None;
+            }
+
+            // If conversion fails, skip this expression (equivalent to lit(true) in AND conjunction)
+            Expression::try_from_df(e.as_ref()).ok()
+        })
+        .collect::<Vec<_>>();
 
     Ok(exprs.into_iter().reduce(and))
 }
 
-/// Trait for converting DataFusion expressions to Vortex ones.
-pub trait ExpressionConvertor: Send + Sync {
-    /// Can an expression be pushed down given a specific schema
-    fn can_be_pushed_down(&self, expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool;
-
-    /// Try and convert a DataFusion [`PhysicalExpr`] into a Vortex [`Expression`].
-    fn convert(&self, expr: &dyn PhysicalExpr) -> VortexResult<Expression>;
-}
-
-/// The default [`ExpressionConvertor`].
-#[derive(Default)]
-pub struct DefaultExpressionConvertor {}
-
-impl DefaultExpressionConvertor {
-    /// Attempts to convert a DataFusion ScalarFunctionExpr to a Vortex expression.
-    fn try_convert_scalar_function(
-        &self,
-        scalar_fn: &ScalarFunctionExpr,
-    ) -> VortexResult<Expression> {
-        if let Some(get_field_fn) = ScalarFunctionExpr::try_downcast_func::<GetFieldFunc>(scalar_fn)
-        {
-            let source_expr = get_field_fn
-                .args()
-                .first()
-                .ok_or_else(|| vortex_err!("get_field missing source expression"))?
-                .as_ref();
-            let field_name_expr = get_field_fn
-                .args()
-                .get(1)
-                .ok_or_else(|| vortex_err!("get_field missing field name argument"))?;
-            let field_name = field_name_expr
-                .as_any()
-                .downcast_ref::<df_expr::Literal>()
-                .ok_or_else(|| vortex_err!("get_field field name must be a literal"))?
-                .value()
-                .try_as_str()
-                .flatten()
-                .ok_or_else(|| vortex_err!("get_field field name must be a UTF-8 string"))?;
-            return Ok(get_item(field_name.to_string(), self.convert(source_expr)?));
-        }
-
-        tracing::debug!(
-            function_name = scalar_fn.name(),
-            "Unsupported ScalarFunctionExpr"
-        );
-        vortex_bail!("Unsupported ScalarFunctionExpr: {}", scalar_fn.name())
-    }
-}
-
-impl ExpressionConvertor for DefaultExpressionConvertor {
-    fn can_be_pushed_down(&self, expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
-        can_be_pushed_down(expr, schema)
-    }
-
-    fn convert(&self, df: &dyn PhysicalExpr) -> VortexResult<Expression> {
-        // TODO(joe): Don't return an error when we have an unsupported node, bubble up "TRUE" as in keep
-        //  for that node, up to any `and` or `or` node.
+impl TryFromDataFusion<dyn PhysicalExpr> for Expression {
+    fn try_from_df(df: &dyn PhysicalExpr) -> VortexResult<Self> {
         if let Some(binary_expr) = df.as_any().downcast_ref::<df_expr::BinaryExpr>() {
-            let left = self.convert(binary_expr.left().as_ref())?;
-            let right = self.convert(binary_expr.right().as_ref())?;
-            let operator = try_operator_from_df(binary_expr.op())?;
+            let left = Expression::try_from_df(binary_expr.left().as_ref())?;
+            let right = Expression::try_from_df(binary_expr.right().as_ref())?;
+            let operator = Operator::try_from_df(binary_expr.op())?;
 
             return Ok(Binary.new_expr(operator, [left, right]));
         }
@@ -119,8 +63,8 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
         }
 
         if let Some(like) = df.as_any().downcast_ref::<df_expr::LikeExpr>() {
-            let child = self.convert(like.expr().as_ref())?;
-            let pattern = self.convert(like.pattern().as_ref())?;
+            let child = Expression::try_from_df(like.expr().as_ref())?;
+            let pattern = Expression::try_from_df(like.pattern().as_ref())?;
             return Ok(Like.new_expr(
                 LikeOptions {
                     negated: like.negated(),
@@ -137,30 +81,22 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
 
         if let Some(cast_expr) = df.as_any().downcast_ref::<df_expr::CastExpr>() {
             let cast_dtype = DType::from_arrow((cast_expr.cast_type(), Nullability::Nullable));
-            let child = self.convert(cast_expr.expr().as_ref())?;
+            let child = Expression::try_from_df(cast_expr.expr().as_ref())?;
             return Ok(cast(child, cast_dtype));
         }
 
-        if let Some(cast_col_expr) = df.as_any().downcast_ref::<df_expr::CastColumnExpr>() {
-            let target = cast_col_expr.target_field();
-
-            let target_dtype = DType::from_arrow((target.data_type(), target.is_nullable().into()));
-            let child = self.convert(cast_col_expr.expr().as_ref())?;
-            return Ok(cast(child, target_dtype));
-        }
-
         if let Some(is_null_expr) = df.as_any().downcast_ref::<df_expr::IsNullExpr>() {
-            let arg = self.convert(is_null_expr.arg().as_ref())?;
+            let arg = Expression::try_from_df(is_null_expr.arg().as_ref())?;
             return Ok(is_null(arg));
         }
 
         if let Some(is_not_null_expr) = df.as_any().downcast_ref::<df_expr::IsNotNullExpr>() {
-            let arg = self.convert(is_not_null_expr.arg().as_ref())?;
+            let arg = Expression::try_from_df(is_not_null_expr.arg().as_ref())?;
             return Ok(not(is_null(arg)));
         }
 
         if let Some(in_list) = df.as_any().downcast_ref::<df_expr::InListExpr>() {
-            let value = self.convert(in_list.expr().as_ref())?;
+            let value = Expression::try_from_df(in_list.expr().as_ref())?;
             let list_elements: Vec<_> = in_list
                 .list()
                 .iter()
@@ -173,8 +109,13 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
                 })
                 .try_collect()?;
 
+            // Handle empty IN list: `x IN ()` is always false, `x NOT IN ()` is always true
+            let Some(first_element) = list_elements.first() else {
+                return Ok(lit(in_list.negated()));
+            };
+
             let list = Scalar::list(
-                list_elements[0].dtype().clone(),
+                first_element.dtype().clone(),
                 list_elements,
                 Nullability::Nullable,
             );
@@ -184,70 +125,108 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
         }
 
         if let Some(scalar_fn) = df.as_any().downcast_ref::<ScalarFunctionExpr>() {
-            return self.try_convert_scalar_function(scalar_fn);
+            return try_convert_scalar_function(scalar_fn);
+        }
+
+        if let Some(dynamic_expr) = df
+            .as_any()
+            .downcast_ref::<df_expr::DynamicFilterPhysicalExpr>()
+            && let Ok(current) = dynamic_expr.current()
+        {
+            let returned_expr = Expression::try_from_df(current.as_ref())?;
+            return Ok(returned_expr);
         }
 
         vortex_bail!("Couldn't convert DataFusion physical {df} expression to a vortex expression")
     }
 }
 
-fn try_operator_from_df(value: &DFOperator) -> VortexResult<Operator> {
-    match value {
-        DFOperator::Eq => Ok(Operator::Eq),
-        DFOperator::NotEq => Ok(Operator::NotEq),
-        DFOperator::Lt => Ok(Operator::Lt),
-        DFOperator::LtEq => Ok(Operator::Lte),
-        DFOperator::Gt => Ok(Operator::Gt),
-        DFOperator::GtEq => Ok(Operator::Gte),
-        DFOperator::And => Ok(Operator::And),
-        DFOperator::Or => Ok(Operator::Or),
-        DFOperator::Plus => Ok(Operator::Add),
-        DFOperator::Minus => Ok(Operator::Sub),
-        DFOperator::Multiply => Ok(Operator::Mul),
-        DFOperator::Divide => Ok(Operator::Div),
-        DFOperator::IsDistinctFrom
-        | DFOperator::IsNotDistinctFrom
-        | DFOperator::RegexMatch
-        | DFOperator::RegexIMatch
-        | DFOperator::RegexNotMatch
-        | DFOperator::RegexNotIMatch
-        | DFOperator::LikeMatch
-        | DFOperator::ILikeMatch
-        | DFOperator::NotLikeMatch
-        | DFOperator::NotILikeMatch
-        | DFOperator::BitwiseAnd
-        | DFOperator::BitwiseOr
-        | DFOperator::BitwiseXor
-        | DFOperator::BitwiseShiftRight
-        | DFOperator::BitwiseShiftLeft
-        | DFOperator::StringConcat
-        | DFOperator::AtArrow
-        | DFOperator::ArrowAt
-        | DFOperator::Modulo
-        | DFOperator::Arrow
-        | DFOperator::LongArrow
-        | DFOperator::HashArrow
-        | DFOperator::HashLongArrow
-        | DFOperator::AtAt
-        | DFOperator::IntegerDivide
-        | DFOperator::HashMinus
-        | DFOperator::AtQuestion
-        | DFOperator::Question
-        | DFOperator::QuestionAnd
-        | DFOperator::QuestionPipe => {
-            tracing::debug!(operator = %value, "Can't pushdown binary_operator operator");
-            Err(vortex_err!("Unsupported datafusion operator {value}"))
+/// Attempts to convert a DataFusion ScalarFunctionExpr to a Vortex expression.
+fn try_convert_scalar_function(scalar_fn: &ScalarFunctionExpr) -> VortexResult<Expression> {
+    if let Some(get_field_fn) = ScalarFunctionExpr::try_downcast_func::<GetFieldFunc>(scalar_fn) {
+        let source_expr = get_field_fn
+            .args()
+            .first()
+            .ok_or_else(|| vortex_err!("get_field missing source expression"))?
+            .as_ref();
+        let field_name_expr = get_field_fn
+            .args()
+            .get(1)
+            .ok_or_else(|| vortex_err!("get_field missing field name argument"))?;
+        let field_name = field_name_expr
+            .as_any()
+            .downcast_ref::<df_expr::Literal>()
+            .ok_or_else(|| vortex_err!("get_field field name must be a literal"))?
+            .value()
+            .try_as_str()
+            .flatten()
+            .ok_or_else(|| vortex_err!("get_field field name must be a UTF-8 string"))?;
+        return Ok(get_item(
+            field_name.to_string(),
+            Expression::try_from_df(source_expr)?,
+        ));
+    }
+
+    tracing::debug!(
+        function_name = scalar_fn.name(),
+        "Unsupported ScalarFunctionExpr"
+    );
+    vortex_bail!("Unsupported ScalarFunctionExpr: {}", scalar_fn.name())
+}
+
+impl TryFromDataFusion<DFOperator> for Operator {
+    fn try_from_df(value: &DFOperator) -> VortexResult<Self> {
+        match value {
+            DFOperator::Eq => Ok(Operator::Eq),
+            DFOperator::NotEq => Ok(Operator::NotEq),
+            DFOperator::Lt => Ok(Operator::Lt),
+            DFOperator::LtEq => Ok(Operator::Lte),
+            DFOperator::Gt => Ok(Operator::Gt),
+            DFOperator::GtEq => Ok(Operator::Gte),
+            DFOperator::And => Ok(Operator::And),
+            DFOperator::Or => Ok(Operator::Or),
+            DFOperator::Plus => Ok(Operator::Add),
+            DFOperator::Minus => Ok(Operator::Sub),
+            DFOperator::Multiply => Ok(Operator::Mul),
+            DFOperator::Divide => Ok(Operator::Div),
+            DFOperator::IsDistinctFrom
+            | DFOperator::IsNotDistinctFrom
+            | DFOperator::RegexMatch
+            | DFOperator::RegexIMatch
+            | DFOperator::RegexNotMatch
+            | DFOperator::RegexNotIMatch
+            | DFOperator::LikeMatch
+            | DFOperator::ILikeMatch
+            | DFOperator::NotLikeMatch
+            | DFOperator::NotILikeMatch
+            | DFOperator::BitwiseAnd
+            | DFOperator::BitwiseOr
+            | DFOperator::BitwiseXor
+            | DFOperator::BitwiseShiftRight
+            | DFOperator::BitwiseShiftLeft
+            | DFOperator::StringConcat
+            | DFOperator::AtArrow
+            | DFOperator::ArrowAt
+            | DFOperator::Modulo
+            | DFOperator::Arrow
+            | DFOperator::LongArrow
+            | DFOperator::HashArrow
+            | DFOperator::HashLongArrow
+            | DFOperator::AtAt
+            | DFOperator::IntegerDivide
+            | DFOperator::HashMinus
+            | DFOperator::AtQuestion
+            | DFOperator::Question
+            | DFOperator::QuestionAnd
+            | DFOperator::QuestionPipe => {
+                tracing::debug!(operator = %value, "Can't pushdown binary_operator operator");
+                Err(vortex_err!("Unsupported datafusion operator {value}"))
+            }
         }
     }
 }
 
-pub(crate) fn can_be_pushed_down(df_expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
-    // We currently do not support pushdown of dynamic expressions in DF.
-    // See issue: https://github.com/vortex-data/vortex/issues/4034
-    if is_dynamic_physical_expr(df_expr) {
-        return false;
-    }
-
+pub(crate) fn can_be_pushed_down(df_expr: &PhysicalExprRef, schema: &Schema) -> bool {
     let expr = df_expr.as_any();
     if let Some(binary) = expr.downcast_ref::<df_expr::BinaryExpr>() {
         can_binary_be_pushed_down(binary, schema)
@@ -260,10 +239,8 @@ pub(crate) fn can_be_pushed_down(df_expr: &Arc<dyn PhysicalExpr>, schema: &Schem
         can_be_pushed_down(like.expr(), schema) && can_be_pushed_down(like.pattern(), schema)
     } else if let Some(lit) = expr.downcast_ref::<df_expr::Literal>() {
         supported_data_types(&lit.value().data_type())
-    } else if expr.downcast_ref::<df_expr::CastExpr>().is_some()
-        || expr.downcast_ref::<df_expr::CastColumnExpr>().is_some()
-    {
-        true
+    } else if let Some(cast) = expr.downcast_ref::<df_expr::CastExpr>() {
+        supported_data_types(cast.cast_type()) && can_be_pushed_down(cast.expr(), schema)
     } else if let Some(is_null) = expr.downcast_ref::<df_expr::IsNullExpr>() {
         can_be_pushed_down(is_null.arg(), schema)
     } else if let Some(is_not_null) = expr.downcast_ref::<df_expr::IsNotNullExpr>() {
@@ -272,7 +249,13 @@ pub(crate) fn can_be_pushed_down(df_expr: &Arc<dyn PhysicalExpr>, schema: &Schem
         can_be_pushed_down(in_list.expr(), schema)
             && in_list.list().iter().all(|e| can_be_pushed_down(e, schema))
     } else if let Some(scalar_fn) = expr.downcast_ref::<ScalarFunctionExpr>() {
-        can_scalar_fn_be_pushed_down(scalar_fn)
+        can_scalar_fn_be_pushed_down(scalar_fn, schema)
+    } else if expr
+        .downcast_ref::<df_expr::DynamicFilterPhysicalExpr>()
+        .is_some()
+    {
+        // assume dynamic filters can be pushed down - the child won't be specified until execution time
+        true
     } else {
         tracing::debug!(%df_expr, "DataFusion expression can't be pushed down");
         false
@@ -280,7 +263,7 @@ pub(crate) fn can_be_pushed_down(df_expr: &Arc<dyn PhysicalExpr>, schema: &Schem
 }
 
 fn can_binary_be_pushed_down(binary: &df_expr::BinaryExpr, schema: &Schema) -> bool {
-    let is_op_supported = try_operator_from_df(binary.op()).is_ok();
+    let is_op_supported = Operator::try_from_df(binary.op()).is_ok();
     is_op_supported
         && can_be_pushed_down(binary.left(), schema)
         && can_be_pushed_down(binary.right(), schema)
@@ -313,31 +296,73 @@ fn supported_data_types(dt: &DataType) -> bool {
         );
 
     if !is_supported {
-        tracing::debug!("DataFusion data type {dt:?} is not supported");
+        tracing::debug!(data_type = ?dt, "DataFusion data type is not supported");
     }
 
     is_supported
 }
 
 /// Checks if a GetField scalar function can be pushed down.
-fn can_scalar_fn_be_pushed_down(scalar_fn: &ScalarFunctionExpr) -> bool {
-    ScalarFunctionExpr::try_downcast_func::<GetFieldFunc>(scalar_fn).is_some()
+fn can_scalar_fn_be_pushed_down(scalar_fn: &ScalarFunctionExpr, schema: &Schema) -> bool {
+    let Some(get_field_fn) = ScalarFunctionExpr::try_downcast_func::<GetFieldFunc>(scalar_fn)
+    else {
+        // Only get_field pushdown is supported.
+        return false;
+    };
+
+    let args = get_field_fn.args();
+    if args.len() != 2 {
+        tracing::debug!(
+            "Expected 2 arguments for GetField, not pushing down {} arguments",
+            args.len()
+        );
+        return false;
+    }
+    let source_expr = &args[0];
+    let field_name_expr = &args[1];
+    let Some(field_name) = field_name_expr
+        .as_any()
+        .downcast_ref::<df_expr::Literal>()
+        .and_then(|lit| lit.value().try_as_str().flatten())
+    else {
+        return false;
+    };
+
+    let Ok(source_dt) = source_expr.data_type(schema) else {
+        tracing::debug!(
+            field_name = field_name,
+            schema = ?schema,
+            source_expr = ?source_expr,
+            "Failed to get source type for GetField, not pushing down"
+        );
+        return false;
+    };
+    let DataType::Struct(fields) = source_dt else {
+        tracing::debug!(
+            field_name = field_name,
+            schema = ?schema,
+            source_expr = ?source_expr,
+            "Failed to get source type as struct for GetField, not pushing down"
+        );
+        return false;
+    };
+    fields.find(field_name).is_some()
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use arrow_schema::DataType;
-    use arrow_schema::Field;
-    use arrow_schema::Schema;
-    use arrow_schema::TimeUnit as ArrowTimeUnit;
+    use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit as ArrowTimeUnit};
+    use datafusion::functions::core::getfield::GetFieldFunc;
     use datafusion_common::ScalarValue;
-    use datafusion_expr::Operator as DFOperator;
+    use datafusion_common::config::ConfigOptions;
+    use datafusion_expr::{Operator as DFOperator, ScalarUDF};
     use datafusion_physical_expr::PhysicalExpr;
     use datafusion_physical_plan::expressions as df_expr;
     use insta::assert_snapshot;
     use rstest::rstest;
+    use vortex::expr::{Expression, Operator};
 
     use super::*;
 
@@ -363,25 +388,22 @@ mod tests {
 
     #[test]
     fn test_make_vortex_predicate_empty() {
-        let expr_convertor = DefaultExpressionConvertor::default();
-        let result = make_vortex_predicate(&expr_convertor, &[]).unwrap();
+        let result = make_vortex_predicate(&[]).unwrap();
         assert!(result.is_none());
     }
 
     #[test]
     fn test_make_vortex_predicate_single() {
-        let expr_convertor = DefaultExpressionConvertor::default();
         let col_expr = Arc::new(df_expr::Column::new("test", 0)) as Arc<dyn PhysicalExpr>;
-        let result = make_vortex_predicate(&expr_convertor, &[col_expr]).unwrap();
+        let result = make_vortex_predicate(&[&col_expr]).unwrap();
         assert!(result.is_some());
     }
 
     #[test]
     fn test_make_vortex_predicate_multiple() {
-        let expr_convertor = DefaultExpressionConvertor::default();
         let col1 = Arc::new(df_expr::Column::new("col1", 0)) as Arc<dyn PhysicalExpr>;
         let col2 = Arc::new(df_expr::Column::new("col2", 1)) as Arc<dyn PhysicalExpr>;
-        let result = make_vortex_predicate(&expr_convertor, &[col1, col2]).unwrap();
+        let result = make_vortex_predicate(&[&col1, &col2]).unwrap();
         assert!(result.is_some());
         // Result should be an AND expression combining the two columns
     }
@@ -403,7 +425,7 @@ mod tests {
         #[case] df_op: DFOperator,
         #[case] expected_vortex_op: Operator,
     ) {
-        let result = try_operator_from_df(&df_op).unwrap();
+        let result = Operator::try_from_df(&df_op).unwrap();
         assert_eq!(result, expected_vortex_op);
     }
 
@@ -413,7 +435,7 @@ mod tests {
     #[case::regex_match(DFOperator::RegexMatch)]
     #[case::like_match(DFOperator::LikeMatch)]
     fn test_operator_conversion_unsupported(#[case] df_op: DFOperator) {
-        let result = try_operator_from_df(&df_op);
+        let result = Operator::try_from_df(&df_op);
         assert!(result.is_err());
         assert!(
             result
@@ -426,24 +448,20 @@ mod tests {
     #[test]
     fn test_expr_from_df_column() {
         let col_expr = df_expr::Column::new("test_column", 0);
-        let result = DefaultExpressionConvertor::default()
-            .convert(&col_expr)
-            .unwrap();
+        let result = Expression::try_from_df(&col_expr).unwrap();
 
-        assert_snapshot!(result.display_tree().to_string(), @r"
-        vortex.get_item(test_column)
-        └── input: vortex.root()
-        ");
+        assert_snapshot!(result.display_tree().to_string(), @r#"
+        vortex.get_item "test_column"
+        └── input: vortex.root
+        "#);
     }
 
     #[test]
     fn test_expr_from_df_literal() {
         let literal_expr = df_expr::Literal::new(ScalarValue::Int32(Some(42)));
-        let result = DefaultExpressionConvertor::default()
-            .convert(&literal_expr)
-            .unwrap();
+        let result = Expression::try_from_df(&literal_expr).unwrap();
 
-        assert_snapshot!(result.display_tree().to_string(), @"vortex.literal(42i32)");
+        assert_snapshot!(result.display_tree().to_string(), @"vortex.literal 42i32");
     }
 
     #[test]
@@ -453,16 +471,14 @@ mod tests {
             Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(42)))) as Arc<dyn PhysicalExpr>;
         let binary_expr = df_expr::BinaryExpr::new(left, DFOperator::Eq, right);
 
-        let result = DefaultExpressionConvertor::default()
-            .convert(&binary_expr)
-            .unwrap();
+        let result = Expression::try_from_df(&binary_expr).unwrap();
 
-        assert_snapshot!(result.display_tree().to_string(), @r"
-        vortex.binary(=)
-        ├── lhs: vortex.get_item(left)
-        │   └── input: vortex.root()
-        └── rhs: vortex.literal(42i32)
-        ");
+        assert_snapshot!(result.display_tree().to_string(), @r#"
+        vortex.binary =
+        ├── lhs: vortex.get_item "left"
+        │   └── input: vortex.root
+        └── rhs: vortex.literal 42i32
+        "#);
     }
 
     #[rstest]
@@ -477,17 +493,37 @@ mod tests {
         )))) as Arc<dyn PhysicalExpr>;
         let like_expr = df_expr::LikeExpr::new(negated, case_insensitive, expr, pattern);
 
-        let result = DefaultExpressionConvertor::default()
-            .convert(&like_expr)
-            .unwrap();
-        let like_opts = result.as_::<Like>();
+        let result = Expression::try_from_df(&like_expr).unwrap();
+        let like_expr = result.as_::<Like>();
         assert_eq!(
-            like_opts,
+            like_expr.data(),
             &LikeOptions {
                 negated,
                 case_insensitive
             }
         );
+    }
+
+    #[test]
+    fn test_expr_from_df_in_list_empty_returns_false() {
+        // `x IN ()` should return lit(false)
+        let value = Arc::new(df_expr::Column::new("col", 0)) as Arc<dyn PhysicalExpr>;
+        let in_list = df_expr::InListExpr::new(value, vec![], false, None);
+
+        let result = Expression::try_from_df(&in_list).unwrap();
+
+        assert_snapshot!(result.display_tree().to_string(), @"vortex.literal false");
+    }
+
+    #[test]
+    fn test_expr_from_df_in_list_empty_negated_returns_true() {
+        // `x NOT IN ()` should return lit(true)
+        let value = Arc::new(df_expr::Column::new("col", 0)) as Arc<dyn PhysicalExpr>;
+        let in_list = df_expr::InListExpr::new(value, vec![], true, None);
+
+        let result = Expression::try_from_df(&in_list).unwrap();
+
+        assert_snapshot!(result.display_tree().to_string(), @"vortex.literal true");
     }
 
     #[rstest]
@@ -522,8 +558,7 @@ mod tests {
         DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
         false
     )]
-    #[case::struct_type(DataType::Struct(vec![Field::new("field", DataType::Int32, true)].into()
-    ), false)]
+    #[case::struct_type(DataType::Struct(vec![Field::new("field", DataType::Int32, true)].into()), false)]
     // Dictionary types - should be supported if value type is supported
     #[case::dict_utf8(
         DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
@@ -642,5 +677,145 @@ mod tests {
             Arc::new(df_expr::LikeExpr::new(false, false, expr, pattern)) as Arc<dyn PhysicalExpr>;
 
         assert!(!can_be_pushed_down(&like_expr, &test_schema));
+    }
+
+    #[test]
+    fn test_expr_from_df_get_field() {
+        let struct_col = Arc::new(df_expr::Column::new("my_struct", 0)) as Arc<dyn PhysicalExpr>;
+        let field_name = Arc::new(df_expr::Literal::new(ScalarValue::Utf8(Some(
+            "field1".to_string(),
+        )))) as Arc<dyn PhysicalExpr>;
+        let get_field_expr = ScalarFunctionExpr::new(
+            "get_field",
+            Arc::new(ScalarUDF::from(GetFieldFunc::new())),
+            vec![struct_col, field_name],
+            Arc::new(Field::new("field1", DataType::Utf8, true)),
+            Arc::new(ConfigOptions::new()),
+        );
+        let result = Expression::try_from_df(&get_field_expr).unwrap();
+        assert_snapshot!(result.display_tree().to_string(), @r#"
+        vortex.get_item "field1"
+        └── input: vortex.get_item "my_struct"
+            └── input: vortex.root
+        "#);
+    }
+
+    #[rstest]
+    #[case::valid_field("field1", true)]
+    #[case::missing_field("nonexistent_field", false)]
+    fn test_can_be_pushed_down_get_field(#[case] field_name: &str, #[case] expected: bool) {
+        let struct_fields = Fields::from(vec![
+            Field::new("field1", DataType::Utf8, true),
+            Field::new("field2", DataType::Int32, true),
+        ]);
+        let schema = Schema::new(vec![Field::new(
+            "my_struct",
+            DataType::Struct(struct_fields),
+            true,
+        )]);
+
+        let struct_col = Arc::new(df_expr::Column::new("my_struct", 0)) as Arc<dyn PhysicalExpr>;
+        let field_name_lit = Arc::new(df_expr::Literal::new(ScalarValue::Utf8(Some(
+            field_name.to_string(),
+        )))) as Arc<dyn PhysicalExpr>;
+
+        let get_field_expr = Arc::new(ScalarFunctionExpr::new(
+            "get_field",
+            Arc::new(ScalarUDF::from(GetFieldFunc::new())),
+            vec![struct_col, field_name_lit],
+            Arc::new(Field::new(field_name, DataType::Utf8, true)),
+            Arc::new(ConfigOptions::new()),
+        )) as Arc<dyn PhysicalExpr>;
+
+        assert_eq!(can_be_pushed_down(&get_field_expr, &schema), expected);
+    }
+
+    /// Create an unsupported scalar function expression (simulating functions like to_timestamp)
+    fn create_unsupported_scalar_fn() -> Arc<dyn PhysicalExpr> {
+        use datafusion_functions::datetime::to_timestamp::ToTimestampFunc;
+
+        let arg = Arc::new(df_expr::Literal::new(ScalarValue::Utf8(Some(
+            "2024-01-01".to_string(),
+        )))) as Arc<dyn PhysicalExpr>;
+
+        Arc::new(ScalarFunctionExpr::new(
+            "to_timestamp",
+            Arc::new(ScalarUDF::from(ToTimestampFunc::new())),
+            vec![arg],
+            Arc::new(Field::new(
+                "result",
+                DataType::Timestamp(ArrowTimeUnit::Nanosecond, None),
+                true,
+            )),
+            Arc::new(ConfigOptions::new()),
+        ))
+    }
+
+    #[test]
+    fn test_make_vortex_predicate_skips_unsupported_scalar_function() {
+        // Unsupported scalar function like to_timestamp should be skipped, not error
+        let unsupported_fn = create_unsupported_scalar_fn();
+        let result = make_vortex_predicate(&[&unsupported_fn]);
+
+        // Should succeed (not error) and return None since the only expression was skipped
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_make_vortex_predicate_combines_supported_and_skips_unsupported() {
+        // Mix of supported column expression and unsupported scalar function
+        let supported_col = Arc::new(df_expr::Column::new("test", 0)) as Arc<dyn PhysicalExpr>;
+        let unsupported_fn = create_unsupported_scalar_fn();
+
+        let result = make_vortex_predicate(&[&supported_col, &unsupported_fn]);
+
+        // Should succeed and return the supported expression only
+        assert!(result.is_ok());
+        let predicate = result.unwrap();
+        assert!(predicate.is_some());
+
+        // The result should just be the column expression since the unsupported one was skipped
+        assert_snapshot!(predicate.unwrap().display_tree().to_string(), @r#"
+        vortex.get_item "test"
+        └── input: vortex.root
+        "#);
+    }
+
+    #[test]
+    fn test_make_vortex_predicate_multiple_supported_with_unsupported() {
+        // Two supported columns and one unsupported function
+        let col1 = Arc::new(df_expr::Column::new("col1", 0)) as Arc<dyn PhysicalExpr>;
+        let col2 = Arc::new(df_expr::Column::new("col2", 1)) as Arc<dyn PhysicalExpr>;
+        let unsupported_fn = create_unsupported_scalar_fn();
+
+        let result = make_vortex_predicate(&[&col1, &unsupported_fn, &col2]);
+
+        // Should succeed and return AND of the two supported expressions
+        assert!(result.is_ok());
+        let predicate = result.unwrap();
+        assert!(predicate.is_some());
+
+        // The result should be an AND of col1 and col2
+        assert_snapshot!(predicate.unwrap().display_tree().to_string(), @r#"
+        vortex.binary and
+        ├── lhs: vortex.get_item "col1"
+        │   └── input: vortex.root
+        └── rhs: vortex.get_item "col2"
+            └── input: vortex.root
+        "#);
+    }
+
+    #[test]
+    fn test_make_vortex_predicate_all_unsupported_returns_none() {
+        // When all expressions are unsupported, should return None (no filter)
+        let unsupported_fn1 = create_unsupported_scalar_fn();
+        let unsupported_fn2 = create_unsupported_scalar_fn();
+
+        let result = make_vortex_predicate(&[&unsupported_fn1, &unsupported_fn2]);
+
+        // Should succeed and return None
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
     }
 }
