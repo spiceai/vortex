@@ -9,6 +9,12 @@ use std::sync::Arc;
 use vortex_buffer::{Alignment, ByteBuffer};
 use vortex_error::{VortexError, VortexExpect, VortexResult};
 
+// Prefer tokio::sync::oneshot when tokio feature is enabled
+#[cfg(feature = "tokio")]
+use tokio::sync::oneshot;
+#[cfg(not(feature = "tokio"))]
+use oneshot;
+
 /// An I/O request, either a single read or a coalesced set of reads.
 pub struct IoRequest(IoRequestInner);
 
@@ -118,6 +124,12 @@ impl Debug for ReadRequest {
 
 impl ReadRequest {
     pub(crate) fn resolve(self, result: VortexResult<ByteBuffer>) {
+        // tokio::sync::oneshot::Sender::send returns Err with the value if receiver dropped
+        #[cfg(feature = "tokio")]
+        if self.callback.send(result).is_err() {
+            log::debug!("ReadRequest {} dropped before resolving", self.id);
+        }
+        #[cfg(not(feature = "tokio"))]
         if let Err(e) = self.callback.send(result) {
             log::debug!("ReadRequest {} dropped before resolving: {e}", self.id);
         }

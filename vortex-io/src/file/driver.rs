@@ -9,6 +9,12 @@ use pin_project_lite::pin_project;
 use vortex_error::VortexExpect;
 use vortex_metrics::VortexMetrics;
 
+// Prefer tokio::sync::oneshot when tokio feature is enabled
+#[cfg(all(test, feature = "tokio"))]
+use tokio::sync::oneshot;
+#[cfg(all(test, not(feature = "tokio")))]
+use oneshot;
+
 use crate::file::read::{
     CoalesceWindow, CoalescedRequest, IoRequest, ReadEvent, ReadRequest, RequestId,
 };

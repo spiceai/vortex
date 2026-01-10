@@ -20,6 +20,12 @@ pub use source::*;
 use vortex_buffer::{Alignment, ByteBuffer};
 use vortex_error::{SharedVortexResult, VortexError, VortexResult, vortex_err};
 
+// Prefer tokio::sync::oneshot when tokio feature is enabled
+#[cfg(feature = "tokio")]
+use tokio::sync::oneshot;
+#[cfg(not(feature = "tokio"))]
+use oneshot;
+
 use crate::VortexReadAt;
 
 /// A handle to an open file that can be read using a Vortex runtime.
