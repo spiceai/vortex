@@ -7,15 +7,14 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 use futures::stream::LocalBoxStream;
 use futures::{Stream, StreamExt};
+#[cfg(not(feature = "tokio"))]
+use oneshot;
 use parking_lot::Mutex;
 use smol::LocalExecutor;
-use vortex_error::vortex_panic;
-
 // Prefer tokio::sync::oneshot when tokio feature is enabled
 #[cfg(feature = "tokio")]
 use tokio::sync::oneshot;
-#[cfg(not(feature = "tokio"))]
-use oneshot;
+use vortex_error::vortex_panic;
 
 use crate::runtime::smol::SmolAbortHandle;
 use crate::runtime::{AbortHandle, AbortHandleRef, BlockingRuntime, Executor, Handle, IoTask};

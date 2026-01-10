@@ -7,13 +7,12 @@ use std::task::{Context, Poll, ready};
 
 use futures::channel::mpsc;
 use futures::{FutureExt, StreamExt};
-use vortex_error::{VortexResult, vortex_panic};
-
+#[cfg(not(feature = "tokio"))]
+use oneshot;
 // Prefer tokio::sync::oneshot when tokio feature is enabled
 #[cfg(feature = "tokio")]
 use tokio::sync::oneshot;
-#[cfg(not(feature = "tokio"))]
-use oneshot;
+use vortex_error::{VortexResult, vortex_panic};
 use vortex_metrics::VortexMetrics;
 
 use crate::file::{FileRead, IntoReadSource, IoRequestStream};

@@ -15,16 +15,15 @@ use async_trait::async_trait;
 use futures::channel::mpsc;
 use futures::future::{BoxFuture, Shared};
 use futures::{FutureExt, TryFutureExt};
+#[cfg(not(feature = "tokio"))]
+use oneshot;
 pub use request::*;
 pub use source::*;
-use vortex_buffer::{Alignment, ByteBuffer};
-use vortex_error::{SharedVortexResult, VortexError, VortexResult, vortex_err};
-
 // Prefer tokio::sync::oneshot when tokio feature is enabled
 #[cfg(feature = "tokio")]
 use tokio::sync::oneshot;
-#[cfg(not(feature = "tokio"))]
-use oneshot;
+use vortex_buffer::{Alignment, ByteBuffer};
+use vortex_error::{SharedVortexResult, VortexError, VortexResult, vortex_err};
 
 use crate::VortexReadAt;
 

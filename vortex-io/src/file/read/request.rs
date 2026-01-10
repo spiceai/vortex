@@ -6,14 +6,13 @@ use std::fmt::{Debug, Formatter};
 use std::ops::Range;
 use std::sync::Arc;
 
-use vortex_buffer::{Alignment, ByteBuffer};
-use vortex_error::{VortexError, VortexExpect, VortexResult};
-
+#[cfg(not(feature = "tokio"))]
+use oneshot;
 // Prefer tokio::sync::oneshot when tokio feature is enabled
 #[cfg(feature = "tokio")]
 use tokio::sync::oneshot;
-#[cfg(not(feature = "tokio"))]
-use oneshot;
+use vortex_buffer::{Alignment, ByteBuffer};
+use vortex_error::{VortexError, VortexExpect, VortexResult};
 
 /// An I/O request, either a single read or a coalesced set of reads.
 pub struct IoRequest(IoRequestInner);
