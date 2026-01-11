@@ -8,8 +8,13 @@ use futures::Stream;
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use futures::stream::LocalBoxStream;
+#[cfg(not(feature = "tokio"))]
+use oneshot;
 use parking_lot::Mutex;
 use smol::LocalExecutor;
+// Prefer tokio::sync::oneshot when tokio feature is enabled
+#[cfg(feature = "tokio")]
+use tokio::sync::oneshot;
 use vortex_error::vortex_panic;
 
 use crate::runtime::AbortHandle;
@@ -18,7 +23,6 @@ use crate::runtime::BlockingRuntime;
 use crate::runtime::Executor;
 use crate::runtime::Handle;
 use crate::runtime::smol::SmolAbortHandle;
-
 /// A runtime that drives all work on the current thread.
 ///
 /// This is subtly different from using a current-thread runtime to drive a future since it is

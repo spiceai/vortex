@@ -8,6 +8,8 @@ use std::task::Context;
 use std::task::Poll;
 
 use futures::Stream;
+#[cfg(all(test, not(feature = "tokio")))]
+use oneshot;
 use pin_project_lite::pin_project;
 use vortex_buffer::Alignment;
 use vortex_error::VortexExpect;
