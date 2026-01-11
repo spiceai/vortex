@@ -11,6 +11,11 @@ use std::task::ready;
 use futures::FutureExt;
 use futures::StreamExt;
 use futures::channel::mpsc;
+#[cfg(not(feature = "tokio"))]
+use oneshot;
+// Prefer tokio::sync::oneshot when tokio feature is enabled
+#[cfg(feature = "tokio")]
+use tokio::sync::oneshot;
 use vortex_error::VortexResult;
 use vortex_error::vortex_panic;
 use vortex_metrics::VortexMetrics;

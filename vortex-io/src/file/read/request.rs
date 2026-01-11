@@ -7,6 +7,11 @@ use std::fmt::Formatter;
 use std::ops::Range;
 use std::sync::Arc;
 
+#[cfg(not(feature = "tokio"))]
+use oneshot;
+// Prefer tokio::sync::oneshot when tokio feature is enabled
+#[cfg(feature = "tokio")]
+use tokio::sync::oneshot;
 use vortex_buffer::Alignment;
 use vortex_buffer::ByteBuffer;
 use vortex_error::VortexError;
@@ -122,6 +127,12 @@ impl Debug for ReadRequest {
 
 impl ReadRequest {
     pub(crate) fn resolve(self, result: VortexResult<ByteBuffer>) {
+        // tokio::sync::oneshot::Sender::send returns Err with the value if receiver dropped
+        #[cfg(feature = "tokio")]
+        if self.callback.send(result).is_err() {
+            log::debug!("ReadRequest {} dropped before resolving", self.id);
+        }
+        #[cfg(not(feature = "tokio"))]
         if let Err(e) = self.callback.send(result) {
             tracing::debug!("ReadRequest {} dropped before resolving: {e}", self.id);
         }

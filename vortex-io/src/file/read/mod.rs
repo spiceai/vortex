@@ -21,8 +21,13 @@ use futures::TryFutureExt;
 use futures::channel::mpsc;
 use futures::future::BoxFuture;
 use futures::future::Shared;
+#[cfg(not(feature = "tokio"))]
+use oneshot;
 pub use request::*;
 pub use source::*;
+// Prefer tokio::sync::oneshot when tokio feature is enabled
+#[cfg(feature = "tokio")]
+use tokio::sync::oneshot;
 use vortex_buffer::Alignment;
 use vortex_buffer::ByteBuffer;
 use vortex_error::SharedVortexResult;
