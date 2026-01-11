@@ -5,7 +5,12 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use futures::Stream;
+#[cfg(all(test, not(feature = "tokio")))]
+use oneshot;
 use pin_project_lite::pin_project;
+// Prefer tokio::sync::oneshot when tokio feature is enabled
+#[cfg(all(test, feature = "tokio"))]
+use tokio::sync::oneshot;
 use vortex_error::VortexExpect;
 use vortex_metrics::VortexMetrics;
 
