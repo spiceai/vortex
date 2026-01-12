@@ -9,9 +9,9 @@ use arrow_array::StructArray as ArrowStructArray;
 use arrow_schema::FieldRef;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
-use vortex_session::VortexSession;
 
 use crate::ArrayRef;
+use crate::ExecutionCtx;
 use crate::arrow::executor::list::to_arrow_list;
 
 /// Convert a Vortex List<Struct<key, value>> array into an Arrow MapArray.
@@ -19,10 +19,10 @@ pub(super) fn to_arrow_map(
     array: ArrayRef,
     entries_field: &FieldRef,
     ordered: bool,
-    session: &VortexSession,
+    ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrowArrayRef> {
     // First, convert to Arrow ListArray<i32> since Map uses i32 offsets.
-    let list_array = to_arrow_list::<i32>(array, entries_field, session)?;
+    let list_array = to_arrow_list::<i32>(array, entries_field, ctx)?;
 
     // Downcast to GenericListArray<i32> to extract its components.
     let Some(list_array) = list_array
