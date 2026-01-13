@@ -20,6 +20,7 @@ use arrow_array::types::TimestampNanosecondType;
 use arrow_array::types::TimestampSecondType;
 use arrow_schema::DataType;
 use arrow_schema::TimeUnit as ArrowTimeUnit;
+use vortex_dtype::DType as VortexDType;
 use vortex_dtype::NativePType;
 use vortex_dtype::datetime::TemporalMetadata;
 use vortex_dtype::datetime::TimeUnit;
@@ -38,11 +39,16 @@ pub(super) fn to_arrow_temporal(
     data_type: &DataType,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrowArrayRef> {
-    let ext_dtype = array.dtype().as_extension();
-
+    let VortexDType::Extension(ext_dtype) = array.dtype() else {
+        vortex_bail!(
+            "Cannot convert {} array to Arrow type {}",
+            array.dtype(),
+            data_type
+        );
+    };
     let temporal_metadata = TemporalMetadata::try_from(ext_dtype)?;
 
-    match (temporal_metadata, &data_type) {
+    match (temporal_metadata, data_type) {
         (TemporalMetadata::Date(TimeUnit::Days), DataType::Date32) => {
             to_temporal::<Date32Type>(array, ctx)
         }
@@ -120,7 +126,10 @@ fn to_arrow_temporal_primitive<T: ArrowTemporalType>(
 where
     T::Native: NativePType,
 {
-    debug_assert!(TemporalMetadata::try_from(array.dtype().as_extension()).is_ok());
+    debug_assert!(matches!(
+        array.dtype(),
+        VortexDType::Extension(ext_dtype) if TemporalMetadata::try_from(ext_dtype).is_ok()
+    ));
 
     let ext_array = array.execute::<Canonical>(ctx)?.into_extension();
     let primitive = ext_array

@@ -29,11 +29,14 @@ use vortex_error::vortex_bail;
 use vortex_proto::expr as pb;
 use vortex_scalar::Scalar;
 use vortex_vector::Datum;
+use vortex_vector::Vector;
 use vortex_vector::VectorOps;
 
 use crate::ArrayRef;
+use crate::Executable;
 use crate::IntoArray;
 use crate::ToCanonical;
+use crate::VortexSessionExecute;
 use crate::arrays::BoolArray;
 use crate::arrays::ConstantArray;
 use crate::compute::zip;
@@ -317,7 +320,6 @@ fn execute_zip(
     use vortex_vector::BoolDatum;
 
     use crate::LEGACY_SESSION;
-    use crate::VectorExecutor;
     use crate::vectors::VectorIntoArray;
 
     let cond_bool = condition.into_bool();
@@ -356,7 +358,8 @@ fn execute_zip(
     let result_array = zip(&true_array, &false_array, &mask)?;
 
     // Convert back to vector
-    let result_vector = result_array.execute_vector(&LEGACY_SESSION)?;
+    let mut ctx = LEGACY_SESSION.create_execution_ctx();
+    let result_vector = result_array.execute::<Vector>(&mut ctx)?;
 
     Ok(Datum::Vector(result_vector))
 }
