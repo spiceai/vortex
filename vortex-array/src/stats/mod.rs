@@ -26,6 +26,7 @@ pub const PRUNING_STATS: &[Stat] = &[
     Stat::Sum,
     Stat::NullCount,
     Stat::NaNCount,
+    Stat::UncompressedSizeInBytes,
 ];
 
 pub fn as_stat_bitset_bytes(stats: &[Stat]) -> Vec<u8> {
