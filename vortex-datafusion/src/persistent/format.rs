@@ -54,7 +54,7 @@ use vortex::io::object_store::ObjectStoreReadAt;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::scalar::Scalar;
 use vortex::session::VortexSession;
-use vortex::stats::{Stat, StatsSet};
+use vortex::stats::{ArrayStats, Stat, StatsSet};
 use vortex::{VortexSessionDefault, stats};
 
 use super::cache::CachedVortexMetadata;
