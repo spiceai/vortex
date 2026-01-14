@@ -89,9 +89,9 @@ impl VortexMetrics {
     /// Create a new metrics registry with additional tags. Metrics created in the
     /// child registry will be included in this registry's snapshots.
     pub fn child_with_tags(&self, additional_tags: impl Into<DefaultTags>) -> Self {
-        let child = Self::new_with_tags(self.inner.default_tags.merge(&additional_tags.into()));
-        self.inner.children.write().push(child.clone());
-        child
+        // TODO: Child metric registration under parent is temporarily disabled due to memory growth - children accumulate indefinitely.
+        // https://github.com/vortex-data/vortex/discussions/5946
+        Self::new_with_tags(self.inner.default_tags.merge(&additional_tags.into()))
     }
 
     /// Returns the counter with the specified ID, creating a default instance if absent.
