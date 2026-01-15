@@ -6,7 +6,7 @@
 use std::fmt::Debug;
 
 use datafusion_common::stats::Precision as DFPrecision;
-use vortex::expr::stats::Precision;
+use vortex::stats::Precision;
 
 mod convert;
 mod persistent;
