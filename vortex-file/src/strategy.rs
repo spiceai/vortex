@@ -28,11 +28,22 @@ const ONE_MEG: u64 = 1 << 20;
 /// Vortex provides an out-of-the-box file writer that optimizes the layout of chunks on-disk,
 /// repartitioning and compressing them to strike a balance between size on-disk,
 /// bulk decoding performance, and IOPS required to perform an indexed read.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WriteStrategyBuilder {
     compressor: Option<Arc<dyn CompressorPlugin>>,
     row_block_size: usize,
     field_writers: HashMap<FieldPath, Arc<dyn LayoutStrategy>>,
+}
+
+
+impl std::fmt::Debug for WriteStrategyBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WriteStrategyBuilder")
+            .field("compressor", &self.compressor)
+            .field("row_block_size", &self.row_block_size)
+            .field("field_writers", &format!("<{} entries>", self.field_writers.len()))
+            .finish()
+    }
 }
 
 impl Default for WriteStrategyBuilder {
