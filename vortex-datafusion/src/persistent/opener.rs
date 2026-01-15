@@ -2,7 +2,8 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::ops::Range;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
+use std::sync::Weak;
 
 use arrow_schema::Schema;
 use datafusion_common::DataFusionError;
@@ -42,7 +43,8 @@ use vortex::metrics::Label;
 use vortex::metrics::MetricsRegistry;
 use vortex::scan::ScanBuilder;
 use vortex::session::VortexSession;
-use vortex_utils::aliases::dash_map::{DashMap, Entry};
+use vortex_utils::aliases::dash_map::DashMap;
+use vortex_utils::aliases::dash_map::Entry;
 
 use crate::VortexAccessPlan;
 use crate::convert::exprs::ExpressionConvertor;
@@ -88,7 +90,6 @@ pub(crate) struct VortexOpener {
     pub layout_readers: Arc<DashMap<Path, Weak<dyn LayoutReader>>>,
     /// Whether the query has output ordering specified
     pub has_output_ordering: bool,
-}
 
     pub expression_convertor: Arc<dyn ExpressionConvertor>,
     pub file_metadata_cache: Option<Arc<dyn FileMetadataCache>>,
@@ -98,7 +99,7 @@ pub(crate) struct VortexOpener {
 }
 
 impl FileOpener for VortexOpener {
-    fn open(&self, file_meta: FileMeta, file: PartitionedFile) -> DFResult<FileOpenFuture> {
+    fn open(&self, file: PartitionedFile) -> DFResult<FileOpenFuture> {
         let session = self.session.clone();
         let metrics_registry = self.metrics_registry.clone();
         let labels = vec![
@@ -157,7 +158,7 @@ impl FileOpener for VortexOpener {
             // - Partition column values (e.g., date=2024-01-01)
             // - File-level statistics (min/max values per column)
             let mut file_pruner = file_pruning_predicate
-                .map(|predicate| {
+                .filter(|p| {
                     // Only create pruner if we have dynamic expressions or file statistics
                     // to work with. Static predicates without stats won't benefit from pruning.
                     is_dynamic_physical_expr(p) || file.has_statistics()
@@ -268,13 +269,13 @@ impl FileOpener for VortexOpener {
             let projector = leftover_projection.make_projector(&stream_schema)?;
 
             // We share our layout readers with others partitions in the scan, so we can only need to read each layout in each file once.
-            let layout_reader = match layout_reader.entry(file_meta.object_meta.location.clone()) {
+            let layout_reader = match layout_reader.entry(file.object_meta.location.clone()) {
                 Entry::Occupied(mut occupied_entry) => {
                     if let Some(reader) = occupied_entry.get().upgrade() {
-                        log::trace!("reusing layout reader for {}", occupied_entry.key());
+                        tracing::trace!("reusing layout reader for {}", occupied_entry.key());
                         reader
                     } else {
-                        log::trace!("creating layout reader for {}", occupied_entry.key());
+                        tracing::trace!("creating layout reader for {}", occupied_entry.key());
                         let reader = vxf.layout_reader().map_err(|e| {
                             DataFusionError::Execution(format!(
                                 "Failed to create layout reader: {e}"
@@ -285,7 +286,7 @@ impl FileOpener for VortexOpener {
                     }
                 }
                 Entry::Vacant(vacant_entry) => {
-                    log::trace!("creating layout reader for {}", vacant_entry.key());
+                    tracing::trace!("creating layout reader for {}", vacant_entry.key());
                     let reader = vxf.layout_reader().map_err(|e| {
                         DataFusionError::Execution(format!("Failed to create layout reader: {e}"))
                     })?;
@@ -295,11 +296,18 @@ impl FileOpener for VortexOpener {
                 }
             };
 
-            let mut scan_builder = ScanBuilder::new(session, layout_reader);
-            if let Some(file_range) = file_meta.range {
+            let mut scan_builder = ScanBuilder::new(session.clone(), layout_reader);
+
+            if let Some(extensions) = file.extensions
+                && let Some(vortex_plan) = extensions.downcast_ref::<VortexAccessPlan>()
+            {
+                scan_builder = vortex_plan.apply_to_builder(scan_builder);
+            }
+
+            if let Some(file_range) = file.range {
                 scan_builder = apply_byte_range(
                     file_range,
-                    file_meta.object_meta.size,
+                    file.object_meta.size,
                     vxf.row_count(),
                     scan_builder,
                 );
@@ -307,10 +315,10 @@ impl FileOpener for VortexOpener {
 
             let filter = filter
                 .and_then(|f| {
-                    let exprs = split_conjunction(&f)
-                        .into_iter()
-                        .filter(|expr| can_be_pushed_down(expr, &predicate_file_schema))
-                        .collect::<Vec<_>>();
+                    // Verify that all filters we've accepted from DataFusion get pushed down.
+                    // This will only fail if the user has not configured a suitable
+                    // PhysicalExprAdapterFactory on the file source to handle rewriting the
+                    // expression to handle missing/reordered columns in the Vortex file.
 
                     let (pushed, unpushed): (Vec<PhysicalExprRef>, Vec<PhysicalExprRef>) =
                         split_conjunction(&f)
@@ -383,7 +391,7 @@ impl FileOpener for VortexOpener {
                 .map_err(move |e: VortexError| {
                     DataFusionError::External(Box::new(e.with_context(format!(
                         "Failed to read Vortex file: {}",
-                        file_meta.object_meta.location
+                        file.object_meta.location
                     ))))
                 })
                 .try_flatten()
@@ -397,13 +405,9 @@ impl FileOpener for VortexOpener {
                 .boxed();
 
             if let Some(file_pruner) = file_pruner {
-                Ok(Box::pin(EarlyStoppingStream::new(
-                    stream,
-                    file_pruner,
-                    Count::new(),
-                )))
+                Ok(PrunableStream::new(file_pruner, stream).boxed())
             } else {
-                Ok(Box::pin(stream))
+                Ok(stream)
             }
         }
         .in_current_span()
@@ -411,7 +415,7 @@ impl FileOpener for VortexOpener {
     }
 }
 
-/// If the file has a [`FileRange`](datafusion::datasource::listing::FileRange), we translate it into a row range in the file for the scan.
+/// If the file has a [`FileRange`], we translate it into a row range in the file for the scan.
 fn apply_byte_range(
     file_range: FileRange,
     total_size: u64,
@@ -443,6 +447,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::LazyLock;
 
+    use arrow_schema::Field;
     use arrow_schema::Fields;
     use arrow_schema::SchemaRef;
     use datafusion::arrow::array::DictionaryArray;
@@ -453,6 +458,7 @@ mod tests {
     use datafusion::arrow::datatypes::Schema;
     use datafusion::arrow::datatypes::UInt32Type;
     use datafusion::arrow::util::display::FormatOptions;
+    use datafusion::arrow::util::pretty::pretty_format_batches_with_options;
     use datafusion::common::record_batch;
     use datafusion::logical_expr::col;
     use datafusion::logical_expr::lit;
@@ -589,7 +595,7 @@ mod tests {
 
         // filter matches partition value
         let filter = col("part").eq(lit(1));
-        let filter = logical2physical(&filter, table_schema.as_ref());
+        let filter = logical2physical(&filter, table_schema.table_schema());
 
         let opener = make_opener(object_store.clone(), table_schema.clone(), Some(filter));
         let stream = opener.open(file.clone()).unwrap().await.unwrap();
@@ -598,11 +604,11 @@ mod tests {
         let num_batches = data.len();
         let num_rows = data.iter().map(|rb| rb.num_rows()).sum::<usize>();
 
-        assert_eq!((num_batches, num_rows), expected_result1);
+        assert_eq!((num_batches, num_rows), (1, 3));
 
         // filter doesn't matches partition value
         let filter = col("part").eq(lit(2));
-        let filter = logical2physical(&filter, table_schema.as_ref());
+        let filter = logical2physical(&filter, table_schema.table_schema());
 
         let opener = make_opener(object_store.clone(), table_schema.clone(), Some(filter));
         let stream = opener.open(file.clone()).unwrap().await.unwrap();
@@ -619,18 +625,29 @@ mod tests {
     #[tokio::test]
     async fn test_open_files_different_table_schema() -> anyhow::Result<()> {
         let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
-        let file1_path = "/path/file1.vortex";
-        let batch1 = record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3)])).unwrap();
-        let data_size1 = write_arrow_to_vortex(object_store.clone(), file1_path, batch1).await?;
-        let file1 = PartitionedFile::new(file1_path.to_string(), data_size1);
 
-        let file2_path = "/path/file2.vortex";
-        let batch2 = record_batch!(("a", Int16, vec![Some(-1), Some(-2), Some(-3)])).unwrap();
-        let data_size2 = write_arrow_to_vortex(object_store.clone(), file2_path, batch2).await?;
-        let file2 = PartitionedFile::new(file1_path.to_string(), data_size1);
+        let file1 = {
+            let file1_path = "/path/file1.vortex";
+            let batch1 = record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3)])).unwrap();
+            let data_size1 =
+                write_arrow_to_vortex(object_store.clone(), file1_path, batch1).await?;
+            PartitionedFile::new(file1_path.to_string(), data_size1)
+        };
+
+        let file2 = {
+            let file2_path = "/path/file2.vortex";
+            let batch2 = record_batch!(("a", Int16, vec![Some(-1), Some(-2), Some(-3)])).unwrap();
+            let data_size2 =
+                write_arrow_to_vortex(object_store.clone(), file2_path, batch2).await?;
+            PartitionedFile::new(file2_path.to_string(), data_size2)
+        };
 
         // Table schema has can accommodate both files
-        let table_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
+        let table_schema = TableSchema::from_file_schema(Arc::new(Schema::new(vec![Field::new(
+            "a",
+            DataType::Int32,
+            true,
+        )])));
 
         let make_opener = |filter| VortexOpener {
             partition: 1,
@@ -653,12 +670,10 @@ mod tests {
         };
 
         let filter = col("a").lt(lit(100_i32));
-        let filter = logical2physical(&filter, table_schema.as_ref());
+        let filter = logical2physical(&filter, table_schema.table_schema());
 
         let opener1 = make_opener(filter.clone());
-        let stream = opener1
-            .open(make_meta(file1_path, data_size1), file1)?
-            .await?;
+        let stream = opener1.open(file1)?.await?;
 
         let format_opts = FormatOptions::new().with_types_info(true);
 
@@ -675,9 +690,7 @@ mod tests {
         ");
 
         let opener2 = make_opener(filter.clone());
-        let stream = opener2
-            .open(make_meta(file2_path, data_size2), file2)?
-            .await?;
+        let stream = opener2.open(file2)?.await?;
 
         let data = stream.try_collect::<Vec<_>>().await?;
         assert_snapshot!(pretty_format_batches_with_options(&data, &format_opts)?.to_string(), @r"
@@ -793,7 +806,7 @@ mod tests {
         let data_size = write_arrow_to_vortex(object_store.clone(), file_path, batch).await?;
 
         // Table schema has an extra utf8 field.
-        let table_schema = Arc::new(Schema::new(vec![Field::new(
+        let table_schema = TableSchema::from_file_schema(Arc::new(Schema::new(vec![Field::new(
             "my_struct",
             DataType::Struct(Fields::from(vec![
                 Field::new(
@@ -809,25 +822,23 @@ mod tests {
                 Field::new("field3", DataType::Utf8, true),
             ])),
             true,
-        )]));
+        )])));
 
-        let opener = VortexOpener {
-            session: SESSION.clone(),
-            object_store: object_store.clone(),
-            projection: None,
-            filter: Some(logical2physical(
+        let opener = make_opener(
+            object_store.clone(),
+            table_schema.clone(),
+            // expression references my_struct column which has different fields in each
+            // field.
+            Some(logical2physical(
                 &col("my_struct").is_not_null(),
-                &table_schema,
+                table_schema.table_schema(),
             )),
         );
 
         // The opener should be able to open the file with a filter on the
         // struct column.
         let data = opener
-            .open(
-                make_meta(file_path, data_size),
-                PartitionedFile::new(file_path.to_string(), data_size),
-            )?
+            .open(PartitionedFile::new(file_path.to_string(), data_size))?
             .await?
             .try_collect::<Vec<_>>()
             .await?;
