@@ -134,7 +134,10 @@ impl GetExt for VortexFormatFactory {
 
 impl VortexFormatFactory {
     /// Creates a new instance with a default [`VortexSession`] and default options.
-    #[allow(clippy::new_without_default)] // FormatFactory defines `default` method, so having `Default` implementation is confusing.
+    #[expect(
+        clippy::new_without_default,
+        reason = "FormatFactory defines `default` method, so having `Default` implementation is confusing"
+    )]
     pub fn new() -> Self {
         Self {
             session: VortexSession::default(),
@@ -167,7 +170,7 @@ impl VortexFormatFactory {
 }
 
 impl FileFormatFactory for VortexFormatFactory {
-    #[allow(clippy::disallowed_types)]
+    #[expect(clippy::disallowed_types, reason = "required by trait signature")]
     fn create(
         &self,
         _state: &dyn Session,
@@ -613,5 +616,14 @@ mod tests {
 
         let format = VortexFormat::new_with_options(VortexSession::default(), opts);
         assert_eq!(format.options().footer_initial_read_size_bytes, 12345);
+    }
+
+    #[test]
+    fn format_plumbs_footer_initial_read_size() {
+        let mut opts = VortexOptions::default();
+        opts.set("footer_initial_read_size_bytes", "12345").unwrap();
+
+        let format = VortexFormat::new_with_options(VortexSession::default(), opts);
+        assert_eq!(format.file_cache.footer_initial_read_size_bytes(), 12345);
     }
 }
