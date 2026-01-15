@@ -2,28 +2,33 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::any::Any;
-use std::fmt::{Debug, Formatter};
+use std::fmt::Debug;
+use std::fmt::Formatter;
 use std::sync::Arc;
 
-use arrow_schema::{Schema, SchemaRef};
+use arrow_schema::Schema;
+use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion_catalog::Session;
+use datafusion_common::ColumnStatistics;
+use datafusion_common::DataFusionError;
+use datafusion_common::GetExt;
+use datafusion_common::Result as DFResult;
+use datafusion_common::Statistics;
 use datafusion_common::config::ConfigField;
 use datafusion_common::config_namespace;
 use datafusion_common::internal_datafusion_err;
 use datafusion_common::not_impl_err;
 use datafusion_common::parsers::CompressionTypeVariant;
 use datafusion_common::stats::Precision;
-use datafusion_common::{
-    ColumnStatistics, DataFusionError, GetExt, Result as DFResult, Statistics, config_namespace,
-    not_impl_err,
-};
 use datafusion_common_runtime::SpawnedTask;
 use datafusion_datasource::TableSchema;
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_compression_type::FileCompressionType;
-use datafusion_datasource::file_format::{FileFormat, FileFormatFactory};
-use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
+use datafusion_datasource::file_format::FileFormat;
+use datafusion_datasource::file_format::FileFormatFactory;
+use datafusion_datasource::file_scan_config::FileScanConfig;
+use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
 use datafusion_datasource::file_sink_config::FileSinkConfig;
 use datafusion_datasource::sink::DataSinkExec;
 use datafusion_datasource::source::DataSourceExec;
@@ -54,14 +59,14 @@ use vortex::io::object_store::ObjectStoreReadAt;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::scalar::Scalar;
 use vortex::session::VortexSession;
-use vortex::stats::{ArrayStats, Stat, StatsSet};
-use vortex::{VortexSessionDefault, stats};
 
 use super::cache::CachedVortexMetadata;
 use super::sink::VortexSink;
 use super::source::VortexSource;
 use crate::PrecisionExt as _;
 use crate::convert::TryToDataFusion;
+
+const DEFAULT_FOOTER_INITIAL_READ_SIZE_BYTES: usize = MAX_POSTSCRIPT_SIZE as usize + EOF_SIZE;
 
 /// Vortex implementation of a DataFusion [`FileFormat`].
 pub struct VortexFormat {
@@ -121,7 +126,10 @@ impl GetExt for VortexFormatFactory {
 
 impl VortexFormatFactory {
     /// Creates a new instance with a default [`VortexSession`] and default options.
-    #[allow(clippy::new_without_default)] // FormatFactory defines `default` method, so having `Default` implementation is confusing.
+    #[expect(
+        clippy::new_without_default,
+        reason = "FormatFactory defines `default` method, so having `Default` implementation is confusing"
+    )]
     pub fn new() -> Self {
         Self {
             session: VortexSession::default(),
@@ -154,7 +162,7 @@ impl VortexFormatFactory {
 }
 
 impl FileFormatFactory for VortexFormatFactory {
-    #[allow(clippy::disallowed_types)]
+    #[expect(clippy::disallowed_types, reason = "required by trait signature")]
     fn create(
         &self,
         _state: &dyn Session,
@@ -566,5 +574,14 @@ mod tests {
 
         let format = VortexFormat::new_with_options(VortexSession::default(), opts);
         assert_eq!(format.options().footer_initial_read_size_bytes, 12345);
+    }
+
+    #[test]
+    fn format_plumbs_footer_initial_read_size() {
+        let mut opts = VortexOptions::default();
+        opts.set("footer_initial_read_size_bytes", "12345").unwrap();
+
+        let format = VortexFormat::new_with_options(VortexSession::default(), opts);
+        assert_eq!(format.file_cache.footer_initial_read_size_bytes(), 12345);
     }
 }
