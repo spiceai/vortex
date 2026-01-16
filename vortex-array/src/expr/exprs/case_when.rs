@@ -33,7 +33,6 @@ use vortex_vector::Vector;
 use vortex_vector::VectorOps;
 
 use crate::ArrayRef;
-use crate::Executable;
 use crate::IntoArray;
 use crate::ToCanonical;
 use crate::VortexSessionExecute;
@@ -351,8 +350,8 @@ fn execute_zip(
     let false_vector = if_false.unwrap_into_vector(row_count);
 
     // Convert vectors to arrays for zip operation
-    let true_array = true_vector.into_array(output_dtype);
-    let false_array = false_vector.into_array(output_dtype);
+    let true_array: ArrayRef = true_vector.into_array(output_dtype);
+    let false_array: ArrayRef = false_vector.into_array(output_dtype);
 
     // Perform zip
     let result_array = zip(&true_array, &false_array, &mask)?;

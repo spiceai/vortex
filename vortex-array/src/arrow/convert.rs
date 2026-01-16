@@ -681,6 +681,7 @@ mod tests {
 
     use crate::ArrayRef;
     use crate::IntoArray;
+    use crate::VortexSessionExecute;
     use crate::arrays::DecimalVTable;
     use crate::arrays::FixedSizeListVTable;
     use crate::arrays::ListVTable;
@@ -1813,9 +1814,8 @@ mod tests {
 
         // Convert back to Arrow as a MapArray
         let map_dtype = arrow_map.data_type().clone();
-        let arrow_back = vortex_array
-            .execute_arrow(&map_dtype, &crate::LEGACY_SESSION)
-            .unwrap();
+        let mut ctx = crate::LEGACY_SESSION.create_execution_ctx();
+        let arrow_back = vortex_array.execute_arrow(&map_dtype, &mut ctx).unwrap();
         let map_back = arrow_back
             .as_any()
             .downcast_ref::<MapArray>()

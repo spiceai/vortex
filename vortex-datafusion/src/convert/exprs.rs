@@ -266,7 +266,7 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
             let r = projection_expr.expr.apply(|node| {
                 // We only pull column children of scalar functions that we can't push into the scan.
                 if let Some(scalar_fn_expr) = node.as_any().downcast_ref::<ScalarFunctionExpr>()
-                    && !can_scalar_fn_be_pushed_down(scalar_fn_expr)
+                    && !can_scalar_fn_be_pushed_down(scalar_fn_expr, input_schema)
                 {
                     scan_projection.extend(
                         collect_columns(node)
@@ -530,7 +530,7 @@ fn can_scalar_fn_be_pushed_down(scalar_fn: &ScalarFunctionExpr, schema: &Schema)
         && scalar_fn
             .args()
             .iter()
-            .all(|arg| can_be_pushed_down(arg, schema))
+            .all(|arg| can_be_pushed_down_impl(arg, schema))
 }
 
 fn is_dtype_incompatible(dt: &DataType) -> bool {

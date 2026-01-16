@@ -453,8 +453,7 @@ fn start_file_writer(
                 )
             })?;
 
-        let stream =
-            receiver.map(|rb| vortex::error::VortexResult::Ok(ArrayRef::from_arrow(rb, false)));
+        let stream = receiver.map(|rb| VortexResult::Ok(ArrayRef::from_arrow(rb, false)));
         let stream_adapter = ArrayStreamAdapter::new(dtype, stream);
 
         let summary = session

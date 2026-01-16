@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
+
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 
@@ -14,14 +16,16 @@ use pin_project_lite::pin_project;
 #[cfg(all(test, feature = "tokio"))]
 use tokio::sync::oneshot;
 use vortex_error::VortexExpect;
+use vortex_io::CoalesceConfig;
+use vortex_metrics::Counter;
+use vortex_metrics::Histogram;
 use vortex_metrics::VortexMetrics;
 
-use crate::file::read::CoalesceWindow;
-use crate::file::read::CoalescedRequest;
-use crate::file::read::IoRequest;
-use crate::file::read::ReadEvent;
-use crate::file::read::ReadRequest;
-use crate::file::read::RequestId;
+use crate::read::ReadRequest;
+use crate::read::RequestId;
+use crate::read::request::CoalescedRequest;
+use crate::read::request::IoRequest;
+use crate::segments::ReadEvent;
 
 pin_project! {
     /// A stream that performs coalescing and prioritization of I/O requests.
@@ -37,7 +41,7 @@ pin_project! {
         #[pin]
         events: S,
         inner_done: bool,
-        coalesce_window: Option<CoalesceWindow>,
+        coalesce_window: Option<CoalesceConfig>,
         state: State,
     }
 }
@@ -47,7 +51,7 @@ impl<S> IoRequestStream<S> {
     //  expanding the request by coalesce_distance, but stop if we hit max_read_size.
     pub(crate) fn new(
         events: S,
-        coalesce_window: Option<CoalesceWindow>,
+        coalesce_window: Option<CoalesceConfig>,
         metrics: VortexMetrics,
     ) -> Self
     where
@@ -117,7 +121,23 @@ struct State {
     requests_by_offset: BTreeSet<(u64, RequestId)>,
 
     // Metrics for tracking I/O request patterns
-    metrics: VortexMetrics,
+    metrics: StateMetrics,
+}
+
+struct StateMetrics {
+    individual_requests: Arc<Counter>,
+    coalesced_requests: Arc<Counter>,
+    num_requests_coalesced: Arc<Histogram>,
+}
+
+impl StateMetrics {
+    fn new(registry: VortexMetrics) -> Self {
+        Self {
+            individual_requests: registry.counter("io.requests.individual"),
+            coalesced_requests: registry.counter("io.requests.coalesced"),
+            num_requests_coalesced: registry.histogram("io.requests.coalesced.num_coalesced"),
+        }
+    }
 }
 
 impl State {
@@ -126,7 +146,7 @@ impl State {
             requests: BTreeMap::new(),
             polled_requests: BTreeMap::new(),
             requests_by_offset: BTreeSet::new(),
-            metrics,
+            metrics: StateMetrics::new(metrics),
         }
     }
 
@@ -157,19 +177,19 @@ impl State {
     }
 
     /// Get the next request, if any.
-    fn next(&mut self, coalesce_window: Option<&CoalesceWindow>) -> Option<IoRequest> {
+    fn next(&mut self, coalesce_window: Option<&CoalesceConfig>) -> Option<IoRequest> {
         match coalesce_window {
             None => self.next_uncoalesced().map(|request| {
-                self.metrics.counter("io.requests.individual").inc();
+                self.metrics.individual_requests.inc();
                 IoRequest::new_single(request)
             }),
             Some(window) => self.next_coalesced(window).map(|request| {
                 match request.requests.len() {
-                    1 => self.metrics.counter("io.requests.individual").inc(),
+                    1 => self.metrics.individual_requests.inc(),
                     num_requests => {
-                        self.metrics.counter("io.requests.coalesced").inc();
+                        self.metrics.coalesced_requests.inc();
                         self.metrics
-                            .histogram("io.requests.coalesced.num_coalesced")
+                            .num_requests_coalesced
                             .update(num_requests as i64);
                     }
                 };
@@ -191,7 +211,7 @@ impl State {
         None
     }
 
-    fn next_coalesced(&mut self, window: &CoalesceWindow) -> Option<CoalescedRequest> {
+    fn next_coalesced(&mut self, window: &CoalesceConfig) -> Option<CoalescedRequest> {
         // Find the next valid request in priority order
         let first_req = self.next_uncoalesced()?;
 
@@ -300,9 +320,7 @@ mod tests {
     use vortex_error::VortexResult;
 
     use super::*;
-    use crate::file::IoRequestInner;
-    use crate::file::ReadEvent;
-    use crate::file::ReadRequest;
+    use crate::read::request::IoRequestInner;
 
     fn create_request(
         id: usize,
@@ -324,7 +342,7 @@ mod tests {
 
     async fn collect_outputs(
         events: Vec<ReadEvent>,
-        coalesce_window: Option<CoalesceWindow>,
+        coalesce_window: Option<CoalesceConfig>,
     ) -> Vec<IoRequest> {
         let event_stream = stream::iter(events);
         let metrics = VortexMetrics::default();
@@ -385,7 +403,7 @@ mod tests {
 
         let outputs = collect_outputs(
             events,
-            Some(CoalesceWindow {
+            Some(CoalesceConfig {
                 distance: 0,
                 max_size: 1024,
             }),
@@ -416,7 +434,7 @@ mod tests {
         // Gap is 5, window is 6 - should coalesce
         let outputs = collect_outputs(
             events,
-            Some(CoalesceWindow {
+            Some(CoalesceConfig {
                 distance: 6,
                 max_size: 1024,
             }),
@@ -515,7 +533,7 @@ mod tests {
 
         let outputs = collect_outputs(
             events,
-            Some(CoalesceWindow {
+            Some(CoalesceConfig {
                 distance: 60,
                 max_size: 1024,
             }),
@@ -560,7 +578,7 @@ mod tests {
 
         let outputs = collect_outputs(
             events,
-            Some(CoalesceWindow {
+            Some(CoalesceConfig {
                 distance: 5,
                 max_size: 1024,
             }),
@@ -592,7 +610,7 @@ mod tests {
         let metrics = VortexMetrics::default();
         let io_stream = IoRequestStream::new(
             event_stream,
-            Some(CoalesceWindow {
+            Some(CoalesceConfig {
                 distance: 5,
                 max_size: 1024,
             }),
