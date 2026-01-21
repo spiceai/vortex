@@ -260,10 +260,12 @@ pub(crate) fn can_be_pushed_down(df_expr: &Arc<dyn PhysicalExpr>, schema: &Schem
         can_be_pushed_down(like.expr(), schema) && can_be_pushed_down(like.pattern(), schema)
     } else if let Some(lit) = expr.downcast_ref::<df_expr::Literal>() {
         supported_data_types(&lit.value().data_type())
-    } else if expr.downcast_ref::<df_expr::CastExpr>().is_some()
-        || expr.downcast_ref::<df_expr::CastColumnExpr>().is_some()
-    {
-        true
+    } else if let Some(cast_expr) = expr.downcast_ref::<df_expr::CastExpr>() {
+        // CastExpr child must be an expression type that convert() can handle
+        is_convertible_expr(cast_expr.expr())
+    } else if let Some(cast_col_expr) = expr.downcast_ref::<df_expr::CastColumnExpr>() {
+        // CastColumnExpr child must be an expression type that convert() can handle
+        is_convertible_expr(cast_col_expr.expr())
     } else if let Some(is_null) = expr.downcast_ref::<df_expr::IsNullExpr>() {
         can_be_pushed_down(is_null.arg(), schema)
     } else if let Some(is_not_null) = expr.downcast_ref::<df_expr::IsNotNullExpr>() {
@@ -272,11 +274,32 @@ pub(crate) fn can_be_pushed_down(df_expr: &Arc<dyn PhysicalExpr>, schema: &Schem
         can_be_pushed_down(in_list.expr(), schema)
             && in_list.list().iter().all(|e| can_be_pushed_down(e, schema))
     } else if let Some(scalar_fn) = expr.downcast_ref::<ScalarFunctionExpr>() {
-        can_scalar_fn_be_pushed_down(scalar_fn)
+        can_scalar_fn_be_pushed_down(scalar_fn, schema)
     } else {
         tracing::debug!(%df_expr, "DataFusion expression can't be pushed down");
         false
     }
+}
+
+/// Checks if an expression type is one that convert() can handle.
+/// This is less restrictive than can_be_pushed_down since it only checks
+/// expression types, not data type support.
+fn is_convertible_expr(df_expr: &Arc<dyn PhysicalExpr>) -> bool {
+    let expr = df_expr.as_any();
+    
+    // Expression types that convert() handles
+    expr.downcast_ref::<df_expr::BinaryExpr>().is_some()
+        || expr.downcast_ref::<df_expr::Column>().is_some()
+        || expr.downcast_ref::<df_expr::LikeExpr>().is_some()
+        || expr.downcast_ref::<df_expr::Literal>().is_some()
+        || expr.downcast_ref::<df_expr::CastExpr>().is_some_and(|e| is_convertible_expr(e.expr()))
+        || expr.downcast_ref::<df_expr::CastColumnExpr>().is_some_and(|e| is_convertible_expr(e.expr()))
+        || expr.downcast_ref::<df_expr::IsNullExpr>().is_some()
+        || expr.downcast_ref::<df_expr::IsNotNullExpr>().is_some()
+        || expr.downcast_ref::<df_expr::InListExpr>().is_some()
+        || expr.downcast_ref::<ScalarFunctionExpr>().is_some_and(|sf| {
+            ScalarFunctionExpr::try_downcast_func::<GetFieldFunc>(sf).is_some()
+        })
 }
 
 fn can_binary_be_pushed_down(binary: &df_expr::BinaryExpr, schema: &Schema) -> bool {
@@ -319,9 +342,11 @@ fn supported_data_types(dt: &DataType) -> bool {
     is_supported
 }
 
-/// Checks if a GetField scalar function can be pushed down.
-fn can_scalar_fn_be_pushed_down(scalar_fn: &ScalarFunctionExpr) -> bool {
+/// Checks if a scalar function can be pushed down.
+/// Currently only GetFieldFunc is supported, and its arguments must also be pushable.
+fn can_scalar_fn_be_pushed_down(scalar_fn: &ScalarFunctionExpr, schema: &Schema) -> bool {
     ScalarFunctionExpr::try_downcast_func::<GetFieldFunc>(scalar_fn).is_some()
+        && scalar_fn.args().iter().all(|arg| can_be_pushed_down(arg, schema))
 }
 
 #[cfg(test)]
