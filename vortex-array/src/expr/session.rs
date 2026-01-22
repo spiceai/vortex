@@ -8,6 +8,7 @@ use vortex_session::registry::Registry;
 use crate::expr::ExprVTable;
 use crate::expr::exprs::between::Between;
 use crate::expr::exprs::binary::Binary;
+use crate::expr::exprs::case_when::CaseWhen;
 use crate::expr::exprs::cast::Cast;
 use crate::expr::exprs::get_item::GetItem;
 use crate::expr::exprs::is_null::IsNull;
@@ -53,6 +54,7 @@ impl Default for ExprSession {
         expressions.register_many([
             ExprVTable::new_static(&Between),
             ExprVTable::new_static(&Binary),
+            ExprVTable::new_static(&CaseWhen),
             ExprVTable::new_static(&Cast),
             ExprVTable::new_static(&GetItem),
             ExprVTable::new_static(&IsNull),

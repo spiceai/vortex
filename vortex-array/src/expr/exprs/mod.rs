@@ -3,6 +3,7 @@
 
 pub(crate) mod between;
 pub(crate) mod binary;
+pub(crate) mod case_when;
 pub(crate) mod cast;
 pub(crate) mod dynamic;
 pub(crate) mod get_item;
@@ -20,6 +21,7 @@ pub(crate) mod select;
 
 pub use between::*;
 pub use binary::*;
+pub use case_when::*;
 pub use cast::*;
 pub use dynamic::*;
 pub use get_item::*;

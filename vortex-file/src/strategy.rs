@@ -35,13 +35,15 @@ pub struct WriteStrategyBuilder {
     field_writers: HashMap<FieldPath, Arc<dyn LayoutStrategy>>,
 }
 
-
 impl std::fmt::Debug for WriteStrategyBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WriteStrategyBuilder")
             .field("compressor", &self.compressor)
             .field("row_block_size", &self.row_block_size)
-            .field("field_writers", &format!("<{} entries>", self.field_writers.len()))
+            .field(
+                "field_writers",
+                &format!("<{} entries>", self.field_writers.len()),
+            )
             .finish()
     }
 }
