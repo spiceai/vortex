@@ -167,46 +167,86 @@ impl VTable for CaseWhen {
         expr: &Expression,
         scope: &ArrayRef,
     ) -> VortexResult<ArrayRef> {
+        use crate::compute::filter;
+        use vortex_buffer::BitBuffer;
+        use vortex_mask::Mask;
+
         let len = scope.len();
 
-        // Collect all (condition, then_value) pairs
-        let mut when_then_pairs = Vec::with_capacity(options.num_when_then_pairs as usize);
+        // Determine output dtype from first THEN expression
+        let output_dtype = expr.child(1).return_dtype(scope.dtype())?;
+        let else_idx = options.num_when_then_pairs as usize * 2;
+
+        // Track which rows have matched a condition (using BitBuffer for boolean ops)
+        let mut matched_bits = BitBuffer::new_unset(len);
+
+        // Start with null result - we'll fill in values as conditions match
+        let mut result: ArrayRef =
+            ConstantArray::new(Scalar::null(output_dtype.as_nullable()), len).into_array();
+
+        // Process when/then pairs in order (first match wins)
         for i in 0..options.num_when_then_pairs as usize {
+            // Evaluate condition
             let cond = expr.child(i * 2).evaluate(scope)?;
-            let then_val = expr.child(i * 2 + 1).evaluate(scope)?;
-            when_then_pairs.push((cond, then_val));
+            let cond_bool = cond.to_bool();
+            let cond_mask = cond_bool.to_mask_fill_null_false();
+            let cond_bits = cond_mask.to_bit_buffer();
+
+            // Compute which rows match THIS condition AND haven't matched a previous one
+            // effective_cond = cond AND NOT(already_matched)
+            let effective_bits = &cond_bits & &(!&matched_bits);
+            let effective_mask = Mask::from_buffer(effective_bits.clone());
+
+            // Short-circuit: skip THEN evaluation if no rows match this condition
+            if effective_mask.all_false() {
+                continue;
+            }
+
+            // Evaluate THEN expression
+            let then_val = if effective_mask.all_true() {
+                // All rows match - safe to evaluate on full scope
+                expr.child(i * 2 + 1).evaluate(scope)?
+            } else {
+                // Filter scope to only matching rows, evaluate, then scatter back
+                let filtered_scope = filter(scope, &effective_mask)?;
+                let filtered_result = expr.child(i * 2 + 1).evaluate(&filtered_scope)?;
+
+                // Scatter the filtered result back using builder
+                scatter_with_mask(&filtered_result, &effective_mask, &output_dtype, len)?
+            };
+
+            // Merge into result: use zip to overlay then_val where effective_mask is true
+            result = zip(&then_val, &result, &effective_mask)?;
+
+            // Update matched_bits
+            matched_bits = &matched_bits | &effective_bits;
+
+            // Short-circuit: if all rows have matched, we're done
+            if matched_bits.true_count() == len {
+                break;
+            }
         }
 
-        // Get the else value if present
-        let else_value = options
-            .has_else
-            .then(|| {
-                let else_idx = options.num_when_then_pairs as usize * 2;
-                expr.child(else_idx).evaluate(scope)
-            })
-            .transpose()?;
+        // Handle ELSE clause for unmatched rows
+        let unmatched_bits = !&matched_bits;
+        let unmatched_mask = Mask::from_buffer(unmatched_bits);
 
-        // Determine the output dtype from the first THEN expression
-        let output_dtype = when_then_pairs[0].1.dtype().clone();
+        if !unmatched_mask.all_false() {
+            let else_val = if options.has_else {
+                // Evaluate ELSE for unmatched rows
+                if unmatched_mask.all_true() {
+                    expr.child(else_idx).evaluate(scope)?
+                } else {
+                    let filtered_scope = filter(scope, &unmatched_mask)?;
+                    let filtered_else = expr.child(else_idx).evaluate(&filtered_scope)?;
+                    scatter_with_mask(&filtered_else, &unmatched_mask, &output_dtype, len)?
+                }
+            } else {
+                // No ELSE - unmatched rows stay null (already set in result)
+                return Ok(result);
+            };
 
-        // Create the result by starting from the else value or null, then layering conditions on top
-        // We process in reverse order so later conditions don't overwrite earlier ones
-        let mut result: ArrayRef = if let Some(else_val) = else_value {
-            else_val
-        } else {
-            // Create a null array of the output dtype
-            ConstantArray::new(Scalar::null(output_dtype.as_nullable()), len).into_array()
-        };
-
-        // Process when/then pairs in reverse order
-        for (cond, then_val) in when_then_pairs.into_iter().rev() {
-            // Convert condition to BoolArray and get a Mask from it
-            let cond_bool = cond.to_bool();
-            // Convert to mask, treating NULL values as false
-            let condition_mask = cond_bool.to_mask_fill_null_false();
-
-            // zip: selects from first array where mask is true, second where false
-            result = zip(&then_val, &result, &condition_mask)?;
+            result = zip(&else_val, &result, &unmatched_mask)?;
         }
 
         Ok(result)
@@ -386,6 +426,37 @@ pub fn case_when_no_else<I: IntoIterator<Item = Expression>>(children: I) -> Exp
     };
 
     CaseWhen.new_expr(options, children)
+}
+
+/// Scatter values from a filtered (shorter) array back to their original positions.
+/// The mask indicates which positions in the output should receive values from the source.
+/// Positions where mask is false will be null.
+fn scatter_with_mask(
+    source: &ArrayRef,
+    mask: &vortex_mask::Mask,
+    dtype: &DType,
+    output_len: usize,
+) -> VortexResult<ArrayRef> {
+    use crate::builders::builder_with_capacity;
+
+    let nullable_dtype = dtype.as_nullable();
+    let mut builder = builder_with_capacity(&nullable_dtype, output_len);
+    let mut source_idx = 0;
+
+    for i in 0..output_len {
+        if mask.value(i) {
+            // Copy value from source, casting to nullable if needed
+            let scalar = source.scalar_at(source_idx);
+            let nullable_scalar = scalar.cast(&nullable_dtype)?;
+            builder.append_scalar(&nullable_scalar)?;
+            source_idx += 1;
+        } else {
+            // Insert null
+            builder.append_null();
+        }
+    }
+
+    Ok(builder.finish())
 }
 
 #[cfg(test)]
@@ -1275,3 +1346,64 @@ mod tests {
         }
     }
 }
+
+    #[test]
+    fn test_evaluate_divide_by_zero_protected_by_case_when() {
+        // This test verifies that CASE WHEN properly short-circuits evaluation
+        // to avoid divide-by-zero errors.
+        // Pattern: CASE WHEN denominator > 0 THEN numerator/denominator ELSE NULL END
+        // With input where some denominators are 0, the division should NOT be evaluated
+        // for those rows.
+
+        use crate::arrays::StructArray;
+        use crate::expr::VTableExt;
+        use crate::expr::exprs::binary::Binary;
+        use crate::expr::exprs::operators::Operator;
+        use crate::expr::{get_item, gt, lit, root};
+        use vortex_buffer::buffer;
+        use vortex_dtype::PType;
+
+        // Create test data: numerator=[10, 20, 30], denominator=[2, 0, 5]
+        // Expected: CASE WHEN denominator > 0 THEN numerator/denominator ELSE NULL END
+        //         = [5, NULL, 6]
+        let test_array = StructArray::from_fields(&[
+            ("numerator", buffer![10i32, 20, 30].into_array()),
+            ("denominator", buffer![2i32, 0, 5].into_array()),
+        ])
+        .unwrap()
+        .into_array();
+
+        // Build: CASE WHEN $.denominator > 0 THEN $.numerator / $.denominator ELSE null END
+        let condition = gt(get_item("denominator", root()), lit(0i32));
+        let division = Binary
+            .try_new_expr(
+                Operator::Div,
+                [get_item("numerator", root()), get_item("denominator", root())],
+            )
+            .unwrap();
+        let null_dtype = DType::Primitive(PType::I32, Nullability::Nullable);
+        let null_val = lit(Scalar::null(null_dtype.clone()));
+
+        let expr = case_when([condition, division, null_val]);
+
+        // This should NOT panic with divide-by-zero
+        let result = expr.evaluate(&test_array).unwrap();
+
+        // Verify results
+        assert_eq!(result.len(), 3);
+
+        // Row 0: 10/2 = 5
+        assert_eq!(
+            result.scalar_at(0),
+            Scalar::from(5i32).cast(result.dtype()).unwrap()
+        );
+
+        // Row 1: denominator=0, so result is NULL (division was NOT evaluated)
+        assert_eq!(result.scalar_at(1), Scalar::null(result.dtype().clone()));
+
+        // Row 2: 30/5 = 6
+        assert_eq!(
+            result.scalar_at(2),
+            Scalar::from(6i32).cast(result.dtype()).unwrap()
+        );
+    }
