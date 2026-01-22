@@ -245,8 +245,11 @@ fn try_operator_from_df(value: &DFOperator) -> VortexResult<Operator> {
         DFOperator::Plus => Ok(Operator::Add),
         DFOperator::Minus => Ok(Operator::Sub),
         DFOperator::Multiply => Ok(Operator::Mul),
-        DFOperator::Divide => Ok(Operator::Div),
-        DFOperator::IsDistinctFrom
+        // Division is not pushed down because Vortex's CaseWhen expression evaluates
+        // all branches before checking conditions, causing divide-by-zero errors when
+        // division is protected by a CASE WHEN guard (e.g. CASE WHEN x > 0 THEN y/x END)
+        DFOperator::Divide
+        | DFOperator::IsDistinctFrom
         | DFOperator::IsNotDistinctFrom
         | DFOperator::RegexMatch
         | DFOperator::RegexIMatch
@@ -497,7 +500,6 @@ mod tests {
     #[case::plus(DFOperator::Plus, Operator::Add)]
     #[case::plus(DFOperator::Minus, Operator::Sub)]
     #[case::plus(DFOperator::Multiply, Operator::Mul)]
-    #[case::plus(DFOperator::Divide, Operator::Div)]
     fn test_operator_conversion_supported(
         #[case] df_op: DFOperator,
         #[case] expected_vortex_op: Operator,
@@ -507,6 +509,7 @@ mod tests {
     }
 
     #[rstest]
+    #[case::divide(DFOperator::Divide)]
     #[case::modulo(DFOperator::Modulo)]
     #[case::bitwise_and(DFOperator::BitwiseAnd)]
     #[case::regex_match(DFOperator::RegexMatch)]
