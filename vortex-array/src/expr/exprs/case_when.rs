@@ -220,8 +220,7 @@ impl VTable for CaseWhen {
         let all_scalars = datums.iter().all(|d| matches!(d, Datum::Scalar(_)));
 
         // Collect when/then pairs from datums
-        let mut when_then_pairs =
-            Vec::with_capacity(options.num_when_then_pairs as usize);
+        let mut when_then_pairs = Vec::with_capacity(options.num_when_then_pairs as usize);
         for i in 0..options.num_when_then_pairs as usize {
             let cond = datums[i * 2].clone();
             let then_val = datums[i * 2 + 1].clone();
@@ -229,12 +228,10 @@ impl VTable for CaseWhen {
         }
 
         // Get the else value if present
-        let else_value = if options.has_else {
+        let else_value = options.has_else.then(|| {
             let else_idx = options.num_when_then_pairs as usize * 2;
-            Some(datums.remove(else_idx))
-        } else {
-            None
-        };
+            datums.remove(else_idx)
+        });
 
         // Determine output dtype from return_dtype
         let output_dtype = args.return_dtype;
@@ -243,9 +240,9 @@ impl VTable for CaseWhen {
         let mut result: Datum = if let Some(else_val) = else_value {
             else_val
         } else {
-            // Create a null vector for the else case
-            use vortex_vector::null::NullVector;
-            Datum::Vector(NullVector::new(row_count).into())
+            // Create a null scalar of the output dtype, which will be repeated as needed
+            use vortex_vector::Scalar as VScalar;
+            Datum::Scalar(VScalar::null(&output_dtype))
         };
 
         // Process when/then pairs in reverse order
@@ -255,12 +252,11 @@ impl VTable for CaseWhen {
         }
 
         // If all inputs were scalars and result is still length 1, return as scalar
-        if all_scalars {
-            if let Datum::Vector(v) = &result {
-                if v.len() == 1 {
-                    return Ok(Datum::Scalar(v.scalar_at(0)));
-                }
-            }
+        if all_scalars
+            && let Datum::Vector(v) = &result
+            && v.len() == 1
+        {
+            return Ok(Datum::Scalar(v.scalar_at(0)));
         }
 
         Ok(result)
@@ -279,9 +275,9 @@ fn execute_zip(
     use vortex_mask::Mask;
     use vortex_vector::BoolDatum;
 
-    use crate::vectors::VectorIntoArray;
-    use crate::VectorExecutor;
     use crate::LEGACY_SESSION;
+    use crate::VectorExecutor;
+    use crate::vectors::VectorIntoArray;
 
     let cond_bool = condition.into_bool();
 
@@ -821,5 +817,461 @@ mod tests {
         // Value 4 matches -> 40
         // Value 5 matches -> 50
         assert_eq!(prim.as_slice::<i32>(), &[0, 0, 30, 40, 50]);
+    }
+
+    #[test]
+    fn test_evaluate_with_all_null_condition() {
+        // Test: CASE WHEN all_nulls THEN 100 ELSE 0 END
+        // All null conditions should be treated as false
+        let test_array = StructArray::from_fields(&[(
+            "cond",
+            BoolArray::from_iter([None, None, None]).into_array(),
+        )])
+        .unwrap()
+        .into_array();
+
+        let expr = case_when([get_item("cond", root()), lit(100i32), lit(0i32)]);
+
+        let result = expr.evaluate(&test_array).unwrap().to_primitive();
+        // All null -> treated as false -> else value
+        assert_eq!(result.as_slice::<i32>(), &[0, 0, 0]);
+    }
+
+    // ==================== Execute Tests ====================
+
+    #[test]
+    fn test_execute_with_scalar_inputs() {
+        use vortex_dtype::PTypeDowncast;
+        use vortex_vector::Scalar as VScalar;
+        use vortex_vector::bool::BoolScalar;
+        use vortex_vector::primitive::PScalar;
+
+        // CASE WHEN true THEN 100 ELSE 0 END with all scalars
+        let options = CaseWhenOptions {
+            num_when_then_pairs: 1,
+            has_else: true,
+        };
+
+        let cond_dtype = DType::Bool(Nullability::NonNullable);
+        let then_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+        let else_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+        let return_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+
+        let datums = vec![
+            Datum::Scalar(VScalar::from(BoolScalar::new(Some(true)))),
+            Datum::Scalar(VScalar::from(PScalar::new(Some(100i32)))),
+            Datum::Scalar(VScalar::from(PScalar::new(Some(0i32)))),
+        ];
+
+        let args = ExecutionArgs {
+            datums,
+            dtypes: vec![cond_dtype, then_dtype, else_dtype],
+            row_count: 1,
+            return_dtype,
+        };
+
+        let result = CaseWhen.execute(&options, args).unwrap();
+
+        // Should return scalar since all inputs were scalars
+        match result {
+            Datum::Scalar(s) => {
+                let prim = s.into_primitive().into_i32();
+                assert_eq!(prim.value(), Some(100));
+            }
+            Datum::Vector(v) => {
+                // Also acceptable: a length-1 vector
+                assert_eq!(v.len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn test_execute_with_scalar_false_condition() {
+        use vortex_dtype::PTypeDowncast;
+        use vortex_vector::Scalar as VScalar;
+        use vortex_vector::bool::BoolScalar;
+        use vortex_vector::primitive::PScalar;
+
+        // CASE WHEN false THEN 100 ELSE 42 END
+        let options = CaseWhenOptions {
+            num_when_then_pairs: 1,
+            has_else: true,
+        };
+
+        let cond_dtype = DType::Bool(Nullability::NonNullable);
+        let then_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+        let else_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+        let return_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+
+        let datums = vec![
+            Datum::Scalar(VScalar::from(BoolScalar::new(Some(false)))),
+            Datum::Scalar(VScalar::from(PScalar::new(Some(100i32)))),
+            Datum::Scalar(VScalar::from(PScalar::new(Some(42i32)))),
+        ];
+
+        let args = ExecutionArgs {
+            datums,
+            dtypes: vec![cond_dtype, then_dtype, else_dtype],
+            row_count: 1,
+            return_dtype,
+        };
+
+        let result = CaseWhen.execute(&options, args).unwrap();
+
+        match result {
+            Datum::Scalar(s) => {
+                let prim = s.into_primitive().into_i32();
+                assert_eq!(prim.value(), Some(42));
+            }
+            Datum::Vector(v) => {
+                assert_eq!(v.len(), 1);
+                let prim = v.into_primitive().into_i32();
+                assert_eq!(prim.get(0).copied(), Some(42));
+            }
+        }
+    }
+
+    #[test]
+    fn test_execute_with_vector_condition() {
+        use vortex_dtype::PTypeDowncast;
+        use vortex_vector::Scalar as VScalar;
+        use vortex_vector::bool::BoolVector;
+        use vortex_vector::primitive::PScalar;
+
+        // CASE WHEN [true, false, true] THEN 100 ELSE 0 END
+        let options = CaseWhenOptions {
+            num_when_then_pairs: 1,
+            has_else: true,
+        };
+
+        let cond_dtype = DType::Bool(Nullability::NonNullable);
+        let then_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+        let else_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+        let return_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+
+        let cond_vector = BoolVector::from_iter([true, false, true]);
+        let datums = vec![
+            Datum::Vector(cond_vector.into()),
+            Datum::Scalar(VScalar::from(PScalar::new(Some(100i32)))),
+            Datum::Scalar(VScalar::from(PScalar::new(Some(0i32)))),
+        ];
+
+        let args = ExecutionArgs {
+            datums,
+            dtypes: vec![cond_dtype, then_dtype, else_dtype],
+            row_count: 3,
+            return_dtype,
+        };
+
+        let result = CaseWhen.execute(&options, args).unwrap();
+
+        match result {
+            Datum::Vector(v) => {
+                let prim = v.into_primitive().into_i32();
+                assert_eq!(prim.get(0).copied(), Some(100));
+                assert_eq!(prim.get(1).copied(), Some(0));
+                assert_eq!(prim.get(2).copied(), Some(100));
+            }
+            Datum::Scalar(_) => panic!("Expected vector result"),
+        }
+    }
+
+    #[test]
+    fn test_execute_with_nullable_condition() {
+        use vortex_dtype::PTypeDowncast;
+        use vortex_mask::Mask;
+        use vortex_vector::Scalar as VScalar;
+        use vortex_vector::bool::BoolVector;
+        use vortex_vector::primitive::PScalar;
+
+        // CASE WHEN [true, NULL, false, NULL] THEN 100 ELSE 0 END
+        // NULL should be treated as false
+        let options = CaseWhenOptions {
+            num_when_then_pairs: 1,
+            has_else: true,
+        };
+
+        let cond_dtype = DType::Bool(Nullability::Nullable);
+        let then_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+        let else_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+        let return_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+
+        let bits = vortex_buffer::BitBuffer::from_iter([true, true, false, false]);
+        let validity = Mask::from_iter([true, false, true, false]); // positions 1, 3 are NULL
+        let cond_vector = BoolVector::new(bits, validity);
+
+        let datums = vec![
+            Datum::Vector(cond_vector.into()),
+            Datum::Scalar(VScalar::from(PScalar::new(Some(100i32)))),
+            Datum::Scalar(VScalar::from(PScalar::new(Some(0i32)))),
+        ];
+
+        let args = ExecutionArgs {
+            datums,
+            dtypes: vec![cond_dtype, then_dtype, else_dtype],
+            row_count: 4,
+            return_dtype,
+        };
+
+        let result = CaseWhen.execute(&options, args).unwrap();
+
+        match result {
+            Datum::Vector(v) => {
+                let prim = v.into_primitive().into_i32();
+                assert_eq!(prim.get(0).copied(), Some(100)); // true -> 100
+                assert_eq!(prim.get(1).copied(), Some(0)); // NULL -> 0 (treated as false)
+                assert_eq!(prim.get(2).copied(), Some(0)); // false -> 0
+                assert_eq!(prim.get(3).copied(), Some(0)); // NULL -> 0 (treated as false)
+            }
+            Datum::Scalar(_) => panic!("Expected vector result"),
+        }
+    }
+
+    #[test]
+    fn test_execute_without_else() {
+        use vortex_dtype::PTypeDowncast;
+        use vortex_vector::Scalar as VScalar;
+        use vortex_vector::bool::BoolVector;
+        use vortex_vector::primitive::PScalar;
+
+        // CASE WHEN [true, false, true] THEN 100 END (no else)
+        let options = CaseWhenOptions {
+            num_when_then_pairs: 1,
+            has_else: false,
+        };
+
+        let cond_dtype = DType::Bool(Nullability::NonNullable);
+        let then_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+        let return_dtype = DType::Primitive(PType::I32, Nullability::Nullable);
+
+        let cond_vector = BoolVector::from_iter([true, false, true]);
+        let datums = vec![
+            Datum::Vector(cond_vector.into()),
+            Datum::Scalar(VScalar::from(PScalar::new(Some(100i32)))),
+        ];
+
+        let args = ExecutionArgs {
+            datums,
+            dtypes: vec![cond_dtype, then_dtype],
+            row_count: 3,
+            return_dtype,
+        };
+
+        let result = CaseWhen.execute(&options, args).unwrap();
+
+        match result {
+            Datum::Vector(v) => {
+                let prim = v.into_primitive().into_i32();
+                assert_eq!(prim.get(0).copied(), Some(100)); // true -> 100
+                assert_eq!(prim.get(1), None); // false -> NULL
+                assert_eq!(prim.get(2).copied(), Some(100)); // true -> 100
+            }
+            Datum::Scalar(_) => panic!("Expected vector result"),
+        }
+    }
+
+    #[test]
+    fn test_execute_multiple_conditions() {
+        use vortex_dtype::PTypeDowncast;
+        use vortex_vector::Scalar as VScalar;
+        use vortex_vector::bool::BoolVector;
+        use vortex_vector::primitive::PScalar;
+
+        // CASE WHEN [true, false, false] THEN 10
+        //      WHEN [false, true, false] THEN 20
+        //      ELSE 0 END
+        // Expected: [10, 20, 0]
+        let options = CaseWhenOptions {
+            num_when_then_pairs: 2,
+            has_else: true,
+        };
+
+        let cond_dtype = DType::Bool(Nullability::NonNullable);
+        let then_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+        let return_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+
+        let cond1 = BoolVector::from_iter([true, false, false]);
+        let cond2 = BoolVector::from_iter([false, true, false]);
+
+        let datums = vec![
+            Datum::Vector(cond1.into()),
+            Datum::Scalar(VScalar::from(PScalar::new(Some(10i32)))),
+            Datum::Vector(cond2.into()),
+            Datum::Scalar(VScalar::from(PScalar::new(Some(20i32)))),
+            Datum::Scalar(VScalar::from(PScalar::new(Some(0i32)))),
+        ];
+
+        let args = ExecutionArgs {
+            datums,
+            dtypes: vec![
+                cond_dtype.clone(),
+                then_dtype.clone(),
+                cond_dtype,
+                then_dtype.clone(),
+                then_dtype,
+            ],
+            row_count: 3,
+            return_dtype,
+        };
+
+        let result = CaseWhen.execute(&options, args).unwrap();
+
+        match result {
+            Datum::Vector(v) => {
+                let prim = v.into_primitive().into_i32();
+                assert_eq!(prim.get(0).copied(), Some(10));
+                assert_eq!(prim.get(1).copied(), Some(20));
+                assert_eq!(prim.get(2).copied(), Some(0));
+            }
+            Datum::Scalar(_) => panic!("Expected vector result"),
+        }
+    }
+
+    #[test]
+    fn test_execute_all_true_short_circuit() {
+        use vortex_dtype::PTypeDowncast;
+        use vortex_vector::Scalar as VScalar;
+        use vortex_vector::bool::BoolVector;
+        use vortex_vector::primitive::PScalar;
+
+        // CASE WHEN [true, true, true] THEN 100 ELSE 0 END
+        // Should short-circuit and return the then value
+        let options = CaseWhenOptions {
+            num_when_then_pairs: 1,
+            has_else: true,
+        };
+
+        let cond_dtype = DType::Bool(Nullability::NonNullable);
+        let then_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+        let else_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+        let return_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+
+        let cond_vector = BoolVector::from_iter([true, true, true]);
+        let datums = vec![
+            Datum::Vector(cond_vector.into()),
+            Datum::Scalar(VScalar::from(PScalar::new(Some(100i32)))),
+            Datum::Scalar(VScalar::from(PScalar::new(Some(0i32)))),
+        ];
+
+        let args = ExecutionArgs {
+            datums,
+            dtypes: vec![cond_dtype, then_dtype, else_dtype],
+            row_count: 3,
+            return_dtype,
+        };
+
+        let result = CaseWhen.execute(&options, args).unwrap();
+
+        // Could be scalar (from short-circuit) or vector
+        match result {
+            Datum::Vector(v) => {
+                let prim = v.into_primitive().into_i32();
+                assert_eq!(prim.get(0).copied(), Some(100));
+                assert_eq!(prim.get(1).copied(), Some(100));
+                assert_eq!(prim.get(2).copied(), Some(100));
+            }
+            Datum::Scalar(s) => {
+                let prim = s.into_primitive().into_i32();
+                assert_eq!(prim.value(), Some(100));
+            }
+        }
+    }
+
+    #[test]
+    fn test_execute_all_false_short_circuit() {
+        use vortex_dtype::PTypeDowncast;
+        use vortex_vector::Scalar as VScalar;
+        use vortex_vector::bool::BoolVector;
+        use vortex_vector::primitive::PScalar;
+
+        // CASE WHEN [false, false, false] THEN 100 ELSE 42 END
+        // Should short-circuit and return the else value
+        let options = CaseWhenOptions {
+            num_when_then_pairs: 1,
+            has_else: true,
+        };
+
+        let cond_dtype = DType::Bool(Nullability::NonNullable);
+        let then_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+        let else_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+        let return_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+
+        let cond_vector = BoolVector::from_iter([false, false, false]);
+        let datums = vec![
+            Datum::Vector(cond_vector.into()),
+            Datum::Scalar(VScalar::from(PScalar::new(Some(100i32)))),
+            Datum::Scalar(VScalar::from(PScalar::new(Some(42i32)))),
+        ];
+
+        let args = ExecutionArgs {
+            datums,
+            dtypes: vec![cond_dtype, then_dtype, else_dtype],
+            row_count: 3,
+            return_dtype,
+        };
+
+        let result = CaseWhen.execute(&options, args).unwrap();
+
+        // Could be scalar (from short-circuit) or vector
+        match result {
+            Datum::Vector(v) => {
+                let prim = v.into_primitive().into_i32();
+                assert_eq!(prim.get(0).copied(), Some(42));
+                assert_eq!(prim.get(1).copied(), Some(42));
+                assert_eq!(prim.get(2).copied(), Some(42));
+            }
+            Datum::Scalar(s) => {
+                let prim = s.into_primitive().into_i32();
+                assert_eq!(prim.value(), Some(42));
+            }
+        }
+    }
+
+    #[test]
+    fn test_execute_with_null_scalar_condition() {
+        use vortex_dtype::PTypeDowncast;
+        use vortex_vector::Scalar as VScalar;
+        use vortex_vector::bool::BoolScalar;
+        use vortex_vector::primitive::PScalar;
+
+        // CASE WHEN NULL THEN 100 ELSE 42 END
+        // NULL condition should be treated as false
+        let options = CaseWhenOptions {
+            num_when_then_pairs: 1,
+            has_else: true,
+        };
+
+        let cond_dtype = DType::Bool(Nullability::Nullable);
+        let then_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+        let else_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+        let return_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+
+        let null_bool = BoolScalar::null();
+        let datums = vec![
+            Datum::Scalar(VScalar::from(null_bool)),
+            Datum::Scalar(VScalar::from(PScalar::new(Some(100i32)))),
+            Datum::Scalar(VScalar::from(PScalar::new(Some(42i32)))),
+        ];
+
+        let args = ExecutionArgs {
+            datums,
+            dtypes: vec![cond_dtype, then_dtype, else_dtype],
+            row_count: 1,
+            return_dtype,
+        };
+
+        let result = CaseWhen.execute(&options, args).unwrap();
+
+        // NULL condition -> treated as false -> else value
+        match result {
+            Datum::Scalar(s) => {
+                let prim = s.into_primitive().into_i32();
+                assert_eq!(prim.value(), Some(42));
+            }
+            Datum::Vector(v) => {
+                let prim = v.into_primitive().into_i32();
+                assert_eq!(prim.get(0).copied(), Some(42));
+            }
+        }
     }
 }
