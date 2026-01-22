@@ -93,7 +93,7 @@ fn cast_date_values_to_timestamp(
 
     let input = values.as_slice::<i64>();
     let mut output = BufferMut::with_capacity(input.len());
-    match values.validity_mask().bit_buffer() {
+    match values.validity_mask()?.bit_buffer() {
         AllOr::All => {
             for &value in input {
                 // SAFETY: output has sufficient capacity for all pushed values.
