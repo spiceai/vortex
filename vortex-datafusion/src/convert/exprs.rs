@@ -178,6 +178,41 @@ impl DefaultExpressionConvertor {
 
         Ok(else_expr)
     }
+
+    /// Attempts to convert a DataFusion CaseExpr to a Vortex expression.
+    fn try_convert_case_expr(&self, case_expr: &df_expr::CaseExpr) -> VortexResult<Expression> {
+        // DataFusion CaseExpr has:
+        // - expr(): Optional base expression (for "CASE expr WHEN ..." form)
+        // - when_then_expr(): Vec of (when, then) pairs
+        // - else_expr(): Optional else expression
+
+        // We don't support the "CASE expr WHEN value1 THEN result1" form yet
+        if case_expr.expr().is_some() {
+            vortex_bail!(
+                "CASE expr WHEN form is not yet supported, only searched CASE is supported"
+            );
+        }
+
+        let when_then_pairs = case_expr.when_then_expr();
+        if when_then_pairs.is_empty() {
+            vortex_bail!("CASE expression must have at least one WHEN clause");
+        }
+
+        // Convert all when/then pairs
+        let mut children = Vec::with_capacity(when_then_pairs.len() * 2 + 1);
+        for (when_expr, then_expr) in when_then_pairs {
+            children.push(self.convert(when_expr.as_ref())?);
+            children.push(self.convert(then_expr.as_ref())?);
+        }
+
+        // Handle the optional else clause
+        if let Some(else_expr) = case_expr.else_expr() {
+            children.push(self.convert(else_expr.as_ref())?);
+            Ok(case_when(children))
+        } else {
+            Ok(case_when_no_else(children))
+        }
+    }
 }
 
 impl ExpressionConvertor for DefaultExpressionConvertor {
@@ -412,10 +447,12 @@ fn can_be_pushed_down_impl(df_expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> 
             && can_be_pushed_down_impl(like.pattern(), schema)
     } else if let Some(lit) = expr.downcast_ref::<df_expr::Literal>() {
         supported_data_types(&lit.value().data_type())
-    } else if expr.downcast_ref::<df_expr::CastExpr>().is_some()
-        || expr.downcast_ref::<df_expr::CastColumnExpr>().is_some()
-    {
-        true
+    } else if let Some(cast_expr) = expr.downcast_ref::<df_expr::CastExpr>() {
+        // CastExpr child must be an expression type that convert() can handle
+        is_convertible_expr(cast_expr.expr())
+    } else if let Some(cast_col_expr) = expr.downcast_ref::<df_expr::CastColumnExpr>() {
+        // CastColumnExpr child must be an expression type that convert() can handle
+        is_convertible_expr(cast_col_expr.expr())
     } else if let Some(is_null) = expr.downcast_ref::<df_expr::IsNullExpr>() {
         can_be_pushed_down_impl(is_null.arg(), schema)
     } else if let Some(is_not_null) = expr.downcast_ref::<df_expr::IsNotNullExpr>() {
@@ -442,6 +479,31 @@ fn can_be_pushed_down_impl(df_expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> 
     }
 }
 
+/// Checks if an expression type is one that convert() can handle.
+/// This is less restrictive than can_be_pushed_down since it only checks
+/// expression types, not data type support.
+fn is_convertible_expr(df_expr: &Arc<dyn PhysicalExpr>) -> bool {
+    let expr = df_expr.as_any();
+
+    // Expression types that convert() handles
+    expr.downcast_ref::<df_expr::BinaryExpr>().is_some()
+        || expr.downcast_ref::<df_expr::Column>().is_some()
+        || expr.downcast_ref::<df_expr::LikeExpr>().is_some()
+        || expr.downcast_ref::<df_expr::Literal>().is_some()
+        || expr
+            .downcast_ref::<df_expr::CastExpr>()
+            .is_some_and(|e| is_convertible_expr(e.expr()))
+        || expr
+            .downcast_ref::<df_expr::CastColumnExpr>()
+            .is_some_and(|e| is_convertible_expr(e.expr()))
+        || expr.downcast_ref::<df_expr::IsNullExpr>().is_some()
+        || expr.downcast_ref::<df_expr::IsNotNullExpr>().is_some()
+        || expr.downcast_ref::<df_expr::InListExpr>().is_some()
+        || expr
+            .downcast_ref::<ScalarFunctionExpr>()
+            .is_some_and(|sf| ScalarFunctionExpr::try_downcast_func::<GetFieldFunc>(sf).is_some())
+}
+
 fn can_binary_be_pushed_down(binary: &df_expr::BinaryExpr, schema: &Schema) -> bool {
     let is_op_supported = try_operator_from_df(binary.op()).is_ok();
     is_op_supported
@@ -463,6 +525,30 @@ fn can_case_be_pushed_down(case_expr: &df_expr::CaseExpr, schema: &Schema) -> bo
         && case_expr
             .else_expr()
             .is_some_and(|else_expr| can_be_pushed_down_impl(else_expr, schema))
+}
+
+fn can_case_be_pushed_down(case_expr: &df_expr::CaseExpr, schema: &Schema) -> bool {
+    // We only support the "searched CASE" form (CASE WHEN cond THEN result ...)
+    // not the "simple CASE" form (CASE expr WHEN value THEN result ...)
+    if case_expr.expr().is_some() {
+        return false;
+    }
+
+    // Check all when/then pairs
+    for (when_expr, then_expr) in case_expr.when_then_expr() {
+        if !can_be_pushed_down(when_expr, schema) || !can_be_pushed_down(then_expr, schema) {
+            return false;
+        }
+    }
+
+    // Check the optional else clause
+    if let Some(else_expr) = case_expr.else_expr()
+        && !can_be_pushed_down(else_expr, schema)
+    {
+        return false;
+    }
+
+    true
 }
 
 fn supported_data_types(dt: &DataType) -> bool {
@@ -498,9 +584,14 @@ fn supported_data_types(dt: &DataType) -> bool {
     is_supported
 }
 
-/// Checks if a GetField scalar function can be pushed down.
-fn can_scalar_fn_be_pushed_down(scalar_fn: &ScalarFunctionExpr) -> bool {
+/// Checks if a scalar function can be pushed down.
+/// Currently only GetFieldFunc is supported, and its arguments must also be pushable.
+fn can_scalar_fn_be_pushed_down(scalar_fn: &ScalarFunctionExpr, schema: &Schema) -> bool {
     ScalarFunctionExpr::try_downcast_func::<GetFieldFunc>(scalar_fn).is_some()
+        && scalar_fn
+            .args()
+            .iter()
+            .all(|arg| can_be_pushed_down(arg, schema))
 }
 
 // TODO(adam): Replace with `DataType::is_decimal` once its released.
