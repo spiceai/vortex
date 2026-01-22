@@ -23,14 +23,18 @@ use std::sync::Arc;
 
 use prost::Message;
 use vortex_dtype::DType;
-use vortex_error::{VortexResult, vortex_bail};
+use vortex_dtype::Nullability;
+use vortex_error::VortexResult;
+use vortex_error::vortex_bail;
 use vortex_proto::expr as pb;
 use vortex_scalar::Scalar;
 use vortex_vector::Datum;
+use vortex_vector::VectorOps;
 
 use crate::ArrayRef;
 use crate::IntoArray;
 use crate::ToCanonical;
+use crate::arrays::BoolArray;
 use crate::arrays::ConstantArray;
 use crate::compute::zip;
 use crate::expr::Arity;
@@ -209,12 +213,115 @@ impl VTable for CaseWhen {
     }
 
     fn execute(&self, options: &Self::Options, args: ExecutionArgs) -> VortexResult<Datum> {
-        // For now, delegate to evaluate by converting datums to arrays
-        // This is a simplified implementation
-        _ = options;
-        drop(args);
-        vortex_bail!("CaseWhen execute() not yet implemented for Datum-based execution");
+        let row_count = args.row_count;
+        let mut datums = args.datums;
+
+        // Check if all inputs are scalars (for returning scalar result)
+        let all_scalars = datums.iter().all(|d| matches!(d, Datum::Scalar(_)));
+
+        // Collect when/then pairs from datums
+        let mut when_then_pairs =
+            Vec::with_capacity(options.num_when_then_pairs as usize);
+        for i in 0..options.num_when_then_pairs as usize {
+            let cond = datums[i * 2].clone();
+            let then_val = datums[i * 2 + 1].clone();
+            when_then_pairs.push((cond, then_val));
+        }
+
+        // Get the else value if present
+        let else_value = if options.has_else {
+            let else_idx = options.num_when_then_pairs as usize * 2;
+            Some(datums.remove(else_idx))
+        } else {
+            None
+        };
+
+        // Determine output dtype from return_dtype
+        let output_dtype = args.return_dtype;
+
+        // Create the result by starting from the else value or null
+        let mut result: Datum = if let Some(else_val) = else_value {
+            else_val
+        } else {
+            // Create a null vector for the else case
+            use vortex_vector::null::NullVector;
+            Datum::Vector(NullVector::new(row_count).into())
+        };
+
+        // Process when/then pairs in reverse order
+        // For each (condition, then_value), we select from then_value where condition is true
+        for (cond, then_val) in when_then_pairs.into_iter().rev() {
+            result = execute_zip(then_val, result, cond, row_count, &output_dtype)?;
+        }
+
+        // If all inputs were scalars and result is still length 1, return as scalar
+        if all_scalars {
+            if let Datum::Vector(v) = &result {
+                if v.len() == 1 {
+                    return Ok(Datum::Scalar(v.scalar_at(0)));
+                }
+            }
+        }
+
+        Ok(result)
     }
+}
+
+/// Helper function to perform zip operation on Datum values.
+/// Selects from `if_true` where `condition` is true, otherwise from `if_false`.
+fn execute_zip(
+    if_true: Datum,
+    if_false: Datum,
+    condition: Datum,
+    row_count: usize,
+    output_dtype: &DType,
+) -> VortexResult<Datum> {
+    use vortex_mask::Mask;
+    use vortex_vector::BoolDatum;
+
+    use crate::vectors::VectorIntoArray;
+    use crate::VectorExecutor;
+    use crate::LEGACY_SESSION;
+
+    let cond_bool = condition.into_bool();
+
+    // Convert condition to Mask using the same pattern as evaluate()
+    let mask = match cond_bool {
+        BoolDatum::Scalar(s) => {
+            let value = s.value().unwrap_or(false); // NULL treated as false
+            Mask::new(row_count, value)
+        }
+        BoolDatum::Vector(v) => {
+            // Convert to BoolArray and use to_mask_fill_null_false() for DRY
+            let bool_dtype = DType::Bool(Nullability::Nullable);
+            let bool_array: BoolArray = v.into_array(&bool_dtype);
+            bool_array.to_mask_fill_null_false()
+        }
+    };
+
+    // Short-circuit: if mask is all true, return if_true; if all false, return if_false
+    if mask.all_true() {
+        return Ok(if_true);
+    }
+    if mask.all_false() {
+        return Ok(if_false);
+    }
+
+    // Convert datums to vectors for zip
+    let true_vector = if_true.unwrap_into_vector(row_count);
+    let false_vector = if_false.unwrap_into_vector(row_count);
+
+    // Convert vectors to arrays for zip operation
+    let true_array = true_vector.into_array(output_dtype);
+    let false_array = false_vector.into_array(output_dtype);
+
+    // Perform zip
+    let result_array = zip(&true_array, &false_array, &mask)?;
+
+    // Convert back to vector
+    let result_vector = result_array.execute_vector(&LEGACY_SESSION)?;
+
+    Ok(Datum::Vector(result_vector))
 }
 
 /// Creates a CASE WHEN expression with an ELSE clause.
