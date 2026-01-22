@@ -167,9 +167,10 @@ impl VTable for CaseWhen {
         expr: &Expression,
         scope: &ArrayRef,
     ) -> VortexResult<ArrayRef> {
-        use crate::compute::filter;
         use vortex_buffer::BitBuffer;
         use vortex_mask::Mask;
+
+        use crate::compute::filter;
 
         let len = scope.len();
 
@@ -1345,7 +1346,6 @@ mod tests {
             }
         }
     }
-}
 
     #[test]
     fn test_evaluate_divide_by_zero_protected_by_case_when() {
@@ -1355,13 +1355,17 @@ mod tests {
         // With input where some denominators are 0, the division should NOT be evaluated
         // for those rows.
 
+        use vortex_buffer::buffer;
+        use vortex_dtype::PType;
+
         use crate::arrays::StructArray;
         use crate::expr::VTableExt;
         use crate::expr::exprs::binary::Binary;
         use crate::expr::exprs::operators::Operator;
-        use crate::expr::{get_item, gt, lit, root};
-        use vortex_buffer::buffer;
-        use vortex_dtype::PType;
+        use crate::expr::get_item;
+        use crate::expr::gt;
+        use crate::expr::lit;
+        use crate::expr::root;
 
         // Create test data: numerator=[10, 20, 30], denominator=[2, 0, 5]
         // Expected: CASE WHEN denominator > 0 THEN numerator/denominator ELSE NULL END
@@ -1378,11 +1382,14 @@ mod tests {
         let division = Binary
             .try_new_expr(
                 Operator::Div,
-                [get_item("numerator", root()), get_item("denominator", root())],
+                [
+                    get_item("numerator", root()),
+                    get_item("denominator", root()),
+                ],
             )
             .unwrap();
         let null_dtype = DType::Primitive(PType::I32, Nullability::Nullable);
-        let null_val = lit(Scalar::null(null_dtype.clone()));
+        let null_val = lit(Scalar::null(null_dtype));
 
         let expr = case_when([condition, division, null_val]);
 
@@ -1407,3 +1414,4 @@ mod tests {
             Scalar::from(6i32).cast(result.dtype()).unwrap()
         );
     }
+}
