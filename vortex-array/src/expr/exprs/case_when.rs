@@ -1,0 +1,718 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright the Vortex contributors
+
+//! CASE WHEN expression for conditional value selection.
+//!
+//! This expression evaluates a series of WHEN conditions and returns the corresponding
+//! THEN value for the first condition that evaluates to true. If no conditions match
+//! and an ELSE clause is provided, the ELSE value is returned; otherwise, NULL is returned.
+//!
+//! # Structure
+//!
+//! The expression has children in the following order:
+//! - pairs of (condition, value) for each WHEN/THEN clause
+//! - optionally, a final ELSE value
+//!
+//! For example, `CASE WHEN a THEN 1 WHEN b THEN 2 ELSE 3 END` has children:
+//! `[a, 1, b, 2, 3]`
+
+use std::fmt;
+use std::fmt::Formatter;
+use std::hash::Hash;
+use std::sync::Arc;
+
+use prost::Message;
+use vortex_dtype::DType;
+use vortex_error::{VortexResult, vortex_bail};
+use vortex_proto::expr as pb;
+use vortex_scalar::Scalar;
+use vortex_vector::Datum;
+
+use crate::ArrayRef;
+use crate::IntoArray;
+use crate::ToCanonical;
+use crate::arrays::ConstantArray;
+use crate::compute::zip;
+use crate::expr::Arity;
+use crate::expr::ChildName;
+use crate::expr::ExecutionArgs;
+use crate::expr::ExprId;
+use crate::expr::VTable;
+use crate::expr::VTableExt;
+use crate::expr::expression::Expression;
+
+/// Options for the CaseWhen expression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CaseWhenOptions {
+    /// Number of WHEN/THEN pairs (each pair contributes 2 children)
+    pub num_when_then_pairs: u32,
+    /// Whether an ELSE clause is present (contributes 1 child at the end)
+    pub has_else: bool,
+}
+
+impl fmt::Display for CaseWhenOptions {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "case_when(pairs={}, else={})",
+            self.num_when_then_pairs, self.has_else
+        )
+    }
+}
+
+/// A CASE WHEN expression.
+///
+/// Evaluates conditions in order and returns the value corresponding to the
+/// first matching condition.
+pub struct CaseWhen;
+
+impl VTable for CaseWhen {
+    type Options = CaseWhenOptions;
+
+    fn id(&self) -> ExprId {
+        ExprId::from("vortex.case_when")
+    }
+
+    fn serialize(&self, options: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
+        Ok(Some(
+            pb::CaseWhenOpts {
+                num_when_then_pairs: options.num_when_then_pairs,
+                has_else: options.has_else,
+            }
+            .encode_to_vec(),
+        ))
+    }
+
+    fn deserialize(&self, metadata: &[u8]) -> VortexResult<Self::Options> {
+        let opts = pb::CaseWhenOpts::decode(metadata)?;
+        Ok(CaseWhenOptions {
+            num_when_then_pairs: opts.num_when_then_pairs,
+            has_else: opts.has_else,
+        })
+    }
+
+    fn arity(&self, options: &Self::Options) -> Arity {
+        let num_children =
+            options.num_when_then_pairs as usize * 2 + if options.has_else { 1 } else { 0 };
+        Arity::Exact(num_children)
+    }
+
+    fn child_name(&self, options: &Self::Options, child_idx: usize) -> ChildName {
+        let pair_count = options.num_when_then_pairs as usize;
+        let num_when_then_children = pair_count * 2;
+
+        if child_idx < num_when_then_children {
+            let pair_idx = child_idx / 2;
+            if child_idx % 2 == 0 {
+                ChildName::from(Arc::from(format!("when_{}", pair_idx)))
+            } else {
+                ChildName::from(Arc::from(format!("then_{}", pair_idx)))
+            }
+        } else if options.has_else && child_idx == num_when_then_children {
+            ChildName::from("else")
+        } else {
+            unreachable!(
+                "Invalid child index {} for CaseWhen expression with {} pairs",
+                child_idx, pair_count
+            )
+        }
+    }
+
+    fn fmt_sql(
+        &self,
+        options: &Self::Options,
+        expr: &Expression,
+        f: &mut Formatter<'_>,
+    ) -> fmt::Result {
+        write!(f, "CASE")?;
+        for i in 0..options.num_when_then_pairs as usize {
+            write!(
+                f,
+                " WHEN {} THEN {}",
+                expr.child(i * 2),
+                expr.child(i * 2 + 1)
+            )?;
+        }
+        if options.has_else {
+            let else_idx = options.num_when_then_pairs as usize * 2;
+            write!(f, " ELSE {}", expr.child(else_idx))?;
+        }
+        write!(f, " END")
+    }
+
+    fn return_dtype(&self, options: &Self::Options, arg_dtypes: &[DType]) -> VortexResult<DType> {
+        // The return dtype is based on the THEN expressions
+        if options.num_when_then_pairs == 0 {
+            vortex_bail!("CaseWhen must have at least one WHEN/THEN pair");
+        }
+
+        // Get the first THEN expression's dtype (index 1)
+        let first_then_dtype = &arg_dtypes[1];
+
+        // If there's no ELSE, the result is always nullable (unmatched rows are NULL)
+        if !options.has_else {
+            Ok(first_then_dtype.as_nullable())
+        } else {
+            Ok(first_then_dtype.clone())
+        }
+    }
+
+    fn evaluate(
+        &self,
+        options: &Self::Options,
+        expr: &Expression,
+        scope: &ArrayRef,
+    ) -> VortexResult<ArrayRef> {
+        let len = scope.len();
+
+        // Collect all (condition, then_value) pairs
+        let mut when_then_pairs = Vec::with_capacity(options.num_when_then_pairs as usize);
+        for i in 0..options.num_when_then_pairs as usize {
+            let cond = expr.child(i * 2).evaluate(scope)?;
+            let then_val = expr.child(i * 2 + 1).evaluate(scope)?;
+            when_then_pairs.push((cond, then_val));
+        }
+
+        // Get the else value if present
+        let else_value = options
+            .has_else
+            .then(|| {
+                let else_idx = options.num_when_then_pairs as usize * 2;
+                expr.child(else_idx).evaluate(scope)
+            })
+            .transpose()?;
+
+        // Determine the output dtype from the first THEN expression
+        let output_dtype = when_then_pairs[0].1.dtype().clone();
+
+        // Create the result by starting from the else value or null, then layering conditions on top
+        // We process in reverse order so later conditions don't overwrite earlier ones
+        let mut result: ArrayRef = if let Some(else_val) = else_value {
+            else_val
+        } else {
+            // Create a null array of the output dtype
+            ConstantArray::new(Scalar::null(output_dtype.as_nullable()), len).into_array()
+        };
+
+        // Process when/then pairs in reverse order
+        for (cond, then_val) in when_then_pairs.into_iter().rev() {
+            // Convert condition to BoolArray and get a Mask from it
+            let cond_bool = cond.to_bool();
+            // Convert to mask, treating NULL values as false
+            let condition_mask = cond_bool.to_mask_fill_null_false();
+
+            // zip: selects from first array where mask is true, second where false
+            result = zip(&then_val, &result, &condition_mask)?;
+        }
+
+        Ok(result)
+    }
+
+    fn execute(&self, options: &Self::Options, args: ExecutionArgs) -> VortexResult<Datum> {
+        // For now, delegate to evaluate by converting datums to arrays
+        // This is a simplified implementation
+        _ = options;
+        drop(args);
+        vortex_bail!("CaseWhen execute() not yet implemented for Datum-based execution");
+    }
+}
+
+/// Creates a CASE WHEN expression with an ELSE clause.
+///
+/// The children should be provided as: condition1, then1, condition2, then2, ..., else_value
+///
+/// # Example
+/// ```ignore
+/// // CASE WHEN x > 0 THEN 'positive' WHEN x < 0 THEN 'negative' ELSE 'zero' END
+/// case_when(vec![
+///     gt(col("x"), lit(0)), lit("positive"),
+///     lt(col("x"), lit(0)), lit("negative"),
+///     lit("zero"),
+/// ])
+/// ```
+pub fn case_when<I: IntoIterator<Item = Expression>>(children: I) -> Expression {
+    let children: Vec<_> = children.into_iter().collect();
+    let num_children = children.len();
+
+    // Must have odd number of children (pairs + else)
+    assert!(
+        num_children >= 3 && num_children % 2 == 1,
+        "case_when requires at least one when/then pair and an else: got {} children",
+        num_children
+    );
+
+    #[allow(clippy::cast_possible_truncation)]
+    let num_when_then_pairs = ((num_children - 1) / 2) as u32;
+    let options = CaseWhenOptions {
+        num_when_then_pairs,
+        has_else: true,
+    };
+
+    CaseWhen.new_expr(options, children)
+}
+
+/// Creates a CASE WHEN expression without an ELSE clause (returns NULL when no conditions match).
+///
+/// The children should be provided as: condition1, then1, condition2, then2, ...
+///
+/// # Example
+/// ```ignore
+/// // CASE WHEN x > 0 THEN 'positive' WHEN x < 0 THEN 'negative' END
+/// // (returns NULL when x = 0)
+/// case_when_no_else(vec![
+///     gt(col("x"), lit(0)), lit("positive"),
+///     lt(col("x"), lit(0)), lit("negative"),
+/// ])
+/// ```
+pub fn case_when_no_else<I: IntoIterator<Item = Expression>>(children: I) -> Expression {
+    let children: Vec<_> = children.into_iter().collect();
+    let num_children = children.len();
+
+    // Must have even number of children (pairs only)
+    assert!(
+        num_children >= 2 && num_children % 2 == 0,
+        "case_when_no_else requires at least one when/then pair: got {} children",
+        num_children
+    );
+
+    #[allow(clippy::cast_possible_truncation)]
+    let num_when_then_pairs = (num_children / 2) as u32;
+    let options = CaseWhenOptions {
+        num_when_then_pairs,
+        has_else: false,
+    };
+
+    CaseWhen.new_expr(options, children)
+}
+
+#[cfg(test)]
+mod tests {
+    use vortex_buffer::buffer;
+    use vortex_dtype::DType;
+    use vortex_dtype::Nullability;
+    use vortex_dtype::PType;
+    use vortex_error::VortexExpect as _;
+    use vortex_scalar::Scalar;
+
+    use super::*;
+    use crate::IntoArray;
+    use crate::ToCanonical;
+    use crate::arrays::BoolArray;
+    use crate::arrays::PrimitiveArray;
+    use crate::arrays::StructArray;
+    use crate::expr::exprs::binary::eq;
+    use crate::expr::exprs::binary::gt;
+    use crate::expr::exprs::get_item::col;
+    use crate::expr::exprs::get_item::get_item;
+    use crate::expr::exprs::literal::lit;
+    use crate::expr::exprs::root::root;
+    use crate::expr::test_harness;
+
+    // ==================== Serialization Tests ====================
+
+    #[test]
+    fn test_serialization_roundtrip() {
+        let options = CaseWhenOptions {
+            num_when_then_pairs: 2,
+            has_else: true,
+        };
+
+        let serialized = CaseWhen.serialize(&options).unwrap().unwrap();
+        let deserialized = CaseWhen.deserialize(&serialized).unwrap();
+
+        assert_eq!(options, deserialized);
+    }
+
+    #[test]
+    fn test_serialization_no_else() {
+        let options = CaseWhenOptions {
+            num_when_then_pairs: 3,
+            has_else: false,
+        };
+
+        let serialized = CaseWhen.serialize(&options).unwrap().unwrap();
+        let deserialized = CaseWhen.deserialize(&serialized).unwrap();
+
+        assert_eq!(options, deserialized);
+    }
+
+    // ==================== Display Tests ====================
+
+    #[test]
+    fn test_display_with_else() {
+        // CASE WHEN col > 0 THEN 100 ELSE 0 END
+        let condition = gt(col("value"), lit(0i32));
+        let then_val = lit(100i32);
+        let else_val = lit(0i32);
+
+        let expr = case_when([condition, then_val, else_val]);
+        let display = format!("{}", expr);
+        assert!(display.contains("CASE"));
+        assert!(display.contains("WHEN"));
+        assert!(display.contains("THEN"));
+        assert!(display.contains("ELSE"));
+        assert!(display.contains("END"));
+    }
+
+    #[test]
+    fn test_display_no_else() {
+        // CASE WHEN col > 0 THEN 100 END
+        let condition = gt(col("value"), lit(0i32));
+        let then_val = lit(100i32);
+
+        let expr = case_when_no_else([condition, then_val]);
+        let display = format!("{}", expr);
+        assert!(display.contains("CASE"));
+        assert!(display.contains("WHEN"));
+        assert!(display.contains("THEN"));
+        assert!(!display.contains("ELSE"));
+        assert!(display.contains("END"));
+    }
+
+    #[test]
+    fn test_display_multiple_conditions() {
+        let expr = case_when([
+            gt(col("x"), lit(10i32)),
+            lit("high"),
+            gt(col("x"), lit(5i32)),
+            lit("medium"),
+            lit("low"),
+        ]);
+        let display = format!("{}", expr);
+        // Should contain two WHEN clauses
+        assert_eq!(display.matches("WHEN").count(), 2);
+        assert_eq!(display.matches("THEN").count(), 2);
+    }
+
+    // ==================== DType Tests ====================
+
+    #[test]
+    fn test_return_dtype_with_else() {
+        let condition = lit(true);
+        let then_val = lit(100i32);
+        let else_val = lit(0i32);
+
+        let expr = case_when([condition, then_val, else_val]);
+        let input_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+        let result_dtype = expr.return_dtype(&input_dtype).unwrap();
+        // With else, result dtype matches the then expression
+        assert_eq!(
+            result_dtype,
+            DType::Primitive(PType::I32, Nullability::NonNullable)
+        );
+    }
+
+    #[test]
+    fn test_return_dtype_without_else_is_nullable() {
+        let condition = lit(true);
+        let then_val = lit(100i32);
+
+        let expr = case_when_no_else([condition, then_val]);
+        let input_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+        let result_dtype = expr.return_dtype(&input_dtype).unwrap();
+        // Without else, result is always nullable
+        assert_eq!(
+            result_dtype,
+            DType::Primitive(PType::I32, Nullability::Nullable)
+        );
+    }
+
+    #[test]
+    fn test_return_dtype_with_struct_input() {
+        let dtype = test_harness::struct_dtype();
+
+        // CASE WHEN $.col1 > 10 THEN 100 ELSE 0 END
+        let expr = case_when([
+            gt(get_item("col1", root()), lit(10u16)),
+            lit(100i32),
+            lit(0i32),
+        ]);
+
+        let result_dtype = expr.return_dtype(&dtype).unwrap();
+        assert_eq!(
+            result_dtype,
+            DType::Primitive(PType::I32, Nullability::NonNullable)
+        );
+    }
+
+    // ==================== Arity Tests ====================
+
+    #[test]
+    fn test_arity_with_else() {
+        let options = CaseWhenOptions {
+            num_when_then_pairs: 2,
+            has_else: true,
+        };
+        // 2 pairs (4 children) + 1 else = 5 children
+        assert_eq!(CaseWhen.arity(&options), Arity::Exact(5));
+    }
+
+    #[test]
+    fn test_arity_without_else() {
+        let options = CaseWhenOptions {
+            num_when_then_pairs: 2,
+            has_else: false,
+        };
+        // 2 pairs (4 children) = 4 children
+        assert_eq!(CaseWhen.arity(&options), Arity::Exact(4));
+    }
+
+    #[test]
+    fn test_arity_single_condition() {
+        let options = CaseWhenOptions {
+            num_when_then_pairs: 1,
+            has_else: true,
+        };
+        // 1 pair (2 children) + 1 else = 3 children
+        assert_eq!(CaseWhen.arity(&options), Arity::Exact(3));
+    }
+
+    // ==================== Child Name Tests ====================
+
+    #[test]
+    fn test_child_names() {
+        let options = CaseWhenOptions {
+            num_when_then_pairs: 2,
+            has_else: true,
+        };
+
+        assert_eq!(CaseWhen.child_name(&options, 0).to_string(), "when_0");
+        assert_eq!(CaseWhen.child_name(&options, 1).to_string(), "then_0");
+        assert_eq!(CaseWhen.child_name(&options, 2).to_string(), "when_1");
+        assert_eq!(CaseWhen.child_name(&options, 3).to_string(), "then_1");
+        assert_eq!(CaseWhen.child_name(&options, 4).to_string(), "else");
+    }
+
+    // ==================== Expression Manipulation Tests ====================
+
+    #[test]
+    fn test_replace_children() {
+        let expr = case_when([lit(true), lit(1i32), lit(0i32)]);
+        expr.with_children([lit(false), lit(2i32), lit(3i32)])
+            .vortex_expect("operation should succeed in test");
+    }
+
+    // ==================== Evaluate Tests ====================
+
+    #[test]
+    fn test_evaluate_simple_condition() {
+        // Test: CASE WHEN value > 2 THEN 100 ELSE 0 END
+        // Input: [1, 2, 3, 4, 5]
+        // Expected: [0, 0, 100, 100, 100]
+        let test_array =
+            StructArray::from_fields(&[("value", buffer![1i32, 2, 3, 4, 5].into_array())])
+                .unwrap()
+                .into_array();
+
+        let expr = case_when([
+            gt(get_item("value", root()), lit(2i32)),
+            lit(100i32),
+            lit(0i32),
+        ]);
+
+        let result = expr.evaluate(&test_array).unwrap().to_primitive();
+        assert_eq!(result.as_slice::<i32>(), &[0, 0, 100, 100, 100]);
+    }
+
+    #[test]
+    fn test_evaluate_multiple_conditions() {
+        // Test: CASE WHEN value == 1 THEN 10 WHEN value == 3 THEN 30 ELSE 0 END
+        // Input: [1, 2, 3, 4, 5]
+        // Expected: [10, 0, 30, 0, 0]
+        let test_array =
+            StructArray::from_fields(&[("value", buffer![1i32, 2, 3, 4, 5].into_array())])
+                .unwrap()
+                .into_array();
+
+        let expr = case_when([
+            eq(get_item("value", root()), lit(1i32)),
+            lit(10i32),
+            eq(get_item("value", root()), lit(3i32)),
+            lit(30i32),
+            lit(0i32),
+        ]);
+
+        let result = expr.evaluate(&test_array).unwrap().to_primitive();
+        assert_eq!(result.as_slice::<i32>(), &[10, 0, 30, 0, 0]);
+    }
+
+    #[test]
+    fn test_evaluate_first_match_wins() {
+        // Test: CASE WHEN value > 2 THEN 100 WHEN value > 3 THEN 200 ELSE 0 END
+        // Input: [1, 2, 3, 4, 5]
+        // Expected: [0, 0, 100, 100, 100] - first condition wins for values 3, 4, 5
+        let test_array =
+            StructArray::from_fields(&[("value", buffer![1i32, 2, 3, 4, 5].into_array())])
+                .unwrap()
+                .into_array();
+
+        let expr = case_when([
+            gt(get_item("value", root()), lit(2i32)),
+            lit(100i32),
+            gt(get_item("value", root()), lit(3i32)),
+            lit(200i32),
+            lit(0i32),
+        ]);
+
+        let result = expr.evaluate(&test_array).unwrap().to_primitive();
+        // First match wins: 3, 4, 5 all get 100 (from first condition)
+        assert_eq!(result.as_slice::<i32>(), &[0, 0, 100, 100, 100]);
+    }
+
+    #[test]
+    fn test_evaluate_no_else_returns_null() {
+        // Test: CASE WHEN value > 3 THEN 100 END
+        // Input: [1, 2, 3, 4, 5]
+        // Expected: [null, null, null, 100, 100]
+        let test_array =
+            StructArray::from_fields(&[("value", buffer![1i32, 2, 3, 4, 5].into_array())])
+                .unwrap()
+                .into_array();
+
+        let expr = case_when_no_else([gt(get_item("value", root()), lit(3i32)), lit(100i32)]);
+
+        let result = expr.evaluate(&test_array).unwrap();
+
+        // Check the dtype is nullable
+        assert!(result.dtype().is_nullable());
+
+        // Positions 0, 1, 2 should be null, 3, 4 should be 100
+        assert_eq!(result.scalar_at(0), Scalar::null(result.dtype().clone()));
+        assert_eq!(result.scalar_at(1), Scalar::null(result.dtype().clone()));
+        assert_eq!(result.scalar_at(2), Scalar::null(result.dtype().clone()));
+        assert_eq!(
+            result.scalar_at(3),
+            Scalar::from(100i32).cast(result.dtype()).unwrap()
+        );
+        assert_eq!(
+            result.scalar_at(4),
+            Scalar::from(100i32).cast(result.dtype()).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_evaluate_all_conditions_false() {
+        // Test: CASE WHEN value > 100 THEN 1 ELSE 0 END
+        // Input: [1, 2, 3, 4, 5]
+        // Expected: [0, 0, 0, 0, 0] - no conditions match
+        let test_array =
+            StructArray::from_fields(&[("value", buffer![1i32, 2, 3, 4, 5].into_array())])
+                .unwrap()
+                .into_array();
+
+        let expr = case_when([
+            gt(get_item("value", root()), lit(100i32)),
+            lit(1i32),
+            lit(0i32),
+        ]);
+
+        let result = expr.evaluate(&test_array).unwrap().to_primitive();
+        assert_eq!(result.as_slice::<i32>(), &[0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_evaluate_all_conditions_true() {
+        // Test: CASE WHEN value > 0 THEN 100 ELSE 0 END
+        // Input: [1, 2, 3, 4, 5]
+        // Expected: [100, 100, 100, 100, 100] - all match
+        let test_array =
+            StructArray::from_fields(&[("value", buffer![1i32, 2, 3, 4, 5].into_array())])
+                .unwrap()
+                .into_array();
+
+        let expr = case_when([
+            gt(get_item("value", root()), lit(0i32)),
+            lit(100i32),
+            lit(0i32),
+        ]);
+
+        let result = expr.evaluate(&test_array).unwrap().to_primitive();
+        assert_eq!(result.as_slice::<i32>(), &[100, 100, 100, 100, 100]);
+    }
+
+    #[test]
+    fn test_evaluate_with_literal_condition() {
+        // Test: CASE WHEN true THEN 100 ELSE 0 END (constant true condition)
+        let test_array = buffer![1i32, 2, 3].into_array();
+
+        let expr = case_when([lit(true), lit(100i32), lit(0i32)]);
+
+        let result = expr.evaluate(&test_array).unwrap();
+        // Constant folding should produce a constant array
+        if let Some(constant) = result.as_constant() {
+            assert_eq!(constant, Scalar::from(100i32));
+        } else {
+            let prim = result.to_primitive();
+            assert_eq!(prim.as_slice::<i32>(), &[100, 100, 100]);
+        }
+    }
+
+    #[test]
+    fn test_evaluate_with_bool_column_result() {
+        // Test: CASE WHEN value > 2 THEN true ELSE false END
+        let test_array =
+            StructArray::from_fields(&[("value", buffer![1i32, 2, 3, 4, 5].into_array())])
+                .unwrap()
+                .into_array();
+
+        let expr = case_when([
+            gt(get_item("value", root()), lit(2i32)),
+            lit(true),
+            lit(false),
+        ]);
+
+        let result = expr.evaluate(&test_array).unwrap().to_bool();
+        assert_eq!(
+            result.bit_buffer().iter().collect::<Vec<_>>(),
+            vec![false, false, true, true, true]
+        );
+    }
+
+    #[test]
+    fn test_evaluate_with_nullable_condition() {
+        // Test: CASE WHEN nullable_bool THEN 100 ELSE 0 END
+        // Where the condition has null values - nulls should be treated as false
+        let test_array = StructArray::from_fields(&[(
+            "cond",
+            BoolArray::from_iter([Some(true), None, Some(false), None, Some(true)]).into_array(),
+        )])
+        .unwrap()
+        .into_array();
+
+        let expr = case_when([get_item("cond", root()), lit(100i32), lit(0i32)]);
+
+        let result = expr.evaluate(&test_array).unwrap().to_primitive();
+        // true -> 100, null -> 0 (treated as false), false -> 0
+        assert_eq!(result.as_slice::<i32>(), &[100, 0, 0, 0, 100]);
+    }
+
+    #[test]
+    fn test_evaluate_with_nullable_result_values() {
+        // Test: CASE WHEN value > 2 THEN nullable_value ELSE 0 END
+        let test_array = StructArray::from_fields(&[
+            ("value", buffer![1i32, 2, 3, 4, 5].into_array()),
+            (
+                "result",
+                PrimitiveArray::from_option_iter([Some(10), None, Some(30), Some(40), Some(50)])
+                    .into_array(),
+            ),
+        ])
+        .unwrap()
+        .into_array();
+
+        let expr = case_when([
+            gt(get_item("value", root()), lit(2i32)),
+            get_item("result", root()),
+            lit(0i32),
+        ]);
+
+        let result = expr.evaluate(&test_array).unwrap();
+        let prim = result.to_primitive();
+
+        // Values 1, 2 don't match -> 0
+        // Value 3 matches -> 30 (from result column)
+        // Value 4 matches -> 40
+        // Value 5 matches -> 50
+        assert_eq!(prim.as_slice::<i32>(), &[0, 0, 30, 40, 50]);
+    }
+}
