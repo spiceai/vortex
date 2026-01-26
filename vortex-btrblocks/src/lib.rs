@@ -415,7 +415,7 @@ impl BtrBlocksCompressor {
             Canonical::Decimal(decimal) => compress_decimal(&decimal),
             Canonical::Struct(struct_array) => {
                 let fields = struct_array
-                    .fields()
+                    .unmasked_fields()
                     .iter()
                     .map(|field| self.compress(field))
                     .collect::<Result<Vec<_>, _>>()?;
@@ -494,7 +494,7 @@ impl BtrBlocksCompressor {
                     .unwrap_or_default()
                     {
                         return Ok(ConstantArray::new(
-                            temporal_array.as_ref().scalar_at(0),
+                            temporal_array.as_ref().scalar_at(0)?,
                             ext_array.len(),
                         )
                         .into_array());

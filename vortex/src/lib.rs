@@ -92,10 +92,6 @@ pub mod utils {
     pub use vortex_utils::*;
 }
 
-pub mod vector {
-    pub use vortex_vector::*;
-}
-
 pub mod encodings {
     pub mod alp {
         pub use vortex_alp::*;
@@ -163,6 +159,16 @@ impl VortexSessionDefault for VortexSession {
             .with::<ExprSession>()
             .with::<RuntimeSession>();
 
+        #[cfg(all(feature = "vortex-cuda", target_os = "linux"))]
+        // Even if the CUDA feature is enabled we need to check at
+        // runtime whether CUDA is available in the current environment.
+        if vortex_cuda::cuda_available() {
+            session = session.with::<CudaSession>();
+            use vortex_cuda::CudaSession;
+            use vortex_cuda::CudaSessionExt;
+            vortex_cuda::initialize_cuda(&session.cuda_session());
+        }
+
         #[cfg(feature = "files")]
         file::register_default_encodings(&mut session);
 
@@ -177,7 +183,6 @@ impl VortexSessionDefault for VortexSession {
 mod test {
     use std::path::PathBuf;
 
-    use itertools::Itertools;
     use vortex_array::ArrayRef;
     use vortex_array::IntoArray;
     use vortex_array::ToCanonical;
@@ -221,9 +226,12 @@ mod test {
         .build()?;
 
         let dtype = DType::from_arrow(reader.schema());
-        let chunks = reader
-            .map_ok(|record_batch| ArrayRef::from_arrow(record_batch, false))
-            .try_collect()?;
+        let chunks: Vec<_> = reader
+            .map(|record_batch| {
+                let batch = record_batch?;
+                ArrayRef::from_arrow(batch, false)
+            })
+            .collect::<VortexResult<_>>()?;
         let vortex_array = ChunkedArray::try_new(chunks, dtype)?.into_array();
         // [convert]
 
@@ -250,7 +258,7 @@ mod test {
 
         // Or apply generally stronger compression with the compact compressor
         let compressed = CompactCompressor::default()
-            .with_values_per_page(8192)
+            .with_zstd_values_per_page(8192)
             .compress(array.as_ref())?;
         println!("Compact size: {} / {}", compressed.nbytes(), array.nbytes());
         // [compress]

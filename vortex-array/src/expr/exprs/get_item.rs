@@ -111,11 +111,11 @@ impl VTable for GetItem {
             .pop()
             .vortex_expect("missing input for GetItem expression")
             .execute::<StructArray>(args.ctx)?;
-        let field = input.field_by_name(field_name).cloned()?;
+        let field = input.unmasked_field_by_name(field_name).cloned()?;
 
         match input.dtype().nullability() {
             Nullability::NonNullable => Ok(field),
-            Nullability::Nullable => mask(&field, &input.validity_mask().not()),
+            Nullability::Nullable => mask(&field, &input.validity_mask()?.not()),
         }?
         .execute(args.ctx)
     }
@@ -296,7 +296,7 @@ mod tests {
         let get_item = get_item("a", root());
         let item = get_item.evaluate(&st).unwrap();
         assert_eq!(
-            item.scalar_at(0),
+            item.scalar_at(0).unwrap(),
             Scalar::null(DType::Primitive(PType::I32, Nullability::Nullable))
         );
     }
@@ -362,5 +362,37 @@ mod tests {
         let result = get_result.optimize_recursive(&dtype).unwrap();
         let expected = checked_add(lit(1), lit(10));
         assert_eq!(&result, &expected);
+    }
+
+    #[test]
+    fn get_item_filter_list_field() {
+        use vortex_mask::Mask;
+
+        use crate::arrays::BoolArray;
+        use crate::arrays::FilterArray;
+        use crate::arrays::ListArray;
+
+        let list = ListArray::try_new(
+            buffer![0f32, 1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11.].into_array(),
+            buffer![2u64, 4, 6, 8, 10, 12].into_array(),
+            Validity::Array(BoolArray::from_iter([true, true, false, true, true]).into_array()),
+        )
+        .unwrap();
+
+        let filtered = FilterArray::try_new(
+            list.into_array(),
+            Mask::from_iter([true, true, false, false, false]),
+        )
+        .unwrap();
+
+        let st = StructArray::try_new(
+            FieldNames::from(["data"]),
+            vec![filtered.into_array()],
+            2,
+            Validity::AllValid,
+        )
+        .unwrap();
+
+        get_item("data", root()).evaluate(&st.to_array()).unwrap();
     }
 }

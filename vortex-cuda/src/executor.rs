@@ -2,8 +2,8 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::fmt::Debug;
-use std::mem::size_of;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use cudarc::driver::CudaEvent;
@@ -12,14 +12,9 @@ use cudarc::driver::CudaSlice;
 use cudarc::driver::CudaStream;
 use cudarc::driver::DevicePtrMut;
 use cudarc::driver::DeviceRepr;
-use cudarc::driver::DriverError;
 use cudarc::driver::LaunchArgs;
-use cudarc::driver::result;
 use cudarc::driver::result::memcpy_htod_async;
-use cudarc::driver::sys;
 use futures::future::BoxFuture;
-use kanal::Sender;
-use result::stream;
 use vortex_array::Array;
 use vortex_array::ArrayRef;
 use vortex_array::Canonical;
@@ -33,76 +28,7 @@ use vortex_error::vortex_err;
 use crate::CudaDeviceBuffer;
 use crate::CudaSession;
 use crate::session::CudaSessionExt;
-
-/// Registers a callback and asynchronously waits for its completion.
-///
-/// This function can be used to asynchronously wait for events previously
-/// submitted to the stream to complete, e.g. async device buffer allocations.
-///
-/// Note: This is not equivalent to calling sync on a stream but only awaits
-/// the registered callback to complete.
-///
-/// # Arguments
-///
-/// * `stream` - The CUDA stream to wait on
-pub async fn await_stream_callback(stream: &CudaStream) -> Result<(), DriverError> {
-    let rx = register_stream_callback(stream)?;
-
-    rx.recv()
-        .await
-        .map_err(|_| DriverError(sys::CUresult::CUDA_ERROR_UNKNOWN))
-}
-
-/// Registers a host function callback on the stream.
-///
-/// # Returns
-///
-/// An async receiver that receives a message when all preceding work on the
-/// stream completes.
-///
-/// # Errors
-///
-/// Returns an error if registering the host callback function fails.
-fn register_stream_callback(stream: &CudaStream) -> Result<kanal::AsyncReceiver<()>, DriverError> {
-    let (tx, rx) = kanal::bounded::<()>(1);
-
-    // There are 2 different scenarios how `tx` gets freed. When the callback
-    // is invoked or during cleanup in case the registration fails.
-    let tx_ptr = Box::into_raw(Box::new(tx));
-
-    /// Called from CUDA driver thread when all preceding work on the stream completes.
-    unsafe extern "C" fn callback(user_data: *mut std::ffi::c_void) {
-        // SAFETY: The memory of `tx` is manually managed has not been freed
-        // before. We have unique ownership and can therefore free it.
-        let tx = unsafe { Box::from_raw(user_data as *mut Sender<()>) };
-
-        // Blocking send as we're in a callback invoked by the CUDA driver.
-        #[expect(clippy::expect_used)]
-        tx.send(())
-            // A send should never fail. Panic otherwise.
-            .expect("CUDA callback receiver dropped unexpectedly");
-    }
-
-    // SAFETY:
-    // 1. Valid handle from the borrowed `CudaStream`.
-    // 2. Valid function pointer with the the correct signature
-    // 3. Valid user data pointer which is consumed exactly once
-    unsafe {
-        stream::launch_host_function(
-            stream.cu_stream(),
-            callback,
-            tx_ptr as *mut std::ffi::c_void,
-        )
-        .inspect_err(|_| {
-            // SAFETY: Registration failed, so callback will never run.
-            // Therefore, we need to free the `user_data` passed to the
-            // callback in the error case.
-            drop(Box::from_raw(tx_ptr));
-        })?;
-    }
-
-    Ok(rx.to_async())
-}
+use crate::stream::await_stream_callback;
 
 /// CUDA kernel events recorded before and after kernel launch.
 #[derive(Debug)]
@@ -111,6 +37,15 @@ pub struct CudaKernelEvents {
     pub before_launch: CudaEvent,
     /// Event recorded after kernel launch.
     pub after_launch: CudaEvent,
+}
+
+impl CudaKernelEvents {
+    pub fn duration(&self) -> VortexResult<Duration> {
+        self.before_launch
+            .elapsed_ms(&self.after_launch) // synchronizes
+            .map_err(|e| vortex_err!("failed to get elapsed time: {}", e))
+            .map(|f| Duration::from_secs_f32(f / 1000.0))
+    }
 }
 
 /// CUDA execution context.
@@ -162,8 +97,42 @@ impl CudaExecutionCtx {
     /// # Errors
     ///
     /// Returns an error if kernel loading fails.
-    pub fn load_function(&self, module_name: &str, ptypes: &[PType]) -> VortexResult<CudaFunction> {
-        self.cuda_session.load_function(module_name, ptypes)
+    pub fn load_function_ptype(
+        &self,
+        module_name: &str,
+        ptypes: &[PType],
+    ) -> VortexResult<CudaFunction> {
+        let type_suffixes: Vec<String> = ptypes.iter().map(|ptype| ptype.to_string()).collect();
+        self.load_function(
+            module_name,
+            type_suffixes
+                .iter()
+                .map(|t| t.as_str())
+                .collect::<Vec<_>>()
+                .as_slice(),
+        )
+    }
+
+    /// Loads a CUDA kernel function by module name and type suffixes.
+    ///
+    /// This is a lower-level version of `load_function` that accepts string suffixes
+    /// directly, useful for types that don't have a `PType` (e.g., i128, i256).
+    ///
+    /// # Arguments
+    ///
+    /// * `module_name` - Name of the module (`kernels/{module_name}.ptx`)
+    /// * `type_suffixes` - List of type suffix strings for the kernel name
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if kernel loading fails.
+    pub fn load_function(
+        &self,
+        module_name: &str,
+        type_suffixes: &[&str],
+    ) -> VortexResult<CudaFunction> {
+        self.cuda_session
+            .load_function_with_suffixes(module_name, type_suffixes)
     }
 
     /// Returns a launch builder for a CUDA kernel function.
@@ -177,47 +146,33 @@ impl CudaExecutionCtx {
         self.stream.launch_builder(func)
     }
 
-    /// Copies host data to the device, returning a [`CudaDeviceBuffer`].
-    pub fn copy_buffer_to_device<T: DeviceRepr>(
-        &self,
-        data: &[T],
-    ) -> VortexResult<CudaDeviceBuffer<T>> {
-        let cuda_slice = self
-            .stream
-            .clone_htod(data)
-            .map_err(|e| vortex_err!("Failed to copy to device: {}", e))?;
-        Ok(CudaDeviceBuffer::new(cuda_slice))
-    }
-
-    /// Copies a pinned host buffer to the device asynchronously.
+    /// Copies host data to the device asynchronously.
     ///
     /// Allocates device memory, schedules an async copy, and returns a future
-    /// that completes when the copy is finished.
+    /// that completes when the copy is finished. The source data is moved into
+    /// the future to ensure it remains valid until the copy completes.
     ///
     /// # Arguments
     ///
-    /// * `handle` - The host buffer to copy. Must be a host buffer (not already on device).
+    /// * `data` - The host data to copy.
     ///
-    /// # Safety
+    /// # Returns
     ///
-    /// The returned future captures the source `BufferHandle` to keep the host
-    /// memory alive until the copy completes.
-    pub fn copy_buffer_to_device_async<T: DeviceRepr + Send + Sync + 'static>(
+    /// A future that resolves to the device buffer handle when the copy completes.
+    pub fn copy_to_device<T, D>(
         &self,
-        handle: BufferHandle,
-    ) -> VortexResult<BoxFuture<'static, VortexResult<BufferHandle>>> {
-        let host_buffer = handle
-            .as_host_opt()
-            .ok_or_else(|| vortex_err!("Buffer is neither on host nor device"))?;
-
-        let mut cuda_slice: CudaSlice<T> = self.device_alloc(host_buffer.len() / size_of::<T>())?;
+        data: D,
+    ) -> VortexResult<BoxFuture<'static, VortexResult<BufferHandle>>>
+    where
+        T: DeviceRepr + Send + Sync + 'static,
+        D: AsRef<[T]> + Send + 'static,
+    {
+        let host_slice: &[T] = data.as_ref();
+        let mut cuda_slice: CudaSlice<T> = self.device_alloc(host_slice.len())?;
         let device_ptr = cuda_slice.device_ptr_mut(&self.stream).0;
 
-        let typed_buffer: Buffer<T> = Buffer::from_byte_buffer(host_buffer.clone());
-        let src_slice: &[T] = typed_buffer.as_slice();
-
         unsafe {
-            memcpy_htod_async(device_ptr, src_slice, self.stream.cu_stream())
+            memcpy_htod_async(device_ptr, host_slice, self.stream.cu_stream())
                 .map_err(|e| vortex_err!("Failed to schedule async copy to device: {}", e))?;
         }
 
@@ -225,16 +180,39 @@ impl CudaExecutionCtx {
         let stream = Arc::clone(&self.stream);
 
         Ok(Box::pin(async move {
-            // Await async copy completion using callback-based async wait.
-            await_stream_callback(&stream)
-                .await
-                .map_err(|e| vortex_err!("CUDA stream wait failed: {}", e))?;
+            await_stream_callback(&stream).await?;
 
             // Keep source memory alive until copy completes.
-            let _keep_alive = handle;
+            let _keep_alive = data;
 
             Ok(BufferHandle::new_device(Arc::new(cuda_buf)))
         }))
+    }
+
+    /// Moves a host buffer handle to the device asynchronously.
+    ///
+    /// # Arguments
+    ///
+    /// * `handle` - The host buffer to move. Must be a host buffer.
+    ///
+    /// # Returns
+    ///
+    /// A future that resolves to the device buffer handle when the copy completes.
+    pub fn move_to_device<T: DeviceRepr + Send + Sync + 'static>(
+        &self,
+        handle: BufferHandle,
+    ) -> VortexResult<BoxFuture<'static, VortexResult<BufferHandle>>> {
+        let host_buffer = handle
+            .as_host_opt()
+            .ok_or_else(|| vortex_err!("Buffer is not on host"))?;
+
+        let buffer: Buffer<T> = Buffer::from_byte_buffer(host_buffer.clone());
+        self.copy_to_device(buffer)
+    }
+
+    /// Returns a reference to the underlying CUDA stream.
+    pub fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
     }
 }
 
@@ -281,5 +259,14 @@ impl CudaArrayExt for ArrayRef {
         );
 
         support.execute(self, ctx).await
+    }
+}
+
+#[cfg(feature = "_test-harness")]
+impl CudaExecutionCtx {
+    pub fn synchronize_stream(&self) -> VortexResult<()> {
+        self.stream
+            .synchronize()
+            .map_err(|e| vortex_err!("cuda error: {e}"))
     }
 }
