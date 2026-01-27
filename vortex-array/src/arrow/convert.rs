@@ -105,7 +105,7 @@ impl IntoArray for ArrowBuffer {
 
 impl IntoArray for BooleanBuffer {
     fn into_array(self) -> ArrayRef {
-        BoolArray::from_bit_buffer(self.into(), Validity::NonNullable).into_array()
+        BoolArray::new(self.into(), Validity::NonNullable).into_array()
     }
 }
 
@@ -321,7 +321,7 @@ impl<T: ByteViewType> FromArrowArray<&GenericByteViewArray<T>> for ArrayRef {
 
 impl FromArrowArray<&ArrowBooleanArray> for ArrayRef {
     fn from_arrow(value: &ArrowBooleanArray, nullable: bool) -> VortexResult<Self> {
-        Ok(BoolArray::from_bit_buffer(
+        Ok(BoolArray::new(
             value.values().clone().into(),
             nulls(value.nulls(), nullable),
         )
