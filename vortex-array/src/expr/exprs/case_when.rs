@@ -510,15 +510,24 @@ mod tests {
         let result = expr.evaluate(&test_array).unwrap();
         assert!(result.dtype().is_nullable());
 
-        assert_eq!(result.scalar_at(0), Scalar::null(result.dtype().clone()));
-        assert_eq!(result.scalar_at(1), Scalar::null(result.dtype().clone()));
-        assert_eq!(result.scalar_at(2), Scalar::null(result.dtype().clone()));
         assert_eq!(
-            result.scalar_at(3),
+            result.scalar_at(0).unwrap(),
+            Scalar::null(result.dtype().clone())
+        );
+        assert_eq!(
+            result.scalar_at(1).unwrap(),
+            Scalar::null(result.dtype().clone())
+        );
+        assert_eq!(
+            result.scalar_at(2).unwrap(),
+            Scalar::null(result.dtype().clone())
+        );
+        assert_eq!(
+            result.scalar_at(3).unwrap(),
             Scalar::from(100i32).cast(result.dtype()).unwrap()
         );
         assert_eq!(
-            result.scalar_at(4),
+            result.scalar_at(4).unwrap(),
             Scalar::from(100i32).cast(result.dtype()).unwrap()
         );
     }
