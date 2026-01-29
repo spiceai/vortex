@@ -12,10 +12,10 @@ use futures::Stream;
 #[cfg(all(test, not(feature = "tokio")))]
 use oneshot;
 use pin_project_lite::pin_project;
-use vortex_buffer::Alignment;
 // Prefer tokio::sync::oneshot when tokio feature is enabled
 #[cfg(all(test, feature = "tokio"))]
 use tokio::sync::oneshot;
+use vortex_buffer::Alignment;
 use vortex_error::VortexExpect;
 use vortex_io::CoalesceConfig;
 use vortex_metrics::Counter;
@@ -330,8 +330,8 @@ impl State {
 mod tests {
     use futures::StreamExt;
     use futures::stream;
+    use vortex_array::buffer::BufferHandle;
     use vortex_buffer::Alignment;
-    use vortex_buffer::ByteBuffer;
     use vortex_error::VortexResult;
 
     use super::*;
@@ -341,7 +341,7 @@ mod tests {
         id: usize,
         offset: u64,
         length: usize,
-    ) -> (ReadRequest, oneshot::Receiver<VortexResult<ByteBuffer>>) {
+    ) -> (ReadRequest, oneshot::Receiver<VortexResult<BufferHandle>>) {
         let (tx, rx) = oneshot::channel();
         (
             ReadRequest {

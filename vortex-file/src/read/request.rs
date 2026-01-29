@@ -12,8 +12,8 @@ use oneshot;
 // Prefer tokio::sync::oneshot when tokio feature is enabled
 #[cfg(feature = "tokio")]
 use tokio::sync::oneshot;
+use vortex_array::buffer::BufferHandle;
 use vortex_buffer::Alignment;
-use vortex_buffer::ByteBuffer;
 use vortex_error::VortexError;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
@@ -56,7 +56,7 @@ impl IoRequest {
     }
 
     /// Resolves the request with the given result.
-    pub fn resolve(self, result: VortexResult<ByteBuffer>) {
+    pub fn resolve(self, result: VortexResult<BufferHandle>) {
         match self.0 {
             IoRequestInner::Single(req) => req.resolve(result),
             IoRequestInner::Coalesced(req) => req.resolve(result),
@@ -95,7 +95,7 @@ pub struct ReadRequest {
     pub(crate) offset: u64,
     pub(crate) length: usize,
     pub(crate) alignment: Alignment,
-    pub(crate) callback: oneshot::Sender<VortexResult<ByteBuffer>>,
+    pub(crate) callback: oneshot::Sender<VortexResult<BufferHandle>>,
 }
 
 impl Debug for ReadRequest {
@@ -111,7 +111,7 @@ impl Debug for ReadRequest {
 }
 
 impl ReadRequest {
-    pub(crate) fn resolve(self, result: VortexResult<ByteBuffer>) {
+    pub(crate) fn resolve(self, result: VortexResult<BufferHandle>) {
         // tokio::sync::oneshot::Sender::send returns Err with the value if receiver dropped
         #[cfg(feature = "tokio")]
         if self.callback.send(result).is_err() {
@@ -143,15 +143,31 @@ impl Debug for CoalescedRequest {
 }
 
 impl CoalescedRequest {
-    pub fn resolve(self, result: VortexResult<ByteBuffer>) {
+    pub fn resolve(self, result: VortexResult<BufferHandle>) {
         match result {
             Ok(buffer) => {
-                let buffer = buffer.aligned(Alignment::none());
+                let base = match buffer.ensure_aligned(Alignment::none()) {
+                    Ok(base) => base,
+                    Err(e) => {
+                        let e = Arc::new(e);
+                        for req in self.requests.into_iter() {
+                            req.resolve(Err(VortexError::from(e.clone())));
+                        }
+                        return;
+                    }
+                };
+
                 for req in self.requests.into_iter() {
                     let start = usize::try_from(req.offset - self.range.start)
                         .vortex_expect("invalid offset");
                     let end = start + req.length;
-                    let slice = buffer.slice(start..end).aligned(req.alignment);
+                    let slice = match base.slice(start..end).ensure_aligned(req.alignment) {
+                        Ok(slice) => slice,
+                        Err(e) => {
+                            req.resolve(Err(e));
+                            continue;
+                        }
+                    };
                     req.resolve(Ok(slice));
                 }
             }
