@@ -15,21 +15,29 @@ use vortex_error::VortexResult;
 /// Move all canonical data from to_host from device.
 #[async_trait]
 pub trait CanonicalCudaExt {
-    async fn to_host(self) -> VortexResult<Self>
+    async fn into_host(self) -> VortexResult<Self>
     where
         Self: Sized;
 }
 
 #[async_trait]
 impl CanonicalCudaExt for Canonical {
-    async fn to_host(self) -> VortexResult<Self> {
+    async fn into_host(self) -> VortexResult<Self> {
         match self {
             n @ Canonical::Null(_) => Ok(n),
             Canonical::Bool(bool) => {
                 // NOTE: update to copy to host when adding buffer handle.
                 // Also update other method to copy validity to host.
-                let BoolArrayParts { bits, validity, .. } = bool.into_parts();
-                Ok(Canonical::Bool(BoolArray::from_bit_buffer(bits, validity)))
+                let BoolArrayParts {
+                    bits,
+                    validity,
+                    offset,
+                    len,
+                    ..
+                } = bool.into_parts();
+                Ok(Canonical::Bool(BoolArray::new_handle(
+                    bits, offset, len, validity,
+                )))
             }
             Canonical::Primitive(prim) => {
                 let PrimitiveArrayParts {

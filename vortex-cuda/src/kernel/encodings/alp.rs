@@ -18,6 +18,7 @@ use vortex_array::Canonical;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::PrimitiveArrayParts;
 use vortex_array::buffer::BufferHandle;
+use vortex_cuda_macros::cuda_tests;
 use vortex_dtype::NativePType;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
@@ -113,8 +114,7 @@ where
     )))
 }
 
-#[cfg(test)]
-#[cfg(cuda_available)]
+#[cuda_tests]
 mod tests {
     use vortex_alp::ALPArray;
     use vortex_alp::Exponents;
@@ -154,7 +154,7 @@ mod tests {
             .execute(alp_array.to_array(), &mut cuda_ctx)
             .await
             .vortex_expect("GPU decompression failed")
-            .to_host()
+            .into_host()
             .await?
             .into_array();
 

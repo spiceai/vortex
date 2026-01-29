@@ -33,7 +33,7 @@ use vortex_array::vtable::VisitorVTable;
 use vortex_buffer::BitBuffer;
 use vortex_buffer::ByteBuffer;
 use vortex_dtype::DType;
-use vortex_error::VortexExpect;
+use vortex_error::VortexExpect as _;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
@@ -122,10 +122,7 @@ impl VTable for ByteBoolVTable {
     fn execute(array: &Self::Array, _ctx: &mut ExecutionCtx) -> VortexResult<Canonical> {
         let boolean_buffer = BitBuffer::from(array.as_slice());
         let validity = array.validity().clone();
-        Ok(Canonical::Bool(BoolArray::from_bit_buffer(
-            boolean_buffer,
-            validity,
-        )))
+        Ok(Canonical::Bool(BoolArray::new(boolean_buffer, validity)))
     }
 }
 
@@ -229,7 +226,7 @@ impl OperationsVTable<ByteBoolVTable> for ByteBoolVTable {
 
 impl VisitorVTable<ByteBoolVTable> for ByteBoolVTable {
     fn visit_buffers(array: &ByteBoolArray, visitor: &mut dyn ArrayBufferVisitor) {
-        visitor.visit_buffer(array.buffer().as_host());
+        visitor.visit_buffer_handle("values", array.buffer());
     }
 
     fn visit_children(array: &ByteBoolArray, visitor: &mut dyn ArrayChildVisitor) {
