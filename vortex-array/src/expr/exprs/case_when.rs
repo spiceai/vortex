@@ -17,12 +17,13 @@ use std::hash::Hash;
 
 use prost::Message;
 use vortex_dtype::DType;
-use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
+use vortex_error::vortex_panic;
 use vortex_proto::expr as pb;
 use vortex_scalar::Scalar;
 
+use crate::ArrayRef;
 use crate::IntoArray;
 use crate::arrays::BoolArray;
 use crate::arrays::ConstantArray;
@@ -132,17 +133,33 @@ impl VTable for CaseWhen {
 
     fn execute(
         &self,
-        options: &Self::Options,
-        mut args: ExecutionArgs,
+        _options: &Self::Options,
+        args: ExecutionArgs,
     ) -> VortexResult<ExecutionResult> {
         let row_count = args.row_count;
 
-        // Extract inputs: condition, then_value, else_value (optional)
-        let condition = args.inputs.remove(0);
-        let then_value = args.inputs.remove(0);
+        // Extract inputs based on arity: [condition, then_value] or [condition, then_value, else_value]
+        let (condition, then_value, else_value) = match args.inputs.len() {
+            2 => {
+                let [condition, then_value]: [ArrayRef; 2] = args
+                    .inputs
+                    .try_into()
+                    .map_err(|_| vortex_error::vortex_err!("Expected 2 inputs"))?;
+                (condition, then_value, None)
+            }
+            3 => {
+                let [condition, then_value, else_value]: [ArrayRef; 3] = args
+                    .inputs
+                    .try_into()
+                    .map_err(|_| vortex_error::vortex_err!("Expected 3 inputs"))?;
+                (condition, then_value, Some(else_value))
+            }
+            n => vortex_bail!("CaseWhen expects 2 or 3 inputs, got {}", n),
+        };
 
         // Execute condition to get a BoolArray
         let cond_bool = condition.execute::<BoolArray>(args.ctx)?;
+        // SQL semantics: NULL condition is treated as FALSE (i.e., we take the ELSE branch)
         let mask = cond_bool.to_mask_fill_null_false();
 
         // Short-circuit: all true -> just return THEN value
@@ -152,27 +169,24 @@ impl VTable for CaseWhen {
 
         // Short-circuit: all false -> return ELSE value or NULL
         if mask.all_false() {
-            return if options.has_else {
-                let else_value = args.inputs.remove(0);
-                else_value.execute::<ExecutionResult>(args.ctx)
-            } else {
-                // Create NULL constant of appropriate type
-                let then_dtype = then_value.dtype().as_nullable();
-                Ok(ExecutionResult::constant(
-                    Scalar::null(then_dtype),
-                    row_count,
-                ))
+            return match else_value {
+                Some(else_value) => else_value.execute::<ExecutionResult>(args.ctx),
+                None => {
+                    // Create NULL constant of appropriate type
+                    let then_dtype = then_value.dtype().as_nullable();
+                    Ok(ExecutionResult::constant(
+                        Scalar::null(then_dtype),
+                        row_count,
+                    ))
+                }
             };
         }
 
-        // Get else value for zip
-        let else_value = if options.has_else {
-            args.inputs.pop().vortex_expect("Missing else input")
-        } else {
-            // Create NULL constant array for the else branch
+        // Get else value for zip (create NULL constant if no else clause)
+        let else_value = else_value.unwrap_or_else(|| {
             let then_dtype = then_value.dtype().as_nullable();
             ConstantArray::new(Scalar::null(then_dtype), row_count).into_array()
-        };
+        });
 
         // Use zip to select: where mask is true, take then_value; else take else_value
         let result = zip(then_value.as_ref(), else_value.as_ref(), &mask)?;
@@ -259,29 +273,16 @@ pub fn nested_case_when(
         "nested_case_when requires at least one when/then pair"
     );
 
-    // Build from right to left (innermost first)
-    // Using fold to avoid expect/unwrap
-    let pairs: Vec<_> = when_then_pairs.into_iter().rev().collect();
-    let first_pair = &pairs[0]; // Safe: assert guarantees non-empty
-    let remaining = &pairs[1..];
-
-    // Build innermost expression
-    let mut result = if let Some(ref else_expr) = else_value {
-        case_when(
-            first_pair.0.clone(),
-            first_pair.1.clone(),
-            else_expr.clone(),
-        )
-    } else {
-        case_when_no_else(first_pair.0.clone(), first_pair.1.clone())
-    };
-
-    // Wrap with remaining pairs
-    for (condition, then_value) in remaining {
-        result = case_when(condition.clone(), then_value.clone(), result);
-    }
-
-    result
+    // Build from right to left (innermost first) using rfold
+    when_then_pairs
+        .into_iter()
+        .rfold(else_value, |acc, (condition, then_value)| {
+            Some(match acc {
+                Some(else_expr) => case_when(condition, then_value, else_expr),
+                None => case_when_no_else(condition, then_value),
+            })
+        })
+        .unwrap_or_else(|| vortex_panic!("rfold on non-empty iterator always produces Some"))
 }
 
 #[cfg(test)]
