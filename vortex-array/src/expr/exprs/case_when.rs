@@ -27,6 +27,7 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_proto::expr as pb;
 use vortex_scalar::Scalar;
+use vortex_session::VortexSession;
 
 use crate::IntoArray;
 use crate::ToCanonical;
@@ -83,7 +84,11 @@ impl VTable for CaseWhen {
         ))
     }
 
-    fn deserialize(&self, metadata: &[u8]) -> VortexResult<Self::Options> {
+    fn deserialize(
+        &self,
+        metadata: &[u8],
+        _session: &VortexSession,
+    ) -> VortexResult<Self::Options> {
         let opts = pb::CaseWhenOpts::decode(metadata)?;
         Ok(CaseWhenOptions {
             num_when_then_pairs: opts.num_when_then_pairs,

@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::sync::Arc;
-
 use vortex_buffer::BufferMut;
 use vortex_dtype::DType;
-use vortex_dtype::ExtDType;
+use vortex_dtype::ExtDTypeRef;
 use vortex_dtype::PType;
+use vortex_dtype::datetime::AnyTemporal;
 use vortex_dtype::datetime::TemporalMetadata;
 use vortex_dtype::datetime::TimeUnit;
 use vortex_error::VortexResult;
@@ -58,20 +57,22 @@ impl CastKernel for ExtensionVTable {
 
 fn cast_temporal_date_to_timestamp(
     array: &ExtensionArray,
-    target_ext_dtype: &Arc<ExtDType>,
+    target_ext_dtype: &ExtDTypeRef,
 ) -> VortexResult<Option<ArrayRef>> {
-    let Ok(source_temporal) = TemporalMetadata::try_from(array.ext_dtype()) else {
+    let Some(source_temporal) = array.ext_dtype().metadata_opt::<AnyTemporal>() else {
         return Ok(None);
     };
-    let Ok(target_temporal) = TemporalMetadata::try_from(target_ext_dtype) else {
+    let Some(target_temporal) = target_ext_dtype.metadata_opt::<AnyTemporal>() else {
         return Ok(None);
     };
 
-    let (TemporalMetadata::Date(source_unit), TemporalMetadata::Timestamp(target_unit, _)) =
-        (source_temporal, target_temporal)
-    else {
+    let TemporalMetadata::Date(source_unit) = source_temporal else {
         return Ok(None);
     };
+    let TemporalMetadata::Timestamp(target_options) = target_temporal else {
+        return Ok(None);
+    };
+    let target_unit = target_options.unit;
 
     let source_i64 = compute::cast(
         array.storage(),
@@ -79,7 +80,7 @@ fn cast_temporal_date_to_timestamp(
     )?;
     let source_i64 = source_i64.to_primitive();
 
-    let converted = cast_date_values_to_timestamp(&source_i64, source_unit, target_unit)?;
+    let converted = cast_date_values_to_timestamp(&source_i64, *source_unit, target_unit)?;
 
     compute::cast(converted.as_ref(), target_ext_dtype.storage_dtype()).map(Some)
 }
@@ -183,18 +184,13 @@ register_kernel!(CastKernelAdapter(ExtensionVTable).lift());
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use rstest::rstest;
     use vortex_buffer::Buffer;
     use vortex_buffer::buffer;
-    use vortex_dtype::ExtDType;
     use vortex_dtype::Nullability;
-    use vortex_dtype::PType;
-    use vortex_dtype::datetime::DATE_ID;
-    use vortex_dtype::datetime::TIMESTAMP_ID;
-    use vortex_dtype::datetime::TemporalMetadata;
+    use vortex_dtype::datetime::Date;
     use vortex_dtype::datetime::TimeUnit;
+    use vortex_dtype::datetime::Timestamp;
 
     use super::*;
     use crate::IntoArray;
@@ -204,11 +200,7 @@ mod tests {
 
     #[test]
     fn cast_same_ext_dtype() {
-        let ext_dtype = Arc::new(ExtDType::new(
-            TIMESTAMP_ID.clone(),
-            Arc::new(PType::I64.into()),
-            Some(TemporalMetadata::Timestamp(TimeUnit::Milliseconds, None).into()),
-        ));
+        let ext_dtype = Timestamp::new(TimeUnit::Milliseconds, Nullability::NonNullable).erased();
         let storage = Buffer::<i64>::empty().into_array();
 
         let arr = ExtensionArray::new(ext_dtype.clone(), storage);
@@ -221,11 +213,7 @@ mod tests {
 
     #[test]
     fn cast_same_ext_dtype_differet_nullability() {
-        let ext_dtype = Arc::new(ExtDType::new(
-            TIMESTAMP_ID.clone(),
-            Arc::new(PType::I64.into()),
-            Some(TemporalMetadata::Timestamp(TimeUnit::Milliseconds, None).into()),
-        ));
+        let ext_dtype = Timestamp::new(TimeUnit::Milliseconds, Nullability::NonNullable).erased();
         let storage = Buffer::<i64>::empty().into_array();
 
         let arr = ExtensionArray::new(ext_dtype.clone(), storage);
@@ -241,16 +229,8 @@ mod tests {
 
     #[test]
     fn cast_date_days_to_timestamp_nanoseconds() {
-        let source_dtype = Arc::new(ExtDType::new(
-            DATE_ID.clone(),
-            Arc::new(DType::Primitive(PType::I32, Nullability::NonNullable)),
-            Some(TemporalMetadata::Date(TimeUnit::Days).into()),
-        ));
-        let target_dtype = Arc::new(ExtDType::new(
-            TIMESTAMP_ID.clone(),
-            Arc::new(DType::Primitive(PType::I64, Nullability::NonNullable)),
-            Some(TemporalMetadata::Timestamp(TimeUnit::Nanoseconds, None).into()),
-        ));
+        let source_dtype = Date::new(TimeUnit::Days, Nullability::NonNullable).erased();
+        let target_dtype = Timestamp::new(TimeUnit::Nanoseconds, Nullability::NonNullable).erased();
 
         let arr = ExtensionArray::new(source_dtype, buffer![0i32, 1, -1].into_array());
         let output = cast(arr.as_ref(), &DType::Extension(target_dtype.clone()))
@@ -268,16 +248,8 @@ mod tests {
 
     #[test]
     fn cast_date_days_to_timestamp_seconds_nullable() {
-        let source_dtype = Arc::new(ExtDType::new(
-            DATE_ID.clone(),
-            Arc::new(DType::Primitive(PType::I32, Nullability::Nullable)),
-            Some(TemporalMetadata::Date(TimeUnit::Days).into()),
-        ));
-        let target_dtype = Arc::new(ExtDType::new(
-            TIMESTAMP_ID.clone(),
-            Arc::new(DType::Primitive(PType::I64, Nullability::Nullable)),
-            Some(TemporalMetadata::Timestamp(TimeUnit::Seconds, None).into()),
-        ));
+        let source_dtype = Date::new(TimeUnit::Days, Nullability::Nullable).erased();
+        let target_dtype = Timestamp::new(TimeUnit::Seconds, Nullability::Nullable).erased();
 
         let arr = ExtensionArray::new(
             source_dtype,
@@ -290,27 +262,23 @@ mod tests {
         assert_eq!(output.dtype(), &DType::Extension(target_dtype));
 
         let storage = output.storage().to_primitive();
-        assert_eq!(storage.scalar_at(0).as_primitive().as_::<i64>(), Some(0));
-        assert!(storage.scalar_at(1).is_null());
         assert_eq!(
-            storage.scalar_at(2).as_primitive().as_::<i64>(),
+            storage.scalar_at(0).unwrap().as_primitive().as_::<i64>(),
+            Some(0)
+        );
+        assert!(storage.scalar_at(1).unwrap().is_null());
+        assert_eq!(
+            storage.scalar_at(2).unwrap().as_primitive().as_::<i64>(),
             Some(172_800)
         );
     }
 
     #[test]
     fn cast_different_ext_dtype() {
-        let original_dtype = Arc::new(ExtDType::new(
-            TIMESTAMP_ID.clone(),
-            Arc::new(PType::I64.into()),
-            Some(TemporalMetadata::Timestamp(TimeUnit::Milliseconds, None).into()),
-        ));
-        let target_dtype = Arc::new(ExtDType::new(
-            TIMESTAMP_ID.clone(),
-            Arc::new(PType::I64.into()),
-            // Note NS here instead of MS
-            Some(TemporalMetadata::Timestamp(TimeUnit::Nanoseconds, None).into()),
-        ));
+        let original_dtype =
+            Timestamp::new(TimeUnit::Milliseconds, Nullability::NonNullable).erased();
+        // Note NS here instead of MS
+        let target_dtype = Timestamp::new(TimeUnit::Nanoseconds, Nullability::NonNullable).erased();
 
         let storage = buffer![1i64].into_array();
         let arr = ExtensionArray::new(original_dtype, storage);
@@ -328,15 +296,8 @@ mod tests {
     }
 
     fn create_timestamp_array(time_unit: TimeUnit, nullable: bool) -> ExtensionArray {
-        let ext_dtype = Arc::new(ExtDType::new(
-            TIMESTAMP_ID.clone(),
-            Arc::new(if nullable {
-                DType::Primitive(PType::I64, Nullability::Nullable)
-            } else {
-                DType::Primitive(PType::I64, Nullability::NonNullable)
-            }),
-            Some(TemporalMetadata::Timestamp(time_unit, Some("UTC".to_string())).into()),
-        ));
+        let ext_dtype =
+            Timestamp::new_with_tz(time_unit, Some("UTC".into()), nullable.into()).erased();
 
         let storage = if nullable {
             PrimitiveArray::from_option_iter([

@@ -22,11 +22,13 @@ use arrow_schema::DataType;
 use arrow_schema::TimeUnit as ArrowTimeUnit;
 use vortex_dtype::DType as VortexDType;
 use vortex_dtype::NativePType;
+use vortex_dtype::datetime::AnyTemporal;
 use vortex_dtype::datetime::TemporalMetadata;
 use vortex_dtype::datetime::TimeUnit;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
+use vortex_error::vortex_err;
 
 use crate::Array;
 use crate::ArrayRef;
@@ -47,47 +49,70 @@ pub(super) fn to_arrow_temporal(
             data_type
         );
     };
-    let temporal_metadata = TemporalMetadata::try_from(ext_dtype)?;
+    let temporal_metadata = ext_dtype.metadata_opt::<AnyTemporal>().ok_or_else(|| {
+        vortex_err!(
+            "Array dtype {} is not a temporal extension type",
+            array.dtype()
+        )
+    })?;
 
     match (temporal_metadata, data_type) {
-        (TemporalMetadata::Date(TimeUnit::Days), DataType::Date32) => {
+        (TemporalMetadata::Date(unit), DataType::Date32) if *unit == TimeUnit::Days => {
             to_temporal::<Date32Type>(array, ctx)
         }
-        (TemporalMetadata::Date(TimeUnit::Milliseconds), DataType::Date64) => {
+        (TemporalMetadata::Date(unit), DataType::Date64) if *unit == TimeUnit::Milliseconds => {
             to_temporal::<Date64Type>(array, ctx)
         }
-        (TemporalMetadata::Time(TimeUnit::Seconds), DataType::Time32(ArrowTimeUnit::Second)) => {
+        (TemporalMetadata::Time(unit), DataType::Time32(ArrowTimeUnit::Second))
+            if *unit == TimeUnit::Seconds =>
+        {
             to_temporal::<Time32SecondType>(array, ctx)
         }
-        (
-            TemporalMetadata::Time(TimeUnit::Milliseconds),
-            DataType::Time32(ArrowTimeUnit::Millisecond),
-        ) => to_temporal::<Time32MillisecondType>(array, ctx),
-        (
-            TemporalMetadata::Time(TimeUnit::Microseconds),
-            DataType::Time64(ArrowTimeUnit::Microsecond),
-        ) => to_temporal::<Time64MicrosecondType>(array, ctx),
+        (TemporalMetadata::Time(unit), DataType::Time32(ArrowTimeUnit::Millisecond))
+            if *unit == TimeUnit::Milliseconds =>
+        {
+            to_temporal::<Time32MillisecondType>(array, ctx)
+        }
+        (TemporalMetadata::Time(unit), DataType::Time64(ArrowTimeUnit::Microsecond))
+            if *unit == TimeUnit::Microseconds =>
+        {
+            to_temporal::<Time64MicrosecondType>(array, ctx)
+        }
 
-        (
-            TemporalMetadata::Time(TimeUnit::Nanoseconds),
-            DataType::Time64(ArrowTimeUnit::Nanosecond),
-        ) => to_temporal::<Time64NanosecondType>(array, ctx),
-        (
-            TemporalMetadata::Timestamp(TimeUnit::Seconds, _),
-            DataType::Timestamp(ArrowTimeUnit::Second, arrow_tz),
-        ) => to_arrow_timestamp::<TimestampSecondType>(array, arrow_tz, ctx),
-        (
-            TemporalMetadata::Timestamp(TimeUnit::Milliseconds, _),
-            DataType::Timestamp(ArrowTimeUnit::Millisecond, arrow_tz),
-        ) => to_arrow_timestamp::<TimestampMillisecondType>(array, arrow_tz, ctx),
-        (
-            TemporalMetadata::Timestamp(TimeUnit::Microseconds, _),
-            DataType::Timestamp(ArrowTimeUnit::Microsecond, arrow_tz),
-        ) => to_arrow_timestamp::<TimestampMicrosecondType>(array, arrow_tz, ctx),
-        (
-            TemporalMetadata::Timestamp(TimeUnit::Nanoseconds, _),
-            DataType::Timestamp(ArrowTimeUnit::Nanosecond, arrow_tz),
-        ) => to_arrow_timestamp::<TimestampNanosecondType>(array, arrow_tz, ctx),
+        (TemporalMetadata::Time(unit), DataType::Time64(ArrowTimeUnit::Nanosecond))
+            if *unit == TimeUnit::Nanoseconds =>
+        {
+            to_temporal::<Time64NanosecondType>(array, ctx)
+        }
+
+        (TemporalMetadata::Timestamp(options), DataType::Timestamp(arrow_unit, arrow_tz)) => {
+            vortex_ensure!(
+                &options.tz == arrow_tz,
+                "Cannot convert {} array to Arrow type {} due to timezone mismatch",
+                array.dtype(),
+                data_type
+            );
+
+            match (options.unit, *arrow_unit) {
+                (TimeUnit::Seconds, ArrowTimeUnit::Second) => {
+                    to_arrow_timestamp::<TimestampSecondType>(array, arrow_tz, ctx)
+                }
+                (TimeUnit::Milliseconds, ArrowTimeUnit::Millisecond) => {
+                    to_arrow_timestamp::<TimestampMillisecondType>(array, arrow_tz, ctx)
+                }
+                (TimeUnit::Microseconds, ArrowTimeUnit::Microsecond) => {
+                    to_arrow_timestamp::<TimestampMicrosecondType>(array, arrow_tz, ctx)
+                }
+                (TimeUnit::Nanoseconds, ArrowTimeUnit::Nanosecond) => {
+                    to_arrow_timestamp::<TimestampNanosecondType>(array, arrow_tz, ctx)
+                }
+                _ => vortex_bail!(
+                    "Cannot convert {} array to Arrow type {}",
+                    array.dtype(),
+                    data_type
+                ),
+            }
+        }
         _ => vortex_bail!(
             "Cannot convert {} array to Arrow type {}",
             array.dtype(),
@@ -129,7 +154,7 @@ where
 {
     debug_assert!(matches!(
         array.dtype(),
-        VortexDType::Extension(ext_dtype) if TemporalMetadata::try_from(ext_dtype).is_ok()
+        VortexDType::Extension(ext_dtype) if ext_dtype.is::<AnyTemporal>()
     ));
 
     let ext_array = array.execute::<ExtensionArray>(ctx)?;
