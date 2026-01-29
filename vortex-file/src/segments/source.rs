@@ -11,6 +11,7 @@ use std::task::Poll;
 
 use futures::FutureExt;
 use futures::StreamExt;
+use futures::channel::mpsc;
 #[cfg(not(feature = "tokio"))]
 use oneshot;
 #[cfg(feature = "tokio")]
@@ -27,8 +28,6 @@ use vortex_layout::segments::SegmentSource;
 use vortex_metrics::VortexMetrics;
 
 use crate::SegmentSpec;
-use crate::read::EventsChannel;
-use crate::read::EventsSender;
 use crate::read::IoRequestStream;
 use crate::read::ReadRequest;
 use crate::read::RequestId;
@@ -64,7 +63,7 @@ pub enum ReadEvent {
 pub struct FileSegmentSource {
     segments: Arc<[SegmentSpec]>,
     /// A queue for sending read request events to the I/O stream.
-    events: EventsSender,
+    events: mpsc::UnboundedSender<ReadEvent>,
     /// The next read request ID.
     next_id: Arc<AtomicUsize>,
 }
@@ -76,7 +75,7 @@ impl FileSegmentSource {
         handle: Handle,
         metrics: VortexMetrics,
     ) -> Self {
-        let (send, recv) = EventsChannel::unbounded();
+        let (send, recv) = mpsc::unbounded();
 
         let max_alignment = segments
             .iter()
@@ -149,10 +148,8 @@ impl SegmentSource for FileSegmentSource {
 
             // If we fail to submit the event, we create a future that has failed.
             if let Err(e) = self.events.unbounded_send(event) {
-                return std::future::ready({
-                    Err(vortex_err!("Failed to submit read request: {e}"))
-                })
-                .boxed();
+                return async move { Err(vortex_err!("Failed to submit read request: {e}")) }
+                    .boxed();
             }
 
             ReadFuture {
@@ -181,7 +178,7 @@ struct ReadFuture {
     id: usize,
     recv: oneshot::Receiver<VortexResult<BufferHandle>>,
     polled: bool,
-    events: EventsSender,
+    events: mpsc::UnboundedSender<ReadEvent>,
 }
 
 impl Future for ReadFuture {
@@ -205,6 +202,8 @@ impl Future for ReadFuture {
 
 impl Drop for ReadFuture {
     fn drop(&mut self) {
+        // When the FileHandle is dropped, we can send a shutdown event to the I/O stream.
+        // If the I/O stream has already been dropped, this will fail silently.
         drop(self.events.unbounded_send(ReadEvent::Dropped(self.id)));
     }
 }
