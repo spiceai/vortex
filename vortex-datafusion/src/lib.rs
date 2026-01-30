@@ -11,6 +11,9 @@ use vortex::expr::stats::Precision;
 mod convert;
 mod persistent;
 
+#[cfg(test)]
+mod tests;
+
 pub use convert::exprs::DefaultExpressionConvertor;
 pub use convert::exprs::ExpressionConvertor;
 pub use persistent::*;
@@ -57,7 +60,10 @@ mod common_tests {
     use datafusion::datasource::provider::DefaultTableFactory;
     use datafusion::execution::SessionStateBuilder;
     use datafusion::prelude::SessionContext;
+    use datafusion_catalog::TableProvider;
+    use datafusion_common::DFSchema;
     use datafusion_common::GetExt;
+    use datafusion_expr::CreateExternalTable;
     use object_store::ObjectStore;
     use object_store::memory::InMemory;
     use url::Url;
@@ -94,17 +100,14 @@ mod common_tests {
                 ..Default::default()
             };
             let factory = Arc::new(VortexFormatFactory::new().with_options(opts));
-            let mut session_state_builder = SessionStateBuilder::new()
+            let session_state_builder = SessionStateBuilder::new()
                 .with_default_features()
                 .with_table_factory(
                     factory.get_ext().to_uppercase(),
                     Arc::new(DefaultTableFactory::new()),
                 )
+                .with_file_formats(vec![factory])
                 .with_object_store(&Url::try_from("file://").unwrap(), store.clone());
-
-            if let Some(file_formats) = session_state_builder.file_formats() {
-                file_formats.push(factory as _);
-            }
 
             let session: SessionContext =
                 SessionContext::new_with_state(session_state_builder.build()).enable_url_table();
@@ -117,7 +120,7 @@ mod common_tests {
         where
             P: Into<object_store::path::Path>,
         {
-            let array = ArrayRef::from_arrow(batch, false);
+            let array = ArrayRef::from_arrow(batch, false)?;
             let mut write = ObjectStoreWriter::new(self.store.clone(), &path.into()).await?;
             VX_SESSION
                 .write_options()
@@ -126,6 +129,32 @@ mod common_tests {
             write.shutdown().await?;
 
             Ok(())
+        }
+
+        /// Creates a ListingTable provider targeted at the provided path
+        pub async fn table_provider<S>(
+            &self,
+            name: &str,
+            location: impl Into<String>,
+            schema: S,
+        ) -> anyhow::Result<Arc<dyn TableProvider>>
+        where
+            DFSchema: TryFrom<S>,
+            anyhow::Error: From<<S as TryInto<DFSchema>>::Error>,
+        {
+            let factory = self.session.table_factory("VORTEX").unwrap();
+
+            let cmd = CreateExternalTable::builder(
+                name,
+                location.into(),
+                "vortex",
+                DFSchema::try_from(schema)?.into(),
+            )
+            .build();
+
+            let table = factory.create(&self.session.state(), &cmd).await?;
+
+            Ok(table)
         }
     }
 }
