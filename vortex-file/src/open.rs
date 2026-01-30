@@ -209,6 +209,8 @@ impl VortexOpenOptions {
         let initial_offset = file_size - initial_read_size as u64;
         let initial_read: ByteBuffer = read
             .read_at(initial_offset, initial_read_size, Alignment::none())
+            .await?
+            .try_into_host()?
             .await?;
 
         let mut deserializer = Footer::deserializer(initial_read, self.session.clone())
@@ -218,7 +220,11 @@ impl VortexOpenOptions {
         let footer = loop {
             match deserializer.deserialize()? {
                 DeserializeStep::NeedMoreData { offset, len } => {
-                    let more_data = read.read_at(offset, len, Alignment::none()).await?;
+                    let more_data = read
+                        .read_at(offset, len, Alignment::none())
+                        .await?
+                        .try_into_host()?
+                        .await?;
                     deserializer.prefix_data(more_data);
                 }
                 DeserializeStep::NeedFileSize => unreachable!("We passed file_size above"),
@@ -287,10 +293,12 @@ mod tests {
 
     use futures::future::BoxFuture;
     use vortex_array::IntoArray;
+    use vortex_array::buffer::BufferHandle;
     use vortex_array::expr::session::ExprSession;
     use vortex_array::session::ArraySession;
     use vortex_buffer::Buffer;
     use vortex_buffer::ByteBufferMut;
+    use vortex_dtype::session::DTypeSession;
     use vortex_io::session::RuntimeSession;
     use vortex_layout::session::LayoutSession;
 
@@ -315,7 +323,7 @@ mod tests {
             offset: u64,
             length: usize,
             alignment: Alignment,
-        ) -> BoxFuture<'static, VortexResult<ByteBuffer>> {
+        ) -> BoxFuture<'static, VortexResult<BufferHandle>> {
             self.total_read.fetch_add(length, Ordering::Relaxed);
             let _ = self.first_read_len.compare_exchange(
                 0,
@@ -337,6 +345,7 @@ mod tests {
         let mut buf = ByteBufferMut::empty();
         let mut session = VortexSession::empty()
             .with::<VortexMetrics>()
+            .with::<DTypeSession>()
             .with::<ArraySession>()
             .with::<LayoutSession>()
             .with::<ExprSession>()
