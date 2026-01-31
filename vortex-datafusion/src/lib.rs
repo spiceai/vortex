@@ -12,6 +12,7 @@ mod convert;
 mod persistent;
 pub mod vendor;
 
+pub use convert::exprs::DefaultExpressionConvertor;
 pub use convert::exprs::ExpressionConvertor;
 pub use persistent::*;
 
