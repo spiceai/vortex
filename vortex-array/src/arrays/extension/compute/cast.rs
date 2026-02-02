@@ -69,10 +69,9 @@ fn cast_temporal_date_to_timestamp(
     let TemporalMetadata::Date(source_unit) = source_temporal else {
         return Ok(None);
     };
-    let TemporalMetadata::Timestamp(target_options) = target_temporal else {
+    let TemporalMetadata::Timestamp((target_unit, _tz)) = target_temporal else {
         return Ok(None);
     };
-    let target_unit = target_options.unit;
 
     let source_i64 = compute::cast(
         array.storage(),
@@ -80,7 +79,7 @@ fn cast_temporal_date_to_timestamp(
     )?;
     let source_i64 = source_i64.to_primitive();
 
-    let converted = cast_date_values_to_timestamp(&source_i64, *source_unit, target_unit)?;
+    let converted = cast_date_values_to_timestamp(&source_i64, *source_unit, *target_unit)?;
 
     compute::cast(converted.as_ref(), target_ext_dtype.storage_dtype()).map(Some)
 }

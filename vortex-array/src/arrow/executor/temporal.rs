@@ -85,15 +85,15 @@ pub(super) fn to_arrow_temporal(
             to_temporal::<Time64NanosecondType>(array, ctx)
         }
 
-        (TemporalMetadata::Timestamp(options), DataType::Timestamp(arrow_unit, arrow_tz)) => {
+        (TemporalMetadata::Timestamp((unit, tz)), DataType::Timestamp(arrow_unit, arrow_tz)) => {
             vortex_ensure!(
-                &options.tz == arrow_tz,
+                tz == arrow_tz,
                 "Cannot convert {} array to Arrow type {} due to timezone mismatch",
                 array.dtype(),
                 data_type
             );
 
-            match (options.unit, *arrow_unit) {
+            match (*unit, *arrow_unit) {
                 (TimeUnit::Seconds, ArrowTimeUnit::Second) => {
                     to_arrow_timestamp::<TimestampSecondType>(array, arrow_tz, ctx)
                 }
