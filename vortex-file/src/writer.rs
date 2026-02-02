@@ -72,7 +72,7 @@ pub trait WriteOptionsSessionExt: SessionExt {
         let maybe_write_strategy_builder = self.get_opt::<WriteStrategyBuilder>();
         let strategy = maybe_write_strategy_builder
             .map(|opt| opt.clone().build())
-            .unwrap_or_else(|| WriteStrategyBuilder::new().build());
+            .unwrap_or_else(|| WriteStrategyBuilder::default().build());
 
         VortexWriteOptions {
             session: self.session(),
@@ -89,8 +89,8 @@ impl VortexWriteOptions {
     /// Create a new [`VortexWriteOptions`] with the given session.
     pub fn new(session: VortexSession) -> Self {
         VortexWriteOptions {
+            strategy: WriteStrategyBuilder::default().build(),
             session,
-            strategy: WriteStrategyBuilder::new().build(),
             exclude_dtype: false,
             file_statistics: PRUNING_STATS.to_vec(),
             max_variable_length_statistics_size: 64,

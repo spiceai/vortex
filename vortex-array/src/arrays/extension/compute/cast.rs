@@ -69,7 +69,7 @@ fn cast_temporal_date_to_timestamp(
     let TemporalMetadata::Date(source_unit) = source_temporal else {
         return Ok(None);
     };
-    let TemporalMetadata::Timestamp((target_unit, _tz)) = target_temporal else {
+    let TemporalMetadata::Timestamp(target_unit, _tz) = target_temporal else {
         return Ok(None);
     };
 
