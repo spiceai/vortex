@@ -88,7 +88,7 @@ pub trait CanonicalCompressor {
 ///     .exclude_int([IntCode::Dict])
 ///     .build();
 /// ```
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct BtrBlocksCompressor {
     /// Integer compressor with configured schemes.
     pub int_schemes: Vec<&'static dyn IntegerScheme>,
