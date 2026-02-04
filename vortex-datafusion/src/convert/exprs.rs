@@ -34,10 +34,10 @@ use vortex::expr::get_item;
 use vortex::expr::is_null;
 use vortex::expr::list_contains;
 use vortex::expr::lit;
-use vortex::expr::nested_case_when;
 use vortex::expr::not;
 use vortex::expr::pack;
 use vortex::expr::root;
+use vortex::expr::{case_when, case_when_no_else};
 use vortex::scalar::Scalar;
 
 use crate::convert::FromDataFusion;
@@ -137,22 +137,20 @@ impl DefaultExpressionConvertor {
             ));
         }
 
-        // Convert all when/then pairs to (condition, value) tuples
-        let mut pairs = Vec::with_capacity(when_then_pairs.len());
+        // Convert all when/then pairs to flat list: [when1, then1, when2, then2, ...]
+        let mut children = Vec::with_capacity(when_then_pairs.len() * 2 + 1);
         for (when_expr, then_expr) in when_then_pairs {
-            let condition = self.convert(when_expr.as_ref())?;
-            let value = self.convert(then_expr.as_ref())?;
-            pairs.push((condition, value));
+            children.push(self.convert(when_expr.as_ref())?);
+            children.push(self.convert(then_expr.as_ref())?);
         }
 
-        // Convert optional else expression
-        let else_value = case_expr
-            .else_expr()
-            .map(|e| self.convert(e.as_ref()))
-            .transpose()?;
-
-        // Use nested_case_when which converts to nested binary case_when expressions
-        Ok(nested_case_when(pairs, else_value))
+        // Handle optional else clause
+        if let Some(else_expr) = case_expr.else_expr() {
+            children.push(self.convert(else_expr.as_ref())?);
+            Ok(case_when(children))
+        } else {
+            Ok(case_when_no_else(children))
+        }
     }
 }
 
@@ -939,4 +937,195 @@ mod tests {
         assert_eq!(df_as_arrow, vec![0, 0, 50, 100, 100]);
         assert_eq!(vortex_as_arrow, df_as_arrow);
     }
+
+    #[test]
+    fn test_case_when_nary_4_conditions() {
+        use datafusion::arrow::array::Int32Array;
+        use datafusion::arrow::array::RecordBatch;
+        use datafusion_physical_expr::expressions::CaseExpr;
+        use vortex::VortexSessionDefault;
+        use vortex::array::ArrayRef;
+        use vortex::array::Canonical;
+        use vortex::array::VortexSessionExecute as _;
+        use vortex::array::arrow::FromArrowArray;
+        use vortex::session::VortexSession;
+
+        // Test with 4 when/then pairs to exercise the n-ary implementation
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]));
+
+        let values = Int32Array::from(vec![1, 10, 25, 50, 75, 100]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(values)]).unwrap();
+
+        let col_value = Arc::new(df_expr::Column::new("value", 0)) as Arc<dyn PhysicalExpr>;
+
+        // Literal thresholds
+        let lit_75 =
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(75)))) as Arc<dyn PhysicalExpr>;
+        let lit_50 =
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(50)))) as Arc<dyn PhysicalExpr>;
+        let lit_25 =
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(25)))) as Arc<dyn PhysicalExpr>;
+        let lit_10 =
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(10)))) as Arc<dyn PhysicalExpr>;
+
+        // Result values
+        let result_4 =
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(4)))) as Arc<dyn PhysicalExpr>;
+        let result_3 =
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(3)))) as Arc<dyn PhysicalExpr>;
+        let result_2 =
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(2)))) as Arc<dyn PhysicalExpr>;
+        let result_1 =
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(1)))) as Arc<dyn PhysicalExpr>;
+        let result_0 =
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(0)))) as Arc<dyn PhysicalExpr>;
+
+        // Build conditions
+        let when1 = Arc::new(df_expr::BinaryExpr::new(
+            col_value.clone(),
+            DFOperator::Gt,
+            lit_75,
+        )) as Arc<dyn PhysicalExpr>;
+        let when2 = Arc::new(df_expr::BinaryExpr::new(
+            col_value.clone(),
+            DFOperator::Gt,
+            lit_50,
+        )) as Arc<dyn PhysicalExpr>;
+        let when3 = Arc::new(df_expr::BinaryExpr::new(
+            col_value.clone(),
+            DFOperator::Gt,
+            lit_25,
+        )) as Arc<dyn PhysicalExpr>;
+        let when4 = Arc::new(df_expr::BinaryExpr::new(col_value, DFOperator::Gt, lit_10))
+            as Arc<dyn PhysicalExpr>;
+
+        let case_expr = CaseExpr::try_new(
+            None,
+            vec![
+                (when1, result_4),
+                (when2, result_3),
+                (when3, result_2),
+                (when4, result_1),
+            ],
+            Some(result_0),
+        )
+        .unwrap();
+
+        // Apply DataFusion expression
+        let df_result = case_expr.evaluate(&batch).unwrap();
+        let df_array = df_result.into_array(batch.num_rows()).unwrap();
+
+        // Convert to Vortex expression
+        let expr_convertor = DefaultExpressionConvertor::default();
+        let vortex_expr = expr_convertor.try_convert_case_expr(&case_expr).unwrap();
+
+        // Convert batch to Vortex array
+        let vortex_array: ArrayRef = ArrayRef::from_arrow(&batch, false).unwrap();
+
+        // Apply Vortex expression
+        let session = VortexSession::default();
+        let mut ctx = session.create_execution_ctx();
+        let vortex_result = vortex_array
+            .apply(&vortex_expr)
+            .unwrap()
+            .execute::<Canonical>(&mut ctx)
+            .unwrap();
+
+        // Convert to Vec for comparison
+        let vortex_as_arrow = vortex_result.into_primitive().as_slice::<i32>().to_vec();
+        let df_as_arrow: Vec<i32> = df_array
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+
+        // Expected: for values [1, 10, 25, 50, 75, 100]
+        // 1: not > 75, not > 50, not > 25, not > 10 -> 0
+        // 10: not > 75, not > 50, not > 25, not > 10 -> 0
+        // 25: not > 75, not > 50, not > 25, > 10 -> 1
+        // 50: not > 75, not > 50, > 25 -> 2
+        // 75: not > 75, > 50 -> 3
+        // 100: > 75 -> 4
+        assert_eq!(df_as_arrow, vec![0, 0, 1, 2, 3, 4]);
+        assert_eq!(vortex_as_arrow, df_as_arrow);
+    }
+
+    #[test]
+    fn test_case_when_no_else() {
+        use datafusion::arrow::array::Int32Array;
+        use datafusion::arrow::array::RecordBatch;
+        use datafusion_physical_expr::expressions::CaseExpr;
+        use vortex::VortexSessionDefault;
+        use vortex::array::ArrayRef;
+        use vortex::array::Canonical;
+        use vortex::array::VortexSessionExecute as _;
+        use vortex::array::arrow::FromArrowArray;
+        use vortex::session::VortexSession;
+
+        // Test CASE WHEN without ELSE clause
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]));
+
+        let values = Int32Array::from(vec![1, 5, 10, 15, 20]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(values)]).unwrap();
+
+        let col_value = Arc::new(df_expr::Column::new("value", 0)) as Arc<dyn PhysicalExpr>;
+        let lit_10 =
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(10)))) as Arc<dyn PhysicalExpr>;
+        let lit_100 =
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(100)))) as Arc<dyn PhysicalExpr>;
+
+        // WHEN value > 10 THEN 100 (no else)
+        let when1 = Arc::new(df_expr::BinaryExpr::new(col_value, DFOperator::Gt, lit_10))
+            as Arc<dyn PhysicalExpr>;
+
+        let case_expr = CaseExpr::try_new(None, vec![(when1, lit_100)], None).unwrap();
+
+        // Convert to Vortex expression
+        let expr_convertor = DefaultExpressionConvertor::default();
+        let vortex_expr = expr_convertor.try_convert_case_expr(&case_expr).unwrap();
+
+        // Verify the expression was created with no else
+        assert!(vortex_expr.to_string().contains("CASE"));
+        assert!(!vortex_expr.to_string().contains("ELSE"));
+
+        // Convert batch to Vortex array
+        let vortex_array: ArrayRef = ArrayRef::from_arrow(&batch, false).unwrap();
+
+        // Apply Vortex expression - result should be nullable
+        let session = VortexSession::default();
+        let mut ctx = session.create_execution_ctx();
+        let vortex_result = vortex_array
+            .apply(&vortex_expr)
+            .unwrap()
+            .execute::<Canonical>(&mut ctx)
+            .unwrap();
+
+        // Result should be nullable
+        assert!(vortex_result.dtype().is_nullable());
+
+        // Convert result to primitive and check values
+        let prim = vortex_result.into_primitive();
+
+        // Check non-null values
+        // value=1: not > 10 -> NULL
+        // value=5: not > 10 -> NULL
+        // value=10: not > 10 -> NULL
+        // value=15: > 10 -> 100
+        // value=20: > 10 -> 100
+        assert!(prim.scalar_at(0).unwrap().is_null());
+        assert!(prim.scalar_at(1).unwrap().is_null());
+        assert!(prim.scalar_at(2).unwrap().is_null());
+        assert_eq!(prim.as_slice::<i32>()[3], 100);
+        assert_eq!(prim.as_slice::<i32>()[4], 100);
+    }
 }
+
