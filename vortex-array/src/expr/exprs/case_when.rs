@@ -849,10 +849,12 @@ mod tests {
     #[test]
     fn test_nary_5_conditions() {
         // Test with 5 when/then pairs to stress the n-ary implementation
-        let test_array =
-            StructArray::from_fields(&[("value", buffer![1i32, 2, 3, 4, 5, 6, 7, 8, 9, 10].into_array())])
-                .unwrap()
-                .into_array();
+        let test_array = StructArray::from_fields(&[(
+            "value",
+            buffer![1i32, 2, 3, 4, 5, 6, 7, 8, 9, 10].into_array(),
+        )])
+        .unwrap()
+        .into_array();
 
         // CASE WHEN value=1 THEN 100 WHEN value=3 THEN 300 WHEN value=5 THEN 500
         //      WHEN value=7 THEN 700 WHEN value=9 THEN 900 ELSE 0 END
@@ -871,7 +873,10 @@ mod tests {
         ]);
 
         let result = evaluate_expr(&expr, &test_array).to_primitive();
-        assert_eq!(result.as_slice::<i32>(), &[100, 0, 300, 0, 500, 0, 700, 0, 900, 0]);
+        assert_eq!(
+            result.as_slice::<i32>(),
+            &[100, 0, 300, 0, 500, 0, 700, 0, 900, 0]
+        );
     }
 
     #[test]
@@ -948,12 +953,19 @@ mod tests {
             ("value", buffer![1i32, 2, 3, 4, 5].into_array()),
             (
                 "cond1",
-                BoolArray::from_iter([Some(true), None, Some(false), None, Some(true)]).into_array(),
+                BoolArray::from_iter([Some(true), None, Some(false), None, Some(true)])
+                    .into_array(),
             ),
             (
                 "cond2",
-                BoolArray::from_iter([Some(false), Some(true), Some(true), Some(false), Some(false)])
-                    .into_array(),
+                BoolArray::from_iter([
+                    Some(false),
+                    Some(true),
+                    Some(true),
+                    Some(false),
+                    Some(false),
+                ])
+                .into_array(),
             ),
         ])
         .unwrap()
@@ -980,10 +992,9 @@ mod tests {
     #[test]
     fn test_nary_no_else_all_unmatched() {
         // N-ary without else where no conditions match
-        let test_array =
-            StructArray::from_fields(&[("value", buffer![1i32, 2, 3].into_array())])
-                .unwrap()
-                .into_array();
+        let test_array = StructArray::from_fields(&[("value", buffer![1i32, 2, 3].into_array())])
+            .unwrap()
+            .into_array();
 
         let expr = case_when_no_else([
             gt(get_item("value", root()), lit(100i32)), // Never true
@@ -1083,10 +1094,55 @@ mod tests {
         let result = evaluate_expr(&expr, &test_array);
         let varbinview = result.to_varbinview();
 
-        assert_eq!(varbinview.scalar_at(0).unwrap().as_utf8().value().unwrap().as_str(), "low");
-        assert_eq!(varbinview.scalar_at(1).unwrap().as_utf8().value().unwrap().as_str(), "medium");
-        assert_eq!(varbinview.scalar_at(2).unwrap().as_utf8().value().unwrap().as_str(), "medium");
-        assert_eq!(varbinview.scalar_at(3).unwrap().as_utf8().value().unwrap().as_str(), "high");
-        assert_eq!(varbinview.scalar_at(4).unwrap().as_utf8().value().unwrap().as_str(), "high");
+        assert_eq!(
+            varbinview
+                .scalar_at(0)
+                .unwrap()
+                .as_utf8()
+                .value()
+                .unwrap()
+                .as_str(),
+            "low"
+        );
+        assert_eq!(
+            varbinview
+                .scalar_at(1)
+                .unwrap()
+                .as_utf8()
+                .value()
+                .unwrap()
+                .as_str(),
+            "medium"
+        );
+        assert_eq!(
+            varbinview
+                .scalar_at(2)
+                .unwrap()
+                .as_utf8()
+                .value()
+                .unwrap()
+                .as_str(),
+            "medium"
+        );
+        assert_eq!(
+            varbinview
+                .scalar_at(3)
+                .unwrap()
+                .as_utf8()
+                .value()
+                .unwrap()
+                .as_str(),
+            "high"
+        );
+        assert_eq!(
+            varbinview
+                .scalar_at(4)
+                .unwrap()
+                .as_utf8()
+                .value()
+                .unwrap()
+                .as_str(),
+            "high"
+        );
     }
 }

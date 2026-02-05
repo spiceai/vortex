@@ -56,19 +56,18 @@ fn case_when_simple(bencher: Bencher, size: usize) {
     ]);
 
     bencher
-        .with_inputs(|| (&expr, &array))
-        .bench_refs(|(expr, array)| {
-            let mut ctx = SESSION.create_execution_ctx();
+        .with_inputs(|| (&expr, &array, SESSION.create_execution_ctx()))
+        .bench_refs(|(expr, array, ctx)| {
             array
                 .apply(expr)
                 .unwrap()
-                .execute::<Canonical>(&mut ctx)
+                .execute::<Canonical>(ctx)
                 .unwrap()
         });
 }
 
 /// Benchmark n-ary CASE WHEN with multiple conditions.
-#[divan::bench(args = [10000, 100000, 1000000])]
+#[divan::bench(args = [1000, 10000, 100000])]
 fn case_when_nary_3_conditions(bencher: Bencher, size: usize) {
     let array = make_struct_array(size);
 
@@ -84,13 +83,12 @@ fn case_when_nary_3_conditions(bencher: Bencher, size: usize) {
     ]);
 
     bencher
-        .with_inputs(|| (&expr, &array))
-        .bench_refs(|(expr, array)| {
-            let mut ctx = SESSION.create_execution_ctx();
+        .with_inputs(|| (&expr, &array, SESSION.create_execution_ctx()))
+        .bench_refs(|(expr, array, ctx)| {
             array
                 .apply(expr)
                 .unwrap()
-                .execute::<Canonical>(&mut ctx)
+                .execute::<Canonical>(ctx)
                 .unwrap()
         });
 }
@@ -108,13 +106,12 @@ fn case_when_all_true(bencher: Bencher, size: usize) {
     ]);
 
     bencher
-        .with_inputs(|| (&expr, &array))
-        .bench_refs(|(expr, array)| {
-            let mut ctx = SESSION.create_execution_ctx();
+        .with_inputs(|| (&expr, &array, SESSION.create_execution_ctx()))
+        .bench_refs(|(expr, array, ctx)| {
             array
                 .apply(expr)
                 .unwrap()
-                .execute::<Canonical>(&mut ctx)
+                .execute::<Canonical>(ctx)
                 .unwrap()
         });
 }
@@ -132,19 +129,18 @@ fn case_when_all_false(bencher: Bencher, size: usize) {
     ]);
 
     bencher
-        .with_inputs(|| (&expr, &array))
-        .bench_refs(|(expr, array)| {
-            let mut ctx = SESSION.create_execution_ctx();
+        .with_inputs(|| (&expr, &array, SESSION.create_execution_ctx()))
+        .bench_refs(|(expr, array, ctx)| {
             array
                 .apply(expr)
                 .unwrap()
-                .execute::<Canonical>(&mut ctx)
+                .execute::<Canonical>(ctx)
                 .unwrap()
         });
 }
 
 /// Benchmark n-ary CASE WHEN with 10 conditions.
-#[divan::bench(args = [10000, 100000, 1000000])]
+#[divan::bench(args = [1000, 10000, 100000])]
 fn case_when_nary_10_conditions(bencher: Bencher, size: usize) {
     let array = make_struct_array(size);
 
@@ -174,13 +170,12 @@ fn case_when_nary_10_conditions(bencher: Bencher, size: usize) {
     ]);
 
     bencher
-        .with_inputs(|| (&expr, &array))
-        .bench_refs(|(expr, array)| {
-            let mut ctx = SESSION.create_execution_ctx();
+        .with_inputs(|| (&expr, &array, SESSION.create_execution_ctx()))
+        .bench_refs(|(expr, array, ctx)| {
             array
                 .apply(expr)
                 .unwrap()
-                .execute::<Canonical>(&mut ctx)
+                .execute::<Canonical>(ctx)
                 .unwrap()
         });
 }
@@ -204,13 +199,12 @@ fn case_when_nary_100_conditions(bencher: Bencher, size: usize) {
     let expr = case_when(children);
 
     bencher
-        .with_inputs(|| (&expr, &array))
-        .bench_refs(|(expr, array)| {
-            let mut ctx = SESSION.create_execution_ctx();
+        .with_inputs(|| (&expr, &array, SESSION.create_execution_ctx()))
+        .bench_refs(|(expr, array, ctx)| {
             array
                 .apply(expr)
                 .unwrap()
-                .execute::<Canonical>(&mut ctx)
+                .execute::<Canonical>(ctx)
                 .unwrap()
         });
 }

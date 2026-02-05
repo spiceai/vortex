@@ -29,6 +29,8 @@ use vortex::expr::Like;
 use vortex::expr::Operator;
 use vortex::expr::VTableExt;
 use vortex::expr::and;
+use vortex::expr::case_when;
+use vortex::expr::case_when_no_else;
 use vortex::expr::cast;
 use vortex::expr::get_item;
 use vortex::expr::is_null;
@@ -37,7 +39,6 @@ use vortex::expr::lit;
 use vortex::expr::not;
 use vortex::expr::pack;
 use vortex::expr::root;
-use vortex::expr::{case_when, case_when_no_else};
 use vortex::scalar::Scalar;
 
 use crate::convert::FromDataFusion;
@@ -1128,4 +1129,3 @@ mod tests {
         assert_eq!(prim.as_slice::<i32>()[4], 100);
     }
 }
-
