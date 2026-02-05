@@ -196,8 +196,8 @@ fn case_when_nary_100_conditions(bencher: Bencher, size: usize) {
     let mut children: Vec<Expression> = Vec::with_capacity(201);
     for i in (1..=100).rev() {
         let threshold = i * 10; // thresholds: 1000, 990, 980, ..., 10
-        children.push(gt(get_item("value", root()), lit(threshold as i32)));
-        children.push(lit(i as i32));
+        children.push(gt(get_item("value", root()), lit(threshold)));
+        children.push(lit(i));
     }
     children.push(lit(0i32)); // else
 
