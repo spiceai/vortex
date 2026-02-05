@@ -44,7 +44,7 @@ fn make_struct_array(size: usize) -> ArrayRef {
 }
 
 /// Benchmark a simple binary CASE WHEN with varying array sizes.
-#[divan::bench(args = [10000, 100000, 1000000])]
+#[divan::bench(args = [1000, 10000, 100000])]
 fn case_when_simple(bencher: Bencher, size: usize) {
     let array = make_struct_array(size);
 
@@ -94,7 +94,7 @@ fn case_when_nary_3_conditions(bencher: Bencher, size: usize) {
 }
 
 /// Benchmark CASE WHEN where all conditions are true (short-circuit path).
-#[divan::bench(args = [10000, 100000, 1000000])]
+#[divan::bench(args = [1000, 10000, 100000])]
 fn case_when_all_true(bencher: Bencher, size: usize) {
     let array = make_struct_array(size);
 
@@ -117,7 +117,7 @@ fn case_when_all_true(bencher: Bencher, size: usize) {
 }
 
 /// Benchmark CASE WHEN where all conditions are false (short-circuit path).
-#[divan::bench(args = [10000, 100000, 1000000])]
+#[divan::bench(args = [1000, 10000, 100000])]
 fn case_when_all_false(bencher: Bencher, size: usize) {
     let array = make_struct_array(size);
 
@@ -181,7 +181,7 @@ fn case_when_nary_10_conditions(bencher: Bencher, size: usize) {
 }
 
 /// Benchmark n-ary CASE WHEN with 100 conditions.
-#[divan::bench(args = [10000, 100000, 1000000])]
+#[divan::bench(args = [1000, 10000, 100000])]
 fn case_when_nary_100_conditions(bencher: Bencher, size: usize) {
     use vortex_array::expr::Expression;
 
