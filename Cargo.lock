@@ -10360,6 +10360,7 @@ dependencies = [
  "vortex-error",
  "vortex-mask",
  "vortex-scalar",
+ "vortex-session",
 ]
 
 [[package]]
@@ -10527,6 +10528,7 @@ dependencies = [
  "vortex-error",
  "vortex-mask",
  "vortex-scalar",
+ "vortex-session",
 ]
 
 [[package]]
@@ -11066,6 +11068,7 @@ dependencies = [
  "vortex-error",
  "vortex-mask",
  "vortex-scalar",
+ "vortex-session",
 ]
 
 [[package]]
@@ -11153,6 +11156,7 @@ dependencies = [
  "vortex-error",
  "vortex-mask",
  "vortex-scalar",
+ "vortex-session",
  "zigzag",
 ]
 
@@ -11170,6 +11174,7 @@ dependencies = [
  "vortex-error",
  "vortex-mask",
  "vortex-scalar",
+ "vortex-session",
  "zstd",
 ]
 
