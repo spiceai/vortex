@@ -36,7 +36,6 @@ use crate::compute::zip;
 use crate::expr::Arity;
 use crate::expr::ChildName;
 use crate::expr::ExecutionArgs;
-use crate::expr::ExecutionResult;
 use crate::expr::ExprId;
 use crate::expr::VTable;
 use crate::expr::VTableExt;
@@ -166,7 +165,7 @@ impl VTable for CaseWhen {
         &self,
         options: &Self::Options,
         args: ExecutionArgs,
-    ) -> VortexResult<ExecutionResult> {
+    ) -> VortexResult<crate::ArrayRef> {
         let ExecutionArgs {
             inputs,
             row_count,
@@ -738,7 +737,6 @@ mod tests {
                 },
             )
             .unwrap()
-            .into_array()
             .to_primitive();
 
         assert_eq!(result.as_slice::<i32>(), &[100, 0, 100]);
