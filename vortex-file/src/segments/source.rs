@@ -21,6 +21,7 @@ use vortex_array::buffer::BufferHandle;
 use vortex_buffer::Alignment;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
+use vortex_error::vortex_panic;
 use vortex_io::VortexReadAt;
 use vortex_io::runtime::Handle;
 use vortex_layout::segments::SegmentFuture;
@@ -95,6 +96,12 @@ impl FileSegmentSource {
             config
         });
         let concurrency = reader.concurrency();
+        if concurrency == 0 {
+            vortex_panic!(
+                "VortexReadAt::concurrency returned 0 (uri={:?}); this would stall I/O",
+                reader.uri()
+            );
+        }
 
         let stream = IoRequestStream::new(
             StreamExt::boxed(recv),
