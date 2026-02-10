@@ -10,6 +10,7 @@ use crate::expr::exprs::between::Between;
 use crate::expr::exprs::binary::Binary;
 use crate::expr::exprs::case_when::CaseWhen;
 use crate::expr::exprs::cast::Cast;
+use crate::expr::exprs::fill_null::FillNull;
 use crate::expr::exprs::get_item::GetItem;
 use crate::expr::exprs::is_null::IsNull;
 use crate::expr::exprs::like::Like;
@@ -58,6 +59,7 @@ impl Default for ExprSession {
             ExprVTable::new_static(&Binary),
             ExprVTable::new_static(&CaseWhen),
             ExprVTable::new_static(&Cast),
+            ExprVTable::new_static(&FillNull),
             ExprVTable::new_static(&GetItem),
             ExprVTable::new_static(&IsNull),
             ExprVTable::new_static(&Like),
