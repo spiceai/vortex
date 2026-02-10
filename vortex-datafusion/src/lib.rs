@@ -100,14 +100,17 @@ mod common_tests {
                 ..Default::default()
             };
             let factory = Arc::new(VortexFormatFactory::new().with_options(opts));
-            let session_state_builder = SessionStateBuilder::new()
+            let mut session_state_builder = SessionStateBuilder::new()
                 .with_default_features()
                 .with_table_factory(
                     factory.get_ext().to_uppercase(),
                     Arc::new(DefaultTableFactory::new()),
                 )
-                .with_file_formats(vec![factory])
                 .with_object_store(&Url::try_from("file://").unwrap(), store.clone());
+
+            if let Some(file_formats) = session_state_builder.file_formats() {
+                file_formats.push(factory as _);
+            }
 
             let session: SessionContext =
                 SessionContext::new_with_state(session_state_builder.build()).enable_url_table();

@@ -552,7 +552,10 @@ impl FileFormat for VortexFormat {
     }
 
     fn file_source(&self, table_schema: TableSchema) -> Arc<dyn FileSource> {
-        Arc::new(VortexSource::new(table_schema, self.session.clone()))
+        Arc::new(
+            VortexSource::new(table_schema, self.session.clone())
+                .with_projection_pushdown(self.opts.projection_pushdown),
+        )
     }
 }
 
