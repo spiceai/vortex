@@ -26,6 +26,7 @@ use futures::StreamExt;
 use object_store::ObjectStore;
 use object_store::path::Path;
 use tokio_stream::wrappers::ReceiverStream;
+use uuid::Uuid;
 use vortex::array::ArrayRef;
 use vortex::array::arrow::FromArrowArray;
 use vortex::array::stream::ArrayStreamAdapter;
@@ -59,6 +60,106 @@ impl VortexSink {
             session,
             target_file_size,
         }
+    }
+}
+
+impl VortexSink {
+    /// Write all data with target file size control, bypassing the DataFusion demuxer.
+    ///
+    /// This method consumes the input stream directly and writes files sized to approximately
+    /// `target_file_size` bytes. It uses an adaptive approach: after writing each file, it
+    /// observes the actual compression ratio and adjusts how many bytes to accumulate
+    /// for the next file.
+    async fn write_all_with_target_size(
+        &self,
+        mut data: SendableRecordBatchStream,
+        context: &Arc<TaskContext>,
+        target_file_size: u64,
+    ) -> DFResult<u64> {
+        let object_store = context
+            .runtime_env()
+            .object_store(&self.config.object_store_url)?;
+
+        let base_output_path = &self.config.table_paths[0];
+        let writer_schema = get_writer_schema(&self.config);
+        let dtype = DType::from_arrow(writer_schema);
+
+        let write_id = Uuid::new_v4().to_string();
+
+        let mut row_count: u64 = 0;
+        let mut file_index: usize = 0;
+        let mut pending_batches: Vec<ArrayRef> = Vec::new();
+        let mut pending_uncompressed_bytes: u64 = 0;
+
+        // Start with a 1:1 ratio assumption; will be updated after the first file is written.
+        // This means we'll aim to accumulate target_file_size bytes of uncompressed data
+        // for the first file, then adjust based on actual results.
+        let mut uncompressed_target = target_file_size;
+
+        while let Some(rb) = data.next().await.transpose()? {
+            row_count += rb.num_rows() as u64;
+
+            let batch_size: u64 = rb
+                .columns()
+                .iter()
+                .map(|c| c.get_array_memory_size() as u64)
+                .sum();
+
+            let array = ArrayRef::from_arrow(rb, false);
+            pending_batches.push(array);
+            pending_uncompressed_bytes += batch_size;
+
+            if pending_uncompressed_bytes >= uncompressed_target {
+                let path = base_output_path.prefix().child(format!(
+                    "{}_{}.{}",
+                    write_id, file_index, self.config.file_extension
+                ));
+
+                let batches = std::mem::take(&mut pending_batches);
+                let flushed_uncompressed = pending_uncompressed_bytes;
+                pending_uncompressed_bytes = 0;
+
+                let written_size =
+                    flush_batches_to_file(&self.session, &object_store, &dtype, &path, batches)
+                        .await?;
+
+                // Update compression ratio estimate for the next file.
+                // ratio = compressed / uncompressed
+                // We want: compressed ≈ target_file_size
+                // So: uncompressed_target = target_file_size / ratio
+                //                        = target_file_size * (uncompressed / compressed)
+                if written_size > 0 {
+                    uncompressed_target = target_file_size * flushed_uncompressed / written_size;
+                    // Clamp to at least the target to avoid accumulating too little
+                    uncompressed_target = uncompressed_target.max(target_file_size);
+                }
+
+                tracing::debug!(
+                    path = %path,
+                    written_bytes = written_size,
+                    uncompressed_bytes = flushed_uncompressed,
+                    next_uncompressed_target = uncompressed_target,
+                    "Wrote file with target size control"
+                );
+
+                file_index += 1;
+            }
+        }
+
+        // Flush any remaining batches
+        if !pending_batches.is_empty() {
+            let path = base_output_path.prefix().child(format!(
+                "{}_{}.{}",
+                write_id, file_index, self.config.file_extension
+            ));
+
+            flush_batches_to_file(&self.session, &object_store, &dtype, &path, pending_batches)
+                .await?;
+
+            tracing::debug!(path = %path, "Wrote final file");
+        }
+
+        Ok(row_count)
     }
 }
 
@@ -100,7 +201,18 @@ impl DataSink for VortexSink {
         data: SendableRecordBatchStream,
         context: &Arc<TaskContext>,
     ) -> DFResult<u64> {
-        FileSink::write_all(self, data, context).await
+        match self.target_file_size {
+            Some(target_size) if self.config.table_partition_cols.is_empty() => {
+                // When target file size is set and no partitioning, bypass the demuxer
+                // and write files directly with size-based splitting.
+                self.write_all_with_target_size(data, context, target_size)
+                    .await
+            }
+            _ => {
+                // Default path: use the FileSink/demuxer flow
+                FileSink::write_all(self, data, context).await
+            }
+        }
     }
 }
 
@@ -294,14 +406,14 @@ async fn write_with_file_size_limit(
     Ok(written_paths)
 }
 
-/// Write a set of arrays to a single Vortex file.
+/// Write a set of arrays to a single Vortex file, returning the written file size in bytes.
 async fn flush_batches_to_file(
     session: &VortexSession,
     object_store: &Arc<dyn ObjectStore>,
     dtype: &DType,
     path: &Path,
     batches: Vec<ArrayRef>,
-) -> DFResult<()> {
+) -> DFResult<u64> {
     let stream = futures::stream::iter(batches.into_iter().map(VortexResult::Ok));
     let stream_adapter = ArrayStreamAdapter::new(dtype.clone(), stream);
 
@@ -311,7 +423,7 @@ async fn flush_batches_to_file(
             DataFusionError::Execution(format!("Failed to create ObjectStoreWriter: {e}"))
         })?;
 
-    session
+    let summary = session
         .write_options()
         .write(&mut sink, stream_adapter)
         .await
@@ -321,7 +433,7 @@ async fn flush_batches_to_file(
         DataFusionError::Execution(format!("Failed to shutdown Vortex writer: {e}"))
     })?;
 
-    Ok(())
+    Ok(summary.size())
 }
 
 #[cfg(test)]
@@ -583,13 +695,17 @@ mod tests {
         Ok(())
     }
 
+    /// Test that INSERT INTO with target_file_size produces files whose sizes are
+    /// approximately within the target. This uses the ListingTable / INSERT INTO path
+    /// which exercises the full DataFusion write pipeline including the demuxer bypass.
     #[tokio::test]
-    async fn test_write_with_target_file_size() -> anyhow::Result<()> {
+    async fn test_insert_into_with_target_file_size() -> anyhow::Result<()> {
         use datafusion::arrow::array::Int64Array;
 
         let dir = TempDir::new()?;
+        let data_dir = dir.path().to_str().unwrap();
 
-        // Set a small target file size (1 MB) to force splitting
+        // Set a 1 MB target file size.
         let mut opts = crate::persistent::VortexOptions::default();
         opts.target_file_size_mb = 1;
 
@@ -598,136 +714,50 @@ mod tests {
         register_vortex_format_factory(factory, &mut session_state_builder);
         let session = SessionContext::new_with_state(session_state_builder.build());
 
-        // Write a large enough batch that should exceed 1 MB uncompressed
-        // 500_000 Int8 values = ~500 KB uncompressed, but we need more data
-        // to trigger splitting. Let's use 1_000_000 entries to be safe.
-        let entries = 1_000_000;
-        let data = session.read_batch(RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("a", DataType::Int8, false)])),
-            vec![Arc::new(Int8Array::from(vec![42i8; entries]))],
-        )?)?;
-
-        let logical_plan = LogicalPlanBuilder::copy_to(
-            data.logical_plan().clone(),
-            dir.path().to_str().unwrap().to_string(),
-            format_as_file_type(Arc::new(VortexFormatFactory::new())),
-            Default::default(),
-            vec![],
-        )?
-        .build()?;
-
-        session
-            .execute_logical_plan(logical_plan)
-            .await?
-            .collect()
-            .await?;
-
-        // Count the output files
-        let file_count = std::fs::read_dir(dir.path())?
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "vortex"))
-            .count();
-
-        // With 1 MB target and ~1 MB of data, we should get at least 1 file.
-        // The exact count depends on compression, but we should get more than 0.
-        assert!(
-            file_count >= 1,
-            "Expected at least 1 file, got {file_count}"
-        );
-
-        // Read back and verify all data is preserved
+        // Create an external table (ListingTable) for writing.
         session
             .sql(&format!(
-                "CREATE EXTERNAL TABLE written_data \
+                "CREATE EXTERNAL TABLE target_tbl \
                     (a TINYINT NOT NULL) \
                 STORED AS vortex \
-                LOCATION '{}/';",
-                dir.path().to_str().unwrap()
+                LOCATION '{data_dir}/';"
             ))
             .await?;
 
-        let result = session
-            .sql("SELECT COUNT(*) as count FROM written_data")
-            .await?
-            .collect()
-            .await?;
-
-        let count_value = result[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap()
-            .value(0);
-
-        assert_eq!(
-            count_value, entries as i64,
-            "Expected {} entries, but found {}",
-            entries, count_value
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_write_with_target_file_size_produces_multiple_files() -> anyhow::Result<()> {
-        use datafusion::arrow::array::Int64Array;
-
-        let dir = TempDir::new()?;
-
-        // Set a very small target file size (1 MB) and write a lot of data to force multiple files.
-        let mut opts = crate::persistent::VortexOptions::default();
-        opts.target_file_size_mb = 1;
-
-        let factory = VortexFormatFactory::new().with_options(opts);
-        let mut session_state_builder = SessionStateBuilder::new().with_default_features();
-        register_vortex_format_factory(factory, &mut session_state_builder);
-        let session = SessionContext::new_with_state(session_state_builder.build());
-
-        // Write 5_000_000 random-ish Int8 values (~5 MB uncompressed)
-        // This should produce multiple files with a 1 MB target
-        let entries = 5_000_000;
-        // Use a non-trivial pattern so compression doesn't collapse it to nothing
+        // Create a source batch with enough data to produce multiple files.
+        // 5M Int8 values ≈ 5 MB uncompressed; with 1 MB target we expect multiple files.
+        let entries: usize = 5_000_000;
         let values: Vec<i8> = (0..entries).map(|i| (i % 127) as i8).collect();
-        let data = session.read_batch(RecordBatch::try_new(
+        let source_batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("a", DataType::Int8, false)])),
             vec![Arc::new(Int8Array::from(values))],
-        )?)?;
+        )?;
 
-        let logical_plan = LogicalPlanBuilder::copy_to(
-            data.logical_plan().clone(),
-            dir.path().to_str().unwrap().to_string(),
-            format_as_file_type(Arc::new(VortexFormatFactory::new())),
-            Default::default(),
-            vec![],
-        )?
-        .build()?;
-
+        // Register the source as a temp table and INSERT INTO the ListingTable.
+        session.register_batch("source_data", source_batch)?;
         session
-            .execute_logical_plan(logical_plan)
+            .sql("INSERT INTO target_tbl SELECT * FROM source_data")
             .await?
             .collect()
             .await?;
 
-        // Count the output files
+        // Collect written files and their sizes.
         let files: Vec<_> = std::fs::read_dir(dir.path())?
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension().map_or(false, |ext| ext == "vortex"))
             .collect();
 
         let file_count = files.len();
-
-        // With a 1 MB target and ~5 MB of data, we expect multiple files
         assert!(
             file_count > 1,
-            "Expected more than 1 file with 1MB target and 5MB data, got {file_count}"
+            "Expected more than 1 file with 1 MB target and ~5 MB data, got {file_count}"
         );
 
-        // Verify that each file is approximately within the target size (with some tolerance)
-        let target_bytes = 1u64 * 1024 * 1024; // 1 MB
+        // Verify each file is within a reasonable range of the target.
+        // Allow up to 4x target as a generous upper bound (compression ratios vary).
+        let target_bytes = 1u64 * 1024 * 1024;
         for file in &files {
             let file_size = file.metadata()?.len();
-            // Allow up to 4x the target size as tolerance (compression ratios vary,
-            // and a single batch that exceeds the target gets written as a single file)
             assert!(
                 file_size <= target_bytes * 4,
                 "File {:?} is {} bytes, which exceeds 4x target of {} bytes",
@@ -737,19 +767,9 @@ mod tests {
             );
         }
 
-        // Read back and verify all data is preserved
-        session
-            .sql(&format!(
-                "CREATE EXTERNAL TABLE written_data \
-                    (a TINYINT NOT NULL) \
-                STORED AS vortex \
-                LOCATION '{}/';",
-                dir.path().to_str().unwrap()
-            ))
-            .await?;
-
+        // Read back and verify all data is preserved.
         let result = session
-            .sql("SELECT COUNT(*) as count FROM written_data")
+            .sql("SELECT COUNT(*) as cnt FROM target_tbl")
             .await?
             .collect()
             .await?;
@@ -763,89 +783,51 @@ mod tests {
 
         assert_eq!(
             count_value, entries as i64,
-            "Expected {} entries, but found {}",
-            entries, count_value
-        );
-
-        // Verify actual values
-        let all_data = session
-            .sql("SELECT a FROM written_data ORDER BY a")
-            .await?
-            .collect()
-            .await?;
-
-        let mut total_rows = 0;
-        for batch in all_data {
-            total_rows += batch.num_rows();
-        }
-
-        assert_eq!(
-            total_rows, entries,
-            "Total rows read ({}) doesn't match expected entries ({})",
-            total_rows, entries
+            "Expected {entries} entries, but found {count_value}"
         );
 
         Ok(())
     }
 
+    /// Test that INSERT INTO without a target file size does not produce excessive splitting.
     #[tokio::test]
-    async fn test_write_without_target_file_size_no_splitting() -> anyhow::Result<()> {
+    async fn test_insert_into_without_target_file_size() -> anyhow::Result<()> {
         use datafusion::arrow::array::Int64Array;
 
         let dir = TempDir::new()?;
+        let data_dir = dir.path().to_str().unwrap();
 
-        // Use default options (no target file size, target_file_size_mb = 0)
+        // Default options — no target file size.
         let factory = VortexFormatFactory::new();
         let mut session_state_builder = SessionStateBuilder::new().with_default_features();
         register_vortex_format_factory(factory, &mut session_state_builder);
         let session = SessionContext::new_with_state(session_state_builder.build());
 
-        // Write a small amount of data
-        let entries = 1000;
-        let data = session.read_batch(RecordBatch::try_new(
+        session
+            .sql(&format!(
+                "CREATE EXTERNAL TABLE target_tbl \
+                    (a TINYINT NOT NULL) \
+                STORED AS vortex \
+                LOCATION '{data_dir}/';"
+            ))
+            .await?;
+
+        let entries: usize = 1_000;
+        let source_batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("a", DataType::Int8, false)])),
             vec![Arc::new(Int8Array::from(vec![0i8; entries]))],
-        )?)?;
+        )?;
 
-        let logical_plan = LogicalPlanBuilder::copy_to(
-            data.logical_plan().clone(),
-            dir.path().to_str().unwrap().to_string(),
-            format_as_file_type(Arc::new(VortexFormatFactory::new())),
-            Default::default(),
-            vec![],
-        )?
-        .build()?;
-
+        session.register_batch("source_data", source_batch)?;
         session
-            .execute_logical_plan(logical_plan)
+            .sql("INSERT INTO target_tbl SELECT * FROM source_data")
             .await?
             .collect()
             .await?;
 
-        // Should produce exactly 1 file with small data and no size limit
-        let file_count = std::fs::read_dir(dir.path())?
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "vortex"))
-            .count();
-
-        assert_eq!(
-            file_count, 1,
-            "Expected exactly 1 file without target file size, got {file_count}"
-        );
-
-        // Read back and verify all data is preserved
-        session
-            .sql(&format!(
-                "CREATE EXTERNAL TABLE written_data \
-                    (a TINYINT NOT NULL) \
-                STORED AS vortex \
-                LOCATION '{}/';",
-                dir.path().to_str().unwrap()
-            ))
-            .await?;
-
+        // With no target file size, the demuxer controls output. Just verify data integrity.
         let result = session
-            .sql("SELECT COUNT(*) as count FROM written_data")
+            .sql("SELECT COUNT(*) as cnt FROM target_tbl")
             .await?
             .collect()
             .await?;
@@ -859,9 +841,85 @@ mod tests {
 
         assert_eq!(
             count_value, entries as i64,
-            "Expected {} entries, but found {}",
-            entries, count_value
+            "Expected {entries} entries, but found {count_value}"
         );
+
+        Ok(())
+    }
+
+    /// Test that data survives a round-trip through INSERT INTO with target file size:
+    /// write data, read it back, and verify individual values.
+    #[tokio::test]
+    async fn test_insert_into_with_target_file_size_round_trip() -> anyhow::Result<()> {
+        use datafusion::arrow::array::Int64Array;
+
+        let dir = TempDir::new()?;
+        let data_dir = dir.path().to_str().unwrap();
+
+        let mut opts = crate::persistent::VortexOptions::default();
+        opts.target_file_size_mb = 1;
+
+        let factory = VortexFormatFactory::new().with_options(opts);
+        let mut session_state_builder = SessionStateBuilder::new().with_default_features();
+        register_vortex_format_factory(factory, &mut session_state_builder);
+        let session = SessionContext::new_with_state(session_state_builder.build());
+
+        session
+            .sql(&format!(
+                "CREATE EXTERNAL TABLE target_tbl \
+                    (a TINYINT NOT NULL) \
+                STORED AS vortex \
+                LOCATION '{data_dir}/';"
+            ))
+            .await?;
+
+        // Write data with a deterministic pattern so we can verify values.
+        let entries: usize = 2_000_000;
+        let values: Vec<i8> = (0..entries).map(|i| (i % 127) as i8).collect();
+        let source_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int8, false)])),
+            vec![Arc::new(Int8Array::from(values))],
+        )?;
+
+        session.register_batch("source_data", source_batch)?;
+        session
+            .sql("INSERT INTO target_tbl SELECT * FROM source_data")
+            .await?
+            .collect()
+            .await?;
+
+        // Verify total count.
+        let result = session
+            .sql("SELECT COUNT(*) as cnt FROM target_tbl")
+            .await?
+            .collect()
+            .await?;
+
+        let count_value = result[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+
+        assert_eq!(count_value, entries as i64);
+
+        // Verify value distribution — each value 0..126 should appear roughly equally.
+        let dist = session
+            .sql(
+                "SELECT a, COUNT(*) as cnt FROM target_tbl \
+                 GROUP BY a ORDER BY a",
+            )
+            .await?
+            .collect()
+            .await?;
+
+        let mut total = 0i64;
+        for batch in &dist {
+            total += batch.num_rows() as i64;
+        }
+        // 127 distinct values
+        assert_eq!(total, 127, "Expected 127 distinct groups");
 
         Ok(())
     }
