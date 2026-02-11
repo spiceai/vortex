@@ -29,6 +29,14 @@ use crate::footer::FileStatistics;
 use crate::segments::writer::BufferedSegmentSink;
 use crate::{Footer, MAGIC_BYTES, WriteStrategyBuilder};
 
+/// A session variable that specifies the target file size in bytes.
+///
+/// When set on a [`VortexSession`], this value is picked up by
+/// [`WriteOptionsSessionExt::write_options`] and used to configure the
+/// [`VortexWriteOptions::target_file_size`].
+#[derive(Debug, Clone, Copy)]
+pub struct TargetFileSize(pub u64);
+
 /// Configure a new writer, which can eventually be used to write an [`ArrayStream`] into a sink
 /// that implements [`VortexWrite`].
 ///
@@ -40,6 +48,7 @@ pub struct VortexWriteOptions {
     exclude_dtype: bool,
     max_variable_length_statistics_size: usize,
     file_statistics: Vec<Stat>,
+    target_file_size: Option<u64>,
 }
 
 pub trait WriteOptionsSessionExt: SessionExt {
@@ -50,12 +59,15 @@ pub trait WriteOptionsSessionExt: SessionExt {
             .map(|opt| opt.clone().build())
             .unwrap_or_else(|| WriteStrategyBuilder::new().build());
 
+        let target_file_size = self.get_opt::<TargetFileSize>().map(|tfs| tfs.0);
+
         VortexWriteOptions {
             session: self.session(),
             strategy,
             exclude_dtype: false,
             file_statistics: PRUNING_STATS.to_vec(),
             max_variable_length_statistics_size: 64,
+            target_file_size,
         }
     }
 }
@@ -70,6 +82,7 @@ impl VortexWriteOptions {
             exclude_dtype: false,
             file_statistics: PRUNING_STATS.to_vec(),
             max_variable_length_statistics_size: 64,
+            target_file_size: None,
         }
     }
 
@@ -91,6 +104,21 @@ impl VortexWriteOptions {
     pub fn with_file_statistics(mut self, file_statistics: Vec<Stat>) -> Self {
         self.file_statistics = file_statistics;
         self
+    }
+
+    /// Set a target file size in bytes for the written Vortex file.
+    ///
+    /// When set, the writer will aim to produce files close to this size.
+    /// This is primarily used by integrations (e.g., DataFusion) that use the
+    /// incremental [`Writer`] API to split data across multiple files.
+    pub fn with_target_file_size(mut self, target_file_size: u64) -> Self {
+        self.target_file_size = Some(target_file_size);
+        self
+    }
+
+    /// Returns the target file size in bytes, if one has been configured.
+    pub fn target_file_size(&self) -> Option<u64> {
+        self.target_file_size
     }
 }
 
