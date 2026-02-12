@@ -99,10 +99,10 @@ config_namespace! {
         /// Target file size in megabytes for written Vortex files.
         ///
         /// When set to a value greater than 0, the writer will attempt to split output
-        /// into multiple files, each approximately this size. A value of 0 (the default)
+        /// into multiple files, each approximately this size. A value of 0
         /// means no file size limit is applied and file sizes are determined by the
         /// incoming data stream.
-        pub target_file_size_mb: usize, default = 0
+        pub target_file_size_mb: usize, default = 16
     }
 }
 
