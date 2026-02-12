@@ -111,8 +111,8 @@ impl VortexSink {
 
             if pending_uncompressed_bytes >= uncompressed_target {
                 let path = base_output_path.prefix().child(format!(
-                    "{}_{}.{}",
-                    write_id, file_index, self.config.file_extension
+                    "{write_id}_{file_index}.{}",
+                    self.config.file_extension
                 ));
 
                 let batches = std::mem::take(&mut pending_batches);
@@ -463,7 +463,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_insert_into() {
-        let dir = TempDir::new().unwrap();
+        let dir = TempDir::new().expect("should create temp dir");
 
         let factory = VortexFormatFactory::new();
 
@@ -477,12 +477,12 @@ mod tests {
                     (c1 VARCHAR NOT NULL, c2 INT NOT NULL) \
                 STORED AS vortex \
                 LOCATION '{}/';",
-                dir.path().to_str().unwrap()
+                dir.path().to_str().expect("should convert path to str")
             ))
             .await
-            .unwrap();
+            .expect("should create external table");
 
-        let my_tbl = session.table("my_tbl").await.unwrap();
+        let my_tbl = session.table("my_tbl").await.expect("should get table");
 
         // It's valuable to have two insert code paths because they actually behave slightly differently
         let values = Values {
@@ -493,7 +493,10 @@ mod tests {
             ]],
         };
 
-        let tbl_provider = session.table_provider("my_tbl").await.unwrap();
+        let tbl_provider = session
+            .table_provider("my_tbl")
+            .await
+            .expect("should get table provider");
 
         let logical_plan = LogicalPlanBuilder::insert_into(
             LogicalPlan::Values(values.clone()),
@@ -501,36 +504,36 @@ mod tests {
             Arc::new(DefaultTableSource::new(tbl_provider)),
             datafusion::logical_expr::dml::InsertOp::Append,
         )
-        .unwrap()
+        .expect("should build insert into plan")
         .build()
-        .unwrap();
+        .expect("should build logical plan");
 
         session
             .execute_logical_plan(logical_plan)
             .await
-            .unwrap()
+            .expect("should execute logical plan")
             .collect()
             .await
-            .unwrap();
+            .expect("should collect results");
 
         session
             .sql("INSERT INTO my_tbl VALUES ('world', 24);")
             .await
-            .unwrap()
+            .expect("should execute insert SQL")
             .collect()
             .await
-            .unwrap();
+            .expect("should collect insert results");
 
-        my_tbl.clone().show().await.unwrap();
+        my_tbl.clone().show().await.expect("should show table");
 
         assert_eq!(
             session
                 .table("my_tbl")
                 .await
-                .unwrap()
+                .expect("should get table")
                 .count()
                 .await
-                .unwrap(),
+                .expect("should count rows"),
             2
         );
     }
@@ -562,7 +565,10 @@ mod tests {
 
         let logical_plan = LogicalPlanBuilder::copy_to(
             data.logical_plan().clone(),
-            dir.path().to_str().unwrap().to_string(),
+            dir.path()
+                .to_str()
+                .expect("should convert path to str")
+                .to_string(),
             format_as_file_type(Arc::new(VortexFormatFactory::new())),
             Default::default(),
             vec![],
@@ -582,7 +588,7 @@ mod tests {
                     (a TINYINT NOT NULL) \
                 STORED AS vortex \
                 LOCATION '{}/';",
-                dir.path().to_str().unwrap()
+                dir.path().to_str().expect("should convert path to str")
             ))
             .await?;
 
@@ -600,7 +606,7 @@ mod tests {
             .column(0)
             .as_any()
             .downcast_ref::<Int64Array>()
-            .unwrap()
+            .expect("should downcast to Int64Array")
             .value(0);
 
         assert_eq!(
@@ -621,7 +627,7 @@ mod tests {
                 .column(0)
                 .as_any()
                 .downcast_ref::<Int8Array>()
-                .unwrap();
+                .expect("should downcast to Int8Array");
 
             for i in 0..batch.num_rows() {
                 assert_eq!(
@@ -654,7 +660,7 @@ mod tests {
     #[tokio::test]
     async fn test_write_partitioned() -> anyhow::Result<()> {
         let dir = TempDir::new()?;
-        let data_dir = dir.path().to_str().unwrap();
+        let data_dir = dir.path().to_str().expect("should convert path to str");
 
         let factory: VortexFormatFactory = VortexFormatFactory::new();
         let mut session_state_builder = SessionStateBuilder::new().with_default_features();
@@ -703,7 +709,7 @@ mod tests {
         use datafusion::arrow::array::Int64Array;
 
         let dir = TempDir::new()?;
-        let data_dir = dir.path().to_str().unwrap();
+        let data_dir = dir.path().to_str().expect("should convert path to str");
 
         // Set a 1 MB target file size.
         let mut opts = crate::persistent::VortexOptions::default();
@@ -778,7 +784,7 @@ mod tests {
             .column(0)
             .as_any()
             .downcast_ref::<Int64Array>()
-            .unwrap()
+            .expect("should downcast to Int64Array")
             .value(0);
 
         assert_eq!(
@@ -795,7 +801,7 @@ mod tests {
         use datafusion::arrow::array::Int64Array;
 
         let dir = TempDir::new()?;
-        let data_dir = dir.path().to_str().unwrap();
+        let data_dir = dir.path().to_str().expect("should convert path to str");
 
         // Default options — no target file size.
         let factory = VortexFormatFactory::new();
@@ -836,7 +842,7 @@ mod tests {
             .column(0)
             .as_any()
             .downcast_ref::<Int64Array>()
-            .unwrap()
+            .expect("should downcast to Int64Array")
             .value(0);
 
         assert_eq!(
@@ -854,7 +860,7 @@ mod tests {
         use datafusion::arrow::array::Int64Array;
 
         let dir = TempDir::new()?;
-        let data_dir = dir.path().to_str().unwrap();
+        let data_dir = dir.path().to_str().expect("should convert path to str");
 
         let mut opts = crate::persistent::VortexOptions::default();
         opts.target_file_size_mb = 1;
@@ -899,7 +905,7 @@ mod tests {
             .column(0)
             .as_any()
             .downcast_ref::<Int64Array>()
-            .unwrap()
+            .expect("should downcast to Int64Array")
             .value(0);
 
         assert_eq!(count_value, entries as i64);
