@@ -42,9 +42,9 @@ pub struct VortexSink {
     config: FileSinkConfig,
     schema: SchemaRef,
     session: VortexSession,
-    /// Target file size in bytes. When set, the writer will split output files
+    /// Target file size in bytes. The writer will split output files
     /// when they reach approximately this size.
-    target_file_size: Option<u64>,
+    target_file_size: u64,
 }
 
 impl VortexSink {
@@ -52,7 +52,7 @@ impl VortexSink {
         config: FileSinkConfig,
         schema: SchemaRef,
         session: VortexSession,
-        target_file_size: Option<u64>,
+        target_file_size: u64,
     ) -> Self {
         Self {
             config,
@@ -201,17 +201,15 @@ impl DataSink for VortexSink {
         data: SendableRecordBatchStream,
         context: &Arc<TaskContext>,
     ) -> DFResult<u64> {
-        match self.target_file_size {
-            Some(target_size) if self.config.table_partition_cols.is_empty() => {
-                // When target file size is set and no partitioning, bypass the demuxer
-                // and write files directly with size-based splitting.
-                self.write_all_with_target_size(data, context, target_size)
-                    .await
-            }
-            _ => {
-                // Default path: use the FileSink/demuxer flow
-                FileSink::write_all(self, data, context).await
-            }
+        if self.config.table_partition_cols.is_empty() {
+            // Non-partitioned: bypass the demuxer and write files directly
+            // with size-based splitting.
+            self.write_all_with_target_size(data, context, self.target_file_size)
+                .await
+        } else {
+            // Partitioned: use the FileSink/demuxer flow, which will call
+            // spawn_writer_tasks_and_join where we also apply size limits.
+            FileSink::write_all(self, data, context).await
         }
     }
 }
@@ -247,22 +245,16 @@ impl FileSink for VortexSink {
             // We need to spawn work because there's a dependency between the different files. If one file has too many batches buffered,
             // the demux task might deadlock itself.
             file_write_tasks.spawn(async move {
-                if let Some(target_size) = target_file_size {
-                    write_with_file_size_limit(
-                        session,
-                        row_counter,
-                        object_store,
-                        dtype,
-                        path,
-                        rx,
-                        target_size,
-                    )
-                    .await
-                } else {
-                    write_single_file(session, row_counter, object_store, dtype, path, rx)
-                        .await
-                        .map(|p| vec![p])
-                }
+                write_with_file_size_limit(
+                    session,
+                    row_counter,
+                    object_store,
+                    dtype,
+                    path,
+                    rx,
+                    target_file_size,
+                )
+                .await
             });
         }
 
@@ -303,41 +295,6 @@ fn split_path(original: &Path, sub_index: usize) -> Path {
     } else {
         Path::from(format!("{path_str}_{sub_index}"))
     }
-}
-
-/// Write the entire stream to a single Vortex file (original behavior).
-async fn write_single_file(
-    session: VortexSession,
-    row_counter: Arc<AtomicU64>,
-    object_store: Arc<dyn ObjectStore>,
-    dtype: DType,
-    path: Path,
-    rx: tokio::sync::mpsc::Receiver<datafusion_common::arrow::array::RecordBatch>,
-) -> DFResult<Path> {
-    let stream = ReceiverStream::new(rx).map(move |rb| {
-        row_counter.fetch_add(rb.num_rows() as u64, Ordering::Relaxed);
-        VortexResult::Ok(ArrayRef::from_arrow(rb, false))
-    });
-
-    let stream_adapter = ArrayStreamAdapter::new(dtype, stream);
-
-    let mut sink = ObjectStoreWriter::new(object_store.clone(), &path)
-        .await
-        .map_err(|e| {
-            DataFusionError::Execution(format!("Failed to create ObjectStoreWriter: {e}"))
-        })?;
-
-    session
-        .write_options()
-        .write(&mut sink, stream_adapter)
-        .await
-        .map_err(|e| DataFusionError::Execution(format!("Failed to write Vortex file: {e}")))?;
-
-    sink.shutdown().await.map_err(|e| {
-        DataFusionError::Execution(format!("Failed to shutdown Vortex writer: {e}"))
-    })?;
-
-    Ok(path)
 }
 
 /// Write the stream to multiple Vortex files, splitting when the target file size is reached.
@@ -1429,14 +1386,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Integration test: target_file_size_mb = 0 uses default demuxer path
+    // Integration test: target_file_size_mb = 0 defaults to 16 MB
     // -----------------------------------------------------------------------
 
-    /// With `target_file_size_mb=0`, the writer should fall through to the
-    /// DataFusion demuxer path (FileSink::write_all) instead of the custom
-    /// size-based splitting. Data integrity should be preserved regardless.
+    /// With `target_file_size_mb=0`, the writer should default to 16 MB and
+    /// still use the custom size-based writer. Data integrity should be
+    /// preserved regardless.
     #[tokio::test]
-    async fn test_target_file_size_zero_uses_demuxer() -> anyhow::Result<()> {
+    async fn test_target_file_size_zero_defaults_to_16mb() -> anyhow::Result<()> {
         use datafusion::arrow::array::Int64Array;
 
         let dir = TempDir::new()?;
@@ -1459,6 +1416,7 @@ mod tests {
             ))
             .await?;
 
+        // 100K Int8 values is well below 16 MB, so should produce a single file.
         let entries: usize = 100_000;
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("a", DataType::Int8, false)])),
@@ -1472,8 +1430,7 @@ mod tests {
             .collect()
             .await?;
 
-        // Verify data integrity — the demuxer controls file count, so we only
-        // check that all rows are present.
+        // Verify data integrity.
         let result = session
             .sql("SELECT COUNT(*) as cnt FROM nosplit_tbl")
             .await?
@@ -1488,6 +1445,19 @@ mod tests {
             .value(0);
 
         assert_eq!(count_value, entries as i64);
+
+        // Small data with a 16 MB default should produce exactly 1 file.
+        let files: Vec<_> = std::fs::read_dir(dir.path())?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map_or(false, |ext| ext == "vortex"))
+            .collect();
+
+        assert_eq!(
+            files.len(),
+            1,
+            "Small data with default 16 MB target (from target_file_size_mb=0) should produce 1 file, got {}",
+            files.len()
+        );
 
         Ok(())
     }

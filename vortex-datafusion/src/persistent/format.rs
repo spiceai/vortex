@@ -98,10 +98,8 @@ config_namespace! {
         pub footer_initial_read_size_bytes: usize, default = DEFAULT_FOOTER_INITIAL_READ_SIZE_BYTES
         /// Target file size in megabytes for written Vortex files.
         ///
-        /// When set to a value greater than 0, the writer will attempt to split output
-        /// into multiple files, each approximately this size. A value of 0
-        /// means no file size limit is applied and file sizes are determined by the
-        /// incoming data stream.
+        /// The writer will attempt to split output into multiple files, each approximately
+        /// this size. Defaults to 16 MB. A value of 0 is treated as the default (16 MB).
         pub target_file_size_mb: usize, default = 16
     }
 }
@@ -424,11 +422,12 @@ impl FileFormat for VortexFormat {
             return not_impl_err!("Overwrites are not implemented yet for Vortex");
         }
 
-        let target_file_size = if self.opts.target_file_size_mb > 0 {
-            Some(self.opts.target_file_size_mb as u64 * 1024 * 1024)
+        let target_file_size_mb = if self.opts.target_file_size_mb > 0 {
+            self.opts.target_file_size_mb
         } else {
-            None
+            16 // Default to 16 MB when set to 0
         };
+        let target_file_size = target_file_size_mb as u64 * 1024 * 1024;
 
         let schema = conf.output_schema().clone();
         let sink = Arc::new(VortexSink::new(
