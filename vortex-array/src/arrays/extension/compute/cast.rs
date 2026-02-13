@@ -18,21 +18,23 @@ use crate::IntoArray;
 use crate::arrays::ExtensionArray;
 use crate::arrays::ExtensionVTable;
 use crate::arrays::PrimitiveArray;
+use crate::builtins::ArrayBuiltins;
 use crate::canonical::ToCanonical;
-use crate::compute::CastKernel;
-use crate::compute::CastKernelAdapter;
-use crate::compute::{self};
-use crate::register_kernel;
+use crate::compute::CastReduce;
 use crate::vtable::ValidityHelper;
 
-impl CastKernel for ExtensionVTable {
-    fn cast(&self, array: &ExtensionArray, dtype: &DType) -> VortexResult<Option<ArrayRef>> {
+impl CastReduce for ExtensionVTable {
+    fn cast(array: &ExtensionArray, dtype: &DType) -> VortexResult<Option<ArrayRef>> {
         let DType::Extension(ext_dtype) = dtype else {
             return Ok(None);
         };
 
         if array.ext_dtype().eq_ignore_nullability(ext_dtype) {
-            let new_storage = match compute::cast(array.storage(), ext_dtype.storage_dtype()) {
+            let new_storage = match array
+                .storage()
+                .cast(ext_dtype.storage_dtype().clone())
+                .and_then(|a| a.to_canonical().map(|c| c.into_array()))
+            {
                 Ok(arr) => arr,
                 Err(e) => {
                     tracing::warn!("Failed to cast storage array: {e}");
@@ -73,15 +75,17 @@ fn cast_temporal_date_to_timestamp(
         return Ok(None);
     };
 
-    let source_i64 = compute::cast(
-        array.storage(),
-        &DType::Primitive(PType::I64, array.dtype().nullability()),
-    )?;
+    let source_i64 = array
+        .storage()
+        .cast(DType::Primitive(PType::I64, array.dtype().nullability()))?;
     let source_i64 = source_i64.to_primitive();
 
     let converted = cast_date_values_to_timestamp(&source_i64, *source_unit, *target_unit)?;
 
-    compute::cast(converted.as_ref(), target_ext_dtype.storage_dtype()).map(Some)
+    converted
+        .into_array()
+        .cast(target_ext_dtype.storage_dtype().clone())
+        .map(Some)
 }
 
 fn cast_date_values_to_timestamp(
@@ -175,11 +179,10 @@ fn convert_temporal_value(value: i64, multiply: i64, divide: i64) -> VortexResul
         vortex_bail!(ComputeError: "Date value {value} overflows target timestamp range");
     }
 
-    i64::try_from(scaled)
-        .map_err(|_| vortex_error::vortex_err!(ComputeError: "Date value {value} overflows target timestamp range"))
+    i64::try_from(scaled).map_err(
+        |_| vortex_err!(ComputeError: "Date value {value} overflows target timestamp range"),
+    )
 }
-
-register_kernel!(CastKernelAdapter(ExtensionVTable).lift());
 
 #[cfg(test)]
 mod tests {
@@ -194,7 +197,7 @@ mod tests {
     use super::*;
     use crate::IntoArray;
     use crate::arrays::PrimitiveArray;
-    use crate::compute::cast;
+    use crate::builtins::ArrayBuiltins;
     use crate::compute::conformance::cast::test_cast_conformance;
 
     #[test]
@@ -204,7 +207,10 @@ mod tests {
 
         let arr = ExtensionArray::new(ext_dtype.clone(), storage);
 
-        let output = cast(arr.as_ref(), &DType::Extension(ext_dtype.clone())).unwrap();
+        let output = arr
+            .to_array()
+            .cast(DType::Extension(ext_dtype.clone()))
+            .unwrap();
         assert_eq!(arr.len(), output.len());
         assert_eq!(arr.dtype(), output.dtype());
         assert_eq!(output.dtype(), &DType::Extension(ext_dtype));
@@ -220,7 +226,7 @@ mod tests {
 
         let new_dtype = DType::Extension(ext_dtype).with_nullability(Nullability::Nullable);
 
-        let output = cast(arr.as_ref(), &new_dtype).unwrap();
+        let output = arr.to_array().cast(new_dtype.clone()).unwrap();
         assert_eq!(arr.len(), output.len());
         assert!(arr.dtype().eq_ignore_nullability(output.dtype()));
         assert_eq!(output.dtype(), &new_dtype);
@@ -232,7 +238,9 @@ mod tests {
         let target_dtype = Timestamp::new(TimeUnit::Nanoseconds, Nullability::NonNullable).erased();
 
         let arr = ExtensionArray::new(source_dtype, buffer![0i32, 1, -1].into_array());
-        let output = cast(arr.as_ref(), &DType::Extension(target_dtype.clone()))
+        let output = arr
+            .to_array()
+            .cast(DType::Extension(target_dtype.clone()))
             .unwrap()
             .to_extension();
 
@@ -254,7 +262,9 @@ mod tests {
             source_dtype,
             PrimitiveArray::from_option_iter([Some(0i32), None, Some(2)]).into_array(),
         );
-        let output = cast(arr.as_ref(), &DType::Extension(target_dtype.clone()))
+        let output = arr
+            .to_array()
+            .cast(DType::Extension(target_dtype.clone()))
             .unwrap()
             .to_extension();
 
@@ -276,13 +286,17 @@ mod tests {
     fn cast_different_ext_dtype() {
         let original_dtype =
             Timestamp::new(TimeUnit::Milliseconds, Nullability::NonNullable).erased();
-        // Note NS here instead of MS
         let target_dtype = Timestamp::new(TimeUnit::Nanoseconds, Nullability::NonNullable).erased();
 
         let storage = buffer![1i64].into_array();
         let arr = ExtensionArray::new(original_dtype, storage);
 
-        assert!(cast(arr.as_ref(), &DType::Extension(target_dtype)).is_err());
+        assert!(
+            arr.to_array()
+                .cast(DType::Extension(target_dtype))
+                .and_then(|a| a.to_canonical().map(|c| c.into_array()))
+                .is_err()
+        );
     }
 
     #[rstest]
@@ -300,7 +314,7 @@ mod tests {
 
         let storage = if nullable {
             PrimitiveArray::from_option_iter([
-                Some(1_000_000i64), // 1 second in microseconds
+                Some(1_000_000i64),
                 None,
                 Some(2_000_000),
                 Some(3_000_000),
