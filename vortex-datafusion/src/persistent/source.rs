@@ -220,7 +220,7 @@ impl FileSource for VortexSource {
         VORTEX_FILE_EXTENSION
     }
 
-    fn projection(&self) -> Option<&datafusion_datasource::projection::ProjectionExprs> {
+    fn projection(&self) -> Option<&datafusion_physical_expr::projection::ProjectionExprs> {
         None
     }
 
