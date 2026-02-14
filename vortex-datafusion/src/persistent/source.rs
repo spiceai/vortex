@@ -222,6 +222,10 @@ impl FileSource for VortexSource {
         VORTEX_FILE_EXTENSION
     }
 
+    fn projection(&self) -> Option<&datafusion_datasource::projection::ProjectionExprs> {
+        None
+    }
+
     fn fmt_extra(&self, t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
