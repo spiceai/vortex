@@ -75,7 +75,7 @@ pub(crate) struct VortexOpener {
     pub file_pruning_predicate: Option<PhysicalExprRef>,
     pub expr_adapter_factory: Arc<dyn PhysicalExprAdapterFactory>,
     /// This is the table's schema without partition columns. It may contain fields which do
-    /// not exist in the file, and are supplied by the `schema_adapter_factory`.
+    /// not exist in the file. Missing columns are null-filled during batch remapping.
     pub table_schema: TableSchema,
     /// A hint for the desired row count of record batches returned from the scan.
     pub batch_size: usize,
