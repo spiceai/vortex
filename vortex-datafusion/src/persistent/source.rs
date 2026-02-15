@@ -220,8 +220,20 @@ impl FileSource for VortexSource {
         VORTEX_FILE_EXTENSION
     }
 
-    fn projection(&self) -> Option<&datafusion_physical_expr::projection::ProjectionExprs> {
-        None
+    fn projection(&self) -> Option<&ProjectionExprs> {
+        self.projection.as_ref()
+    }
+
+    fn try_pushdown_projection(
+        &self,
+        projection: &ProjectionExprs,
+    ) -> DFResult<Option<Arc<dyn FileSource>>> {
+        let mut source = self.clone();
+        source.projection = match &self.projection {
+            Some(existing) => Some(existing.try_merge(projection)?),
+            None => Some(projection.clone()),
+        };
+        Ok(Some(Arc::new(source)))
     }
 
     fn fmt_extra(&self, t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
