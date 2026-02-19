@@ -20,7 +20,7 @@ use crate::arrays::ExtensionVTable;
 use crate::arrays::PrimitiveArray;
 use crate::builtins::ArrayBuiltins;
 use crate::canonical::ToCanonical;
-use crate::compute::CastReduce;
+use crate::expr::CastReduce;
 use crate::vtable::ValidityHelper;
 
 impl CastReduce for ExtensionVTable {
@@ -161,14 +161,14 @@ fn convert_temporal_value(value: i64, multiply: i64, divide: i64) -> VortexResul
     let mut scaled = i128::from(value)
         .checked_mul(i128::from(multiply))
         .ok_or_else(
-            || vortex_err!(ComputeError: "Date value {value} overflows while scaling to timestamp"),
+            || vortex_err!(Compute: "Date value {value} overflows while scaling to timestamp"),
         )?;
 
     if divide != 1 {
         let divisor = i128::from(divide);
         if scaled % divisor != 0 {
             vortex_bail!(
-                ComputeError:
+                Compute:
                 "Date value {value} cannot be represented exactly in target timestamp unit"
             );
         }
@@ -176,12 +176,11 @@ fn convert_temporal_value(value: i64, multiply: i64, divide: i64) -> VortexResul
     }
 
     if scaled < i128::from(i64::MIN) || scaled > i128::from(i64::MAX) {
-        vortex_bail!(ComputeError: "Date value {value} overflows target timestamp range");
+        vortex_bail!(Compute: "Date value {value} overflows target timestamp range");
     }
 
-    i64::try_from(scaled).map_err(
-        |_| vortex_err!(ComputeError: "Date value {value} overflows target timestamp range"),
-    )
+    i64::try_from(scaled)
+        .map_err(|_| vortex_err!(Compute: "Date value {value} overflows target timestamp range"))
 }
 
 #[cfg(test)]

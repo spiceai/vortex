@@ -26,13 +26,12 @@ use vortex_dtype::DType;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_proto::expr as pb;
-use vortex_scalar::Scalar;
 use vortex_session::VortexSession;
 
 use crate::IntoArray;
 use crate::ToCanonical;
 use crate::arrays::ConstantArray;
-use crate::compute::zip;
+use crate::builtins::ArrayBuiltins;
 use crate::expr::Arity;
 use crate::expr::ChildName;
 use crate::expr::ExecutionArgs;
@@ -40,6 +39,7 @@ use crate::expr::ExprId;
 use crate::expr::VTable;
 use crate::expr::VTableExt;
 use crate::expr::expression::Expression;
+use crate::scalar::Scalar;
 
 /// Options for the CaseWhen expression.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -187,7 +187,7 @@ impl VTable for CaseWhen {
 
         for i in (0..options.num_when_then_pairs as usize).rev() {
             let cond_mask = inputs[i * 2].to_bool().to_mask_fill_null_false();
-            result = zip(inputs[i * 2 + 1].as_ref(), result.as_ref(), &cond_mask)?;
+            result = inputs[i * 2 + 1].zip(result, cond_mask.into_array())?;
         }
 
         result.execute(ctx)
