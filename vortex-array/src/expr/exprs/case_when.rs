@@ -22,7 +22,6 @@ use std::hash::Hash;
 use std::sync::Arc;
 
 use prost::Message;
-use vortex_dtype::DType;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_proto::expr as pb;
@@ -32,6 +31,7 @@ use crate::IntoArray;
 use crate::ToCanonical;
 use crate::arrays::ConstantArray;
 use crate::builtins::ArrayBuiltins;
+use crate::dtype::DType;
 use crate::expr::Arity;
 use crate::expr::ChildName;
 use crate::expr::ExecutionArgs;
@@ -265,11 +265,7 @@ pub fn case_when_no_else<I: IntoIterator<Item = Expression>>(children: I) -> Exp
 #[cfg(test)]
 mod tests {
     use vortex_buffer::buffer;
-    use vortex_dtype::DType;
-    use vortex_dtype::Nullability;
-    use vortex_dtype::PType;
     use vortex_error::VortexExpect as _;
-    use vortex_scalar::Scalar;
 
     use super::*;
     use crate::IntoArray;
@@ -277,6 +273,9 @@ mod tests {
     use crate::arrays::BoolArray;
     use crate::arrays::PrimitiveArray;
     use crate::arrays::StructArray;
+    use crate::dtype::DType;
+    use crate::dtype::Nullability;
+    use crate::dtype::PType;
     use crate::expr::exprs::binary::eq;
     use crate::expr::exprs::binary::gt;
     use crate::expr::exprs::get_item::col;
@@ -284,6 +283,7 @@ mod tests {
     use crate::expr::exprs::literal::lit;
     use crate::expr::exprs::root::root;
     use crate::expr::test_harness;
+    use crate::scalar::Scalar;
 
     // ==================== Serialization Tests ====================
 

@@ -20,11 +20,6 @@ use arrow_array::types::TimestampNanosecondType;
 use arrow_array::types::TimestampSecondType;
 use arrow_schema::DataType;
 use arrow_schema::TimeUnit as ArrowTimeUnit;
-use vortex_dtype::DType as VortexDType;
-use vortex_dtype::NativePType;
-use vortex_dtype::datetime::AnyTemporal;
-use vortex_dtype::datetime::TemporalMetadata;
-use vortex_dtype::datetime::TimeUnit;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
@@ -36,6 +31,11 @@ use crate::ExecutionCtx;
 use crate::arrays::ExtensionArray;
 use crate::arrays::PrimitiveArray as VortexPrimitiveArray;
 use crate::arrow::null_buffer::to_null_buffer;
+use crate::dtype::DType as VortexDType;
+use crate::dtype::NativePType;
+use crate::dtype::datetime::AnyTemporal;
+use crate::dtype::datetime::TemporalMetadata;
+use crate::dtype::datetime::TimeUnit;
 
 pub(super) fn to_arrow_temporal(
     array: ArrayRef,
@@ -128,7 +128,6 @@ fn to_temporal<T: ArrowTemporalType>(
 where
     T::Native: NativePType,
 {
-    // We cast the array to the native primitive type.
     Ok(Arc::new(to_arrow_temporal_primitive::<T>(array, ctx)?))
 }
 

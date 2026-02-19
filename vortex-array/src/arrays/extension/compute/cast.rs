@@ -2,12 +2,6 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use vortex_buffer::BufferMut;
-use vortex_dtype::DType;
-use vortex_dtype::ExtDTypeRef;
-use vortex_dtype::PType;
-use vortex_dtype::datetime::AnyTemporal;
-use vortex_dtype::datetime::TemporalMetadata;
-use vortex_dtype::datetime::TimeUnit;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
@@ -20,6 +14,12 @@ use crate::arrays::ExtensionVTable;
 use crate::arrays::PrimitiveArray;
 use crate::builtins::ArrayBuiltins;
 use crate::canonical::ToCanonical;
+use crate::dtype::DType;
+use crate::dtype::ExtDTypeRef;
+use crate::dtype::PType;
+use crate::dtype::datetime::AnyTemporal;
+use crate::dtype::datetime::TemporalMetadata;
+use crate::dtype::datetime::TimeUnit;
 use crate::expr::CastReduce;
 use crate::vtable::ValidityHelper;
 
@@ -188,16 +188,16 @@ mod tests {
     use rstest::rstest;
     use vortex_buffer::Buffer;
     use vortex_buffer::buffer;
-    use vortex_dtype::Nullability;
-    use vortex_dtype::datetime::Date;
-    use vortex_dtype::datetime::TimeUnit;
-    use vortex_dtype::datetime::Timestamp;
 
     use super::*;
     use crate::IntoArray;
     use crate::arrays::PrimitiveArray;
     use crate::builtins::ArrayBuiltins;
     use crate::compute::conformance::cast::test_cast_conformance;
+    use crate::dtype::Nullability;
+    use crate::dtype::datetime::Date;
+    use crate::dtype::datetime::TimeUnit;
+    use crate::dtype::datetime::Timestamp;
 
     #[test]
     fn cast_same_ext_dtype() {
