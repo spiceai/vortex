@@ -15,12 +15,12 @@ use crate::arrays::PrimitiveArray;
 use crate::builtins::ArrayBuiltins;
 use crate::canonical::ToCanonical;
 use crate::dtype::DType;
-use crate::dtype::ExtDTypeRef;
 use crate::dtype::PType;
-use crate::dtype::datetime::AnyTemporal;
-use crate::dtype::datetime::TemporalMetadata;
-use crate::dtype::datetime::TimeUnit;
+use crate::dtype::extension::ExtDTypeRef;
 use crate::expr::CastReduce;
+use crate::extension::datetime::AnyTemporal;
+use crate::extension::datetime::TemporalMetadata;
+use crate::extension::datetime::TimeUnit;
 use crate::vtable::ValidityHelper;
 
 impl CastReduce for ExtensionVTable {
@@ -195,9 +195,9 @@ mod tests {
     use crate::builtins::ArrayBuiltins;
     use crate::compute::conformance::cast::test_cast_conformance;
     use crate::dtype::Nullability;
-    use crate::dtype::datetime::Date;
-    use crate::dtype::datetime::TimeUnit;
-    use crate::dtype::datetime::Timestamp;
+    use crate::extension::datetime::Date;
+    use crate::extension::datetime::TimeUnit;
+    use crate::extension::datetime::Timestamp;
 
     #[test]
     fn cast_same_ext_dtype() {
