@@ -52,6 +52,26 @@ impl VortexSession {
         }
         self
     }
+
+    /// Inserts a new session variable of type `V` with the supplied value.
+    ///
+    /// # Panics
+    ///
+    /// If a variable of that type already exists.
+    pub fn set<V: SessionVar>(self, val: V) -> Self {
+        match self.0.entry(TypeId::of::<V>()) {
+            Entry::Occupied(_) => {
+                vortex_panic!(
+                    "Session variable of type {} already exists",
+                    type_name::<V>()
+                );
+            }
+            Entry::Vacant(e) => {
+                e.insert(Box::new(val));
+            }
+        }
+        self
+    }
 }
 
 /// Trait for accessing and modifying the state of a Vortex session.
