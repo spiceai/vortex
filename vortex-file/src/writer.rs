@@ -486,7 +486,7 @@ mod tests {
         assert!(fetched_write_strategy.is_none());
         drop(fetched_write_strategy);
 
-        let session = session.set(WriteStrategyBuilder::new());
+        let session = session.set(WriteStrategyBuilder::default());
         let fetched_write_strategy = session.get_opt::<WriteStrategyBuilder>();
         assert!(fetched_write_strategy.is_some());
     }

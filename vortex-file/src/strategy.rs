@@ -135,7 +135,7 @@ pub struct WriteStrategyBuilder {
 impl std::fmt::Debug for WriteStrategyBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WriteStrategyBuilder")
-            .field("compressor", &self.compressor.as_ref().map(|_| "<plugin>"))
+            .field("compressor", &self.compressor)
             .field("row_block_size", &self.row_block_size)
             .field(
                 "field_writers",
