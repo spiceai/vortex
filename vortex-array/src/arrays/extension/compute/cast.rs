@@ -17,10 +17,10 @@ use crate::canonical::ToCanonical;
 use crate::dtype::DType;
 use crate::dtype::PType;
 use crate::dtype::extension::ExtDTypeRef;
-use crate::expr::CastReduce;
 use crate::extension::datetime::AnyTemporal;
 use crate::extension::datetime::TemporalMetadata;
 use crate::extension::datetime::TimeUnit;
+use crate::scalar_fn::fns::cast::CastReduce;
 use crate::vtable::ValidityHelper;
 
 impl CastReduce for ExtensionVTable {
