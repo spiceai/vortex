@@ -3,7 +3,6 @@
 
 pub mod between;
 pub mod binary;
-pub mod case_when;
 pub mod cast;
 pub mod dynamic;
 pub mod fill_null;
