@@ -28,6 +28,7 @@ use datafusion_datasource::file_compression_type::FileCompressionType;
 use datafusion_datasource::file_format::FileFormat;
 use datafusion_datasource::file_format::FileFormatFactory;
 use datafusion_datasource::file_scan_config::FileScanConfig;
+use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
 use datafusion_datasource::file_sink_config::FileSinkConfig;
 use datafusion_datasource::sink::DataSinkExec;
 use datafusion_datasource::source::DataSourceExec;
