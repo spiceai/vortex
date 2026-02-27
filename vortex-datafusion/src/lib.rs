@@ -15,6 +15,7 @@ pub mod v2;
 #[cfg(test)]
 mod tests;
 
+pub use convert::exprs::DefaultExpressionConvertor;
 pub use convert::exprs::ExpressionConvertor;
 pub use persistent::*;
 

@@ -31,6 +31,7 @@ use vortex::expr::lit;
 use vortex::expr::not;
 use vortex::expr::pack;
 use vortex::expr::root;
+use vortex::expr::zip_expr;
 use vortex::scalar::Scalar;
 use vortex::scalar_fn::ScalarFnVTableExt;
 use vortex::scalar_fn::fns::binary::Binary;
@@ -146,6 +147,37 @@ impl DefaultExpressionConvertor {
             scalar_fn.name()
         ))
     }
+
+    fn try_convert_case_expr(&self, case_expr: &df_expr::CaseExpr) -> DFResult<Expression> {
+        let mut else_expr = if let Some(else_expr) = case_expr.else_expr() {
+            self.convert(else_expr.as_ref())?
+        } else {
+            return Err(exec_datafusion_err!(
+                "CASE expression without ELSE is not supported for pushdown"
+            ));
+        };
+
+        if let Some(base_expr) = case_expr.expr() {
+            let base_expr = self.convert(base_expr.as_ref())?;
+            for (when_expr, then_expr) in case_expr.when_then_expr().iter().rev() {
+                let when_expr = self.convert(when_expr.as_ref())?;
+                let then_expr = self.convert(then_expr.as_ref())?;
+                else_expr = zip_expr(
+                    then_expr,
+                    else_expr,
+                    Binary.new_expr(Operator::Eq, [base_expr.clone(), when_expr]),
+                );
+            }
+        } else {
+            for (when_expr, then_expr) in case_expr.when_then_expr().iter().rev() {
+                let when_expr = self.convert(when_expr.as_ref())?;
+                let then_expr = self.convert(then_expr.as_ref())?;
+                else_expr = zip_expr(then_expr, else_expr, when_expr);
+            }
+        }
+
+        Ok(else_expr)
+    }
 }
 
 impl ExpressionConvertor for DefaultExpressionConvertor {
@@ -240,6 +272,10 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
 
         if let Some(scalar_fn) = df.as_any().downcast_ref::<ScalarFunctionExpr>() {
             return self.try_convert_scalar_function(scalar_fn);
+        }
+
+        if let Some(case_expr) = df.as_any().downcast_ref::<df_expr::CaseExpr>() {
+            return self.try_convert_case_expr(case_expr);
         }
 
         Err(exec_datafusion_err!(
@@ -397,6 +433,8 @@ fn can_be_pushed_down_impl(df_expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> 
                 .all(|e| can_be_pushed_down_impl(e, schema))
     } else if let Some(scalar_fn) = expr.downcast_ref::<ScalarFunctionExpr>() {
         can_scalar_fn_be_pushed_down(scalar_fn)
+    } else if let Some(case_expr) = expr.downcast_ref::<df_expr::CaseExpr>() {
+        can_case_be_pushed_down(case_expr, schema)
     } else if expr
         .downcast_ref::<df_expr::DynamicFilterPhysicalExpr>()
         .is_some()
@@ -414,6 +452,22 @@ fn can_binary_be_pushed_down(binary: &df_expr::BinaryExpr, schema: &Schema) -> b
     is_op_supported
         && can_be_pushed_down_impl(binary.left(), schema)
         && can_be_pushed_down_impl(binary.right(), schema)
+}
+
+fn can_case_be_pushed_down(case_expr: &df_expr::CaseExpr, schema: &Schema) -> bool {
+    case_expr
+        .expr()
+        .is_none_or(|base_expr| can_be_pushed_down_impl(base_expr, schema))
+        && case_expr
+            .when_then_expr()
+            .iter()
+            .all(|(when_expr, then_expr)| {
+                can_be_pushed_down_impl(when_expr, schema)
+                    && can_be_pushed_down_impl(then_expr, schema)
+            })
+        && case_expr
+            .else_expr()
+            .is_some_and(|else_expr| can_be_pushed_down_impl(else_expr, schema))
 }
 
 fn supported_data_types(dt: &DataType) -> bool {
@@ -630,6 +684,51 @@ mod tests {
                 case_insensitive
             }
         );
+    }
+
+    #[test]
+    fn test_expr_from_df_case_when_with_else() {
+        let when_then_expr = vec![(
+            Arc::new(df_expr::Column::new("active", 0)) as Arc<dyn PhysicalExpr>,
+            Arc::new(df_expr::Literal::new(ScalarValue::Utf8(Some(
+                "yes".to_string(),
+            )))) as Arc<dyn PhysicalExpr>,
+        )];
+        let case_expr = df_expr::CaseExpr::try_new(
+            None,
+            when_then_expr,
+            Some(Arc::new(df_expr::Literal::new(ScalarValue::Utf8(Some(
+                "no".to_string(),
+            )))) as Arc<dyn PhysicalExpr>),
+        )
+        .unwrap();
+
+        let result = DefaultExpressionConvertor::default()
+            .convert(&case_expr)
+            .unwrap();
+
+        assert_snapshot!(result.display_tree().to_string(), @r#"
+        vortex.zip()
+        ├── if_true: vortex.literal("yes")
+        ├── if_false: vortex.literal("no")
+        └── mask: vortex.get_item(active)
+            └── input: vortex.root()
+        "#);
+    }
+
+    #[test]
+    fn test_expr_from_df_case_when_without_else_not_pushable() {
+        let when_then_expr = vec![(
+            Arc::new(df_expr::Column::new("active", 0)) as Arc<dyn PhysicalExpr>,
+            Arc::new(df_expr::Literal::new(ScalarValue::Utf8(Some(
+                "yes".to_string(),
+            )))) as Arc<dyn PhysicalExpr>,
+        )];
+        let case_expr = Arc::new(df_expr::CaseExpr::try_new(None, when_then_expr, None).unwrap())
+            as Arc<dyn PhysicalExpr>;
+
+        let schema = Schema::new(vec![Field::new("active", DataType::Boolean, false)]);
+        assert!(!can_be_pushed_down_impl(&case_expr, &schema));
     }
 
     #[rstest]
