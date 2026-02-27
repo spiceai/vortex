@@ -442,11 +442,11 @@ fn start_file_writer(
     let path_for_task = path.clone();
 
     let task = tokio::spawn(async move {
-        let mut object_writer = ObjectStoreWriter::new(object_store, &path_for_task)
+        let mut object_writer = ObjectStoreWrite::new(object_store, &path_for_task)
             .await
             .map_err(|e| {
                 exec_datafusion_err!(
-                    "Failed to create ObjectStoreWriter for '{}': {e}",
+                    "Failed to create ObjectStoreWrite for '{}': {e}",
                     path_for_task
                 )
             })?;

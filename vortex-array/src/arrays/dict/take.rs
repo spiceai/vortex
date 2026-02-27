@@ -157,14 +157,14 @@ pub(crate) fn propagate_take_stats(
             Stat::IsConstant,
         ]
         .into_iter()
-            .filter_map(|stat| {
-                source
-                    .statistics()
-                    .get(stat)
-                    .and_then(|v| v.map(|s| s.into_value()).into_inexact().transpose())
-                    .map(|sv| (stat, sv))
-            })
-            .collect::<Vec<_>>();
+        .filter_map(|stat| {
+            source
+                .statistics()
+                .get(stat)
+                .and_then(|v| v.map(|s| s.into_value()).into_inexact().transpose())
+                .map(|sv| (stat, sv))
+        })
+        .collect::<Vec<_>>();
         st.combine_sets(
             &(unsafe { StatsSet::new_unchecked(inexact_min_max) }).as_typed_ref(source.dtype()),
         )

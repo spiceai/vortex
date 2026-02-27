@@ -16,7 +16,6 @@ use datafusion_physical_expr::ScalarFunctionExpr;
 use datafusion_physical_expr::projection::ProjectionExpr;
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr::utils::collect_columns;
-use datafusion_physical_expr_common::physical_expr::is_dynamic_physical_expr;
 use datafusion_physical_plan::expressions as df_expr;
 use itertools::Itertools;
 use vortex::dtype::DType;
@@ -54,10 +53,13 @@ pub(crate) fn make_vortex_predicate(
     expr_convertor: &dyn ExpressionConvertor,
     predicate: &[Arc<dyn PhysicalExpr>],
 ) -> DFResult<Option<Expression>> {
-    let exprs = predicate
+    let exprs: Vec<_> = predicate
         .iter()
-        .map(|e| expr_convertor.convert(e.as_ref()))
-        .collect::<DFResult<Vec<_>>>()?;
+        .filter_map(|e| {
+            // If conversion fails, skip this expression (equivalent to lit(true) in AND conjunction)
+            expr_convertor.convert(e.as_ref()).ok()
+        })
+        .collect();
 
     Ok(and_collect(exprs))
 }
@@ -260,8 +262,13 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
                 })
                 .try_collect()?;
 
+            // Handle empty IN list: `x IN ()` is always false, `x NOT IN ()` is always true
+            let Some(first_element) = list_elements.first() else {
+                return Ok(lit(in_list.negated()));
+            };
+
             let list = Scalar::list(
-                list_elements[0].dtype().clone(),
+                first_element.dtype().clone(),
                 list_elements,
                 Nullability::Nullable,
             );
@@ -404,12 +411,6 @@ fn try_operator_from_df(value: &DFOperator) -> DFResult<Operator> {
 }
 
 fn can_be_pushed_down_impl(df_expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
-    // We currently do not support pushdown of dynamic expressions in DF.
-    // See issue: https://github.com/vortex-data/vortex/issues/4034
-    if is_dynamic_physical_expr(df_expr) {
-        return false;
-    }
-
     let expr = df_expr.as_any();
     if let Some(binary) = expr.downcast_ref::<df_expr::BinaryExpr>() {
         can_binary_be_pushed_down(binary, schema)
@@ -443,6 +444,12 @@ fn can_be_pushed_down_impl(df_expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> 
         can_scalar_fn_be_pushed_down(scalar_fn, schema)
     } else if let Some(case_expr) = expr.downcast_ref::<df_expr::CaseExpr>() {
         can_case_be_pushed_down(case_expr, schema)
+    } else if expr
+        .downcast_ref::<df_expr::DynamicFilterPhysicalExpr>()
+        .is_some()
+    {
+        // Assume dynamic filters can be pushed down - the child won't be specified until execution time
+        true
     } else {
         tracing::debug!(%df_expr, "DataFusion expression can't be pushed down");
         false

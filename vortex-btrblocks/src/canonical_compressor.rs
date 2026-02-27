@@ -89,7 +89,7 @@ pub trait CanonicalCompressor {
 ///     .exclude_int([IntCode::Dict])
 ///     .build();
 /// ```
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct BtrBlocksCompressor {
     /// Integer compressor with configured schemes.
     pub int_schemes: Vec<&'static dyn IntegerScheme>,
@@ -99,6 +99,16 @@ pub struct BtrBlocksCompressor {
 
     /// String compressor with configured schemes.
     pub string_schemes: Vec<&'static dyn StringScheme>,
+}
+
+impl std::fmt::Debug for BtrBlocksCompressor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BtrBlocksCompressor")
+            .field("int_schemes", &self.int_schemes.len())
+            .field("float_schemes", &self.float_schemes.len())
+            .field("string_schemes", &self.string_schemes.len())
+            .finish()
+    }
 }
 
 impl Default for BtrBlocksCompressor {
