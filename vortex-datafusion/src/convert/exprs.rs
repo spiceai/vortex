@@ -37,7 +37,11 @@ use vortex::scalar_fn::ScalarFnVTableExt;
 use vortex::scalar_fn::fns::binary::Binary;
 use vortex::scalar_fn::fns::like::Like;
 use vortex::scalar_fn::fns::like::LikeOptions;
+use vortex::scalar_fn::fns::case_when::case_when;
+use vortex::scalar_fn::fns::case_when::case_when_no_else;
 use vortex::scalar_fn::fns::operators::Operator;
+use vortex::error::VortexResult;
+use vortex::error::vortex_bail;
 
 use crate::convert::FromDataFusion;
 
@@ -512,22 +516,6 @@ fn can_binary_be_pushed_down(binary: &df_expr::BinaryExpr, schema: &Schema) -> b
 }
 
 fn can_case_be_pushed_down(case_expr: &df_expr::CaseExpr, schema: &Schema) -> bool {
-    case_expr
-        .expr()
-        .is_none_or(|base_expr| can_be_pushed_down_impl(base_expr, schema))
-        && case_expr
-            .when_then_expr()
-            .iter()
-            .all(|(when_expr, then_expr)| {
-                can_be_pushed_down_impl(when_expr, schema)
-                    && can_be_pushed_down_impl(then_expr, schema)
-            })
-        && case_expr
-            .else_expr()
-            .is_some_and(|else_expr| can_be_pushed_down_impl(else_expr, schema))
-}
-
-fn can_case_be_pushed_down(case_expr: &df_expr::CaseExpr, schema: &Schema) -> bool {
     // We only support the "searched CASE" form (CASE WHEN cond THEN result ...)
     // not the "simple CASE" form (CASE expr WHEN value THEN result ...)
     if case_expr.expr().is_some() {
@@ -536,14 +524,14 @@ fn can_case_be_pushed_down(case_expr: &df_expr::CaseExpr, schema: &Schema) -> bo
 
     // Check all when/then pairs
     for (when_expr, then_expr) in case_expr.when_then_expr() {
-        if !can_be_pushed_down(when_expr, schema) || !can_be_pushed_down(then_expr, schema) {
+        if !can_be_pushed_down_impl(when_expr, schema) || !can_be_pushed_down_impl(then_expr, schema) {
             return false;
         }
     }
 
     // Check the optional else clause
     if let Some(else_expr) = case_expr.else_expr()
-        && !can_be_pushed_down(else_expr, schema)
+        && !can_be_pushed_down_impl(else_expr, schema)
     {
         return false;
     }
@@ -591,7 +579,7 @@ fn can_scalar_fn_be_pushed_down(scalar_fn: &ScalarFunctionExpr, schema: &Schema)
         && scalar_fn
             .args()
             .iter()
-            .all(|arg| can_be_pushed_down(arg, schema))
+            .all(|arg| can_be_pushed_down_impl(arg, schema))
 }
 
 // TODO(adam): Replace with `DataType::is_decimal` once its released.
