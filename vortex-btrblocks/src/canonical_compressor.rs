@@ -101,6 +101,16 @@ pub struct BtrBlocksCompressor {
     pub string_schemes: Vec<&'static dyn StringScheme>,
 }
 
+impl std::fmt::Debug for BtrBlocksCompressor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BtrBlocksCompressor")
+            .field("int_schemes", &self.int_schemes.len())
+            .field("float_schemes", &self.float_schemes.len())
+            .field("string_schemes", &self.string_schemes.len())
+            .finish()
+    }
+}
+
 impl Default for BtrBlocksCompressor {
     fn default() -> Self {
         BtrBlocksCompressorBuilder::default().build()
