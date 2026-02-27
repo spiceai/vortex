@@ -617,4 +617,19 @@ mod tests {
         let format = VortexFormat::new_with_options(VortexSession::default(), opts);
         assert_eq!(format.options().footer_initial_read_size_bytes, 12345);
     }
+
+    #[test]
+    fn format_plumbs_target_file_size_mb() {
+        let mut opts = VortexTableOptions::default();
+        opts.set("target_file_size_mb", "123").unwrap();
+
+        let format = VortexFormat::new_with_options(VortexSession::default(), opts);
+        assert_eq!(format.options().target_file_size_mb, 123);
+    }
+
+    #[test]
+    fn format_target_file_size_default_is_128mb() {
+        let opts = VortexTableOptions::default();
+        assert_eq!(opts.target_file_size_mb, 128);
+    }
 }
