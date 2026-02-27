@@ -150,9 +150,15 @@ impl VortexWriteOptions {
         // serialised array order is deterministic. The serialisation of arrays are done
         // parallel and with an empty context they can register their encodings to the context
         // in different order, changing the written bytes from run to run.
-        let ctx = ArrayContext::new(self.session.arrays().registry().ids().sorted().collect())
+        // Avoid calling `self.session.arrays()` multiple times in one expression.
+        // `Ref` holds a session lock; reacquiring it in the same statement can deadlock.
+        let registry = {
+            let arrays = self.session.arrays();
+            arrays.registry().clone()
+        };
+        let ctx = ArrayContext::new(registry.ids().sorted().collect())
             // Configure a registry just to ensure only known encodings are interned.
-            .with_registry(self.session.arrays().registry().clone());
+            .with_registry(registry);
         let dtype = stream.dtype().clone();
 
         let (mut ptr, eof) = SequenceId::root().split();
