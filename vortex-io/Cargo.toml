@@ -26,6 +26,7 @@ getrandom_v03 = { workspace = true } # Needed to pickup the "wasm_js" feature fo
 glob = { workspace = true }
 handle = "1.0.2"
 kanal = { workspace = true }
+log = { workspace = true }
 object_store = { workspace = true, optional = true, features = ["fs"] }
 oneshot = { workspace = true }
 parking_lot = { workspace = true }
@@ -38,7 +39,6 @@ tokio = { workspace = true, features = [
 tracing = { workspace = true }
 vortex-array = { workspace = true }
 vortex-buffer = { workspace = true }
-log = { workspace = true }
 vortex-error = { workspace = true }
 vortex-metrics = { workspace = true }
 vortex-session = { workspace = true }
