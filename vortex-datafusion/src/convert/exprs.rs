@@ -37,7 +37,11 @@ use vortex::scalar_fn::ScalarFnVTableExt;
 use vortex::scalar_fn::fns::binary::Binary;
 use vortex::scalar_fn::fns::like::Like;
 use vortex::scalar_fn::fns::like::LikeOptions;
+use vortex::scalar_fn::fns::case_when::case_when;
+use vortex::scalar_fn::fns::case_when::case_when_no_else;
 use vortex::scalar_fn::fns::operators::Operator;
+use vortex::error::VortexResult;
+use vortex::error::vortex_bail;
 
 use crate::convert::FromDataFusion;
 
