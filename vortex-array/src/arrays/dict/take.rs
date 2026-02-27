@@ -150,8 +150,13 @@ pub(crate) fn propagate_take_stats(
                 st.set(Stat::IsConstant, Precision::exact(true));
             }
         }
-        let inexact_min_max = [Stat::Min, Stat::Max]
-            .into_iter()
+        let inexact_min_max = [
+            Stat::Min,
+            Stat::Max,
+            Stat::UncompressedSizeInBytes,
+            Stat::IsConstant,
+        ]
+        .into_iter()
             .filter_map(|stat| {
                 source
                     .statistics()
