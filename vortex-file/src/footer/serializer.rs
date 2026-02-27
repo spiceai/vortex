@@ -16,7 +16,6 @@ use crate::Footer;
 use crate::MAGIC_BYTES;
 use crate::MAX_POSTSCRIPT_SIZE;
 use crate::VERSION;
-use crate::footer::FileStatistics;
 use crate::footer::file_layout::FooterFlatBufferWriter;
 use crate::footer::postscript::Postscript;
 use crate::footer::postscript::PostscriptSegment;
@@ -72,7 +71,10 @@ impl FooterSerializer {
             Some(dtype_segment)
         };
 
-        let layout_ctx = LayoutContext::empty();
+        // TODO(ngates): we should separate the read/write side of Context since the write side
+        //  doesn't need to look anything up in the registry.
+        let layout_ctx = LayoutContext::default();
+
         let (buffer, layout_segment) = write_flatbuffer(
             &mut self.offset,
             &self.footer.layout().flatbuffer_writer(&layout_ctx),
@@ -81,10 +83,9 @@ impl FooterSerializer {
 
         let statistics_segment = match self.footer.statistics() {
             None => None,
-            Some(stats) if stats.is_empty() => None,
+            Some(stats) if stats.stats_sets().is_empty() => None,
             Some(stats) => {
-                let stats = FileStatistics(stats.clone());
-                let (buffer, stats_segment) = write_flatbuffer(&mut self.offset, &stats)?;
+                let (buffer, stats_segment) = write_flatbuffer(&mut self.offset, stats)?;
                 buffers.push(buffer);
                 Some(stats_segment)
             }
@@ -107,7 +108,7 @@ impl FooterSerializer {
             statistics: statistics_segment,
             footer: footer_segment,
         };
-        let postscript_buffer = postscript.write_flatbuffer_bytes();
+        let postscript_buffer = postscript.write_flatbuffer_bytes()?;
         if postscript_buffer.len() > MAX_POSTSCRIPT_SIZE as usize {
             Err(vortex_err!(
                 "Postscript is too large ({} bytes); max postscript size is {}",
@@ -135,7 +136,7 @@ fn write_flatbuffer<F: FlatBufferRoot + WriteFlatBuffer>(
     offset: &mut u64,
     flatbuffer: &F,
 ) -> VortexResult<(ByteBuffer, PostscriptSegment)> {
-    let buffer = flatbuffer.write_flatbuffer_bytes();
+    let buffer = flatbuffer.write_flatbuffer_bytes()?;
     let length = u32::try_from(buffer.len())
         .map_err(|_| vortex_err!("flatbuffer length exceeds maximum u32"))?;
 

@@ -2,42 +2,34 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::hash::Hash;
-use std::ops::Range;
 
-use vortex_dtype::DType;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
-use vortex_mask::Mask;
-use vortex_scalar::Scalar;
-use vortex_vector::Vector;
-use vortex_vector::null::NullVector;
+use vortex_session::VortexSession;
 
 use crate::ArrayBufferVisitor;
 use crate::ArrayChildVisitor;
 use crate::ArrayRef;
-use crate::Canonical;
 use crate::EmptyMetadata;
-use crate::IntoArray;
+use crate::ExecutionCtx;
 use crate::Precision;
+use crate::arrays::null::compute::rules::PARENT_RULES;
 use crate::buffer::BufferHandle;
-use crate::executor::ExecutionCtx;
+use crate::dtype::DType;
+use crate::scalar::Scalar;
 use crate::serde::ArrayChildren;
 use crate::stats::ArrayStats;
 use crate::stats::StatsSetRef;
 use crate::validity::Validity;
 use crate::vtable;
 use crate::vtable::ArrayId;
-use crate::vtable::ArrayVTable;
-use crate::vtable::ArrayVTableExt;
 use crate::vtable::BaseArrayVTable;
-use crate::vtable::CanonicalVTable;
-use crate::vtable::NotSupported;
 use crate::vtable::OperationsVTable;
 use crate::vtable::VTable;
 use crate::vtable::ValidityVTable;
 use crate::vtable::VisitorVTable;
 
-mod compute;
+pub(crate) mod compute;
 
 vtable!(Null);
 
@@ -47,19 +39,12 @@ impl VTable for NullVTable {
     type Metadata = EmptyMetadata;
 
     type ArrayVTable = Self;
-    type CanonicalVTable = Self;
     type OperationsVTable = Self;
     type ValidityVTable = Self;
     type VisitorVTable = Self;
-    type ComputeVTable = NotSupported;
-    type EncodeVTable = NotSupported;
 
-    fn id(&self) -> ArrayId {
-        ArrayId::new_ref("vortex.null")
-    }
-
-    fn encoding(_array: &Self::Array) -> ArrayVTable {
-        NullVTable.as_vtable()
+    fn id(_array: &Self::Array) -> ArrayId {
+        Self::ID
     }
 
     fn metadata(_array: &NullArray) -> VortexResult<Self::Metadata> {
@@ -70,12 +55,17 @@ impl VTable for NullVTable {
         Ok(Some(vec![]))
     }
 
-    fn deserialize(_buffer: &[u8]) -> VortexResult<Self::Metadata> {
+    fn deserialize(
+        _bytes: &[u8],
+        _dtype: &DType,
+        _len: usize,
+        _buffers: &[BufferHandle],
+        _session: &VortexSession,
+    ) -> VortexResult<Self::Metadata> {
         Ok(EmptyMetadata)
     }
 
     fn build(
-        &self,
         _dtype: &DType,
         len: usize,
         _metadata: &Self::Metadata,
@@ -85,10 +75,6 @@ impl VTable for NullVTable {
         Ok(NullArray::new(len))
     }
 
-    fn execute(array: &Self::Array, _ctx: &mut ExecutionCtx) -> VortexResult<Vector> {
-        Ok(NullVector::new(array.len()).into())
-    }
-
     fn with_children(_array: &mut Self::Array, children: Vec<ArrayRef>) -> VortexResult<()> {
         vortex_ensure!(
             children.is_empty(),
@@ -96,6 +82,18 @@ impl VTable for NullVTable {
             children.len()
         );
         Ok(())
+    }
+
+    fn reduce_parent(
+        array: &Self::Array,
+        parent: &ArrayRef,
+        child_idx: usize,
+    ) -> VortexResult<Option<ArrayRef>> {
+        PARENT_RULES.evaluate(array, parent, child_idx)
+    }
+
+    fn execute(array: &Self::Array, _ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
+        Ok(array.to_array())
     }
 }
 
@@ -109,6 +107,7 @@ impl VTable for NullVTable {
 /// # Examples
 ///
 /// ```
+/// # fn main() -> vortex_error::VortexResult<()> {
 /// use vortex_array::arrays::NullArray;
 /// use vortex_array::IntoArray;
 ///
@@ -116,12 +115,14 @@ impl VTable for NullVTable {
 /// let array = NullArray::new(5);
 ///
 /// // Slice the array - still contains nulls
-/// let sliced = array.slice(1..3);
+/// let sliced = array.slice(1..3)?;
 /// assert_eq!(sliced.len(), 2);
 ///
 /// // All elements are null
-/// let scalar = array.scalar_at(0);
+/// let scalar = array.scalar_at(0).unwrap();
 /// assert!(scalar.is_null());
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Clone, Debug)]
 pub struct NullArray {
@@ -131,6 +132,10 @@ pub struct NullArray {
 
 #[derive(Debug)]
 pub struct NullVTable;
+
+impl NullVTable {
+    pub const ID: ArrayId = ArrayId::new_ref("vortex.null");
+}
 
 impl NullArray {
     pub fn new(len: usize) -> Self {
@@ -167,42 +172,24 @@ impl VisitorVTable<NullVTable> for NullVTable {
     fn visit_buffers(_array: &NullArray, _visitor: &mut dyn ArrayBufferVisitor) {}
 
     fn visit_children(_array: &NullArray, _visitor: &mut dyn ArrayChildVisitor) {}
-}
 
-impl CanonicalVTable<NullVTable> for NullVTable {
-    fn canonicalize(array: &NullArray) -> Canonical {
-        Canonical::Null(array.clone())
+    fn nchildren(_array: &NullArray) -> usize {
+        0
+    }
+
+    fn nth_child(_array: &NullArray, _idx: usize) -> Option<ArrayRef> {
+        None
     }
 }
 
 impl OperationsVTable<NullVTable> for NullVTable {
-    fn slice(_array: &NullArray, range: Range<usize>) -> ArrayRef {
-        NullArray::new(range.len()).into_array()
-    }
-
-    fn scalar_at(_array: &NullArray, _index: usize) -> Scalar {
-        Scalar::null(DType::Null)
+    fn scalar_at(_array: &NullArray, _index: usize) -> VortexResult<Scalar> {
+        Ok(Scalar::null(DType::Null))
     }
 }
 
 impl ValidityVTable<NullVTable> for NullVTable {
-    fn is_valid(_array: &NullArray, _index: usize) -> bool {
-        false
-    }
-
-    fn all_valid(array: &NullArray) -> bool {
-        array.is_empty()
-    }
-
-    fn all_invalid(array: &NullArray) -> bool {
-        !array.is_empty()
-    }
-
     fn validity(_array: &NullArray) -> VortexResult<Validity> {
         Ok(Validity::AllInvalid)
-    }
-
-    fn validity_mask(array: &NullArray) -> Mask {
-        Mask::AllFalse(array.len)
     }
 }

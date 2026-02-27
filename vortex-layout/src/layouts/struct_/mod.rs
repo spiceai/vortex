@@ -10,11 +10,11 @@ use reader::StructReader;
 use vortex_array::ArrayContext;
 use vortex_array::DeserializeMetadata;
 use vortex_array::EmptyMetadata;
-use vortex_dtype::DType;
-use vortex_dtype::Field;
-use vortex_dtype::FieldMask;
-use vortex_dtype::Nullability;
-use vortex_dtype::StructFields;
+use vortex_array::dtype::DType;
+use vortex_array::dtype::Field;
+use vortex_array::dtype::FieldMask;
+use vortex_array::dtype::Nullability;
+use vortex_array::dtype::StructFields;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
@@ -124,23 +124,6 @@ impl VTable for StructVTable {
         )?))
     }
 
-    #[cfg(gpu_unstable)]
-    fn new_gpu_reader(
-        layout: &Self::Layout,
-        name: Arc<str>,
-        segment_source: Arc<dyn SegmentSource>,
-        ctx: Arc<cudarc::driver::CudaContext>,
-    ) -> VortexResult<crate::gpu::GpuLayoutReaderRef> {
-        Ok(Arc::new(
-            crate::gpu::layouts::struct_::GpuStructReader::try_new(
-                layout.clone(),
-                name,
-                segment_source,
-                ctx,
-            )?,
-        ))
-    }
-
     fn build(
         _encoding: &Self::Encoding,
         dtype: &DType,
@@ -148,7 +131,7 @@ impl VTable for StructVTable {
         _metadata: &<Self::Metadata as DeserializeMetadata>::Output,
         _segment_ids: Vec<SegmentId>,
         children: &dyn LayoutChildren,
-        _ctx: ArrayContext,
+        _ctx: &ArrayContext,
     ) -> VortexResult<Self::Layout> {
         let struct_dt = dtype
             .as_struct_fields_opt()

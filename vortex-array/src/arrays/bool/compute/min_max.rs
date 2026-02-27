@@ -4,25 +4,25 @@
 use std::ops::BitAnd;
 
 use Nullability::NonNullable;
-use vortex_dtype::Nullability;
 use vortex_error::VortexResult;
 use vortex_mask::Mask;
-use vortex_scalar::Scalar;
 
 use crate::arrays::BoolArray;
 use crate::arrays::BoolVTable;
 use crate::compute::MinMaxKernel;
 use crate::compute::MinMaxKernelAdapter;
 use crate::compute::MinMaxResult;
+use crate::dtype::Nullability;
 use crate::register_kernel;
+use crate::scalar::Scalar;
 
 impl MinMaxKernel for BoolVTable {
     fn min_max(&self, array: &BoolArray) -> VortexResult<Option<MinMaxResult>> {
-        let mask = array.validity_mask();
-        let true_non_null = match mask {
-            Mask::AllTrue(_) => array.bit_buffer().clone(),
+        let mask = array.validity_mask()?;
+        let true_non_null = match &mask {
+            Mask::AllTrue(_) => array.to_bit_buffer(),
             Mask::AllFalse(_) => return Ok(None),
-            Mask::Values(ref v) => array.bit_buffer().bitand(v.bit_buffer()),
+            Mask::Values(v) => array.to_bit_buffer().bitand(v.bit_buffer()),
         };
 
         // TODO(ngates): we should be able to bail out earlier as soon as we have one true and
@@ -48,11 +48,11 @@ impl MinMaxKernel for BoolVTable {
         };
 
         // If the non null true slice doesn't cover the whole array we need to check for valid false values
-        match mask {
+        match &mask {
             // if the mask is all true or all false we don't need to look for false values
             Mask::AllTrue(_) | Mask::AllFalse(_) => {}
             Mask::Values(v) => {
-                let false_non_null = (!array.bit_buffer()).bitand(v.bit_buffer());
+                let false_non_null = (!array.to_bit_buffer()).bitand(v.bit_buffer());
                 let mut false_slices = false_non_null.set_slices();
 
                 let Some(_) = false_slices.next() else {
@@ -77,12 +77,12 @@ register_kernel!(MinMaxKernelAdapter(BoolVTable).lift());
 #[cfg(test)]
 mod tests {
     use Nullability::NonNullable;
-    use vortex_dtype::Nullability;
-    use vortex_scalar::Scalar;
 
     use crate::arrays::BoolArray;
     use crate::compute::MinMaxResult;
     use crate::compute::min_max;
+    use crate::dtype::Nullability;
+    use crate::scalar::Scalar;
 
     #[test]
     fn test_min_max_nulls() {

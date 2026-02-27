@@ -11,13 +11,11 @@ use futures::future::BoxFuture;
 use vortex_array::Array;
 use vortex_array::ArrayRef;
 use vortex_array::MaskFuture;
-use vortex_array::compute::filter;
+use vortex_array::VortexSessionExecute;
+use vortex_array::dtype::DType;
+use vortex_array::dtype::FieldMask;
 use vortex_array::expr::Expression;
-use vortex_array::expr::Root;
-use vortex_array::mask::MaskExecutor;
 use vortex_array::serde::ArrayParts;
-use vortex_dtype::DType;
-use vortex_dtype::FieldMask;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_mask::Mask;
@@ -25,7 +23,6 @@ use vortex_session::VortexSession;
 
 use crate::LayoutReader;
 use crate::layouts::SharedArrayFuture;
-use crate::layouts::USE_VORTEX_OPERATORS;
 use crate::layouts::flat::FlatLayout;
 use crate::segments::SegmentSource;
 
@@ -69,6 +66,7 @@ impl FlatReader {
         let segment_fut = self.segment_source.request(self.layout.segment_id());
 
         let ctx = self.layout.array_ctx().clone();
+        let session = self.session.clone();
         let dtype = self.layout.dtype().clone();
         let array_tree = self.layout.array_tree().cloned();
         async move {
@@ -80,7 +78,9 @@ impl FlatReader {
                 // Parse the flatbuffer from the segment itself.
                 ArrayParts::try_from(segment)?
             };
-            parts.decode(&ctx, &dtype, row_count).map_err(Arc::new)
+            parts
+                .decode(&dtype, row_count, &ctx, &session)
+                .map_err(Arc::new)
         }
         .boxed()
         .shared()
@@ -143,53 +143,26 @@ impl LayoutReader for FlatReader {
 
             // Slice the array based on the row mask.
             if row_range.start > 0 || row_range.end < array.len() {
-                array = array.slice(row_range.clone());
+                array = array.slice(row_range.clone())?;
             }
 
-            let array_mask = if *USE_VORTEX_OPERATORS {
-                if mask.density() < EXPR_EVAL_THRESHOLD {
-                    // We have the choice to apply the filter or the expression first, we apply the
-                    // expression first so that it can try pushing down itself and then the filter
-                    // after this.
-                    let array = array.apply(&expr)?;
-                    let array = array.filter(mask.clone())?;
-                    let array_mask = array.execute_mask(&session)?;
+            let array_mask = if mask.density() < EXPR_EVAL_THRESHOLD {
+                // We have the choice to apply the filter or the expression first, we apply the
+                // expression first so that it can try pushing down itself and then the filter
+                // after this.
+                let array = array.apply(&expr)?;
+                let array = array.filter(mask.clone())?;
+                let mut ctx = session.create_execution_ctx();
+                let array_mask = array.execute::<Mask>(&mut ctx)?;
 
-                    mask.intersect_by_rank(&array_mask)
-                } else {
-                    // Run over the full array, with a simpler bitand at the end.
-                    let array = array.apply(&expr)?;
-                    let array_mask = array.execute_mask(&session)?;
-
-                    mask.bitand(&array_mask)
-                }
+                mask.intersect_by_rank(&array_mask)
             } else {
-                // TODO(ngates): the mask may actually be dense within a range, as is often the case when
-                //  we have approximate mask results from a zone map. In which case we could look at
-                //  the true_count between the mask's first and last true positions.
-                // TODO(ngates): we could also track runtime statistics about whether it's worth selecting
-                //   or not.
-                if mask.density() < EXPR_EVAL_THRESHOLD {
-                    // Evaluate only the selected rows of the mask.
-                    array = filter(&array, &mask)?;
-                    // TODO(joe): fixme casting null to false is *VERY* unsound, if the expression in the filter
-                    // can inspect nulls (e.g. `is_null`).
-                    // you will need to call the array evaluation instead of the mask evaluation.
-                    let array_mask = expr
-                        .evaluate(&array)
-                        .map_err(|err| {
-                            err.with_context(format!("While evaluating filter {}", expr))
-                        })?
-                        .try_to_mask_fill_null_false()?;
-                    mask.intersect_by_rank(&array_mask)
-                } else {
-                    // Evaluate all rows, avoiding the more expensive rank intersection.
-                    array = expr.evaluate(&array).map_err(|err| {
-                        err.with_context(format!("While evaluating filter {}", expr))
-                    })?;
-                    let array_mask = array.try_to_mask_fill_null_false()?;
-                    mask.bitand(&array_mask)
-                }
+                // Run over the full array, with a simpler bitand at the end.
+                let array = array.apply(&expr)?;
+                let mut ctx = session.create_execution_ctx();
+                let array_mask = array.execute::<Mask>(&mut ctx)?;
+
+                mask.bitand(&array_mask)
             };
 
             tracing::debug!(
@@ -226,36 +199,21 @@ impl LayoutReader for FlatReader {
 
             // Slice the array based on the row mask.
             if row_range.start > 0 || row_range.end < array.len() {
-                array = array.slice(row_range.clone());
+                array = array.slice(row_range.clone())?;
             }
 
-            Ok(if *USE_VORTEX_OPERATORS {
-                // First apply the filter to the array.
-                // NOTE(ngates): we *must* filter first before applying the expression, as the
-                // expression may depend on the filtered rows being removed e.g.
-                //  `CAST(a, u8) WHERE a < 256`
-                if !mask.all_true() {
-                    array = array.filter(mask)?;
-                }
+            // First apply the filter to the array.
+            // NOTE(ngates): we *must* filter first before applying the expression, as the
+            // expression may depend on the filtered rows being removed e.g.
+            //  `CAST(a, u8) WHERE a < 256`
+            if !mask.all_true() {
+                array = array.filter(mask)?;
+            }
 
-                // Evaluate the projection expression.
-                array = array.apply(&expr)?;
+            // Evaluate the projection expression.
+            array = array.apply(&expr)?;
 
-                array
-            } else {
-                // Filter the array based on the row mask.
-                if !mask.all_true() {
-                    array = filter(&array, &mask)?;
-                }
-
-                // Evaluate the projection expression.
-                if !expr.is::<Root>() {
-                    array = expr.evaluate(&array).map_err(|err| {
-                        err.with_context(format!("While evaluating projection {}", expr))
-                    })?;
-                }
-                array
-            })
+            Ok(array)
         }
         .boxed())
     }
@@ -268,15 +226,15 @@ mod test {
     use vortex_array::ArrayContext;
     use vortex_array::IntoArray;
     use vortex_array::MaskFuture;
-    use vortex_array::ToCanonical;
+    use vortex_array::arrays::BoolArray;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::assert_arrays_eq;
     use vortex_array::expr::gt;
     use vortex_array::expr::lit;
     use vortex_array::expr::root;
     use vortex_array::validity::Validity;
-    use vortex_buffer::BitBuffer;
     use vortex_buffer::buffer;
+    use vortex_error::VortexResult;
     use vortex_io::runtime::single::block_on;
 
     use crate::LayoutStrategy;
@@ -287,7 +245,7 @@ mod test {
     use crate::test::SESSION;
 
     #[test]
-    fn flat_identity() {
+    fn flat_identity() -> VortexResult<()> {
         block_on(|handle| async {
             let ctx = ArrayContext::empty();
             let segments = Arc::new(TestSegments::default());
@@ -301,8 +259,7 @@ mod test {
                     eof,
                     handle,
                 )
-                .await
-                .unwrap();
+                .await?;
 
             assert_eq!(
                 format!("{}", layout),
@@ -310,22 +267,17 @@ mod test {
             );
 
             let result = layout
-                .new_reader("".into(), segments, &SESSION)
-                .unwrap()
+                .new_reader("".into(), segments, &SESSION)?
                 .projection_evaluation(
                     &(0..layout.row_count()),
                     &root(),
-                    MaskFuture::new_true(layout.row_count().try_into().unwrap()),
-                )
-                .unwrap()
-                .await
-                .unwrap()
-                .to_primitive();
+                    MaskFuture::new_true(layout.row_count().try_into()?),
+                )?
+                .await?;
 
-            assert_eq!(
-                array.to_primitive().as_slice::<i32>(),
-                result.as_slice::<i32>()
-            );
+            assert_arrays_eq!(result, array);
+
+            Ok(())
         })
     }
 
@@ -359,13 +311,10 @@ mod test {
                 )
                 .unwrap()
                 .await
-                .unwrap()
-                .to_bool();
+                .unwrap();
 
-            assert_eq!(
-                &BitBuffer::from_iter([false, false, false, true, true]),
-                result.bit_buffer()
-            );
+            let expected = BoolArray::from_iter([false, false, false, true, true].map(Some));
+            assert_arrays_eq!(result, expected);
         })
     }
 

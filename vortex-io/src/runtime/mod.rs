@@ -11,13 +11,8 @@
 //! * Multi-threaded: work is driven on a pool of threads managed by Vortex.
 //! * Worker Pool: work is driven on a pool of threads provided by the caller.
 //! * Tokio: work is driven on a Tokio runtime provided by the caller.
-//!
 
 use futures::future::BoxFuture;
-use futures::stream::BoxStream;
-
-use crate::file::IoRequest;
-use crate::file::ReadSourceRef;
 
 mod blocking;
 pub use blocking::*;
@@ -41,7 +36,7 @@ pub mod wasm;
 mod tests;
 
 /// Trait used to abstract over different async runtimes.
-pub(crate) trait Executor: Send + Sync {
+pub trait Executor: Send + Sync {
     /// Spawns a future to be executed on the runtime.
     ///
     /// The future should continue to be polled in the background by the runtime.
@@ -58,40 +53,15 @@ pub(crate) trait Executor: Send + Sync {
     ///
     /// The returned `AbortHandle` may be used to optimistically cancel the task if it has not
     /// yet started executing.
-    fn spawn_blocking(&self, task: Box<dyn FnOnce() + Send + 'static>) -> AbortHandleRef;
-
-    /// Spawns an I/O task for execution on the runtime.
-    /// The runtime can choose to invoke the task's `Send` or `!Send` versions.
-    ///
-    /// Cancellation is implied by termination of the request stream.
-    fn spawn_io(&self, task: IoTask);
+    fn spawn_blocking_io(&self, task: Box<dyn FnOnce() + Send + 'static>) -> AbortHandleRef;
 }
 
 /// A handle that may be used to optimistically abort a spawned task.
 ///
 /// If dropped, the task should continue to completion.
 /// If explicitly aborted, the task should be cancelled if it has not yet started executing.
-pub(crate) trait AbortHandle: Send + Sync {
+pub trait AbortHandle: Send + Sync {
     fn abort(self: Box<Self>);
 }
 
-pub(crate) type AbortHandleRef = Box<dyn AbortHandle>;
-
-/// A task for driving I/O requests against a source.
-///
-/// Instead of just spawning a future to process requests, we allow each runtime to decide how
-/// spawn the driver for the request stream. This allows runtimes to shared, parallelize, further
-/// spawn, or otherwise manage the I/O task as they see fit.
-///
-// NOTE(ngates): We could in theory make IoSource support as_any if we wanted each runtime to implement the
-// actual read logic themselves? Not sure yet...
-pub(crate) struct IoTask {
-    pub(crate) source: ReadSourceRef,
-    pub(crate) stream: BoxStream<'static, IoRequest>,
-}
-
-impl IoTask {
-    pub(crate) fn new(source: ReadSourceRef, stream: BoxStream<'static, IoRequest>) -> Self {
-        IoTask { source, stream }
-    }
-}
+pub type AbortHandleRef = Box<dyn AbortHandle>;

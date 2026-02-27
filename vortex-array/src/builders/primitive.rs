@@ -5,14 +5,10 @@ use std::any::Any;
 use std::mem::MaybeUninit;
 
 use vortex_buffer::BufferMut;
-use vortex_dtype::DType;
-use vortex_dtype::NativePType;
-use vortex_dtype::Nullability;
+use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 use vortex_mask::Mask;
-use vortex_scalar::PrimitiveScalar;
-use vortex_scalar::Scalar;
 
 use crate::Array;
 use crate::ArrayRef;
@@ -23,6 +19,10 @@ use crate::builders::DEFAULT_BUILDER_CAPACITY;
 use crate::builders::LazyBitBufferBuilder;
 use crate::canonical::Canonical;
 use crate::canonical::ToCanonical;
+use crate::dtype::DType;
+use crate::dtype::NativePType;
+use crate::dtype::Nullability;
+use crate::scalar::Scalar;
 
 /// The builder for building a [`PrimitiveArray`], parametrized by the `PType`.
 pub struct PrimitiveBuilder<T> {
@@ -72,7 +72,7 @@ impl<T: NativePType> PrimitiveBuilder<T> {
     /// ```
     /// use std::mem::MaybeUninit;
     /// use vortex_array::builders::{ArrayBuilder, PrimitiveBuilder};
-    /// use vortex_dtype::Nullability;
+    /// use vortex_array::dtype::Nullability;
     ///
     /// // Create a new builder.
     /// let mut builder: PrimitiveBuilder<i32> =
@@ -150,15 +150,15 @@ impl<T: NativePType> ArrayBuilder for PrimitiveBuilder<T> {
     fn append_scalar(&mut self, scalar: &Scalar) -> VortexResult<()> {
         vortex_ensure!(
             scalar.dtype() == self.dtype(),
-            "PrimitiveBuilder expected scalar with dtype {:?}, got {:?}",
+            "PrimitiveBuilder expected scalar with dtype {}, got {}",
             self.dtype(),
             scalar.dtype()
         );
 
-        let primitive_scalar = PrimitiveScalar::try_from(scalar)?;
-        match primitive_scalar.pvalue() {
-            Some(pv) => self.append_value(pv.cast::<T>()),
-            None => self.append_null(),
+        if let Some(pv) = scalar.as_primitive().pvalue() {
+            self.append_value(pv.cast::<T>()?)
+        } else {
+            self.append_null()
         }
 
         Ok(())
@@ -175,7 +175,11 @@ impl<T: NativePType> ArrayBuilder for PrimitiveBuilder<T> {
         );
 
         self.values.extend_from_slice(array.as_slice::<T>());
-        self.nulls.append_validity_mask(array.validity_mask());
+        self.nulls.append_validity_mask(
+            array
+                .validity_mask()
+                .vortex_expect("validity_mask in extend_from_array_unchecked"),
+        );
     }
 
     fn reserve_exact(&mut self, additional: usize) {
@@ -345,6 +349,7 @@ impl<T> UninitRange<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::assert_arrays_eq;
 
     /// REGRESSION TEST: This test verifies that multiple sequential ranges have correct offsets.
     ///
@@ -381,7 +386,7 @@ mod tests {
         assert_eq!(builder.values(), &[1, 2, 3, 4, 5]);
 
         let array = builder.finish_into_primitive();
-        assert_eq!(array.as_slice::<i32>(), &[1, 2, 3, 4, 5]);
+        assert_arrays_eq!(array, PrimitiveArray::from_iter([1i32, 2, 3, 4, 5]));
     }
 
     /// REGRESSION TEST: This test verifies that `append_mask` was correctly moved from
@@ -413,9 +418,9 @@ mod tests {
         let array = builder.finish_into_primitive();
         assert_eq!(array.len(), 3);
         // Check validity using scalar_at - nulls will return is_null() = true.
-        assert!(!array.scalar_at(0).is_null());
-        assert!(array.scalar_at(1).is_null());
-        assert!(!array.scalar_at(2).is_null());
+        assert!(!array.scalar_at(0).unwrap().is_null());
+        assert!(array.scalar_at(1).unwrap().is_null());
+        assert!(!array.scalar_at(2).unwrap().is_null());
     }
 
     /// REGRESSION TEST: This test verifies that `append_mask` validates the mask length.
@@ -457,7 +462,7 @@ mod tests {
         }
 
         let array = builder.finish_into_primitive();
-        assert_eq!(array.as_slice::<i32>(), &[1, 2, 3, 4, 5, 6]);
+        assert_arrays_eq!(array, PrimitiveArray::from_iter([1i32, 2, 3, 4, 5, 6]));
     }
 
     /// Test that `set_bit` uses relative indexing within the range.
@@ -503,13 +508,13 @@ mod tests {
         assert_eq!(array.as_slice::<i32>(), &[100, 200, 10, 20, 30]);
 
         // Check validity - the first two should be valid (from append_value).
-        assert!(!array.scalar_at(0).is_null()); // initial value 100
-        assert!(!array.scalar_at(1).is_null()); // initial value 200
+        assert!(!array.scalar_at(0).unwrap().is_null()); // initial value 100
+        assert!(!array.scalar_at(1).unwrap().is_null()); // initial value 200
 
         // Check the range items with modified validity.
-        assert!(!array.scalar_at(2).is_null()); // range index 0 - set to valid
-        assert!(array.scalar_at(3).is_null()); // range index 1 - left as null
-        assert!(!array.scalar_at(4).is_null()); // range index 2 - set to valid
+        assert!(!array.scalar_at(2).unwrap().is_null()); // range index 0 - set to valid
+        assert!(array.scalar_at(3).unwrap().is_null()); // range index 1 - left as null
+        assert!(!array.scalar_at(4).unwrap().is_null()); // range index 2 - set to valid
     }
 
     /// Test that creating a zero-length uninit range panics.
@@ -574,8 +579,8 @@ mod tests {
 
     #[test]
     fn test_append_scalar() {
-        use vortex_dtype::DType;
-        use vortex_scalar::Scalar;
+        use crate::dtype::DType;
+        use crate::scalar::Scalar;
 
         let mut builder = PrimitiveBuilder::<i32>::with_capacity(Nullability::Nullable, 10);
 
@@ -589,7 +594,7 @@ mod tests {
 
         // Test appending null value.
         let null_scalar = Scalar::null(DType::Primitive(
-            vortex_dtype::PType::I32,
+            crate::dtype::PType::I32,
             Nullability::Nullable,
         ));
         builder.append_scalar(&null_scalar).unwrap();
@@ -605,9 +610,9 @@ mod tests {
 
         // Check validity - first two should be valid, third should be null.
         use crate::vtable::ValidityHelper;
-        assert!(array.validity().is_valid(0));
-        assert!(array.validity().is_valid(1));
-        assert!(!array.validity().is_valid(2));
+        assert!(array.validity().is_valid(0).unwrap());
+        assert!(array.validity().is_valid(1).unwrap());
+        assert!(!array.validity().is_valid(2).unwrap());
 
         // Test wrong dtype error.
         let mut builder = PrimitiveBuilder::<i32>::with_capacity(Nullability::NonNullable, 10);

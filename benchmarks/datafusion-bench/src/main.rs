@@ -7,7 +7,9 @@ use std::time::Instant;
 
 use clap::Parser;
 use clap::value_parser;
+use custom_labels::asynchronous::Label;
 use datafusion::arrow::array::RecordBatch;
+use datafusion::common::runtime::set_join_set_tracer;
 use datafusion::datasource::listing::ListingOptions;
 use datafusion::datasource::listing::ListingTable;
 use datafusion::datasource::listing::ListingTableConfig;
@@ -15,9 +17,16 @@ use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::parquet::arrow::ParquetRecordBatchStreamBuilder;
 use datafusion::prelude::SessionContext;
 use datafusion_bench::format_to_df_format;
+use datafusion_bench::metrics::MetricsSetExt;
+use datafusion_bench::tracer::get_labelset_from_global;
+use datafusion_bench::tracer::get_static_tracer;
+use datafusion_bench::tracer::set_labels;
 use datafusion_physical_plan::ExecutionPlan;
+use datafusion_physical_plan::collect;
 use futures::StreamExt;
+use parking_lot::Mutex;
 use tokio::fs::File;
+use vortex::scan::api::DataSourceRef;
 use vortex_bench::Benchmark;
 use vortex_bench::BenchmarkArg;
 use vortex_bench::CompactionStrategy;
@@ -25,13 +34,15 @@ use vortex_bench::Engine;
 use vortex_bench::Format;
 use vortex_bench::Opt;
 use vortex_bench::Opts;
-use vortex_bench::conversions::convert_parquet_to_vortex;
+use vortex_bench::SESSION;
+use vortex_bench::conversions::convert_parquet_directory_to_vortex;
 use vortex_bench::create_benchmark;
 use vortex_bench::create_output_writer;
 use vortex_bench::display::DisplayFormat;
 use vortex_bench::runner::SqlBenchmarkRunner;
 use vortex_bench::runner::filter_queries;
 use vortex_bench::setup_logging_and_tracing;
+use vortex_datafusion::metrics::VortexMetricsFinder;
 
 /// Common arguments shared across benchmarks
 #[derive(Parser)]
@@ -99,6 +110,7 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let opts = Opts::from(args.options);
 
+    set_join_set_tracer(get_static_tracer())?;
     setup_logging_and_tracing(args.verbose, args.tracing)?;
 
     let benchmark = create_benchmark(args.benchmark, &opts)?;
@@ -121,15 +133,19 @@ async fn main() -> anyhow::Result<()> {
         for format in args.formats.iter() {
             match format {
                 Format::OnDiskVortex => {
-                    convert_parquet_to_vortex(&base_path, CompactionStrategy::Default).await?;
+                    convert_parquet_directory_to_vortex(&base_path, CompactionStrategy::Default)
+                        .await?;
                 }
                 Format::VortexCompact => {
-                    convert_parquet_to_vortex(&base_path, CompactionStrategy::Compact).await?;
+                    convert_parquet_directory_to_vortex(&base_path, CompactionStrategy::Compact)
+                        .await?;
                 }
                 _ => {}
             }
         }
     }
+
+    let benchmark_name = benchmark.dataset().to_string();
 
     let mut runner = SqlBenchmarkRunner::new(
         &*benchmark,
@@ -138,6 +154,13 @@ async fn main() -> anyhow::Result<()> {
         args.track_memory,
         args.hide_progress_bar,
     )?;
+
+    // Collect execution plans for metrics if show_metrics is enabled
+    // Structure: (query_idx, format, execution_plan)
+    #[allow(clippy::type_complexity)]
+    let collected_plans: Arc<Mutex<Vec<(usize, Format, Arc<dyn ExecutionPlan>)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let show_metrics = args.show_metrics;
 
     runner
         .run_all_async(
@@ -149,26 +172,58 @@ async fn main() -> anyhow::Result<()> {
                     let session = datafusion_bench::get_session_context();
                     datafusion_bench::make_object_store(&session, benchmark.data_url())?;
                     register_benchmark_tables(&session, benchmark, format).await?;
-                    Ok(session)
+                    Ok((session, format))
                 }
             },
-            |session, query| {
-                Box::pin(async move {
-                    let timer = Instant::now();
-                    let (batches, plan) = execute_query(session, query).await?;
-                    let time = timer.elapsed();
-                    let row_count = batches.iter().map(|batch| batch.num_rows()).sum::<usize>();
-                    anyhow::Ok((row_count, Some(time), plan))
-                })
+            |query_idx, (session, format), query| {
+                let plans = Arc::clone(&collected_plans);
+
+                let labelset = set_labels(benchmark_name.clone(), query_idx, *format);
+
+                Box::pin(
+                    async move {
+                        let timer = Instant::now();
+                        let (batches, plan) = execute_query(session, query)
+                            .with_labelset(get_labelset_from_global())
+                            .await?;
+                        let time = timer.elapsed();
+                        let row_count = batches.iter().map(|batch| batch.num_rows()).sum::<usize>();
+
+                        // Store plan for metrics (only store once per query/format combination)
+                        if show_metrics {
+                            let mut plans_mut = plans.lock();
+                            // Only store if we don't already have this query/format combo
+                            if !plans_mut
+                                .iter()
+                                .any(|(idx, f, _)| *idx == query_idx && *f == *format)
+                            {
+                                plans_mut.push((query_idx, *format, plan.clone()));
+                            }
+                        }
+
+                        anyhow::Ok((row_count, Some(time), plan))
+                    }
+                    .with_labelset(labelset),
+                )
             },
         )
         .await?;
+
+    // Print metrics if requested
+    if show_metrics {
+        let plans = collected_plans.lock();
+        print_metrics(plans.as_ref());
+    }
 
     let benchmark_id = format!("datafusion-{}", benchmark.dataset_name());
     let writer = create_output_writer(&args.display_format, args.output_path, &benchmark_id)?;
     runner.export_to(&args.display_format, writer)?;
 
     Ok(())
+}
+
+fn use_scan_api() -> bool {
+    std::env::var("VORTEX_USE_SCAN_API").is_ok_and(|v| v == "1")
 }
 
 async fn register_benchmark_tables<B: Benchmark + ?Sized>(
@@ -178,6 +233,9 @@ async fn register_benchmark_tables<B: Benchmark + ?Sized>(
 ) -> anyhow::Result<()> {
     match format {
         Format::Arrow => register_arrow_tables(session, benchmark).await,
+        _ if use_scan_api() && matches!(format, Format::OnDiskVortex | Format::VortexCompact) => {
+            register_v2_tables(session, benchmark, format).await
+        }
         _ => {
             let benchmark_base = benchmark.data_url().join(&format!("{}/", format.name()))?;
             let file_format = format_to_df_format(format);
@@ -186,10 +244,20 @@ async fn register_benchmark_tables<B: Benchmark + ?Sized>(
                 let pattern = benchmark.pattern(table.name, format);
                 let table_url = ListingTableUrl::try_new(benchmark_base.clone(), pattern)?;
 
-                let mut config = ListingTableConfig::new(table_url).with_listing_options(
-                    ListingOptions::new(file_format.clone())
-                        .with_session_config_options(session.state().config()),
-                );
+                let mut listing_options = ListingOptions::new(file_format.clone())
+                    .with_session_config_options(session.state().config());
+                if benchmark.dataset_name() == "polarsignals" && format == Format::Parquet {
+                    // Work around a DataFusion bug (fixed in 53.0.0) where the
+                    // constant-column optimization extracts ScalarValues using
+                    // the statistic scalar type, which may not match the table
+                    // column type.
+                    // See: https://github.com/apache/datafusion/pull/20042
+                    // TODO(asubiotto): Remove this after the datafusion 53
+                    // upgrade.
+                    listing_options = listing_options.with_collect_stat(false);
+                }
+                let mut config =
+                    ListingTableConfig::new(table_url).with_listing_options(listing_options);
 
                 config = match table.schema.as_ref() {
                     Some(schema) => config.with_schema(Arc::new(schema.clone())),
@@ -204,6 +272,54 @@ async fn register_benchmark_tables<B: Benchmark + ?Sized>(
             Ok(())
         }
     }
+}
+
+/// Register tables using the V2 `VortexTable` + `MultiFileDataSource` path.
+async fn register_v2_tables<B: Benchmark + ?Sized>(
+    session: &SessionContext,
+    benchmark: &B,
+    format: Format,
+) -> anyhow::Result<()> {
+    use vortex::file::multi::MultiFileDataSource;
+    use vortex::io::object_store::ObjectStoreFileSystem;
+    use vortex::io::session::RuntimeSessionExt;
+    use vortex::scan::api::DataSource as _;
+    use vortex_datafusion::v2::VortexTable;
+
+    let benchmark_base = benchmark.data_url().join(&format!("{}/", format.name()))?;
+
+    for table in benchmark.table_specs().iter() {
+        let pattern = benchmark.pattern(table.name, format);
+        let table_url = ListingTableUrl::try_new(benchmark_base.clone(), pattern.clone())?;
+        let store = session
+            .state()
+            .runtime_env()
+            .object_store(table_url.object_store())?;
+
+        let fs: vortex::io::filesystem::FileSystemRef =
+            Arc::new(ObjectStoreFileSystem::new(store.clone(), SESSION.handle()));
+        let base_prefix = benchmark_base.path().trim_start_matches('/').to_string();
+        let fs = fs.with_prefix(base_prefix);
+
+        let glob_pattern = match &pattern {
+            Some(p) => p.as_str().to_string(),
+            None => format!("*.{}", format.ext()),
+        };
+
+        let multi_ds = MultiFileDataSource::new(SESSION.clone())
+            .with_filesystem(fs)
+            .with_glob(glob_pattern)
+            .build()
+            .await?;
+
+        let arrow_schema = Arc::new(multi_ds.dtype().to_arrow_schema()?);
+        let data_source: DataSourceRef = Arc::new(multi_ds);
+
+        let table_provider = Arc::new(VortexTable::new(data_source, SESSION.clone(), arrow_schema));
+        session.register_table(table.name, table_provider)?;
+    }
+
+    Ok(())
 }
 
 /// Load Arrow IPC files into in-memory DataFusion tables.
@@ -267,10 +383,37 @@ pub async fn execute_query(
     ctx: &SessionContext,
     query: &str,
 ) -> anyhow::Result<(Vec<RecordBatch>, Arc<dyn ExecutionPlan>)> {
-    let df = ctx.sql(query).await?;
+    let df = ctx
+        .sql(query)
+        .with_labelset(get_labelset_from_global())
+        .await?;
 
-    let physical_plan = df.clone().create_physical_plan().await?;
-    let result = df.collect().await?;
+    let task_ctx = Arc::new(df.task_ctx());
+    let plan = df
+        .create_physical_plan()
+        .with_labelset(get_labelset_from_global())
+        .await?;
+    let result = collect(plan.clone(), task_ctx)
+        .with_labelset(get_labelset_from_global())
+        .await?;
 
-    Ok((result, physical_plan))
+    Ok((result, plan))
+}
+
+/// Print Vortex metrics from execution plans.
+fn print_metrics(plans: &[(usize, Format, Arc<dyn ExecutionPlan>)]) {
+    for (query_idx, format, plan) in plans {
+        let metric_sets = VortexMetricsFinder::find_all(plan.as_ref());
+        if metric_sets.is_empty() {
+            continue;
+        }
+
+        eprintln!("metrics for query={query_idx}, {format}:");
+        for (scan_idx, metrics_set) in metric_sets.iter().enumerate() {
+            eprintln!("\tscan[{scan_idx}]:");
+            for metric in metrics_set.aggregate().sorted_for_display().iter() {
+                eprintln!("\t\t{metric}");
+            }
+        }
+    }
 }

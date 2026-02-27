@@ -11,7 +11,6 @@ use crate::runtime::AbortHandle;
 use crate::runtime::AbortHandleRef;
 use crate::runtime::Executor;
 use crate::runtime::Handle;
-use crate::runtime::IoTask;
 
 /// A Vortex runtime that drives work in a WebAssembly environment.
 pub struct WasmRuntime;
@@ -37,11 +36,7 @@ impl Executor for WasmRuntime {
         Box::new(NoOpAbortHandle)
     }
 
-    fn spawn_io(&self, task: IoTask) {
-        spawn_local(task.source.drive_local(task.stream));
-    }
-
-    fn spawn_blocking(&self, task: Box<dyn FnOnce() + Send + 'static>) -> AbortHandleRef {
+    fn spawn_blocking_io(&self, task: Box<dyn FnOnce() + Send + 'static>) -> AbortHandleRef {
         spawn_local(async move { task() });
         Box::new(NoOpAbortHandle)
     }

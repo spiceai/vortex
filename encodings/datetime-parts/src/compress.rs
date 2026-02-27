@@ -6,11 +6,11 @@ use vortex_array::IntoArray;
 use vortex_array::ToCanonical;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::TemporalArray;
-use vortex_array::compute::cast;
+use vortex_array::builtins::ArrayBuiltins;
+use vortex_array::dtype::DType;
+use vortex_array::dtype::PType;
 use vortex_array::vtable::ValidityHelper;
 use vortex_buffer::BufferMut;
-use vortex_dtype::DType;
-use vortex_dtype::PType;
 use vortex_error::VortexError;
 use vortex_error::VortexResult;
 
@@ -31,11 +31,13 @@ pub fn split_temporal(array: TemporalArray) -> VortexResult<TemporalParts> {
     let temporal_values = array.temporal_values().to_primitive();
 
     // After this operation, timestamps will be a PrimitiveArray<i64>
-    let timestamps = cast(
-        temporal_values.as_ref(),
-        &DType::Primitive(PType::I64, temporal_values.dtype().nullability()),
-    )?
-    .to_primitive();
+    let timestamps = temporal_values
+        .to_array()
+        .cast(DType::Primitive(
+            PType::I64,
+            temporal_values.dtype().nullability(),
+        ))?
+        .to_primitive();
 
     let length = timestamps.len();
     let mut days = BufferMut::with_capacity(length);
@@ -77,10 +79,10 @@ mod tests {
     use vortex_array::ToCanonical;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::arrays::TemporalArray;
+    use vortex_array::extension::datetime::TimeUnit;
     use vortex_array::validity::Validity;
     use vortex_array::vtable::ValidityHelper;
     use vortex_buffer::buffer;
-    use vortex_dtype::datetime::TimeUnit;
 
     use crate::TemporalParts;
     use crate::split_temporal;
@@ -100,11 +102,8 @@ mod tests {
             validity.clone(),
         )
         .into_array();
-        let temporal_array = TemporalArray::new_timestamp(
-            milliseconds,
-            TimeUnit::Milliseconds,
-            Some("UTC".to_string()),
-        );
+        let temporal_array =
+            TemporalArray::new_timestamp(milliseconds, TimeUnit::Milliseconds, Some("UTC".into()));
         let TemporalParts {
             days,
             seconds,

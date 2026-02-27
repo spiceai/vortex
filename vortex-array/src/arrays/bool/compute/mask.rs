@@ -2,27 +2,29 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use vortex_error::VortexResult;
-use vortex_mask::Mask;
 
 use crate::ArrayRef;
 use crate::IntoArray;
 use crate::arrays::BoolArray;
 use crate::arrays::BoolVTable;
-use crate::compute::MaskKernel;
-use crate::compute::MaskKernelAdapter;
-use crate::register_kernel;
+use crate::scalar_fn::fns::mask::MaskReduce;
+use crate::validity::Validity;
 use crate::vtable::ValidityHelper;
 
-impl MaskKernel for BoolVTable {
-    fn mask(&self, array: &BoolArray, mask: &Mask) -> VortexResult<ArrayRef> {
-        Ok(
-            BoolArray::from_bit_buffer(array.bit_buffer().clone(), array.validity().mask(mask))
-                .into_array(),
-        )
+impl MaskReduce for BoolVTable {
+    fn mask(array: &BoolArray, mask: &ArrayRef) -> VortexResult<Option<ArrayRef>> {
+        Ok(Some(
+            BoolArray::new(
+                array.to_bit_buffer(),
+                array
+                    .validity()
+                    .clone()
+                    .and(Validity::Array(mask.clone()))?,
+            )
+            .into_array(),
+        ))
     }
 }
-
-register_kernel!(MaskKernelAdapter(BoolVTable).lift());
 
 #[cfg(test)]
 mod test {

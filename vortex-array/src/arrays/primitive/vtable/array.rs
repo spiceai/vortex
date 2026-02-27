@@ -4,11 +4,10 @@
 use std::hash::Hash;
 use std::hash::Hasher;
 
-use vortex_dtype::DType;
-
 use crate::Precision;
 use crate::arrays::PrimitiveArray;
 use crate::arrays::PrimitiveVTable;
+use crate::dtype::DType;
 use crate::hash::ArrayEq;
 use crate::hash::ArrayHash;
 use crate::stats::StatsSetRef;
@@ -16,7 +15,7 @@ use crate::vtable::BaseArrayVTable;
 
 impl BaseArrayVTable<PrimitiveVTable> for PrimitiveVTable {
     fn len(array: &PrimitiveArray) -> usize {
-        array.byte_buffer().len() / array.ptype().byte_width()
+        array.buffer_handle().len() / array.ptype().byte_width()
     }
 
     fn dtype(array: &PrimitiveArray) -> &DType {

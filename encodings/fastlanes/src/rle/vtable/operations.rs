@@ -1,59 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::ops::Range;
-
-use vortex_array::ArrayRef;
-use vortex_array::IntoArray;
+use vortex_array::scalar::Scalar;
 use vortex_array::vtable::OperationsVTable;
 use vortex_error::VortexExpect;
-use vortex_scalar::Scalar;
+use vortex_error::VortexResult;
 
 use super::RLEVTable;
 use crate::FL_CHUNK_SIZE;
 use crate::RLEArray;
 
 impl OperationsVTable<RLEVTable> for RLEVTable {
-    fn slice(array: &RLEArray, range: Range<usize>) -> ArrayRef {
+    fn scalar_at(array: &RLEArray, index: usize) -> VortexResult<Scalar> {
         let offset_in_chunk = array.offset();
-        let chunk_start_idx = (offset_in_chunk + range.start) / FL_CHUNK_SIZE;
-        let chunk_end_idx = (offset_in_chunk + range.end).div_ceil(FL_CHUNK_SIZE);
-
-        let values_start_idx = array.values_idx_offset(chunk_start_idx);
-        let values_end_idx = if chunk_end_idx < array.values_idx_offsets().len() {
-            array.values_idx_offset(chunk_end_idx)
-        } else {
-            array.values().len()
-        };
-
-        let sliced_values = array.values().slice(values_start_idx..values_end_idx);
-
-        let sliced_values_idx_offsets = array
-            .values_idx_offsets()
-            .slice(chunk_start_idx..chunk_end_idx);
-
-        let sliced_indices = array
-            .indices()
-            .slice(chunk_start_idx * FL_CHUNK_SIZE..chunk_end_idx * FL_CHUNK_SIZE);
-
-        // SAFETY: Slicing preserves all invariants.
-        unsafe {
-            RLEArray::new_unchecked(
-                sliced_values,
-                sliced_indices,
-                sliced_values_idx_offsets,
-                array.dtype().clone(),
-                // Keep the offset relative to the first chunk.
-                (array.offset() + range.start) % FL_CHUNK_SIZE,
-                range.len(),
-            )
-            .into_array()
-        }
-    }
-
-    fn scalar_at(array: &RLEArray, index: usize) -> Scalar {
-        let offset_in_chunk = array.offset();
-        let chunk_relative_idx = array.indices().scalar_at(offset_in_chunk + index);
+        let chunk_relative_idx = array.indices().scalar_at(offset_in_chunk + index)?;
 
         let chunk_relative_idx = chunk_relative_idx
             .as_primitive()
@@ -65,9 +25,9 @@ impl OperationsVTable<RLEVTable> for RLEVTable {
 
         let scalar = array
             .values()
-            .scalar_at(value_idx_offset + chunk_relative_idx);
+            .scalar_at(value_idx_offset + chunk_relative_idx)?;
 
-        Scalar::new(array.dtype().clone(), scalar.into_value())
+        Scalar::try_new(array.dtype().clone(), scalar.into_value())
     }
 }
 
@@ -151,7 +111,7 @@ mod tests {
 
         let array = fixture::rle_array();
         let expected = PrimitiveArray::from_iter([10u32, 10, 20, 20, 20, 30, 10]);
-        assert_arrays_eq!(array.slice(0..7), expected);
+        assert_arrays_eq!(array.slice(0..7).unwrap(), expected);
     }
 
     #[test]
@@ -168,7 +128,7 @@ mod tests {
             Some(30),
             Some(10),
         ]);
-        assert_arrays_eq!(array.slice(0..7), expected);
+        assert_arrays_eq!(array.slice(0..7).unwrap(), expected);
     }
 
     #[test]
@@ -176,7 +136,7 @@ mod tests {
         use vortex_array::assert_arrays_eq;
 
         let array = fixture::rle_array();
-        let sliced = array.slice(2..6); // [20, 20, 20, 30]
+        let sliced = array.slice(2..6).unwrap(); // [20, 20, 20, 30]
 
         assert_eq!(sliced.len(), 4);
         let expected = PrimitiveArray::from_iter([20u32, 20, 20, 30]);
@@ -188,7 +148,7 @@ mod tests {
         use vortex_array::assert_arrays_eq;
 
         let array = fixture::rle_array_with_nulls();
-        let sliced = array.slice(2..6); // [20, 20, null, 30]
+        let sliced = array.slice(2..6).unwrap(); // [20, 20, null, 30]
 
         assert_eq!(sliced.len(), 4);
         let expected = PrimitiveArray::from_option_iter([Some(20u32), Some(20), None, Some(30)]);
@@ -208,7 +168,12 @@ mod tests {
         for &idx in &[1023, 1024, 1025, 2047, 2048, 2049] {
             if idx < encoded.len() {
                 let original_value = expected[idx];
-                let encoded_value = encoded.scalar_at(idx).as_primitive().as_::<u16>().unwrap();
+                let encoded_value = encoded
+                    .scalar_at(idx)
+                    .unwrap()
+                    .as_primitive()
+                    .as_::<u16>()
+                    .unwrap();
                 assert_eq!(original_value, encoded_value, "Mismatch at index {}", idx);
             }
         }
@@ -218,20 +183,20 @@ mod tests {
     #[should_panic]
     fn test_scalar_at_out_of_bounds() {
         let array = fixture::rle_array();
-        array.scalar_at(1025);
+        array.scalar_at(1025).unwrap();
     }
 
     #[test]
     #[should_panic]
     fn test_scalar_at_slice_out_of_bounds() {
-        let array = fixture::rle_array().slice(0..1);
-        array.scalar_at(1);
+        let array = fixture::rle_array().slice(0..1).unwrap();
+        array.scalar_at(1).unwrap();
     }
 
     #[test]
     fn test_slice_full_range() {
         let array = fixture::rle_array_with_nulls();
-        let sliced = array.slice(0..7);
+        let sliced = array.slice(0..7).unwrap();
 
         let expected = PrimitiveArray::from_option_iter([
             Some(10u32),
@@ -248,7 +213,7 @@ mod tests {
     #[test]
     fn test_slice_partial_range() {
         let array = fixture::rle_array();
-        let sliced = array.slice(4..6); // [20, 30]
+        let sliced = array.slice(4..6).unwrap(); // [20, 30]
 
         let expected = buffer![20u32, 30].into_array();
         assert_arrays_eq!(sliced.to_array(), expected);
@@ -257,7 +222,7 @@ mod tests {
     #[test]
     fn test_slice_single_element() {
         let array = fixture::rle_array();
-        let sliced = array.slice(5..6); // [30]
+        let sliced = array.slice(5..6).unwrap(); // [30]
 
         let expected = buffer![30u32].into_array();
         assert_arrays_eq!(sliced.to_array(), expected);
@@ -266,7 +231,7 @@ mod tests {
     #[test]
     fn test_slice_empty_range() {
         let array = fixture::rle_array();
-        let sliced = array.slice(3..3);
+        let sliced = array.slice(3..3).unwrap();
 
         assert_eq!(sliced.len(), 0);
     }
@@ -274,7 +239,7 @@ mod tests {
     #[test]
     fn test_slice_with_nulls() {
         let array = fixture::rle_array_with_nulls();
-        let sliced = array.slice(1..4); // [null, 20, 20]
+        let sliced = array.slice(1..4).unwrap(); // [null, 20, 20]
 
         let expected = PrimitiveArray::from_option_iter([Option::<u32>::None, Some(20), Some(20)]);
         assert_arrays_eq!(sliced.to_array(), expected.to_array());
@@ -283,7 +248,7 @@ mod tests {
     #[test]
     fn test_slice_decode_with_nulls() {
         let array = fixture::rle_array_with_nulls();
-        let sliced = array.slice(1..4).to_array().to_primitive(); // [null, 20, 20]
+        let sliced = array.slice(1..4).unwrap().to_array().to_primitive(); // [null, 20, 20]
 
         let expected = PrimitiveArray::from_option_iter([Option::<u32>::None, Some(20), Some(20)]);
         assert_arrays_eq!(sliced.to_array(), expected.to_array());
@@ -292,7 +257,7 @@ mod tests {
     #[test]
     fn test_slice_preserves_dtype() {
         let array = fixture::rle_array();
-        let sliced = array.slice(1..4);
+        let sliced = array.slice(1..4).unwrap();
 
         assert_eq!(array.dtype(), sliced.dtype());
     }
@@ -306,14 +271,14 @@ mod tests {
         let encoded = RLEArray::encode(&array.to_primitive()).unwrap();
 
         // Slice across first and second chunk.
-        let slice = encoded.slice(500..1500);
+        let slice = encoded.slice(500..1500).unwrap();
         assert_arrays_eq!(
             slice,
             PrimitiveArray::from_iter(expected[500..1500].iter().copied())
         );
 
         // Slice across second and third chunk.
-        let slice = encoded.slice(1000..2000);
+        let slice = encoded.slice(1000..2000).unwrap();
         assert_arrays_eq!(
             slice,
             PrimitiveArray::from_iter(expected[1000..2000].iter().copied())

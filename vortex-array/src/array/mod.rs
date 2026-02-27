@@ -14,53 +14,53 @@ use std::sync::Arc;
 
 pub use visitor::*;
 use vortex_buffer::ByteBuffer;
-use vortex_dtype::DType;
-use vortex_dtype::Nullability;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
 use vortex_mask::Mask;
-use vortex_scalar::Scalar;
 
+use crate::AnyCanonical;
 use crate::ArrayEq;
 use crate::ArrayHash;
 use crate::Canonical;
 use crate::DynArrayEq;
 use crate::DynArrayHash;
+use crate::ExecutionCtx;
+use crate::LEGACY_SESSION;
+use crate::VortexSessionExecute;
 use crate::arrays::BoolVTable;
 use crate::arrays::ConstantVTable;
-use crate::arrays::DecimalVTable;
 use crate::arrays::DictArray;
-use crate::arrays::ExtensionVTable;
 use crate::arrays::FilterArray;
-use crate::arrays::FixedSizeListVTable;
-use crate::arrays::ListViewVTable;
 use crate::arrays::NullVTable;
 use crate::arrays::PrimitiveVTable;
-use crate::arrays::StructVTable;
+use crate::arrays::ScalarFnVTable;
+use crate::arrays::SliceArray;
 use crate::arrays::VarBinVTable;
 use crate::arrays::VarBinViewVTable;
+use crate::buffer::BufferHandle;
 use crate::builders::ArrayBuilder;
-use crate::compute::ComputeFn;
-use crate::compute::Cost;
-use crate::compute::InvocationArgs;
-use crate::compute::IsConstantOpts;
-use crate::compute::Output;
-use crate::compute::is_constant_opts;
+use crate::compute;
+use crate::dtype::DType;
+use crate::dtype::Nullability;
 use crate::expr::stats::Precision;
 use crate::expr::stats::Stat;
 use crate::expr::stats::StatsProviderExt;
 use crate::hash;
+use crate::matcher::Matcher;
 use crate::optimizer::ArrayOptimizer;
+use crate::scalar::Scalar;
+use crate::scalar_fn::ReduceNode;
+use crate::scalar_fn::ReduceNodeRef;
+use crate::scalar_fn::ScalarFnRef;
 use crate::stats::StatsSetRef;
 use crate::validity::Validity;
 use crate::vtable::ArrayId;
-use crate::vtable::ArrayVTable;
+use crate::vtable::ArrayVTableExt;
 use crate::vtable::BaseArrayVTable;
-use crate::vtable::CanonicalVTable;
-use crate::vtable::ComputeVTable;
+use crate::vtable::DynVTable;
 use crate::vtable::OperationsVTable;
 use crate::vtable::VTable;
 use crate::vtable::ValidityVTable;
@@ -68,7 +68,15 @@ use crate::vtable::VisitorVTable;
 
 /// The public API trait for all Vortex arrays.
 pub trait Array:
-    'static + private::Sealed + Send + Sync + Debug + DynArrayEq + DynArrayHash + ArrayVisitor
+    'static
+    + private::Sealed
+    + Send
+    + Sync
+    + Debug
+    + DynArrayEq
+    + DynArrayHash
+    + ArrayVisitor
+    + ReduceNode
 {
     /// Returns the array as a reference to a generic [`Any`] trait object.
     fn as_any(&self) -> &dyn Any;
@@ -90,14 +98,14 @@ pub trait Array:
     /// Returns the logical Vortex [`DType`] of the array.
     fn dtype(&self) -> &DType;
 
-    /// Returns the encoding of the array.
-    fn encoding(&self) -> ArrayVTable;
+    /// Returns the vtable of the array.
+    fn vtable(&self) -> &dyn DynVTable;
 
     /// Returns the encoding ID of the array.
     fn encoding_id(&self) -> ArrayId;
 
     /// Performs a constant-time slice of the array.
-    fn slice(&self, range: Range<usize>) -> ArrayRef;
+    fn slice(&self, range: Range<usize>) -> VortexResult<ArrayRef>;
 
     /// Wraps the array in a [`FilterArray`] such that it is logically filtered by the given mask.
     fn filter(&self, mask: Mask) -> VortexResult<ArrayRef>;
@@ -108,72 +116,49 @@ pub trait Array:
     /// Fetch the scalar at the given index.
     ///
     /// This method panics if the index is out of bounds for the array.
-    fn scalar_at(&self, index: usize) -> Scalar;
-
-    /// Returns whether the array is of the given encoding.
-    fn is_encoding(&self, encoding: ArrayId) -> bool {
-        self.encoding_id() == encoding
-    }
-
-    /// Returns whether this array is an arrow encoding.
-    // TODO(ngates): this shouldn't live here.
-    fn is_arrow(&self) -> bool {
-        self.is_encoding(NullVTable.id())
-            || self.is_encoding(BoolVTable.id())
-            || self.is_encoding(PrimitiveVTable.id())
-            || self.is_encoding(VarBinVTable.id())
-            || self.is_encoding(VarBinViewVTable.id())
-    }
-
-    /// Whether the array is of a canonical encoding.
-    // TODO(ngates): this shouldn't live here.
-    fn is_canonical(&self) -> bool {
-        self.is_encoding(NullVTable.id())
-            || self.is_encoding(BoolVTable.id())
-            || self.is_encoding(PrimitiveVTable.id())
-            || self.is_encoding(DecimalVTable.id())
-            || self.is_encoding(StructVTable.id())
-            || self.is_encoding(ListViewVTable.id())
-            || self.is_encoding(FixedSizeListVTable.id())
-            || self.is_encoding(VarBinViewVTable.id())
-            || self.is_encoding(ExtensionVTable.id())
-    }
+    fn scalar_at(&self, index: usize) -> VortexResult<Scalar>;
 
     /// Returns whether the item at `index` is valid.
-    fn is_valid(&self, index: usize) -> bool;
+    fn is_valid(&self, index: usize) -> VortexResult<bool>;
 
     /// Returns whether the item at `index` is invalid.
-    fn is_invalid(&self, index: usize) -> bool;
+    fn is_invalid(&self, index: usize) -> VortexResult<bool>;
 
     /// Returns whether all items in the array are valid.
     ///
-    /// This is usually cheaper than computing a precise `valid_count`.
-    fn all_valid(&self) -> bool;
+    /// This is usually cheaper than computing a precise `valid_count`, but may return false
+    /// negatives.
+    fn all_valid(&self) -> VortexResult<bool>;
 
     /// Returns whether the array is all invalid.
     ///
-    /// This is usually cheaper than computing a precise `invalid_count`.
-    fn all_invalid(&self) -> bool;
+    /// This is usually cheaper than computing a precise `invalid_count`, but may return false
+    /// negatives.
+    fn all_invalid(&self) -> VortexResult<bool>;
 
     /// Returns the number of valid elements in the array.
-    fn valid_count(&self) -> usize;
+    fn valid_count(&self) -> VortexResult<usize>;
 
     /// Returns the number of invalid elements in the array.
-    fn invalid_count(&self) -> usize;
+    fn invalid_count(&self) -> VortexResult<usize>;
 
     /// Returns the [`Validity`] of the array.
     fn validity(&self) -> VortexResult<Validity>;
 
     /// Returns the canonical validity mask for the array.
-    fn validity_mask(&self) -> Mask;
+    fn validity_mask(&self) -> VortexResult<Mask>;
 
     /// Returns the canonical representation of the array.
-    fn to_canonical(&self) -> Canonical;
+    fn to_canonical(&self) -> VortexResult<Canonical>;
 
     /// Writes the array into the canonical builder.
     ///
     /// The [`DType`] of the builder must match that of the array.
-    fn append_to_builder(&self, builder: &mut dyn ArrayBuilder);
+    fn append_to_builder(
+        &self,
+        builder: &mut dyn ArrayBuilder,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<()>;
 
     /// Returns the statistics of the array.
     // TODO(ngates): change how this works. It's weird.
@@ -181,31 +166,12 @@ pub trait Array:
 
     /// Replaces the children of the array with the given array references.
     fn with_children(&self, children: Vec<ArrayRef>) -> VortexResult<ArrayRef>;
-
-    /// Optionally invoke a kernel for the given compute function.
-    ///
-    /// These encoding-specific kernels are independent of kernels registered directly with
-    /// compute functions using [`ComputeFn::register_kernel`], and are attempted only if none of
-    /// the function-specific kernels returns a result.
-    ///
-    /// This allows encodings the opportunity to generically implement many compute functions
-    /// that share some property, for example [`ComputeFn::is_elementwise`], without prior
-    /// knowledge of the function itself, while still allowing users to override the implementation
-    /// of compute functions for built-in encodings. For an example, see the implementation for
-    /// chunked arrays.
-    ///
-    /// The first input in the [`InvocationArgs`] is always the array itself.
-    ///
-    /// Warning: do not call `compute_fn.invoke(args)` directly, as this will result in a recursive
-    /// call.
-    fn invoke(&self, compute_fn: &ComputeFn, args: &InvocationArgs)
-    -> VortexResult<Option<Output>>;
 }
 
 impl Array for Arc<dyn Array> {
     #[inline]
     fn as_any(&self) -> &dyn Any {
-        self.as_ref().as_any()
+        Array::as_any(self.as_ref())
     }
 
     fn as_any_arc(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
@@ -227,9 +193,8 @@ impl Array for Arc<dyn Array> {
         self.as_ref().dtype()
     }
 
-    #[inline]
-    fn encoding(&self) -> ArrayVTable {
-        self.as_ref().encoding()
+    fn vtable(&self) -> &dyn DynVTable {
+        self.as_ref().vtable()
     }
 
     #[inline]
@@ -238,7 +203,7 @@ impl Array for Arc<dyn Array> {
     }
 
     #[inline]
-    fn slice(&self, range: Range<usize>) -> ArrayRef {
+    fn slice(&self, range: Range<usize>) -> VortexResult<ArrayRef> {
         self.as_ref().slice(range)
     }
 
@@ -251,37 +216,37 @@ impl Array for Arc<dyn Array> {
     }
 
     #[inline]
-    fn scalar_at(&self, index: usize) -> Scalar {
+    fn scalar_at(&self, index: usize) -> VortexResult<Scalar> {
         self.as_ref().scalar_at(index)
     }
 
     #[inline]
-    fn is_valid(&self, index: usize) -> bool {
+    fn is_valid(&self, index: usize) -> VortexResult<bool> {
         self.as_ref().is_valid(index)
     }
 
     #[inline]
-    fn is_invalid(&self, index: usize) -> bool {
+    fn is_invalid(&self, index: usize) -> VortexResult<bool> {
         self.as_ref().is_invalid(index)
     }
 
     #[inline]
-    fn all_valid(&self) -> bool {
+    fn all_valid(&self) -> VortexResult<bool> {
         self.as_ref().all_valid()
     }
 
     #[inline]
-    fn all_invalid(&self) -> bool {
+    fn all_invalid(&self) -> VortexResult<bool> {
         self.as_ref().all_invalid()
     }
 
     #[inline]
-    fn valid_count(&self) -> usize {
+    fn valid_count(&self) -> VortexResult<usize> {
         self.as_ref().valid_count()
     }
 
     #[inline]
-    fn invalid_count(&self) -> usize {
+    fn invalid_count(&self) -> VortexResult<usize> {
         self.as_ref().invalid_count()
     }
 
@@ -291,16 +256,20 @@ impl Array for Arc<dyn Array> {
     }
 
     #[inline]
-    fn validity_mask(&self) -> Mask {
+    fn validity_mask(&self) -> VortexResult<Mask> {
         self.as_ref().validity_mask()
     }
 
-    fn to_canonical(&self) -> Canonical {
+    fn to_canonical(&self) -> VortexResult<Canonical> {
         self.as_ref().to_canonical()
     }
 
-    fn append_to_builder(&self, builder: &mut dyn ArrayBuilder) {
-        self.as_ref().append_to_builder(builder)
+    fn append_to_builder(
+        &self,
+        builder: &mut dyn ArrayBuilder,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<()> {
+        self.as_ref().append_to_builder(builder, ctx)
     }
 
     fn statistics(&self) -> StatsSetRef<'_> {
@@ -309,14 +278,6 @@ impl Array for Arc<dyn Array> {
 
     fn with_children(&self, children: Vec<ArrayRef>) -> VortexResult<ArrayRef> {
         self.as_ref().with_children(children)
-    }
-
-    fn invoke(
-        &self,
-        compute_fn: &ComputeFn,
-        args: &InvocationArgs,
-    ) -> VortexResult<Option<Output>> {
-        self.as_ref().invoke(compute_fn, args)
     }
 }
 
@@ -332,16 +293,19 @@ impl ToOwned for dyn Array {
 }
 
 impl dyn Array + '_ {
-    /// Returns the array downcast to the given `A`.
-    pub fn as_<V: VTable>(&self) -> &V::Array {
-        self.as_opt::<V>().vortex_expect("Failed to downcast")
+    /// Does the array match the given matcher.
+    pub fn is<M: Matcher>(&self) -> bool {
+        M::matches(self)
     }
 
-    /// Returns the array downcast to the given `A`.
-    pub fn as_opt<V: VTable>(&self) -> Option<&V::Array> {
-        self.as_any()
-            .downcast_ref::<ArrayAdapter<V>>()
-            .map(|array_adapter| &array_adapter.0)
+    /// Returns the array downcast by the given matcher.
+    pub fn as_<M: Matcher>(&self) -> M::Match<'_> {
+        self.as_opt::<M>().vortex_expect("Failed to downcast")
+    }
+
+    /// Returns the array downcast by the given matcher.
+    pub fn as_opt<M: Matcher>(&self) -> Option<M::Match<'_>> {
+        M::try_match(self)
     }
 
     /// Returns the array downcast to the given `A` as an owned object.
@@ -362,33 +326,8 @@ impl dyn Array + '_ {
         }
     }
 
-    /// Is self an array with encoding from vtable `V`.
-    pub fn is<V: VTable>(&self) -> bool {
-        self.as_opt::<V>().is_some()
-    }
-
-    pub fn is_constant(&self) -> bool {
-        let opts = IsConstantOpts {
-            cost: Cost::Specialized,
-        };
-        is_constant_opts(self, &opts)
-            .inspect_err(|e| tracing::warn!("Failed to compute IsConstant: {e}"))
-            .ok()
-            .flatten()
-            .unwrap_or_default()
-    }
-
-    pub fn is_constant_opts(&self, cost: Cost) -> bool {
-        let opts = IsConstantOpts { cost };
-        is_constant_opts(self, &opts)
-            .inspect_err(|e| tracing::warn!("Failed to compute IsConstant: {e}"))
-            .ok()
-            .flatten()
-            .unwrap_or_default()
-    }
-
     pub fn as_constant(&self) -> Option<Scalar> {
-        self.is_constant().then(|| self.scalar_at(0))
+        self.as_opt::<ConstantVTable>().map(|a| a.scalar().clone())
     }
 
     /// Total size of the array in bytes, including all children and buffers.
@@ -400,6 +339,20 @@ impl dyn Array + '_ {
             }
         }
         nbytes
+    }
+
+    /// Returns whether this array is an arrow encoding.
+    pub fn is_arrow(&self) -> bool {
+        self.is::<NullVTable>()
+            || self.is::<BoolVTable>()
+            || self.is::<PrimitiveVTable>()
+            || self.is::<VarBinVTable>()
+            || self.is::<VarBinViewVTable>()
+    }
+
+    /// Whether the array is of a canonical encoding.
+    pub fn is_canonical(&self) -> bool {
+        self.is::<AnyCanonical>()
     }
 }
 
@@ -445,6 +398,29 @@ impl<V: VTable> Debug for ArrayAdapter<V> {
     }
 }
 
+impl<V: VTable> ReduceNode for ArrayAdapter<V> {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn node_dtype(&self) -> VortexResult<DType> {
+        Ok(<V::ArrayVTable as BaseArrayVTable<V>>::dtype(&self.0).clone())
+    }
+
+    fn scalar_fn(&self) -> Option<&ScalarFnRef> {
+        self.0.as_opt::<ScalarFnVTable>().map(|a| a.scalar_fn())
+    }
+
+    fn child(&self, idx: usize) -> ReduceNodeRef {
+        self.nth_child(idx)
+            .unwrap_or_else(|| vortex_panic!("Child index out of bounds: {}", idx))
+    }
+
+    fn child_count(&self) -> usize {
+        self.nchildren()
+    }
+}
+
 impl<V: VTable> Array for ArrayAdapter<V> {
     fn as_any(&self) -> &dyn Any {
         self
@@ -466,55 +442,42 @@ impl<V: VTable> Array for ArrayAdapter<V> {
         <V::ArrayVTable as BaseArrayVTable<V>>::dtype(&self.0)
     }
 
-    fn encoding(&self) -> ArrayVTable {
-        V::encoding(&self.0)
+    fn vtable(&self) -> &dyn DynVTable {
+        V::vtable()
     }
 
     fn encoding_id(&self) -> ArrayId {
-        V::encoding(&self.0).id()
+        V::id(&self.0)
     }
 
-    fn slice(&self, range: Range<usize>) -> ArrayRef {
+    fn slice(&self, range: Range<usize>) -> VortexResult<ArrayRef> {
         let start = range.start;
         let stop = range.end;
 
         if start == 0 && stop == self.len() {
-            return self.to_array();
+            return Ok(self.to_array());
         }
 
-        assert!(
+        vortex_ensure!(
             start <= self.len(),
             "OutOfBounds: start {start} > length {}",
             self.len()
         );
-        assert!(
+        vortex_ensure!(
             stop <= self.len(),
             "OutOfBounds: stop {stop} > length {}",
             self.len()
         );
 
-        assert!(start <= stop, "start ({start}) must be <= stop ({stop})");
+        vortex_ensure!(start <= stop, "start ({start}) must be <= stop ({stop})");
 
         if start == stop {
-            return Canonical::empty(self.dtype()).into_array();
+            return Ok(Canonical::empty(self.dtype()).into_array());
         }
 
-        let sliced = <V::OperationsVTable as OperationsVTable<V>>::slice(&self.0, range);
-
-        assert_eq!(
-            sliced.len(),
-            stop - start,
-            "Slice length mismatch {}",
-            self.encoding_id()
-        );
-
-        // Slightly more expensive, so only do this in debug builds.
-        debug_assert_eq!(
-            sliced.dtype(),
-            self.dtype(),
-            "Slice dtype mismatch {}",
-            self.encoding_id()
-        );
+        let sliced = SliceArray::try_new(self.to_array(), range)?
+            .into_array()
+            .optimize()?;
 
         // Propagate some stats from the original array to the sliced array.
         if !sliced.is::<ConstantVTable>() {
@@ -524,7 +487,8 @@ impl<V: VTable> Array for ArrayAdapter<V> {
                         stat,
                         Stat::IsConstant | Stat::IsSorted | Stat::IsStrictSorted
                     ) && value.as_ref().as_exact().is_some_and(|v| {
-                        Scalar::new(DType::Bool(Nullability::NonNullable), v.clone())
+                        Scalar::try_new(DType::Bool(Nullability::NonNullable), Some(v.clone()))
+                            .vortex_expect("A stat that was expected to be a boolean stat was not")
                             .as_bool()
                             .value()
                             .unwrap_or_default()
@@ -533,12 +497,11 @@ impl<V: VTable> Array for ArrayAdapter<V> {
             });
         }
 
-        sliced
+        Ok(sliced)
     }
 
     fn filter(&self, mask: Mask) -> VortexResult<ArrayRef> {
-        vortex_ensure!(self.len() == mask.len(), "Filter mask length mismatch");
-        FilterArray::new(self.to_array(), mask)
+        FilterArray::try_new(self.to_array(), mask)?
             .into_array()
             .optimize()
     }
@@ -549,107 +512,113 @@ impl<V: VTable> Array for ArrayAdapter<V> {
             .optimize()
     }
 
-    fn scalar_at(&self, index: usize) -> Scalar {
-        assert!(index < self.len(), "index {index} out of bounds");
-        if self.is_invalid(index) {
-            return Scalar::null(self.dtype().clone());
+    fn scalar_at(&self, index: usize) -> VortexResult<Scalar> {
+        vortex_ensure!(index < self.len(), OutOfBounds: index, 0, self.len());
+        if self.is_invalid(index)? {
+            return Ok(Scalar::null(self.dtype().clone()));
         }
-        let scalar = <V::OperationsVTable as OperationsVTable<V>>::scalar_at(&self.0, index);
-        assert_eq!(self.dtype(), scalar.dtype(), "Scalar dtype mismatch");
-        scalar
+        let scalar = <V::OperationsVTable as OperationsVTable<V>>::scalar_at(&self.0, index)?;
+        vortex_ensure!(self.dtype() == scalar.dtype(), "Scalar dtype mismatch");
+        Ok(scalar)
     }
 
-    fn is_valid(&self, index: usize) -> bool {
-        if index >= self.len() {
-            vortex_panic!(OutOfBounds: index, 0, self.len());
+    fn is_valid(&self, index: usize) -> VortexResult<bool> {
+        vortex_ensure!(index < self.len(), OutOfBounds: index, 0, self.len());
+        match self.validity()? {
+            Validity::NonNullable | Validity::AllValid => Ok(true),
+            Validity::AllInvalid => Ok(false),
+            Validity::Array(a) => a
+                .scalar_at(index)?
+                .as_bool()
+                .value()
+                .ok_or_else(|| vortex_err!("validity value at index {} is null", index)),
         }
-        <V::ValidityVTable as ValidityVTable<V>>::is_valid(&self.0, index)
     }
 
-    fn is_invalid(&self, index: usize) -> bool {
-        !self.is_valid(index)
+    fn is_invalid(&self, index: usize) -> VortexResult<bool> {
+        Ok(!self.is_valid(index)?)
     }
 
-    fn all_valid(&self) -> bool {
-        <V::ValidityVTable as ValidityVTable<V>>::all_valid(&self.0)
+    fn all_valid(&self) -> VortexResult<bool> {
+        match self.validity()? {
+            Validity::NonNullable | Validity::AllValid => Ok(true),
+            Validity::AllInvalid => Ok(false),
+            Validity::Array(a) => Ok(a.statistics().compute_min::<bool>().unwrap_or(false)),
+        }
     }
 
-    fn all_invalid(&self) -> bool {
-        <V::ValidityVTable as ValidityVTable<V>>::all_invalid(&self.0)
+    fn all_invalid(&self) -> VortexResult<bool> {
+        match self.validity()? {
+            Validity::NonNullable | Validity::AllValid => Ok(false),
+            Validity::AllInvalid => Ok(true),
+            Validity::Array(a) => Ok(!a.statistics().compute_max::<bool>().unwrap_or(true)),
+        }
     }
 
-    fn valid_count(&self) -> usize {
+    fn valid_count(&self) -> VortexResult<usize> {
         if let Some(Precision::Exact(invalid_count)) =
             self.statistics().get_as::<usize>(Stat::NullCount)
         {
-            return self.len() - invalid_count;
+            return Ok(self.len() - invalid_count);
         }
 
-        let count = <V::ValidityVTable as ValidityVTable<V>>::valid_count(&self.0);
-        assert!(count <= self.len(), "Valid count exceeds array length");
+        let count = match self.validity()? {
+            Validity::NonNullable | Validity::AllValid => self.len(),
+            Validity::AllInvalid => 0,
+            Validity::Array(a) => {
+                let sum = compute::sum(&a)?;
+                sum.as_primitive()
+                    .as_::<usize>()
+                    .ok_or_else(|| vortex_err!("sum of validity array is null"))?
+            }
+        };
+        vortex_ensure!(count <= self.len(), "Valid count exceeds array length");
 
         self.statistics()
             .set(Stat::NullCount, Precision::exact(self.len() - count));
 
-        count
+        Ok(count)
     }
 
-    fn invalid_count(&self) -> usize {
-        if let Some(Precision::Exact(invalid_count)) =
-            self.statistics().get_as::<usize>(Stat::NullCount)
-        {
-            return invalid_count;
-        }
-
-        let count = <V::ValidityVTable as ValidityVTable<V>>::invalid_count(&self.0);
-        assert!(count <= self.len(), "Invalid count exceeds array length");
-
-        self.statistics()
-            .set(Stat::NullCount, Precision::exact(count));
-
-        count
+    fn invalid_count(&self) -> VortexResult<usize> {
+        Ok(self.len() - self.valid_count()?)
     }
 
     fn validity(&self) -> VortexResult<Validity> {
         if self.dtype().is_nullable() {
-            <V::ValidityVTable as ValidityVTable<V>>::validity(&self.0)
+            let validity = <V::ValidityVTable as ValidityVTable<V>>::validity(&self.0)?;
+            if let Validity::Array(array) = &validity {
+                vortex_ensure!(array.len() == self.len(), "Validity array length mismatch");
+                vortex_ensure!(
+                    matches!(array.dtype(), DType::Bool(Nullability::NonNullable)),
+                    "Validity array is not non-nullable boolean: {}",
+                    self.encoding_id(),
+                );
+            }
+            Ok(validity)
         } else {
             Ok(Validity::NonNullable)
         }
     }
 
-    fn validity_mask(&self) -> Mask {
-        let mask = <V::ValidityVTable as ValidityVTable<V>>::validity_mask(&self.0);
-        assert_eq!(mask.len(), self.len(), "Validity mask length mismatch");
-        mask
+    fn validity_mask(&self) -> VortexResult<Mask> {
+        match self.validity()? {
+            Validity::NonNullable | Validity::AllValid => Ok(Mask::new_true(self.len())),
+            Validity::AllInvalid => Ok(Mask::new_false(self.len())),
+            Validity::Array(a) => a.try_to_mask_fill_null_false(),
+        }
     }
 
-    fn to_canonical(&self) -> Canonical {
-        let canonical = <V::CanonicalVTable as CanonicalVTable<V>>::canonicalize(&self.0);
-        assert_eq!(
-            self.len(),
-            canonical.as_ref().len(),
-            "Canonical length mismatch {}. Expected {} but encoded into {}.",
-            self.encoding_id(),
-            self.len(),
-            canonical.as_ref().len()
-        );
-        assert_eq!(
-            self.dtype(),
-            canonical.as_ref().dtype(),
-            "Canonical dtype mismatch {}. Expected {} but encoded into {}.",
-            self.encoding_id(),
-            self.dtype(),
-            canonical.as_ref().dtype()
-        );
-        canonical
-            .as_ref()
-            .statistics()
-            .inherit_from(self.statistics());
-        canonical
+    fn to_canonical(&self) -> VortexResult<Canonical> {
+        self.to_array()
+            .execute(&mut LEGACY_SESSION.create_execution_ctx())
     }
 
-    fn append_to_builder(&self, builder: &mut dyn ArrayBuilder) {
+    fn append_to_builder(
+        &self,
+        builder: &mut dyn ArrayBuilder,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<()> {
         if builder.dtype() != self.dtype() {
             vortex_panic!(
                 "Builder dtype mismatch: expected {}, got {}",
@@ -659,13 +628,15 @@ impl<V: VTable> Array for ArrayAdapter<V> {
         }
         let len = builder.len();
 
-        <V::CanonicalVTable as CanonicalVTable<V>>::append_to_builder(&self.0, builder);
+        V::append_to_builder(&self.0, builder, ctx)?;
+
         assert_eq!(
             len + self.len(),
             builder.len(),
             "Builder length mismatch after writing array for encoding {}",
             self.encoding_id(),
         );
+        Ok(())
     }
 
     fn statistics(&self) -> StatsSetRef<'_> {
@@ -673,15 +644,9 @@ impl<V: VTable> Array for ArrayAdapter<V> {
     }
 
     fn with_children(&self, children: Vec<ArrayRef>) -> VortexResult<ArrayRef> {
-        self.encoding().as_dyn().with_children(self, children)
-    }
-
-    fn invoke(
-        &self,
-        compute_fn: &ComputeFn,
-        args: &InvocationArgs,
-    ) -> VortexResult<Option<Output>> {
-        <V::ComputeVTable as ComputeVTable<V>>::invoke(&self.0, compute_fn, args)
+        let mut this = self.0.clone();
+        V::with_children(&mut this, children)?;
+        Ok(this.into_array())
     }
 }
 
@@ -704,8 +669,8 @@ impl<V: VTable> ArrayVisitor for ArrayAdapter<V> {
             children: Vec<ArrayRef>,
         }
 
-        impl ArrayChildVisitor for ChildrenCollector {
-            fn visit_child(&mut self, _name: &str, array: &ArrayRef) {
+        impl ArrayChildVisitorUnnamed for ChildrenCollector {
+            fn visit_child(&mut self, array: &ArrayRef) {
                 self.children.push(array.clone());
             }
         }
@@ -713,12 +678,16 @@ impl<V: VTable> ArrayVisitor for ArrayAdapter<V> {
         let mut collector = ChildrenCollector {
             children: Vec::new(),
         };
-        <V::VisitorVTable as VisitorVTable<V>>::visit_children(&self.0, &mut collector);
+        <V::VisitorVTable as VisitorVTable<V>>::visit_children_unnamed(&self.0, &mut collector);
         collector.children
     }
 
     fn nchildren(&self) -> usize {
         <V::VisitorVTable as VisitorVTable<V>>::nchildren(&self.0)
+    }
+
+    fn nth_child(&self, idx: usize) -> Option<ArrayRef> {
+        <V::VisitorVTable as VisitorVTable<V>>::nth_child(&self.0, idx)
     }
 
     fn children_names(&self) -> Vec<String> {
@@ -762,12 +731,52 @@ impl<V: VTable> ArrayVisitor for ArrayAdapter<V> {
         }
 
         impl ArrayBufferVisitor for BufferCollector {
-            fn visit_buffer(&mut self, buffer: &ByteBuffer) {
-                self.buffers.push(buffer.clone());
+            fn visit_buffer_handle(&mut self, _name: &str, handle: &BufferHandle) {
+                self.buffers.push(handle.to_host_sync());
             }
         }
 
         let mut collector = BufferCollector {
+            buffers: Vec::new(),
+        };
+        <V::VisitorVTable as VisitorVTable<V>>::visit_buffers(&self.0, &mut collector);
+        collector.buffers
+    }
+
+    fn buffer_handles(&self) -> Vec<BufferHandle> {
+        struct BufferHandleCollector {
+            handles: Vec<BufferHandle>,
+        }
+
+        impl ArrayBufferVisitor for BufferHandleCollector {
+            fn visit_buffer_handle(&mut self, _name: &str, handle: &BufferHandle) {
+                self.handles.push(handle.clone());
+            }
+        }
+
+        let mut collector = BufferHandleCollector {
+            handles: Vec::new(),
+        };
+        <V::VisitorVTable as VisitorVTable<V>>::visit_buffers(&self.0, &mut collector);
+        collector.handles
+    }
+
+    fn buffer_names(&self) -> Vec<String> {
+        <V::VisitorVTable as VisitorVTable<V>>::buffer_names(&self.0)
+    }
+
+    fn named_buffers(&self) -> Vec<(String, BufferHandle)> {
+        struct NamedBufferCollector {
+            buffers: Vec<(String, BufferHandle)>,
+        }
+
+        impl ArrayBufferVisitor for NamedBufferCollector {
+            fn visit_buffer_handle(&mut self, name: &str, handle: &BufferHandle) {
+                self.buffers.push((name.to_string(), handle.clone()));
+            }
+        }
+
+        let mut collector = NamedBufferCollector {
             buffers: Vec::new(),
         };
         <V::VisitorVTable as VisitorVTable<V>>::visit_buffers(&self.0, &mut collector);
@@ -787,5 +796,30 @@ impl<V: VTable> ArrayVisitor for ArrayAdapter<V> {
             Err(e) => write!(f, "<serde error: {e}>"),
             Ok(metadata) => Debug::fmt(&metadata, f),
         }
+    }
+
+    fn is_host(&self) -> bool {
+        for array in self.depth_first_traversal() {
+            if !array.buffer_handles().iter().all(BufferHandle::is_on_host) {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
+/// Implement a matcher for a specific VTable type
+impl<V: VTable> Matcher for V {
+    type Match<'a> = &'a V::Array;
+
+    fn matches(array: &dyn Array) -> bool {
+        Array::as_any(array).is::<ArrayAdapter<V>>()
+    }
+
+    fn try_match<'a>(array: &'a dyn Array) -> Option<Self::Match<'a>> {
+        Array::as_any(array)
+            .downcast_ref::<ArrayAdapter<V>>()
+            .map(|array_adapter| &array_adapter.0)
     }
 }

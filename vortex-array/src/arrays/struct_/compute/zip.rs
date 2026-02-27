@@ -10,21 +10,21 @@ use vortex_mask::Mask;
 
 use crate::Array;
 use crate::ArrayRef;
+use crate::ExecutionCtx;
+use crate::IntoArray;
 use crate::arrays::StructArray;
 use crate::arrays::StructVTable;
-use crate::compute::ZipKernel;
-use crate::compute::ZipKernelAdapter;
-use crate::compute::zip;
-use crate::register_kernel;
+use crate::builtins::ArrayBuiltins;
+use crate::scalar_fn::fns::zip::ZipKernel;
 use crate::validity::Validity;
 use crate::vtable::ValidityHelper;
 
 impl ZipKernel for StructVTable {
     fn zip(
-        &self,
         if_true: &StructArray,
         if_false: &dyn Array,
         mask: &Mask,
+        _ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
         let Some(if_false) = if_false.as_opt::<StructVTable>() else {
             return Ok(None);
@@ -36,10 +36,10 @@ impl ZipKernel for StructVTable {
         );
 
         let fields = if_true
-            .fields()
+            .unmasked_fields()
             .iter()
-            .zip(if_false.fields().iter())
-            .map(|(t, f)| zip(t, f, mask))
+            .zip(if_false.unmasked_fields().iter())
+            .map(|(t, f)| ArrayBuiltins::zip(t, f.clone(), mask.clone().into_array()))
             .collect::<VortexResult<Vec<_>>>()?;
 
         let validity = match (if_true.validity(), if_false.validity()) {
@@ -66,17 +66,16 @@ impl ZipKernel for StructVTable {
     }
 }
 
-register_kernel!(ZipKernelAdapter(StructVTable).lift());
-
 #[cfg(test)]
 mod tests {
-    use vortex_dtype::FieldNames;
     use vortex_mask::Mask;
 
     use crate::IntoArray;
     use crate::arrays::PrimitiveArray;
     use crate::arrays::StructArray;
+    #[expect(deprecated)]
     use crate::compute::zip;
+    use crate::dtype::FieldNames;
     use crate::validity::Validity;
 
     #[test]
@@ -100,6 +99,7 @@ mod tests {
 
         let mask = Mask::from_iter([false, false, true, false]);
 
+        #[expect(deprecated)]
         let result = zip(&if_true, &if_false, &mask).unwrap();
 
         insta::assert_snapshot!(result.display_table(), @r"
@@ -137,6 +137,7 @@ mod tests {
 
         let mask = Mask::from_iter([true, false, false, false]);
 
+        #[expect(deprecated)]
         let result = zip(&if_true, &if_false, &mask).unwrap();
 
         insta::assert_snapshot!(result.display_table(), @r"

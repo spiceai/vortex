@@ -3,7 +3,6 @@
 
 use bytes::bytes_dict_builder;
 use primitive::primitive_dict_builder;
-use vortex_dtype::match_each_native_ptype;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_panic;
@@ -16,6 +15,8 @@ use crate::arrays::DictArray;
 use crate::arrays::PrimitiveVTable;
 use crate::arrays::VarBinVTable;
 use crate::arrays::VarBinViewVTable;
+use crate::dtype::PType;
+use crate::match_each_native_ptype;
 
 mod bytes;
 mod primitive;
@@ -37,6 +38,9 @@ pub trait DictEncoder: Send {
 
     /// Clear the encoder state to make it ready for a new round of decoding.
     fn reset(&mut self) -> ArrayRef;
+
+    /// Returns the PType of the codes this encoder produces.
+    fn codes_ptype(&self) -> PType;
 }
 
 pub fn dict_encoder(array: &dyn Array, constraints: &DictConstraints) -> Box<dyn DictEncoder> {
@@ -54,6 +58,9 @@ pub fn dict_encoder(array: &dyn Array, constraints: &DictConstraints) -> Box<dyn
     dict_builder
 }
 
+/// Encode an array as a `DictArray` subject to the given constraints.
+///
+/// Vortex encoders must always produce unsigned integer codes; signed codes are only accepted for external compatibility.
 pub fn dict_encode_with_constraints(
     array: &dyn Array,
     constraints: &DictConstraints,

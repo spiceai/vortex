@@ -2,37 +2,37 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use itertools::Itertools;
-use vortex_dtype::DType;
-use vortex_dtype::Nullability;
-use vortex_dtype::PType;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
+use vortex_session::VortexSession;
 
 use crate::ArrayRef;
 use crate::Canonical;
 use crate::EmptyMetadata;
+use crate::ExecutionCtx;
 use crate::IntoArray;
 use crate::ToCanonical;
 use crate::arrays::ChunkedArray;
 use crate::arrays::PrimitiveArray;
-use crate::arrays::chunked::vtable::rules::PARENT_RULES;
+use crate::arrays::chunked::compute::kernel::PARENT_KERNELS;
+use crate::arrays::chunked::compute::rules::PARENT_RULES;
+use crate::arrays::chunked::vtable::canonical::_canonicalize;
 use crate::buffer::BufferHandle;
+use crate::builders::ArrayBuilder;
+use crate::dtype::DType;
+use crate::dtype::Nullability;
+use crate::dtype::PType;
 use crate::serde::ArrayChildren;
 use crate::validity::Validity;
 use crate::vtable;
 use crate::vtable::ArrayId;
-use crate::vtable::ArrayVTable;
-use crate::vtable::ArrayVTableExt;
-use crate::vtable::NotSupported;
 use crate::vtable::VTable;
 
 mod array;
 mod canonical;
-mod compute;
 mod operations;
-mod rules;
 mod validity;
 mod visitor;
 
@@ -41,25 +41,22 @@ vtable!(Chunked);
 #[derive(Debug)]
 pub struct ChunkedVTable;
 
+impl ChunkedVTable {
+    pub const ID: ArrayId = ArrayId::new_ref("vortex.chunked");
+}
+
 impl VTable for ChunkedVTable {
     type Array = ChunkedArray;
 
     type Metadata = EmptyMetadata;
 
     type ArrayVTable = Self;
-    type CanonicalVTable = Self;
     type OperationsVTable = Self;
     type ValidityVTable = Self;
     type VisitorVTable = Self;
-    type ComputeVTable = Self;
-    type EncodeVTable = NotSupported;
 
-    fn id(&self) -> ArrayId {
-        ArrayId::new_ref("vortex.chunked")
-    }
-
-    fn encoding(_array: &Self::Array) -> ArrayVTable {
-        ChunkedVTable.as_vtable()
+    fn id(_array: &Self::Array) -> ArrayId {
+        Self::ID
     }
 
     fn metadata(_array: &ChunkedArray) -> VortexResult<Self::Metadata> {
@@ -70,12 +67,17 @@ impl VTable for ChunkedVTable {
         Ok(Some(vec![]))
     }
 
-    fn deserialize(_buffer: &[u8]) -> VortexResult<Self::Metadata> {
+    fn deserialize(
+        _bytes: &[u8],
+        _dtype: &DType,
+        _len: usize,
+        _buffers: &[BufferHandle],
+        _session: &VortexSession,
+    ) -> VortexResult<Self::Metadata> {
         Ok(EmptyMetadata)
     }
 
     fn build(
-        &self,
         dtype: &DType,
         _len: usize,
         _metadata: &Self::Metadata,
@@ -98,7 +100,7 @@ impl VTable for ChunkedVTable {
             )?
             .to_primitive();
 
-        let chunk_offsets_buf = chunk_offsets_array.buffer::<u64>();
+        let chunk_offsets_buf = chunk_offsets_array.to_buffer::<u64>();
 
         // The remaining children contain the actual data of the chunks
         let chunks = chunk_offsets_buf
@@ -139,7 +141,7 @@ impl VTable for ChunkedVTable {
 
         let nchunks = children.len() - 1;
         let chunk_offsets_array = children[0].to_primitive();
-        let chunk_offsets_buf = chunk_offsets_array.buffer::<u64>();
+        let chunk_offsets_buf = chunk_offsets_array.to_buffer::<u64>();
 
         vortex_ensure!(
             chunk_offsets_buf.len() == nchunks + 1,
@@ -161,6 +163,21 @@ impl VTable for ChunkedVTable {
         Ok(())
     }
 
+    fn append_to_builder(
+        array: &ChunkedArray,
+        builder: &mut dyn ArrayBuilder,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<()> {
+        for chunk in array.chunks() {
+            chunk.append_to_builder(builder, ctx)?;
+        }
+        Ok(())
+    }
+
+    fn execute(array: &Self::Array, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
+        Ok(_canonicalize(array, ctx)?.into_array())
+    }
+
     fn reduce(array: &Self::Array) -> VortexResult<Option<ArrayRef>> {
         Ok(match array.chunks.len() {
             0 => Some(Canonical::empty(array.dtype()).into_array()),
@@ -175,5 +192,14 @@ impl VTable for ChunkedVTable {
         child_idx: usize,
     ) -> VortexResult<Option<ArrayRef>> {
         PARENT_RULES.evaluate(array, parent, child_idx)
+    }
+
+    fn execute_parent(
+        array: &Self::Array,
+        parent: &ArrayRef,
+        child_idx: usize,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<ArrayRef>> {
+        PARENT_KERNELS.execute(array, parent, child_idx, ctx)
     }
 }

@@ -3,16 +3,16 @@
 
 //! All the built-in encoding schemes and arrays.
 
-#[cfg(any(test, feature = "test-harness"))]
+#[cfg(any(test, feature = "_test-harness"))]
 mod assertions;
 
-#[cfg(any(test, feature = "test-harness"))]
+#[cfg(any(test, feature = "_test-harness"))]
 pub use assertions::format_indices;
 
 #[cfg(test)]
 mod validation_tests;
 
-#[cfg(any(test, feature = "test-harness"))]
+#[cfg(any(test, feature = "_test-harness"))]
 pub mod dict_test;
 
 mod bool;
@@ -30,6 +30,8 @@ mod masked;
 mod null;
 mod primitive;
 mod scalar_fn;
+mod shared;
+mod slice;
 mod struct_;
 mod varbin;
 mod varbinview;
@@ -54,6 +56,8 @@ pub use masked::*;
 pub use null::*;
 pub use primitive::*;
 pub use scalar_fn::*;
+pub use shared::*;
+pub use slice::*;
 pub use struct_::*;
 pub use varbin::*;
 pub use varbinview::*;

@@ -3,9 +3,6 @@
 
 use itertools::Itertools;
 use num_traits::AsPrimitive;
-use vortex_dtype::DType;
-use vortex_dtype::IntegerPType;
-use vortex_dtype::match_each_integer_ptype;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
@@ -15,24 +12,28 @@ use vortex_mask::Mask;
 use vortex_mask::MaskIter;
 
 use crate::ArrayRef;
+use crate::ExecutionCtx;
 use crate::IntoArray;
 use crate::ToCanonical;
 use crate::arrays::VarBinVTable;
+use crate::arrays::filter::FilterKernel;
 use crate::arrays::varbin::VarBinArray;
 use crate::arrays::varbin::builder::VarBinBuilder;
-use crate::compute::FilterKernel;
-use crate::compute::FilterKernelAdapter;
-use crate::register_kernel;
+use crate::dtype::DType;
+use crate::dtype::IntegerPType;
+use crate::match_each_integer_ptype;
 use crate::validity::Validity;
 use crate::vtable::ValidityHelper;
 
 impl FilterKernel for VarBinVTable {
-    fn filter(&self, array: &VarBinArray, mask: &Mask) -> VortexResult<ArrayRef> {
-        filter_select_var_bin(array, mask).map(|a| a.into_array())
+    fn filter(
+        array: &VarBinArray,
+        mask: &Mask,
+        _ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<ArrayRef>> {
+        filter_select_var_bin(array, mask).map(|a| Some(a.into_array()))
     }
 }
-
-register_kernel!(FilterKernelAdapter(VarBinVTable).lift());
 
 fn filter_select_var_bin(arr: &VarBinArray, mask: &Mask) -> VortexResult<VarBinArray> {
     match mask
@@ -59,7 +60,7 @@ fn filter_select_var_bin_by_slice(
             offsets.as_slice::<O>(),
             values.bytes().as_slice(),
             mask_slices,
-            values.validity_mask(),
+            values.validity_mask()?,
             selection_count,
         )
     })
@@ -174,7 +175,7 @@ fn filter_select_var_bin_by_index_primitive_offset<O: IntegerPType>(
 ) -> VortexResult<VarBinArray> {
     let mut builder = VarBinBuilder::<O>::with_capacity(selection_count);
     for idx in mask_indices.iter().copied() {
-        if validity.is_valid(idx) {
+        if validity.is_valid(idx)? {
             let (start, end) = (
                 offsets[idx].to_usize().ok_or_else(|| {
                     vortex_err!("Failed to convert offset to usize: {}", offsets[idx])
@@ -195,9 +196,6 @@ fn filter_select_var_bin_by_index_primitive_offset<O: IntegerPType>(
 mod test {
     use vortex_buffer::ByteBuffer;
     use vortex_buffer::buffer;
-    use vortex_dtype::DType;
-    use vortex_dtype::Nullability::NonNullable;
-    use vortex_dtype::Nullability::Nullable;
 
     use crate::IntoArray;
     use crate::arrays::BoolArray;
@@ -206,6 +204,9 @@ mod test {
     use crate::arrays::varbin::compute::filter::filter_select_var_bin_by_slice;
     use crate::assert_arrays_eq;
     use crate::compute::conformance::filter::test_filter_conformance;
+    use crate::dtype::DType;
+    use crate::dtype::Nullability::NonNullable;
+    use crate::dtype::Nullability::Nullable;
     use crate::validity::Validity;
 
     #[test]

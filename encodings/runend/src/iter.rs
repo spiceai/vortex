@@ -3,7 +3,7 @@
 
 use std::cmp::min;
 
-use vortex_dtype::IntegerPType;
+use vortex_array::dtype::IntegerPType;
 use vortex_error::vortex_panic;
 
 #[inline]
@@ -29,7 +29,12 @@ pub fn trimmed_ends_iter<E: IntegerPType>(
     run_ends
         .iter()
         .copied()
-        .map(move |v| v - offset_e)
+        .map(move |v| {
+            if v < offset_e {
+                vortex_panic!("run end {v} must be >= offset {offset}");
+            }
+            v - offset_e
+        })
         .map(move |v| min(v, length_e))
         .map(|v| v.as_())
 }

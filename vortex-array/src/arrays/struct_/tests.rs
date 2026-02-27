@@ -2,20 +2,20 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use vortex_buffer::buffer;
-use vortex_dtype::DType;
-use vortex_dtype::FieldName;
-use vortex_dtype::FieldNames;
-use vortex_dtype::Nullability;
-use vortex_dtype::PType;
+use vortex_error::VortexResult;
 
-use crate::Array;
 use crate::IntoArray;
-use crate::ToCanonical;
 use crate::arrays::BoolArray;
 use crate::arrays::ConstantArray;
 use crate::arrays::primitive::PrimitiveArray;
 use crate::arrays::struct_::StructArray;
 use crate::arrays::varbin::VarBinArray;
+use crate::assert_arrays_eq;
+use crate::dtype::DType;
+use crate::dtype::FieldName;
+use crate::dtype::FieldNames;
+use crate::dtype::Nullability;
+use crate::dtype::PType;
 use crate::validity::Validity;
 
 #[test]
@@ -46,13 +46,13 @@ fn test_project() {
     assert_eq!(struct_b.len(), 5);
 
     let bools = &struct_b.fields[0];
-    assert_eq!(
-        bools.to_bool().bit_buffer().iter().collect::<Vec<_>>(),
-        vec![true, true, true, false, false]
+    assert_arrays_eq!(
+        bools,
+        BoolArray::from_iter([true, true, true, false, false])
     );
 
     let prims = &struct_b.fields[1];
-    assert_eq!(prims.to_primitive().as_slice::<i64>(), [0i64, 1, 2, 3, 4]);
+    assert_arrays_eq!(prims, PrimitiveArray::from_iter([0i64, 1, 2, 3, 4]));
 }
 
 #[test]
@@ -73,7 +73,7 @@ fn test_remove_column() {
         removed.dtype(),
         &DType::Primitive(PType::I64, Nullability::NonNullable)
     );
-    assert_eq!(removed.to_primitive().as_slice::<i64>(), [0i64, 1, 2, 3, 4]);
+    assert_arrays_eq!(removed, PrimitiveArray::from_iter([0i64, 1, 2, 3, 4]));
 
     assert_eq!(struct_a.names(), &["ys"]);
     assert_eq!(struct_a.fields.len(), 1);
@@ -82,9 +82,9 @@ fn test_remove_column() {
         struct_a.fields[0].dtype(),
         &DType::Primitive(PType::U64, Nullability::NonNullable)
     );
-    assert_eq!(
-        struct_a.fields[0].to_primitive().as_slice::<u64>(),
-        [4u64, 5, 6, 7, 8]
+    assert_arrays_eq!(
+        struct_a.fields[0],
+        PrimitiveArray::from_iter([4u64, 5, 6, 7, 8])
     );
 
     let empty = struct_a.remove_column("non_existent");
@@ -112,29 +112,26 @@ fn test_duplicate_field_names() {
     .unwrap();
 
     // field_by_name should return the first field with the matching name
-    let first_value_field = struct_array.field_by_name("value").unwrap();
-    assert_eq!(
-        first_value_field.to_primitive().as_slice::<i32>(),
-        [1i32, 2, 3] // This is field1, not field3
+    let first_value_field = struct_array.unmasked_field_by_name("value").unwrap();
+    assert_arrays_eq!(
+        first_value_field,
+        PrimitiveArray::from_iter([1i32, 2, 3]) // This is field1, not field3
     );
 
     // Verify field_by_name_opt also returns the first match
-    let opt_field = struct_array.field_by_name_opt("value").unwrap();
-    assert_eq!(
-        opt_field.to_primitive().as_slice::<i32>(),
-        [1i32, 2, 3] // First "value" field
+    let opt_field = struct_array.unmasked_field_by_name_opt("value").unwrap();
+    assert_arrays_eq!(
+        opt_field,
+        PrimitiveArray::from_iter([1i32, 2, 3]) // First "value" field
     );
 
     // Verify the third field (second "value") can be accessed by index
-    let third_field = &struct_array.fields()[2];
-    assert_eq!(
-        third_field.to_primitive().as_slice::<i32>(),
-        [100i32, 200, 300]
-    );
+    let third_field = &struct_array.unmasked_fields()[2];
+    assert_arrays_eq!(third_field, PrimitiveArray::from_iter([100i32, 200, 300]));
 }
 
 #[test]
-fn test_uncompressed_size_in_bytes() {
+fn test_uncompressed_size_in_bytes() -> VortexResult<()> {
     let struct_array = StructArray::new(
         FieldNames::from(["integers"]),
         vec![ConstantArray::new(5, 1000).into_array()],
@@ -142,11 +139,12 @@ fn test_uncompressed_size_in_bytes() {
         Validity::NonNullable,
     );
 
-    let canonical_size = struct_array.to_canonical().into_array().nbytes();
+    let canonical_size = struct_array.to_canonical()?.into_array().nbytes();
     let uncompressed_size = struct_array
         .statistics()
         .compute_uncompressed_size_in_bytes();
 
     assert_eq!(canonical_size, 2);
     assert_eq!(uncompressed_size, Some(4000));
+    Ok(())
 }

@@ -4,17 +4,12 @@
 use std::any::Any;
 
 use itertools::Itertools;
-use vortex_dtype::DType;
-use vortex_dtype::Nullability;
-use vortex_dtype::StructFields;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_panic;
 use vortex_mask::Mask;
-use vortex_scalar::Scalar;
-use vortex_scalar::StructScalar;
 
 use crate::Array;
 use crate::ArrayRef;
@@ -26,6 +21,11 @@ use crate::builders::LazyBitBufferBuilder;
 use crate::builders::builder_with_capacity;
 use crate::canonical::Canonical;
 use crate::canonical::ToCanonical;
+use crate::dtype::DType;
+use crate::dtype::Nullability;
+use crate::dtype::StructFields;
+use crate::scalar::Scalar;
+use crate::scalar::StructScalar;
 
 /// The builder for building a [`StructArray`].
 pub struct StructBuilder {
@@ -73,7 +73,7 @@ impl StructBuilder {
             );
         }
 
-        if let Some(fields) = struct_scalar.fields() {
+        if let Some(fields) = struct_scalar.fields_iter() {
             for (builder, field) in self.builders.iter_mut().zip_eq(fields) {
                 builder.append_scalar(&field)?;
             }
@@ -151,34 +151,36 @@ impl ArrayBuilder for StructBuilder {
             // We push zero values into our children when appending a null in case the children are
             // themselves non-nullable.
             .for_each(|builder| builder.append_defaults(n));
-        self.nulls.append_null();
+        self.nulls.append_n_nulls(n);
     }
 
     fn append_scalar(&mut self, scalar: &Scalar) -> VortexResult<()> {
         vortex_ensure!(
             scalar.dtype() == self.dtype(),
-            "StructBuilder expected scalar with dtype {:?}, got {:?}",
+            "StructBuilder expected scalar with dtype {}, got {}",
             self.dtype(),
             scalar.dtype()
         );
 
-        let struct_scalar = StructScalar::try_from(scalar)?;
-        self.append_value(struct_scalar)
+        self.append_value(scalar.as_struct())
     }
 
     unsafe fn extend_from_array_unchecked(&mut self, array: &dyn Array) {
         let array = array.to_struct();
 
         for (a, builder) in array
-            .fields()
+            .unmasked_fields()
             .iter()
-            .cloned()
             .zip_eq(self.builders.iter_mut())
         {
-            a.append_to_builder(builder.as_mut());
+            builder.extend_from_array(a.as_ref());
         }
 
-        self.nulls.append_validity_mask(array.validity_mask());
+        self.nulls.append_validity_mask(
+            array
+                .validity_mask()
+                .vortex_expect("validity_mask in extend_from_array_unchecked"),
+        );
     }
 
     fn reserve_exact(&mut self, capacity: usize) {
@@ -204,12 +206,6 @@ impl ArrayBuilder for StructBuilder {
 
 #[cfg(test)]
 mod tests {
-    use vortex_dtype::DType;
-    use vortex_dtype::Nullability;
-    use vortex_dtype::PType::I32;
-    use vortex_dtype::StructFields;
-    use vortex_scalar::Scalar;
-
     use crate::IntoArray;
     use crate::arrays::PrimitiveArray;
     use crate::arrays::StructArray;
@@ -217,6 +213,11 @@ mod tests {
     use crate::assert_arrays_eq;
     use crate::builders::ArrayBuilder;
     use crate::builders::struct_::StructBuilder;
+    use crate::dtype::DType;
+    use crate::dtype::Nullability;
+    use crate::dtype::PType::I32;
+    use crate::dtype::StructFields;
+    use crate::scalar::Scalar;
     use crate::validity::Validity;
 
     #[test]
@@ -244,14 +245,17 @@ mod tests {
             .append_value(Scalar::struct_(dtype.clone(), vec![1.into(), 2.into()]).as_struct())
             .unwrap();
 
+        builder.append_nulls(2);
+
         let struct_ = builder.finish();
-        assert_eq!(struct_.len(), 1);
+        assert_eq!(struct_.len(), 3);
         assert_eq!(struct_.dtype(), &dtype);
+        assert_eq!(struct_.valid_count().unwrap(), 1);
     }
 
     #[test]
     fn test_append_scalar() {
-        use vortex_scalar::Scalar;
+        use crate::scalar::Scalar;
 
         let dtype = DType::Struct(
             StructFields::from_iter([

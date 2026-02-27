@@ -10,6 +10,8 @@ use vortex_array::ArrayContext;
 use vortex_array::ArrayRef;
 use vortex_array::expr::stats::Stat;
 use vortex_btrblocks::BtrBlocksCompressor;
+use vortex_btrblocks::BtrBlocksCompressorBuilder;
+use vortex_btrblocks::IntCode;
 use vortex_error::VortexResult;
 use vortex_io::runtime::Handle;
 
@@ -23,10 +25,7 @@ use crate::sequence::SequentialStreamExt;
 
 /// A boxed compressor function from arrays into compressed arrays.
 ///
-/// Both the balanced `BtrBlocksCompressor` and the size-optimized `CompactCompressor`
-/// meet this interface.
-///
-/// API consumers are also free to implement this trait to provide new plugin compressors.
+/// API consumers are free to implement this trait to provide new plugin compressors.
 pub trait CompressorPlugin: std::fmt::Debug + Send + Sync + 'static {
     fn compress_chunk(&self, chunk: &dyn Array) -> VortexResult<ArrayRef>;
 }
@@ -52,13 +51,6 @@ impl CompressorPlugin for BtrBlocksCompressor {
     }
 }
 
-#[cfg(feature = "zstd")]
-impl CompressorPlugin for crate::layouts::compact::CompactCompressor {
-    fn compress_chunk(&self, chunk: &dyn Array) -> VortexResult<ArrayRef> {
-        self.compress(chunk)
-    }
-}
-
 /// A layout writer that compresses chunks.
 #[derive(Clone)]
 pub struct CompressingStrategy {
@@ -75,26 +67,13 @@ impl CompressingStrategy {
     /// Set `exclude_int_dict_encoding` to true to prevent dictionary encoding of integer arrays,
     /// which is useful when compressing dictionary codes to avoid recursive dictionary encoding.
     pub fn new_btrblocks<S: LayoutStrategy>(child: S, exclude_int_dict_encoding: bool) -> Self {
-        Self::new(
-            child,
-            Arc::new(BtrBlocksCompressor {
-                exclude_int_dict_encoding,
-            }),
-        )
-    }
-
-    /// Create a new writer that compresses using a `CompactCompressor` to compress chunks.
-    ///
-    /// This may create smaller files than the BtrBlocks writer, in exchange for some penalty
-    /// to decoding performance. This is only recommended for datasets that make heavy use of
-    /// floating point numbers.
-    ///
-    /// [`CompactCompressor`]: crate::layouts::compact::CompactCompressor
-    #[cfg(feature = "zstd")]
-    pub fn new_compact<S: LayoutStrategy>(
-        child: S,
-        compressor: crate::layouts::compact::CompactCompressor,
-    ) -> Self {
+        let compressor = if exclude_int_dict_encoding {
+            BtrBlocksCompressorBuilder::default()
+                .exclude_int([IntCode::Dict])
+                .build()
+        } else {
+            BtrBlocksCompressor::default()
+        };
         Self::new(child, Arc::new(compressor))
     }
 

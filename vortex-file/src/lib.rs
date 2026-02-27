@@ -24,7 +24,7 @@
 //!
 //! A layout, alone, is _not_ a standalone Vortex file because layouts are not self-describing. They
 //! neither contain a description of the kind of layout (e.g. flat, column of flat, chunked of
-//! column of flat) nor a data type ([`DType`](vortex_dtype::DType)).
+//! column of flat) nor a data type ([`DType`](vortex_array::dtype::DType)).
 //!
 //! # Reading
 //!
@@ -93,12 +93,15 @@
 mod counting;
 mod file;
 mod footer;
+pub mod multi;
 mod open;
 mod pruning;
+mod read;
 pub mod segments;
 mod strategy;
 #[cfg(test)]
 mod tests;
+pub mod v2;
 mod writer;
 
 pub use file::*;
@@ -110,7 +113,6 @@ use vortex_alp::ALPRDVTable;
 use vortex_alp::ALPVTable;
 use vortex_array::arrays::DictVTable;
 use vortex_array::session::ArraySessionExt;
-use vortex_array::vtable::ArrayVTableExt;
 use vortex_bytebool::ByteBoolVTable;
 use vortex_datetime_parts::DateTimePartsVTable;
 use vortex_decimal_byte_parts::DecimalBytePartsVTable;
@@ -163,25 +165,31 @@ mod forever_constant {
 /// NOTE: this function will be changed in the future to encapsulate logic for using different
 /// Vortex "Editions" that may support different sets of encodings.
 pub fn register_default_encodings(session: &mut VortexSession) {
-    session.arrays().register_many([
-        ALPVTable.as_vtable(),
-        ALPRDVTable.as_vtable(),
-        BitPackedVTable.as_vtable(),
-        ByteBoolVTable.as_vtable(),
-        DateTimePartsVTable.as_vtable(),
-        DecimalBytePartsVTable.as_vtable(),
-        DeltaVTable.as_vtable(),
-        DictVTable.as_vtable(),
-        FSSTVTable.as_vtable(),
-        FoRVTable.as_vtable(),
-        PcoVTable.as_vtable(),
-        RLEVTable.as_vtable(),
-        SequenceVTable.as_vtable(),
-        SparseVTable.as_vtable(),
-        ZigZagVTable.as_vtable(),
+    {
+        let arrays = session.arrays();
+        arrays.register(ALPVTable::ID, ALPVTable);
+        arrays.register(ALPRDVTable::ID, ALPRDVTable);
+        arrays.register(BitPackedVTable::ID, BitPackedVTable);
+        arrays.register(ByteBoolVTable::ID, ByteBoolVTable);
+        arrays.register(DateTimePartsVTable::ID, DateTimePartsVTable);
+        arrays.register(DecimalBytePartsVTable::ID, DecimalBytePartsVTable);
+        arrays.register(DeltaVTable::ID, DeltaVTable);
+        arrays.register(DictVTable::ID, DictVTable);
+        arrays.register(FSSTVTable::ID, FSSTVTable);
+        arrays.register(FoRVTable::ID, FoRVTable);
+        arrays.register(PcoVTable::ID, PcoVTable);
+        arrays.register(RLEVTable::ID, RLEVTable);
+        arrays.register(SequenceVTable::ID, SequenceVTable);
+        arrays.register(SparseVTable::ID, SparseVTable);
+        arrays.register(ZigZagVTable::ID, ZigZagVTable);
         #[cfg(feature = "zstd")]
-        vortex_zstd::ZstdVTable.as_vtable(),
-    ]);
+        arrays.register(vortex_zstd::ZstdVTable::ID, vortex_zstd::ZstdVTable);
+        #[cfg(all(feature = "zstd", feature = "unstable_encodings"))]
+        arrays.register(
+            vortex_zstd::ZstdBuffersVTable::ID,
+            vortex_zstd::ZstdBuffersVTable,
+        );
+    }
 
     // Eventually all encodings crates should expose an initialize function. For now it's only
     // a few of them.

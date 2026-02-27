@@ -4,16 +4,12 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use vortex_dtype::DType;
-use vortex_dtype::Nullability;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_panic;
 use vortex_mask::Mask;
-use vortex_scalar::ListScalar;
-use vortex_scalar::Scalar;
 
 use crate::Array;
 use crate::ArrayRef;
@@ -25,6 +21,10 @@ use crate::builders::LazyBitBufferBuilder;
 use crate::builders::builder_with_capacity;
 use crate::canonical::Canonical;
 use crate::canonical::ToCanonical;
+use crate::dtype::DType;
+use crate::dtype::Nullability;
+use crate::scalar::ListScalar;
+use crate::scalar::Scalar;
 
 /// The builder for building a [`FixedSizeListArray`].
 pub struct FixedSizeListBuilder {
@@ -223,7 +223,7 @@ impl ArrayBuilder for FixedSizeListBuilder {
     fn append_scalar(&mut self, scalar: &Scalar) -> VortexResult<()> {
         vortex_ensure!(
             scalar.dtype() == self.dtype(),
-            "FixedSizeListBuilder expected scalar with dtype {:?}, got {:?}",
+            "FixedSizeListBuilder expected scalar with dtype {}, got {}",
             self.dtype(),
             scalar.dtype()
         );
@@ -241,7 +241,11 @@ impl ArrayBuilder for FixedSizeListBuilder {
         }
 
         self.elements_builder.extend_from_array(fsl.elements());
-        self.nulls.append_validity_mask(array.validity_mask());
+        self.nulls.append_validity_mask(
+            array
+                .validity_mask()
+                .vortex_expect("validity_mask in extend_from_array_unchecked"),
+        );
     }
 
     fn reserve_exact(&mut self, additional: usize) {
@@ -269,11 +273,6 @@ mod tests {
     use std::sync::Arc;
 
     use vortex_buffer::buffer;
-    use vortex_dtype::DType;
-    use vortex_dtype::Nullability::NonNullable;
-    use vortex_dtype::Nullability::Nullable;
-    use vortex_dtype::PType::I32;
-    use vortex_scalar::Scalar;
 
     use super::FixedSizeListBuilder;
     use crate::IntoArray as _;
@@ -282,6 +281,11 @@ mod tests {
     use crate::arrays::FixedSizeListArray;
     use crate::arrays::PrimitiveArray;
     use crate::builders::ArrayBuilder;
+    use crate::dtype::DType;
+    use crate::dtype::Nullability::NonNullable;
+    use crate::dtype::Nullability::Nullable;
+    use crate::dtype::PType::I32;
+    use crate::scalar::Scalar;
     use crate::validity::Validity;
     use crate::vtable::ValidityHelper;
 
@@ -443,9 +447,9 @@ mod tests {
         assert_eq!(fsl.len(), 3);
 
         let fsl_array = fsl.to_fixed_size_list();
-        assert!(fsl_array.validity().is_valid(0));
-        assert!(!fsl_array.validity().is_valid(1));
-        assert!(fsl_array.validity().is_valid(2));
+        assert!(fsl_array.validity().is_valid(0).unwrap());
+        assert!(!fsl_array.validity().is_valid(1).unwrap());
+        assert!(fsl_array.validity().is_valid(2).unwrap());
     }
 
     #[test]
@@ -528,7 +532,7 @@ mod tests {
 
         // Check that all lists are null.
         for i in 0..3 {
-            assert!(!fsl_array.validity().is_valid(i));
+            assert!(!fsl_array.validity().is_valid(i).unwrap());
         }
     }
 
@@ -551,7 +555,7 @@ mod tests {
         assert_eq!(fsl_array.list_size(), 2);
 
         // Check that all lists are null.
-        assert!(!fsl_array.validity().is_valid(0));
+        assert!(!fsl_array.validity().is_valid(0).unwrap());
     }
 
     #[test]
@@ -620,12 +624,12 @@ mod tests {
         assert_eq!(fsl_array.elements().len(), 12);
 
         // Check validity pattern is repeated.
-        assert!(fsl_array.validity().is_valid(0));
-        assert!(!fsl_array.validity().is_valid(1));
-        assert!(fsl_array.validity().is_valid(2));
-        assert!(fsl_array.validity().is_valid(3));
-        assert!(!fsl_array.validity().is_valid(4));
-        assert!(fsl_array.validity().is_valid(5));
+        assert!(fsl_array.validity().is_valid(0).unwrap());
+        assert!(!fsl_array.validity().is_valid(1).unwrap());
+        assert!(fsl_array.validity().is_valid(2).unwrap());
+        assert!(fsl_array.validity().is_valid(3).unwrap());
+        assert!(!fsl_array.validity().is_valid(4).unwrap());
+        assert!(fsl_array.validity().is_valid(5).unwrap());
     }
 
     #[test]
@@ -660,11 +664,11 @@ mod tests {
         assert_eq!(fsl_array.elements().len(), 0);
 
         // Check validity pattern.
-        assert!(fsl_array.validity().is_valid(0));
-        assert!(!fsl_array.validity().is_valid(1));
-        assert!(fsl_array.validity().is_valid(2));
-        assert!(!fsl_array.validity().is_valid(3));
-        assert!(fsl_array.validity().is_valid(4));
+        assert!(fsl_array.validity().is_valid(0).unwrap());
+        assert!(!fsl_array.validity().is_valid(1).unwrap());
+        assert!(fsl_array.validity().is_valid(2).unwrap());
+        assert!(!fsl_array.validity().is_valid(3).unwrap());
+        assert!(fsl_array.validity().is_valid(4).unwrap());
     }
 
     #[test]
@@ -740,12 +744,12 @@ mod tests {
         assert_eq!(fsl_array.elements().len(), 12);
 
         // Check validity.
-        assert!(fsl_array.validity().is_valid(0)); // append_value
-        assert!(!fsl_array.validity().is_valid(1)); // append_null
-        assert!(fsl_array.validity().is_valid(2)); // append_zeros
-        assert!(fsl_array.validity().is_valid(3)); // append_zeros
-        assert!(!fsl_array.validity().is_valid(4)); // append_nulls
-        assert!(fsl_array.validity().is_valid(5)); // extend_from_array
+        assert!(fsl_array.validity().is_valid(0).unwrap()); // append_value
+        assert!(!fsl_array.validity().is_valid(1).unwrap()); // append_null
+        assert!(fsl_array.validity().is_valid(2).unwrap()); // append_zeros
+        assert!(fsl_array.validity().is_valid(3).unwrap()); // append_zeros
+        assert!(!fsl_array.validity().is_valid(4).unwrap()); // append_nulls
+        assert!(fsl_array.validity().is_valid(5).unwrap()); // extend_from_array
     }
 
     #[test]
@@ -771,7 +775,7 @@ mod tests {
 
         // Check actual values using scalar_at.
 
-        let scalar0 = array.scalar_at(0);
+        let scalar0 = array.scalar_at(0).unwrap();
         let list0 = scalar0.as_list();
         assert_eq!(list0.len(), 2);
         if let Some(list0_items) = list0.elements() {
@@ -779,7 +783,7 @@ mod tests {
             assert_eq!(list0_items[1].as_primitive().typed_value::<i32>(), Some(2));
         }
 
-        let scalar1 = array.scalar_at(1);
+        let scalar1 = array.scalar_at(1).unwrap();
         let list1 = scalar1.as_list();
         assert_eq!(list1.len(), 2);
         if let Some(list1_items) = list1.elements() {
@@ -788,9 +792,9 @@ mod tests {
         }
 
         // Check validity - first two should be valid, third should be null.
-        assert!(array.validity().is_valid(0));
-        assert!(array.validity().is_valid(1));
-        assert!(!array.validity().is_valid(2));
+        assert!(array.validity().is_valid(0).unwrap());
+        assert!(array.validity().is_valid(1).unwrap());
+        assert!(!array.validity().is_valid(2).unwrap());
 
         // Test wrong dtype error.
         let mut builder = FixedSizeListBuilder::with_capacity(dtype, 2, NonNullable, 10);

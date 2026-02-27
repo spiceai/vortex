@@ -1,29 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::ffi::CStr;
 use std::ffi::CString;
 use std::fmt::Debug;
-use std::fmt::Display;
 use std::fmt::Formatter;
 
-use vortex::dtype::ExtDType;
-use vortex::dtype::FieldName;
 use vortex::error::VortexExpect;
 use vortex::error::VortexResult;
 use vortex::error::vortex_bail;
-use vortex::error::vortex_err;
 
 use crate::cpp::*;
-use crate::wrapper;
+use crate::duckdb::ddb_string::DDBString;
+use crate::lifetime_wrapper;
 
-wrapper!(
+lifetime_wrapper!(
     LogicalType,
     duckdb_logical_type,
     duckdb_destroy_logical_type
 );
 
-/// `LogicalType` is Send, as the wrapped pointer and bool are Send.
+/// `LogicalType` is Send+Sync, as the wrapped pointer is Send+Sync.
 unsafe impl Send for LogicalType {}
 unsafe impl Sync for LogicalType {}
 
@@ -107,54 +103,6 @@ impl LogicalType {
         Ok(unsafe { Self::own(ptr) })
     }
 
-    /// Converts temporal extension types to corresponding DuckDB types.
-    ///
-    /// # Arguments
-    ///
-    /// * `ext_dtype` - A reference to the extension data type containing temporal metadata.
-    ///
-    /// # Supported Temporal Types
-    ///
-    /// - **Date**: Must use `TimeUnit::D`
-    /// - **Time**: Must use `TimeUnit::Us`
-    /// - **Timestamp**: Supports `TimeUnit::Ns`, `Us`, `Ms`, `S`
-    pub fn temporal_type(ext_dtype: &ExtDType) -> VortexResult<Self> {
-        use vortex::dtype::datetime::TemporalMetadata;
-        use vortex::dtype::datetime::TimeUnit;
-
-        let temporal_metadata = TemporalMetadata::try_from(ext_dtype)
-            .map_err(|e| vortex_err!("Failed to extract temporal metadata: {}", e))?;
-
-        let duckdb_type = match temporal_metadata {
-            TemporalMetadata::Date(TimeUnit::Days) => DUCKDB_TYPE::DUCKDB_TYPE_DATE,
-            TemporalMetadata::Date(time_unit) => {
-                vortex_bail!("Invalid TimeUnit {} for date", time_unit);
-            }
-            TemporalMetadata::Time(TimeUnit::Microseconds) => DUCKDB_TYPE::DUCKDB_TYPE_TIME,
-            TemporalMetadata::Time(time_unit) => {
-                vortex_bail!("Invalid TimeUnit {} for time", time_unit);
-            }
-            TemporalMetadata::Timestamp(time_unit, tz) => match time_unit {
-                TimeUnit::Nanoseconds => DUCKDB_TYPE::DUCKDB_TYPE_TIMESTAMP_NS,
-                TimeUnit::Microseconds => {
-                    if let Some(tz) = tz {
-                        if tz != "UTC" {
-                            vortex_bail!("Invalid timezone for timestamp: {tz}");
-                        }
-                        DUCKDB_TYPE::DUCKDB_TYPE_TIMESTAMP_TZ
-                    } else {
-                        DUCKDB_TYPE::DUCKDB_TYPE_TIMESTAMP
-                    }
-                }
-                TimeUnit::Milliseconds => DUCKDB_TYPE::DUCKDB_TYPE_TIMESTAMP_MS,
-                TimeUnit::Seconds => DUCKDB_TYPE::DUCKDB_TYPE_TIMESTAMP_S,
-                _ => vortex_bail!("Invalid TimeUnit {} for timestamp", time_unit),
-            },
-        };
-
-        Ok(Self::new(duckdb_type))
-    }
-
     pub fn new_array(element_dtype: DUCKDB_TYPE, array_size: u32) -> Self {
         let element_dtype = Self::new(element_dtype);
 
@@ -167,8 +115,8 @@ impl LogicalType {
         }
     }
 
-    pub fn as_type_id(&self) -> DUCKDB_TYPE {
-        unsafe { duckdb_get_type_id(self.as_ptr()) }
+    pub fn null() -> Self {
+        Self::new(DUCKDB_TYPE::DUCKDB_TYPE_SQLNULL)
     }
 
     pub fn varchar() -> Self {
@@ -179,20 +127,50 @@ impl LogicalType {
         Self::new(DUCKDB_TYPE::DUCKDB_TYPE_BLOB)
     }
 
-    pub fn int64() -> Self {
-        Self::new(DUCKDB_TYPE::DUCKDB_TYPE_BIGINT)
-    }
-
     pub fn uint64() -> Self {
         Self::new(DUCKDB_TYPE::DUCKDB_TYPE_UBIGINT)
+    }
+
+    pub fn uint128() -> Self {
+        Self::new(DUCKDB_TYPE::DUCKDB_TYPE_UHUGEINT)
     }
 
     pub fn int32() -> Self {
         Self::new(DUCKDB_TYPE::DUCKDB_TYPE_INTEGER)
     }
 
+    pub fn int64() -> Self {
+        Self::new(DUCKDB_TYPE::DUCKDB_TYPE_BIGINT)
+    }
+
+    pub fn int128() -> Self {
+        Self::new(DUCKDB_TYPE::DUCKDB_TYPE_HUGEINT)
+    }
+
     pub fn bool() -> Self {
         Self::new(DUCKDB_TYPE::DUCKDB_TYPE_BOOLEAN)
+    }
+
+    pub fn float32() -> Self {
+        Self::new(DUCKDB_TYPE::DUCKDB_TYPE_FLOAT)
+    }
+
+    pub fn float64() -> Self {
+        Self::new(DUCKDB_TYPE::DUCKDB_TYPE_DOUBLE)
+    }
+
+    pub fn timestamp() -> Self {
+        Self::new(DUCKDB_TYPE::DUCKDB_TYPE_TIMESTAMP)
+    }
+
+    pub fn timestamp_tz() -> Self {
+        Self::new(DUCKDB_TYPE::DUCKDB_TYPE_TIMESTAMP_TZ)
+    }
+}
+
+impl LogicalTypeRef {
+    pub fn as_type_id(&self) -> DUCKDB_TYPE {
+        unsafe { duckdb_get_type_id(self.as_ptr()) }
     }
 
     pub fn as_decimal(&self) -> (u8, u8) {
@@ -204,7 +182,7 @@ impl LogicalType {
         }
     }
 
-    pub fn array_child_type(&self) -> Self {
+    pub fn array_child_type(&self) -> LogicalType {
         unsafe { LogicalType::own(duckdb_array_type_child_type(self.as_ptr())) }
     }
 
@@ -213,19 +191,19 @@ impl LogicalType {
             .vortex_expect("Array size must fit in u32")
     }
 
-    pub fn list_child_type(&self) -> Self {
+    pub fn list_child_type(&self) -> LogicalType {
         unsafe { LogicalType::own(duckdb_list_type_child_type(self.as_ptr())) }
     }
 
-    pub fn map_key_type(&self) -> Self {
+    pub fn map_key_type(&self) -> LogicalType {
         unsafe { LogicalType::own(duckdb_map_type_key_type(self.as_ptr())) }
     }
 
-    pub fn map_value_type(&self) -> Self {
+    pub fn map_value_type(&self) -> LogicalType {
         unsafe { LogicalType::own(duckdb_map_type_value_type(self.as_ptr())) }
     }
 
-    pub fn struct_child_type(&self, idx: usize) -> Self {
+    pub fn struct_child_type(&self, idx: usize) -> LogicalType {
         unsafe { LogicalType::own(duckdb_struct_type_child_type(self.as_ptr(), idx as idx_t)) }
     }
 
@@ -238,7 +216,7 @@ impl LogicalType {
             .vortex_expect("Struct type child count must fit in usize")
     }
 
-    pub fn union_member_type(&self, idx: usize) -> Self {
+    pub fn union_member_type(&self, idx: usize) -> LogicalType {
         unsafe { LogicalType::own(duckdb_union_type_member_type(self.as_ptr(), idx as idx_t)) }
     }
 
@@ -252,54 +230,16 @@ impl LogicalType {
     }
 }
 
-impl Debug for LogicalType {
+impl Debug for LogicalTypeRef {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let debug = unsafe { DDBString::own(duckdb_vx_logical_type_stringify(self.as_ptr())) };
         write!(f, "{}", debug)
     }
 }
 
-wrapper!(
-    #[derive(Debug)]
-    DDBString,
-    *mut std::ffi::c_char,
-    |ptr: *mut std::ffi::c_char| {
-        unsafe { CStr::from_ptr(ptr) }
-            .to_str()
-            .map_err(|e| vortex_err!("Failed to convert C string to str: {e}"))
-            .vortex_expect("DuckDB string should be valid UTF-8")
-    },
-    |ptr: &mut *mut std::ffi::c_char| unsafe { duckdb_free((*ptr).cast()) }
-);
-
-impl Display for DDBString {
+impl Debug for LogicalType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_ref())
-    }
-}
-
-impl AsRef<str> for DDBString {
-    fn as_ref(&self) -> &str {
-        // SAFETY: The string have been validated on construction.
-        unsafe { str::from_utf8_unchecked(CStr::from_ptr(self.ptr).to_bytes()) }
-    }
-}
-
-impl PartialEq for DDBString {
-    fn eq(&self, other: &Self) -> bool {
-        self.as_ref() == other.as_ref()
-    }
-}
-
-impl PartialEq<str> for DDBString {
-    fn eq(&self, other: &str) -> bool {
-        self.as_ref() == other
-    }
-}
-
-impl From<DDBString> for FieldName {
-    fn from(value: DDBString) -> Self {
-        FieldName::from(value.as_ref())
+        Debug::fmt(&**self, f)
     }
 }
 
@@ -351,7 +291,7 @@ integer_type!(UHugeInt, u128);
 #[macro_export]
 macro_rules! match_each_primitive_type {
     ($self:expr, | $type:ident | $body:block) => {{
-        use $crate::duckdb::LogicalType;
+        use $crate::duckdb::LogicalTypeRef;
         match $self.as_type_id() {
             DUCKDB_TYPE::DUCKDB_TYPE_TINYINT => {
                 let $type = <$crate::duckdb::TinyInt as $crate::duckdb::PrimitiveType>::NATIVE;
@@ -426,7 +366,6 @@ floating_type!(Double, f64);
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
-    use crate::duckdb::LogicalType;
 
     #[test]
     fn test_clone_logical_type() {
@@ -434,24 +373,13 @@ mod tests {
             ..=DUCKDB_TYPE::DUCKDB_TYPE_INTEGER_LITERAL as u32)
             .map(|variant| unsafe { std::mem::transmute::<u32, DUCKDB_TYPE>(variant) })
             .filter(|&variant| {
-                // `LogicalType::new` calls the DuckDB C API function
-                // `duckdb_create_logical_type` with just the type enum.
-                //
-                // Though complex types require additional parameters:
                 let excluded_types = [
-                    // Needs width and scale parameters
                     DUCKDB_TYPE::DUCKDB_TYPE_DECIMAL,
-                    // Needs the enum dictionary/values
                     DUCKDB_TYPE::DUCKDB_TYPE_ENUM,
-                    // Needs the child element type
                     DUCKDB_TYPE::DUCKDB_TYPE_LIST,
-                    // Needs field names and their type
                     DUCKDB_TYPE::DUCKDB_TYPE_STRUCT,
-                    //  Needs key and value types
                     DUCKDB_TYPE::DUCKDB_TYPE_MAP,
-                    // Needs member types
                     DUCKDB_TYPE::DUCKDB_TYPE_UNION,
-                    //  Needs element type and array size
                     DUCKDB_TYPE::DUCKDB_TYPE_ARRAY,
                 ];
                 !excluded_types.contains(&variant)
@@ -470,9 +398,7 @@ mod tests {
 
         assert_eq!(decimal_type.as_type_id(), cloned.as_type_id());
 
-        // Further verify the parameters are preserved.
         let (original_width, original_scale) = decimal_type.as_decimal();
-
         let (cloned_width, cloned_scale) = cloned.as_decimal();
 
         assert_eq!(original_width, cloned_width);
@@ -481,7 +407,6 @@ mod tests {
 
     #[test]
     fn test_clone_list_logical_type() {
-        // Create a list of integers
         let int_type = LogicalType::new(DUCKDB_TYPE::DUCKDB_TYPE_INTEGER);
         let list_type =
             LogicalType::list_type(int_type).vortex_expect("Failed to create list type");
@@ -492,7 +417,6 @@ mod tests {
         assert_eq!(list_type.as_type_id(), cloned.as_type_id());
         assert_eq!(list_type.as_type_id(), DUCKDB_TYPE::DUCKDB_TYPE_LIST);
 
-        // Verify the child type is preserved
         let original_child = list_type.list_child_type();
         let cloned_child = cloned.list_child_type();
 
@@ -505,7 +429,6 @@ mod tests {
 
     #[test]
     fn test_clone_array_logical_type() {
-        // Create an array of strings with size 5
         let array_type =
             LogicalType::array_type(LogicalType::new(DUCKDB_TYPE::DUCKDB_TYPE_VARCHAR), 5)
                 .vortex_expect("Failed to create array type");
@@ -515,7 +438,6 @@ mod tests {
         assert_eq!(array_type.as_type_id(), cloned.as_type_id());
         assert_eq!(array_type.as_type_id(), DUCKDB_TYPE::DUCKDB_TYPE_ARRAY);
 
-        // Verify the child type is preserved
         let original_child = array_type.array_child_type();
         let cloned_child = cloned.array_child_type();
 
@@ -525,7 +447,6 @@ mod tests {
         assert_eq!(original_child_type_id, cloned_child_type_id);
         assert_eq!(original_child_type_id, DUCKDB_TYPE::DUCKDB_TYPE_VARCHAR);
 
-        // Verify the array size is preserved
         let original_size = array_type.array_type_array_size();
         let cloned_size = cloned.array_type_array_size();
 
@@ -535,7 +456,6 @@ mod tests {
 
     #[test]
     fn test_clone_map_logical_type() {
-        // Create a map of string -> integer
         let key_type = LogicalType::new(DUCKDB_TYPE::DUCKDB_TYPE_VARCHAR);
         let value_type = LogicalType::new(DUCKDB_TYPE::DUCKDB_TYPE_INTEGER);
         let map_type = unsafe {
@@ -551,7 +471,6 @@ mod tests {
         assert_eq!(map_type.as_type_id(), cloned.as_type_id());
         assert_eq!(map_type.as_type_id(), DUCKDB_TYPE::DUCKDB_TYPE_MAP);
 
-        // Verify the key and value types are preserved
         let original_key = map_type.map_key_type();
         let original_value = map_type.map_value_type();
         let cloned_key = cloned.map_key_type();
@@ -568,7 +487,6 @@ mod tests {
 
     #[test]
     fn test_clone_struct_logical_type() {
-        // Create a struct with two fields: {name: VARCHAR, age: INTEGER}
         let name_type = LogicalType::new(DUCKDB_TYPE::DUCKDB_TYPE_VARCHAR);
         let age_type = LogicalType::new(DUCKDB_TYPE::DUCKDB_TYPE_INTEGER);
 
@@ -584,13 +502,11 @@ mod tests {
         assert_eq!(struct_type.as_type_id(), cloned.as_type_id());
         assert_eq!(struct_type.as_type_id(), DUCKDB_TYPE::DUCKDB_TYPE_STRUCT);
 
-        // Verify the child count is preserved
         let original_count = struct_type.struct_type_child_count();
         let cloned_count = cloned.struct_type_child_count();
         assert_eq!(original_count, cloned_count);
         assert_eq!(original_count, 2);
 
-        // Verify each field
         for idx in 0..original_count {
             let original_child_type = struct_type.struct_child_type(idx);
             let cloned_child_type = cloned.struct_child_type(idx);
@@ -608,7 +524,6 @@ mod tests {
 
     #[test]
     fn test_clone_union_logical_type() {
-        // Create a union with two members: {str: VARCHAR, num: INTEGER}
         let str_type = LogicalType::new(DUCKDB_TYPE::DUCKDB_TYPE_VARCHAR);
         let num_type = LogicalType::new(DUCKDB_TYPE::DUCKDB_TYPE_INTEGER);
 
@@ -631,13 +546,11 @@ mod tests {
         assert_eq!(union_type.as_type_id(), cloned.as_type_id());
         assert_eq!(union_type.as_type_id(), DUCKDB_TYPE::DUCKDB_TYPE_UNION);
 
-        // Verify the member count is preserved
         let original_count = union_type.union_member_count();
         let cloned_count = cloned.union_member_count();
         assert_eq!(original_count, cloned_count);
         assert_eq!(original_count, 2);
 
-        // Verify each member
         for idx in 0..original_count {
             let original_member_type = union_type.union_member_type(idx);
             let cloned_member_type = cloned.union_member_type(idx);

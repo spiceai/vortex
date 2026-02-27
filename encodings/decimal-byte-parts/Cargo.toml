@@ -21,11 +21,10 @@ num-traits = { workspace = true }
 prost = { workspace = true }
 vortex-array = { workspace = true }
 vortex-buffer = { workspace = true }
-vortex-dtype = { workspace = true }
 vortex-error = { workspace = true }
 vortex-mask = { workspace = true }
-vortex-scalar = { workspace = true }
+vortex-session = { workspace = true }
 
 [dev-dependencies]
 rstest = { workspace = true }
-vortex-array = { path = "../../vortex-array", features = ["test-harness"] }
+vortex-array = { path = "../../vortex-array", features = ["_test-harness"] }

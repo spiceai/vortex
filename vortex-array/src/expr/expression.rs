@@ -10,18 +10,15 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use itertools::Itertools;
-use vortex_dtype::DType;
-use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 
-use crate::ArrayRef;
-use crate::expr::Root;
-use crate::expr::ScalarFn;
+use crate::dtype::DType;
 use crate::expr::StatsCatalog;
-use crate::expr::VTable;
 use crate::expr::display::DisplayTreeExpr;
 use crate::expr::stats::Stat;
+use crate::scalar_fn::ScalarFnRef;
+use crate::scalar_fn::fns::root::Root;
 
 /// A node in a Vortex expression tree.
 ///
@@ -30,13 +27,13 @@ use crate::expr::stats::Stat;
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Expression {
     /// The scalar fn for this node.
-    scalar_fn: ScalarFn,
+    scalar_fn: ScalarFnRef,
     /// Any children of this expression.
-    children: Arc<[Expression]>,
+    children: Arc<Vec<Expression>>,
 }
 
 impl Deref for Expression {
-    type Target = ScalarFn;
+    type Target = ScalarFnRef;
 
     fn deref(&self) -> &Self::Target {
         &self.scalar_fn
@@ -46,10 +43,10 @@ impl Deref for Expression {
 impl Expression {
     /// Create a new expression node from a scalar_fn expression and its children.
     pub fn try_new(
-        scalar_fn: ScalarFn,
-        children: impl Into<Arc<[Expression]>>,
+        scalar_fn: ScalarFnRef,
+        children: impl IntoIterator<Item = Expression>,
     ) -> VortexResult<Self> {
-        let children: Arc<[Expression]> = children.into();
+        let children = Vec::from_iter(children);
 
         vortex_ensure!(
             scalar_fn.signature().arity().matches(children.len()),
@@ -60,33 +57,17 @@ impl Expression {
 
         Ok(Self {
             scalar_fn,
-            children,
+            children: children.into(),
         })
     }
 
-    /// Returns true if this expression is of the given vtable type.
-    pub fn is<V: VTable>(&self) -> bool {
-        self.vtable().is::<V>()
-    }
-
-    /// Returns the typed options for this expression if it matches the given vtable type.
-    pub fn as_opt<V: VTable>(&self) -> Option<&V::Options> {
-        self.options().as_any().downcast_ref::<V::Options>()
-    }
-
-    /// Returns the typed options for this expression if it matches the given vtable type.
-    pub fn as_<V: VTable>(&self) -> &V::Options {
-        self.as_opt::<V>()
-            .vortex_expect("Expression options type mismatch")
-    }
-
     /// Returns the scalar fn vtable for this expression.
-    pub fn scalar_fn(&self) -> &ScalarFn {
+    pub fn scalar_fn(&self) -> &ScalarFnRef {
         &self.scalar_fn
     }
 
     /// Returns the children of this expression.
-    pub fn children(&self) -> &Arc<[Expression]> {
+    pub fn children(&self) -> &Arc<Vec<Expression>> {
         &self.children
     }
 
@@ -96,15 +77,18 @@ impl Expression {
     }
 
     /// Replace the children of this expression with the provided new children.
-    pub fn with_children(mut self, children: impl Into<Arc<[Expression]>>) -> VortexResult<Self> {
-        let children = children.into();
+    pub fn with_children(
+        mut self,
+        children: impl IntoIterator<Item = Expression>,
+    ) -> VortexResult<Self> {
+        let children = Vec::from_iter(children);
         vortex_ensure!(
             self.signature().arity().matches(children.len()),
             "Expression arity mismatch: expected {} children but got {}",
             self.signature().arity(),
             children.len()
         );
-        self.children = children;
+        self.children = Arc::new(children);
         Ok(self)
     }
 
@@ -122,12 +106,11 @@ impl Expression {
         self.scalar_fn.return_dtype(&dtypes)
     }
 
-    /// Evaluates the expression in the given scope, returning an array.
-    pub fn evaluate(&self, scope: &ArrayRef) -> VortexResult<ArrayRef> {
-        if self.is::<Root>() {
-            return Ok(scope.clone());
-        }
-        self.scalar_fn.evaluate(self, scope)
+    /// Returns a new expression representing the validity mask output of this expression.
+    ///
+    /// The returned expression evaluates to a non-nullable boolean array.
+    pub fn validity(&self) -> VortexResult<Expression> {
+        self.scalar_fn.validity(self)
     }
 
     /// An expression over zone-statistics which implies all records in the zone evaluate to false.
@@ -149,7 +132,7 @@ impl Expression {
     /// Some expressions, in theory, have falsifications but this function does not support them
     /// such as `x < (y < z)` or `x LIKE "needle%"`.
     pub fn stat_falsification(&self, catalog: &dyn StatsCatalog) -> Option<Expression> {
-        self.vtable().as_dyn().stat_falsification(self, catalog)
+        self.scalar_fn().stat_falsification(self, catalog)
     }
 
     /// Returns an expression representing the zoned statistic for the given stat, if available.
@@ -161,7 +144,7 @@ impl Expression {
     /// NOTE(gatesn): we currently cannot represent statistics over nested fields. Please file an
     /// issue to discuss a solution to this.
     pub fn stat_expression(&self, stat: Stat, catalog: &dyn StatsCatalog) -> Option<Expression> {
-        self.vtable().as_dyn().stat_expression(self, stat, catalog)
+        self.scalar_fn().stat_expression(self, stat, catalog)
     }
 
     /// Returns an expression representing the zoned maximum statistic, if available.
@@ -179,7 +162,7 @@ impl Expression {
     /// Since this is a recursive formatter, it is exposed on the public Expression type.
     /// See fmt_data that is only implemented on the vtable trait.
     pub fn fmt_sql(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        self.vtable().as_dyn().fmt_sql(self, f)
+        self.scalar_fn().fmt_sql(self, f)
     }
 
     /// Display the expression as a formatted tree structure.
@@ -191,10 +174,10 @@ impl Expression {
     /// # Example
     ///
     /// ```rust
-    /// # use vortex_array::compute::LikeOptions;
-    /// # use vortex_array::expr::VTableExt;
-    /// # use vortex_dtype::{DType, Nullability, PType};
-    /// # use vortex_array::expr::{and, cast, eq, get_item, gt, lit, not, root, select, Like};
+    /// # use vortex_array::dtype::{DType, Nullability, PType};
+    /// # use vortex_array::scalar_fn::fns::like::{Like, LikeOptions};
+    /// # use vortex_array::scalar_fn::ScalarFnVTableExt;
+    /// # use vortex_array::expr::{and, cast, eq, get_item, gt, lit, not, root, select};
     /// // Build a complex nested expression
     /// let complex_expr = select(
     ///     ["result"],
@@ -243,5 +226,20 @@ impl Expression {
 impl Display for Expression {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         self.fmt_sql(f)
+    }
+}
+
+/// Iterative drop for expression to avoid stack overflows.
+impl Drop for Expression {
+    fn drop(&mut self) {
+        if let Some(children) = Arc::get_mut(&mut self.children) {
+            let mut children_to_drop = std::mem::take(children);
+
+            while let Some(mut child) = children_to_drop.pop() {
+                if let Some(expr_children) = Arc::get_mut(&mut child.children) {
+                    children_to_drop.append(expr_children);
+                }
+            }
+        }
     }
 }

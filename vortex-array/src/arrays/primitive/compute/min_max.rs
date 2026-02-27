@@ -2,20 +2,20 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use itertools::Itertools;
-use vortex_dtype::NativePType;
-use vortex_dtype::Nullability::NonNullable;
-use vortex_dtype::match_each_native_ptype;
 use vortex_error::VortexResult;
 use vortex_mask::Mask;
-use vortex_scalar::PValue;
-use vortex_scalar::Scalar;
 
 use crate::arrays::PrimitiveArray;
 use crate::arrays::PrimitiveVTable;
 use crate::compute::MinMaxKernel;
 use crate::compute::MinMaxKernelAdapter;
 use crate::compute::MinMaxResult;
+use crate::dtype::NativePType;
+use crate::dtype::Nullability::NonNullable;
+use crate::match_each_native_ptype;
 use crate::register_kernel;
+use crate::scalar::PValue;
+use crate::scalar::Scalar;
 
 impl MinMaxKernel for PrimitiveVTable {
     fn min_max(&self, array: &PrimitiveArray) -> VortexResult<Option<MinMaxResult>> {
@@ -33,7 +33,7 @@ where
     T: NativePType,
     PValue: From<T>,
 {
-    Ok(match array.validity_mask() {
+    Ok(match array.validity_mask()? {
         Mask::AllTrue(_) => compute_min_max(array.as_slice::<T>().iter()),
         Mask::AllFalse(_) => None,
         Mask::Values(v) => compute_min_max(
@@ -87,8 +87,8 @@ mod tests {
             Validity::NonNullable,
         );
         let min_max = min_max(array.as_ref()).unwrap().unwrap();
-        assert_eq!(f32::try_from(min_max.min).unwrap(), -1.0);
-        assert_eq!(f32::try_from(min_max.max).unwrap(), 1.0);
+        assert_eq!(f32::try_from(&min_max.min).unwrap(), -1.0);
+        assert_eq!(f32::try_from(&min_max.max).unwrap(), 1.0);
     }
 
     #[test]
@@ -98,7 +98,7 @@ mod tests {
             Validity::NonNullable,
         );
         let min_max = min_max(array.as_ref()).unwrap().unwrap();
-        assert_eq!(f32::try_from(min_max.min).unwrap(), f32::NEG_INFINITY);
-        assert_eq!(f32::try_from(min_max.max).unwrap(), f32::INFINITY);
+        assert_eq!(f32::try_from(&min_max.min).unwrap(), f32::NEG_INFINITY);
+        assert_eq!(f32::try_from(&min_max.max).unwrap(), f32::INFINITY);
     }
 }

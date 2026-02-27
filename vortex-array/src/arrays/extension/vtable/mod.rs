@@ -3,31 +3,28 @@
 
 mod array;
 mod canonical;
+mod kernel;
 mod operations;
-mod rules;
 mod validity;
 mod visitor;
 
-use vortex_dtype::DType;
+use kernel::PARENT_KERNELS;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
-use vortex_vector::Vector;
+use vortex_session::VortexSession;
 
 use crate::ArrayRef;
 use crate::EmptyMetadata;
-use crate::VectorExecutor;
+use crate::ExecutionCtx;
 use crate::arrays::extension::ExtensionArray;
-use crate::arrays::extension::vtable::rules::PARENT_RULES;
+use crate::arrays::extension::compute::rules::PARENT_RULES;
 use crate::buffer::BufferHandle;
-use crate::executor::ExecutionCtx;
+use crate::dtype::DType;
 use crate::serde::ArrayChildren;
 use crate::vtable;
 use crate::vtable::ArrayId;
-use crate::vtable::ArrayVTable;
-use crate::vtable::ArrayVTableExt;
-use crate::vtable::NotSupported;
 use crate::vtable::VTable;
 use crate::vtable::ValidityVTableFromChild;
 
@@ -39,19 +36,12 @@ impl VTable for ExtensionVTable {
     type Metadata = EmptyMetadata;
 
     type ArrayVTable = Self;
-    type CanonicalVTable = Self;
     type OperationsVTable = Self;
     type ValidityVTable = ValidityVTableFromChild;
     type VisitorVTable = Self;
-    type ComputeVTable = NotSupported;
-    type EncodeVTable = NotSupported;
 
-    fn id(&self) -> ArrayId {
-        ArrayId::new_ref("vortex.ext")
-    }
-
-    fn encoding(_array: &Self::Array) -> ArrayVTable {
-        ExtensionVTable.as_vtable()
+    fn id(_array: &Self::Array) -> ArrayId {
+        Self::ID
     }
 
     fn metadata(_array: &ExtensionArray) -> VortexResult<Self::Metadata> {
@@ -62,12 +52,17 @@ impl VTable for ExtensionVTable {
         Ok(Some(vec![]))
     }
 
-    fn deserialize(_buffer: &[u8]) -> VortexResult<Self::Metadata> {
+    fn deserialize(
+        _bytes: &[u8],
+        _dtype: &DType,
+        _len: usize,
+        _buffers: &[BufferHandle],
+        _session: &VortexSession,
+    ) -> VortexResult<Self::Metadata> {
         Ok(EmptyMetadata)
     }
 
     fn build(
-        &self,
         dtype: &DType,
         len: usize,
         _metadata: &Self::Metadata,
@@ -97,8 +92,8 @@ impl VTable for ExtensionVTable {
         Ok(())
     }
 
-    fn execute(array: &Self::Array, ctx: &mut ExecutionCtx) -> VortexResult<Vector> {
-        array.storage().execute(ctx)
+    fn execute(array: &Self::Array, _ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
+        Ok(array.to_array())
     }
 
     fn reduce_parent(
@@ -108,7 +103,20 @@ impl VTable for ExtensionVTable {
     ) -> VortexResult<Option<ArrayRef>> {
         PARENT_RULES.evaluate(array, parent, child_idx)
     }
+
+    fn execute_parent(
+        array: &Self::Array,
+        parent: &ArrayRef,
+        child_idx: usize,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<ArrayRef>> {
+        PARENT_KERNELS.execute(array, parent, child_idx, ctx)
+    }
 }
 
 #[derive(Debug)]
 pub struct ExtensionVTable;
+
+impl ExtensionVTable {
+    pub const ID: ArrayId = ArrayId::new_ref("vortex.ext");
+}

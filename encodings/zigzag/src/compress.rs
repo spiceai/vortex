@@ -2,11 +2,11 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use vortex_array::arrays::PrimitiveArray;
+use vortex_array::dtype::NativePType;
+use vortex_array::dtype::PType;
 use vortex_array::validity::Validity;
 use vortex_array::vtable::ValidityHelper;
 use vortex_buffer::BufferMut;
-use vortex_dtype::NativePType;
-use vortex_dtype::PType;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_panic;
@@ -72,6 +72,7 @@ where
 #[cfg(test)]
 mod test {
     use vortex_array::ToCanonical;
+    use vortex_array::assert_arrays_eq;
 
     use super::*;
     use crate::ZigZagVTable;
@@ -80,36 +81,36 @@ mod test {
     fn test_compress_i8() {
         let compressed = zigzag_encode(PrimitiveArray::from_iter(-100_i8..100)).unwrap();
         assert!(compressed.is::<ZigZagVTable>());
-        assert_eq!(
-            compressed.to_primitive().as_slice::<i8>(),
-            (-100_i8..100).collect::<Vec<_>>()
+        assert_arrays_eq!(
+            compressed.to_primitive(),
+            PrimitiveArray::from_iter(-100_i8..100)
         );
     }
     #[test]
     fn test_compress_i16() {
         let compressed = zigzag_encode(PrimitiveArray::from_iter(-100_i16..100)).unwrap();
         assert!(compressed.is::<ZigZagVTable>());
-        assert_eq!(
-            compressed.to_primitive().as_slice::<i16>(),
-            (-100_i16..100).collect::<Vec<_>>()
+        assert_arrays_eq!(
+            compressed.to_primitive(),
+            PrimitiveArray::from_iter(-100_i16..100)
         );
     }
     #[test]
     fn test_compress_i32() {
         let compressed = zigzag_encode(PrimitiveArray::from_iter(-100_i32..100)).unwrap();
         assert!(compressed.is::<ZigZagVTable>());
-        assert_eq!(
-            compressed.to_primitive().as_slice::<i32>(),
-            (-100_i32..100).collect::<Vec<_>>()
+        assert_arrays_eq!(
+            compressed.to_primitive(),
+            PrimitiveArray::from_iter(-100_i32..100)
         );
     }
     #[test]
     fn test_compress_i64() {
         let compressed = zigzag_encode(PrimitiveArray::from_iter(-100_i64..100)).unwrap();
         assert!(compressed.is::<ZigZagVTable>());
-        assert_eq!(
-            compressed.to_primitive().as_slice::<i64>(),
-            (-100_i64..100).collect::<Vec<_>>()
+        assert_arrays_eq!(
+            compressed.to_primitive(),
+            PrimitiveArray::from_iter(-100_i64..100)
         );
     }
 }

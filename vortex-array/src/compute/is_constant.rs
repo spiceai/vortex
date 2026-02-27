@@ -5,13 +5,10 @@ use std::any::Any;
 use std::sync::LazyLock;
 
 use arcref::ArcRef;
-use vortex_dtype::DType;
-use vortex_dtype::Nullability;
 use vortex_error::VortexError;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
-use vortex_scalar::Scalar;
 
 use crate::Array;
 use crate::arrays::ConstantVTable;
@@ -22,10 +19,13 @@ use crate::compute::InvocationArgs;
 use crate::compute::Kernel;
 use crate::compute::Options;
 use crate::compute::Output;
+use crate::dtype::DType;
+use crate::dtype::Nullability;
 use crate::expr::stats::Precision;
 use crate::expr::stats::Stat;
 use crate::expr::stats::StatsProvider;
 use crate::expr::stats::StatsProviderExt;
+use crate::scalar::Scalar;
 use crate::vtable::VTable;
 
 static IS_CONSTANT_FN: LazyLock<ComputeFn> = LazyLock::new(|| {
@@ -85,7 +85,8 @@ impl ComputeFnVTable for IsConstant {
 
         // We try and rely on some easy-to-get stats
         if let Some(Precision::Exact(value)) = array.statistics().get_as::<bool>(Stat::IsConstant) {
-            return Ok(Scalar::from(Some(value)).into());
+            let scalar: Scalar = Some(value).into();
+            return Ok(scalar.into());
         }
 
         let value = is_constant_impl(array, options, kernels)?;
@@ -105,7 +106,8 @@ impl ComputeFnVTable for IsConstant {
                 .set(Stat::IsConstant, Precision::Exact(value.into()));
         }
 
-        Ok(Scalar::from(value).into())
+        let scalar: Scalar = value.into();
+        Ok(scalar.into())
     }
 
     fn return_dtype(&self, _args: &InvocationArgs) -> VortexResult<DType> {
@@ -141,12 +143,12 @@ fn is_constant_impl(
         return Ok(Some(true));
     }
 
-    let all_invalid = array.all_invalid();
+    let all_invalid = array.all_invalid()?;
     if all_invalid {
         return Ok(Some(true));
     }
 
-    let all_valid = array.all_valid();
+    let all_valid = array.all_valid()?;
 
     // If we have some nulls, array can't be constant
     if !all_valid && !all_invalid {
@@ -181,9 +183,6 @@ fn is_constant_impl(
             return Ok(output.unwrap_scalar()?.as_bool().value());
         }
     }
-    if let Some(output) = array.invoke(&IS_CONSTANT_FN, &args)? {
-        return Ok(output.unwrap_scalar()?.as_bool().value());
-    }
 
     tracing::debug!(
         "No is_constant implementation found for {}",
@@ -191,7 +190,7 @@ fn is_constant_impl(
     );
 
     if options.cost == Cost::Canonicalize && !array.is_canonical() {
-        let array = array.to_canonical();
+        let array = array.to_canonical()?;
         let is_constant = is_constant_opts(array.as_ref(), options)?;
         return Ok(is_constant);
     }
@@ -230,7 +229,8 @@ impl<V: VTable + IsConstantKernel> Kernel for IsConstantKernelAdapter<V> {
             return Ok(None);
         };
         let is_constant = V::is_constant(&self.0, array, args.options)?;
-        Ok(Some(Scalar::from(is_constant).into()))
+        let scalar: Scalar = is_constant.into();
+        Ok(Some(scalar.into()))
     }
 }
 
@@ -307,6 +307,7 @@ mod tests {
 
     use crate::IntoArray as _;
     use crate::arrays::PrimitiveArray;
+    use crate::compute::is_constant;
     use crate::expr::stats::Stat;
 
     #[test]
@@ -315,16 +316,16 @@ mod tests {
         arr.statistics()
             .compute_all(&[Stat::Min, Stat::Max])
             .unwrap();
-        assert!(!arr.is_constant());
+        assert!(!is_constant(&arr).unwrap().unwrap_or_default());
 
         let arr = buffer![0, 0].into_array();
         arr.statistics()
             .compute_all(&[Stat::Min, Stat::Max])
             .unwrap();
-        assert!(arr.is_constant());
+        assert!(is_constant(&arr).unwrap().unwrap_or_default());
 
         let arr = PrimitiveArray::from_option_iter([Some(0), Some(0)]);
-        assert!(arr.is_constant());
+        assert!(is_constant(arr.as_ref()).unwrap().unwrap_or_default());
     }
 
     #[test]
@@ -333,13 +334,13 @@ mod tests {
         arr.statistics()
             .compute_all(&[Stat::Min, Stat::Max])
             .unwrap();
-        assert!(!arr.is_constant());
+        assert!(!is_constant(arr.as_ref()).unwrap().unwrap_or_default());
 
         let arr =
             PrimitiveArray::from_option_iter([Some(f32::NEG_INFINITY), Some(f32::NEG_INFINITY)]);
         arr.statistics()
             .compute_all(&[Stat::Min, Stat::Max])
             .unwrap();
-        assert!(arr.is_constant());
+        assert!(is_constant(arr.as_ref()).unwrap().unwrap_or_default());
     }
 }

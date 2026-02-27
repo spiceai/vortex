@@ -6,20 +6,21 @@ use vortex_buffer::BitBufferMut;
 use vortex_buffer::Buffer;
 use vortex_buffer::BufferMut;
 use vortex_buffer::ByteBuffer;
-use vortex_dtype::BigCast;
-use vortex_dtype::DType;
-use vortex_dtype::DecimalDType;
-use vortex_dtype::DecimalType;
-use vortex_dtype::IntegerPType;
-use vortex_dtype::NativeDecimalType;
-use vortex_dtype::match_each_decimal_value_type;
-use vortex_dtype::match_each_integer_ptype;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_panic;
 
 use crate::ToCanonical;
+use crate::buffer::BufferHandle;
+use crate::dtype::BigCast;
+use crate::dtype::DType;
+use crate::dtype::DecimalDType;
+use crate::dtype::DecimalType;
+use crate::dtype::IntegerPType;
+use crate::dtype::NativeDecimalType;
+use crate::match_each_decimal_value_type;
+use crate::match_each_integer_ptype;
 use crate::patches::Patches;
 use crate::stats::ArrayStats;
 use crate::validity::Validity;
@@ -69,7 +70,7 @@ use crate::vtable::ValidityHelper;
 ///
 /// ```
 /// use vortex_array::arrays::DecimalArray;
-/// use vortex_dtype::DecimalDType;
+/// use vortex_array::dtype::DecimalDType;
 /// use vortex_buffer::{buffer, Buffer};
 /// use vortex_array::validity::Validity;
 ///
@@ -85,14 +86,21 @@ use crate::vtable::ValidityHelper;
 #[derive(Clone, Debug)]
 pub struct DecimalArray {
     pub(super) dtype: DType,
-    pub(super) values: ByteBuffer,
+    pub(super) values: BufferHandle,
     pub(super) values_type: DecimalType,
     pub(super) validity: Validity,
     pub(super) stats_set: ArrayStats,
 }
 
+pub struct DecimalArrayParts {
+    pub decimal_dtype: DecimalDType,
+    pub values: BufferHandle,
+    pub values_type: DecimalType,
+    pub validity: Validity,
+}
+
 impl DecimalArray {
-    /// Creates a new [`DecimalArray`].
+    /// Creates a new [`DecimalArray`] using a host-native buffer.
     ///
     /// # Panics
     ///
@@ -104,6 +112,23 @@ impl DecimalArray {
         validity: Validity,
     ) -> Self {
         Self::try_new(buffer, decimal_dtype, validity)
+            .vortex_expect("DecimalArray construction failed")
+    }
+
+    /// Creates a new [`DecimalArray`] from a [`BufferHandle`] of values that may live in
+    /// host or device memory.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the provided components do not satisfy the invariants documented in
+    /// [`DecimalArray::new_unchecked`].
+    pub fn new_handle(
+        values: BufferHandle,
+        values_type: DecimalType,
+        decimal_dtype: DecimalDType,
+        validity: Validity,
+    ) -> Self {
+        Self::try_new_handle(values, values_type, decimal_dtype, validity)
             .vortex_expect("DecimalArray construction failed")
     }
 
@@ -120,10 +145,29 @@ impl DecimalArray {
         decimal_dtype: DecimalDType,
         validity: Validity,
     ) -> VortexResult<Self> {
-        Self::validate(&buffer, &validity)?;
+        let values = BufferHandle::new_host(buffer.into_byte_buffer());
+        let values_type = T::DECIMAL_TYPE;
+
+        Self::try_new_handle(values, values_type, decimal_dtype, validity)
+    }
+
+    /// Constructs a new `DecimalArray` with validation from a [`BufferHandle`].
+    ///
+    /// This pathway allows building new decimal arrays that may come from host or device memory.
+    ///
+    /// # Errors
+    ///
+    /// See [`DecimalArray::new_unchecked`] for invariants that are checked.
+    pub fn try_new_handle(
+        values: BufferHandle,
+        values_type: DecimalType,
+        decimal_dtype: DecimalDType,
+        validity: Validity,
+    ) -> VortexResult<Self> {
+        Self::validate(&values, values_type, &validity)?;
 
         // SAFETY: validate ensures all invariants are met.
-        Ok(unsafe { Self::new_unchecked(buffer, decimal_dtype, validity) })
+        Ok(unsafe { Self::new_unchecked_handle(values, values_type, decimal_dtype, validity) })
     }
 
     /// Creates a new [`DecimalArray`] without validation from these components:
@@ -144,41 +188,108 @@ impl DecimalArray {
         decimal_dtype: DecimalDType,
         validity: Validity,
     ) -> Self {
+        // SAFETY: new_unchecked_handle inherits the safety guarantees of new_unchecked
+        unsafe {
+            Self::new_unchecked_handle(
+                BufferHandle::new_host(buffer.into_byte_buffer()),
+                T::DECIMAL_TYPE,
+                decimal_dtype,
+                validity,
+            )
+        }
+    }
+
+    /// Create a new array with decimal values backed by the given buffer handle.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure all of the following invariants are satisfied:
+    ///
+    /// - All non-null values in `values` must be representable within the specified precision.
+    /// - For example, with precision=5 and scale=2, all values must be in range [-999.99, 999.99].
+    /// - If `validity` is [`Validity::Array`], its length must exactly equal `buffer.len()`.
+    pub unsafe fn new_unchecked_handle(
+        values: BufferHandle,
+        values_type: DecimalType,
+        decimal_dtype: DecimalDType,
+        validity: Validity,
+    ) -> Self {
         #[cfg(debug_assertions)]
-        Self::validate(&buffer, &validity)
-            .vortex_expect("[Debug Assertion]: Invalid `DecimalArray` parameters");
+        {
+            Self::validate(&values, values_type, &validity)
+                .vortex_expect("[Debug Assertion]: Invalid `DecimalArray` parameters");
+        }
 
         Self {
-            values: buffer.into_byte_buffer(),
-            values_type: T::DECIMAL_TYPE,
+            values,
+            values_type,
             dtype: DType::Decimal(decimal_dtype, validity.nullability()),
             validity,
             stats_set: Default::default(),
         }
     }
 
-    /// Validates the components that would be used to create a [`DecimalArray`].
+    /// Validates the components that would be used to create a [`DecimalArray`] from a byte buffer.
     ///
     /// This function checks all the invariants required by [`DecimalArray::new_unchecked`].
-    pub fn validate<T: NativeDecimalType>(
-        buffer: &Buffer<T>,
+    fn validate(
+        buffer: &BufferHandle,
+        values_type: DecimalType,
         validity: &Validity,
     ) -> VortexResult<()> {
-        if let Some(len) = validity.maybe_len() {
+        if let Some(validity_len) = validity.maybe_len() {
+            let expected_len = values_type.byte_width() * validity_len;
             vortex_ensure!(
-                buffer.len() == len,
-                "Buffer and validity length mismatch: buffer={}, validity={}",
+                buffer.len() == expected_len,
+                InvalidArgument: "expected buffer of size {} bytes, was {} bytes",
+                expected_len,
                 buffer.len(),
-                len,
             );
         }
 
         Ok(())
     }
 
+    /// Creates a new [`DecimalArray`] from a raw byte buffer without validation.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure:
+    /// - The `byte_buffer` contains valid data for the specified `values_type`
+    /// - The buffer length is compatible with the `values_type` (i.e., divisible by the type size)
+    /// - All non-null values are representable within the specified precision
+    /// - If `validity` is [`Validity::Array`], its length must equal the number of elements
+    pub unsafe fn new_unchecked_from_byte_buffer(
+        byte_buffer: ByteBuffer,
+        values_type: DecimalType,
+        decimal_dtype: DecimalDType,
+        validity: Validity,
+    ) -> Self {
+        // SAFETY: inherits the same safety contract as `new_unchecked_from_byte_buffer`
+        unsafe {
+            Self::new_unchecked_handle(
+                BufferHandle::new_host(byte_buffer),
+                values_type,
+                decimal_dtype,
+                validity,
+            )
+        }
+    }
+
+    pub fn into_parts(self) -> DecimalArrayParts {
+        let decimal_dtype = self.dtype.into_decimal_opt().vortex_expect("cannot fail");
+
+        DecimalArrayParts {
+            decimal_dtype,
+            values: self.values,
+            values_type: self.values_type,
+            validity: self.validity,
+        }
+    }
+
     /// Returns the underlying [`ByteBuffer`] of the array.
-    pub fn byte_buffer(&self) -> ByteBuffer {
-        self.values.clone()
+    pub fn buffer_handle(&self) -> &BufferHandle {
+        &self.values
     }
 
     pub fn buffer<T: NativeDecimalType>(&self) -> Buffer<T> {
@@ -189,7 +300,7 @@ impl DecimalArray {
                 self.values_type,
             );
         }
-        Buffer::<T>::from_byte_buffer(self.values.clone())
+        Buffer::<T>::from_byte_buffer(self.values.as_host().clone())
     }
 
     /// Returns the decimal type information
@@ -201,6 +312,7 @@ impl DecimalArray {
         }
     }
 
+    /// Return the `DecimalType` used to represent the values in the array.
     pub fn values_type(&self) -> DecimalType {
         self.values_type
     }
@@ -257,7 +369,7 @@ impl DecimalArray {
         clippy::cognitive_complexity,
         reason = "complexity from nested match_each_* macros"
     )]
-    pub fn patch(self, patches: &Patches) -> Self {
+    pub fn patch(self, patches: &Patches) -> VortexResult<Self> {
         let offset = patches.offset();
         let patch_indices = patches.indices().to_primitive();
         let patch_values = patches.values().to_decimal();
@@ -267,10 +379,10 @@ impl DecimalArray {
             offset,
             patch_indices.as_ref(),
             patch_values.validity(),
-        );
+        )?;
         assert_eq!(self.decimal_dtype(), patch_values.decimal_dtype());
 
-        match_each_integer_ptype!(patch_indices.ptype(), |I| {
+        Ok(match_each_integer_ptype!(patch_indices.ptype(), |I| {
             let patch_indices = patch_indices.as_slice::<I>();
             match_each_decimal_value_type!(patch_values.values_type(), |PatchDVT| {
                 let patch_values = patch_values.buffer::<PatchDVT>();
@@ -286,7 +398,7 @@ impl DecimalArray {
                     )
                 })
             })
-        })
+        }))
     }
 }
 

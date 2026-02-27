@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use std::iter::once;
 use std::ops::Range;
 
-use vortex_dtype::FieldMask;
+use vortex_array::dtype::FieldMask;
 use vortex_error::VortexResult;
 use vortex_layout::LayoutReader;
 
@@ -56,8 +56,8 @@ mod test {
 
     use vortex_array::ArrayContext;
     use vortex_array::IntoArray;
+    use vortex_array::dtype::FieldPath;
     use vortex_buffer::buffer;
-    use vortex_dtype::FieldPath;
     use vortex_io::runtime::single::block_on;
     use vortex_layout::LayoutReaderRef;
     use vortex_layout::LayoutStrategy;
@@ -67,7 +67,7 @@ mod test {
     use vortex_layout::sequence::SequentialArrayStreamExt;
 
     use super::*;
-    use crate::test::SESSION;
+    use crate::test::SCAN_SESSION;
 
     fn reader() -> LayoutReaderRef {
         let ctx = ArrayContext::empty();
@@ -89,7 +89,9 @@ mod test {
         })
         .unwrap();
 
-        layout.new_reader("".into(), segments, &SESSION).unwrap()
+        layout
+            .new_reader("".into(), segments, &SCAN_SESSION)
+            .unwrap()
     }
 
     #[test]

@@ -3,11 +3,11 @@
 
 use vortex::mask::Mask;
 
-use crate::Value;
-use crate::duckdb::Vector;
+use crate::duckdb::Value;
+use crate::duckdb::VectorRef;
 use crate::exporter::copy_from_slice;
 
-impl Vector {
+impl VectorRef {
     pub(super) unsafe fn set_validity(&mut self, mask: &Mask, offset: usize, len: usize) -> bool {
         match mask {
             Mask::AllTrue(_) => {
@@ -22,7 +22,7 @@ impl Vector {
                 true
             }
             Mask::Values(arr) => {
-                let true_count = arr.bit_buffer().true_count();
+                let true_count = arr.bit_buffer().slice(offset..(offset + len)).true_count();
                 if true_count == len {
                     unsafe { self.set_all_true_validity(len) }
                 } else if true_count == 0 {

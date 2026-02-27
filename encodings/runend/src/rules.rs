@@ -7,16 +7,24 @@ use vortex_array::arrays::AnyScalarFn;
 use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::ConstantVTable;
 use vortex_array::arrays::ScalarFnArray;
+use vortex_array::dtype::DType;
 use vortex_array::optimizer::rules::ArrayParentReduceRule;
 use vortex_array::optimizer::rules::ParentRuleSet;
-use vortex_dtype::DType;
+use vortex_array::scalar_fn::fns::cast::CastReduceAdaptor;
+use vortex_array::scalar_fn::fns::fill_null::FillNullReduceAdaptor;
 use vortex_error::VortexResult;
 
 use crate::RunEndArray;
 use crate::RunEndVTable;
 
-pub(super) const RULES: ParentRuleSet<RunEndVTable> =
-    ParentRuleSet::new(&[ParentRuleSet::lift(&RunEndScalarFnRule)]);
+pub(super) const RULES: ParentRuleSet<RunEndVTable> = ParentRuleSet::new(&[
+    // CastReduceAdaptor must come before RunEndScalarFnRule so that cast operations are executed
+    // eagerly (surfacing out-of-range errors immediately) rather than being pushed lazily into
+    // the values array by the generic scalar function push-down rule.
+    ParentRuleSet::lift(&CastReduceAdaptor(RunEndVTable)),
+    ParentRuleSet::lift(&RunEndScalarFnRule),
+    ParentRuleSet::lift(&FillNullReduceAdaptor(RunEndVTable)),
+]);
 
 /// A rule to push down scalar functions through run-end encoding into the values array.
 ///
@@ -26,10 +34,6 @@ pub(crate) struct RunEndScalarFnRule;
 
 impl ArrayParentReduceRule<RunEndVTable> for RunEndScalarFnRule {
     type Parent = AnyScalarFn;
-
-    fn parent(&self) -> AnyScalarFn {
-        AnyScalarFn
-    }
 
     fn reduce_parent(
         &self,

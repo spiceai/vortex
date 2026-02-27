@@ -15,18 +15,14 @@ use vortex_array::Array;
 use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
 use vortex_array::MaskFuture;
-use vortex_array::VectorExecutor;
+use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::DictArray;
-use vortex_array::compute::MinMaxResult;
-use vortex_array::compute::min_max;
-use vortex_array::compute::take;
+use vortex_array::arrays::SharedArray;
+use vortex_array::dtype::DType;
+use vortex_array::dtype::FieldMask;
 use vortex_array::expr::Expression;
 use vortex_array::expr::root;
-use vortex_array::mask::MaskExecutor;
 use vortex_array::optimizer::ArrayOptimizer;
-use vortex_array::vectors::VectorIntoArray;
-use vortex_dtype::DType;
-use vortex_dtype::FieldMask;
 use vortex_error::VortexError;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
@@ -38,12 +34,10 @@ use super::DictLayout;
 use crate::LayoutReader;
 use crate::LayoutReaderRef;
 use crate::layouts::SharedArrayFuture;
-use crate::layouts::USE_VORTEX_OPERATORS;
 use crate::segments::SegmentSource;
 
 pub struct DictReader {
     layout: DictLayout,
-    #[allow(dead_code)] // Typically used for logging
     name: Arc<str>,
     session: VortexSession,
 
@@ -92,7 +86,6 @@ impl DictReader {
         // We capture the name, so it may be wrong if we re-use the same reader within multiple
         // different parent readers. But that's rare...
         let values_len = self.values_len;
-        let session = self.session.clone();
         self.values_array
             .get_or_init(move || {
                 self.values
@@ -104,13 +97,8 @@ impl DictReader {
                     .vortex_expect("must construct dict values array evaluation")
                     .map_err(Arc::new)
                     .map(move |array| {
-                        if *USE_VORTEX_OPERATORS {
-                            // We execute the array to avoid re-evaluating for every split.
-                            let array = array?;
-                            Ok(array.execute_vector(&session)?.into_array(array.dtype()))
-                        } else {
-                            Ok(array?.to_canonical().into_array())
-                        }
+                        let array = array?;
+                        Ok(SharedArray::new(array).into_array())
                     })
                     .boxed()
                     .shared()
@@ -123,19 +111,19 @@ impl DictReader {
         // after applying the filter, so if the expression is fallible this might fail when it
         // shouldn't.
         // TODO(joe): fixme
-        let session = self.session.clone();
+
+        // Check cache first with read-only lock
+        if let Some(fut) = self.values_evals.get(&expr) {
+            return fut.clone();
+        }
+
         self.values_evals
             .entry(expr.clone())
             .or_insert_with(|| {
                 self.values_array()
                     .map(move |array| {
-                        if *USE_VORTEX_OPERATORS {
-                            let array = array?.apply(&expr)?;
-                            // We execute the array to avoid re-evaluating for every split.
-                            Ok(array.execute_vector(&session)?.into_array(array.dtype()))
-                        } else {
-                            expr.evaluate(&array?).map_err(Arc::new)
-                        }
+                        let array = array?.apply(&expr)?;
+                        Ok(SharedArray::new(array).into_array())
                     })
                     .boxed()
                     .shared()
@@ -204,34 +192,8 @@ impl LayoutReader for DictReader {
             let (codes, values) = try_join!(codes_eval, values_eval.map_err(VortexError::from))?;
             let mask = mask.await?;
 
-            let dict_mask = if *USE_VORTEX_OPERATORS {
-                values.take(codes)?.execute_mask(&session)?
-            } else {
-                // Short-circuit when the values are all true/false.
-                if values.all_valid()
-                    && let Some(MinMaxResult { min, max }) = min_max(&values)?
-                {
-                    #[expect(clippy::bool_comparison, reason = "easy to follow")]
-                    if max.as_bool().value().vortex_expect("non null") == false {
-                        // All values are false
-                        return Ok(Mask::AllFalse(mask.len()));
-                    }
-                    #[expect(clippy::bool_comparison, reason = "easy to follow")]
-                    if min.as_bool().value().vortex_expect("not null") == true {
-                        // All values are true, but we still need to respect codes validity
-                        return Ok(mask.bitand(&codes.validity_mask()));
-                    }
-                }
-
-                // Creating a mask from the dict array would canonicalize it,
-                // it should be fine for now as long as values is already canonical,
-                // so different row ranges do not canonicalize to the same array
-                // multiple times.
-                // TODO(joe): fixme casting null to false is *VERY* unsound, if the expression in the filter
-                // can inspect nulls (e.g. `is_null`).
-                // See `FlatEvaluation` for more details.
-                take(&values, &codes)?.try_to_mask_fill_null_false()?
-            };
+            let mut ctx = session.create_execution_ctx();
+            let dict_mask = values.take(codes)?.execute::<Mask>(&mut ctx)?;
 
             Ok(mask.bitand(&dict_mask))
         }))
@@ -256,7 +218,7 @@ impl LayoutReader for DictReader {
             let (values, codes) = try_join!(values_eval.map_err(VortexError::from), codes_eval)?;
 
             // SAFETY: Layout was validated at write time.
-            //  * The codes dtype is guaranteed to be an unsigned integer type from the layout
+            //  * The codes dtype is guaranteed to be an integer type from the layout
             //  * The codes child reader ensures the correct dtype.
             //  * The layout stores `all_values_referenced` and if this is malicious then it must
             //    only affect correctness not memory safety.
@@ -267,11 +229,7 @@ impl LayoutReader for DictReader {
             .to_array()
             .optimize()?;
 
-            if *USE_VORTEX_OPERATORS {
-                array.apply(&expr)
-            } else {
-                expr.evaluate(&array)
-            }
+            array.apply(&expr)
         }
         .boxed())
     }
@@ -285,9 +243,14 @@ mod tests {
     use vortex_array::ArrayContext;
     use vortex_array::IntoArray as _;
     use vortex_array::MaskFuture;
+    use vortex_array::arrays::BoolArray;
     use vortex_array::arrays::StructArray;
     use vortex_array::arrays::VarBinArray;
     use vortex_array::assert_arrays_eq;
+    use vortex_array::dtype::DType;
+    use vortex_array::dtype::FieldName;
+    use vortex_array::dtype::FieldNames;
+    use vortex_array::dtype::Nullability;
     use vortex_array::expr::eq;
     use vortex_array::expr::is_null;
     use vortex_array::expr::lit;
@@ -295,10 +258,7 @@ mod tests {
     use vortex_array::expr::pack;
     use vortex_array::expr::root;
     use vortex_array::validity::Validity;
-    use vortex_dtype::DType;
-    use vortex_dtype::FieldName;
-    use vortex_dtype::FieldNames;
-    use vortex_dtype::Nullability;
+    use vortex_error::VortexExpect;
     use vortex_io::runtime::single::block_on;
 
     use crate::LayoutId;
@@ -443,7 +403,7 @@ mod tests {
 
             let filter = eq(
                 root(),
-                lit(vortex_scalar::Scalar::utf8(
+                lit(vortex_array::scalar::Scalar::utf8(
                     filter_value,
                     Nullability::Nullable,
                 )),
@@ -456,7 +416,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert_eq!(mask.to_bit_buffer().iter().collect::<Vec<_>>(), expected);
+            assert_arrays_eq!(mask.into_array(), BoolArray::from_iter(expected));
         })
     }
 
@@ -506,7 +466,7 @@ mod tests {
                 .unwrap();
 
             let expression = not(is_null(root())); // easier to test not_is_null b/c that's the validity array
-            assert!(layout.encoding_id() == LayoutId::new_ref("vortex.dict"));
+            assert_eq!(layout.encoding_id(), LayoutId::new_ref("vortex.dict"));
             let actual = layout
                 .new_reader("".into(), segments, &SESSION)
                 .unwrap()
@@ -518,8 +478,14 @@ mod tests {
                 .unwrap()
                 .await
                 .unwrap();
-            let expected = array.validity_mask().into_array();
-            assert_arrays_eq!(actual.to_canonical().into_array(), expected);
+            let expected = array.validity_mask().unwrap().into_array();
+            assert_arrays_eq!(
+                actual
+                    .to_canonical()
+                    .vortex_expect("to_canonical failed")
+                    .into_array(),
+                expected
+            );
         })
     }
 }

@@ -4,13 +4,10 @@
 use std::sync::LazyLock;
 
 use arcref::ArcRef;
-use vortex_dtype::DType;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
-use vortex_scalar::Scalar;
-use vortex_scalar::ScalarValue;
 
 use crate::Array;
 use crate::compute::ComputeFn;
@@ -19,9 +16,12 @@ use crate::compute::InvocationArgs;
 use crate::compute::Kernel;
 use crate::compute::Output;
 use crate::compute::UnaryArgs;
+use crate::dtype::DType;
 use crate::expr::stats::Precision;
 use crate::expr::stats::Stat;
 use crate::expr::stats::StatsProviderExt;
+use crate::scalar::Scalar;
+use crate::scalar::ScalarValue;
 use crate::vtable::VTable;
 
 static NAN_COUNT_FN: LazyLock<ComputeFn> = LazyLock::new(|| {
@@ -115,7 +115,7 @@ impl<V: VTable + NaNCountKernel> Kernel for NaNCountKernelAdapter<V> {
 }
 
 fn nan_count_impl(array: &dyn Array, kernels: &[ArcRef<dyn Kernel>]) -> VortexResult<usize> {
-    if array.is_empty() || array.valid_count() == 0 {
+    if array.is_empty() || array.valid_count()? == 0 {
         return Ok(0);
     }
 
@@ -142,16 +142,9 @@ fn nan_count_impl(array: &dyn Array, kernels: &[ArcRef<dyn Kernel>]) -> VortexRe
                 .ok_or_else(|| vortex_err!("NaN count should not return null"));
         }
     }
-    if let Some(output) = array.invoke(&NAN_COUNT_FN, &args)? {
-        return output
-            .unwrap_scalar()?
-            .as_primitive()
-            .as_::<usize>()
-            .ok_or_else(|| vortex_err!("NaN count should not return null"));
-    }
 
     if !array.is_canonical() {
-        let canonical = array.to_canonical();
+        let canonical = array.to_canonical()?;
         return nan_count(canonical.as_ref());
     }
 

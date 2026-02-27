@@ -3,28 +3,30 @@
 
 use prost::Message;
 use vortex_array::ArrayRef;
+use vortex_array::ExecutionCtx;
+use vortex_array::IntoArray;
 use vortex_array::ProstMetadata;
 use vortex_array::buffer::BufferHandle;
+use vortex_array::dtype::DType;
+use vortex_array::dtype::Nullability;
+use vortex_array::dtype::PType;
 use vortex_array::serde::ArrayChildren;
 use vortex_array::vtable;
 use vortex_array::vtable::ArrayId;
-use vortex_array::vtable::ArrayVTable;
-use vortex_array::vtable::ArrayVTableExt;
-use vortex_array::vtable::NotSupported;
 use vortex_array::vtable::VTable;
 use vortex_array::vtable::ValidityVTableFromChildSliceHelper;
-use vortex_dtype::DType;
-use vortex_dtype::Nullability;
-use vortex_dtype::PType;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
+use vortex_session::VortexSession;
 
 use crate::RLEArray;
+use crate::rle::array::rle_decompress::rle_decompress;
+use crate::rle::kernel::PARENT_KERNELS;
+use crate::rle::vtable::rules::RULES;
 
 mod array;
-mod canonical;
-mod encode;
 mod operations;
+mod rules;
 mod validity;
 mod visitor;
 
@@ -52,19 +54,20 @@ impl VTable for RLEVTable {
     type Metadata = ProstMetadata<RLEMetadata>;
 
     type ArrayVTable = Self;
-    type CanonicalVTable = Self;
     type OperationsVTable = Self;
     type ValidityVTable = ValidityVTableFromChildSliceHelper;
     type VisitorVTable = Self;
-    type ComputeVTable = NotSupported;
-    type EncodeVTable = Self;
 
-    fn id(&self) -> ArrayId {
-        ArrayId::new_ref("fastlanes.rle")
+    fn id(_array: &Self::Array) -> ArrayId {
+        Self::ID
     }
 
-    fn encoding(_array: &Self::Array) -> ArrayVTable {
-        RLEVTable.as_vtable()
+    fn reduce_parent(
+        array: &Self::Array,
+        parent: &ArrayRef,
+        child_idx: usize,
+    ) -> VortexResult<Option<ArrayRef>> {
+        RULES.evaluate(array, parent, child_idx)
     }
 
     fn with_children(array: &mut Self::Array, children: Vec<ArrayRef>) -> VortexResult<()> {
@@ -101,12 +104,17 @@ impl VTable for RLEVTable {
         Ok(Some(metadata.0.encode_to_vec()))
     }
 
-    fn deserialize(buffer: &[u8]) -> VortexResult<Self::Metadata> {
-        Ok(ProstMetadata(RLEMetadata::decode(buffer)?))
+    fn deserialize(
+        bytes: &[u8],
+        _dtype: &DType,
+        _len: usize,
+        _buffers: &[BufferHandle],
+        _session: &VortexSession,
+    ) -> VortexResult<Self::Metadata> {
+        Ok(ProstMetadata(RLEMetadata::decode(bytes)?))
     }
 
     fn build(
-        &self,
         dtype: &DType,
         len: usize,
         metadata: &Self::Metadata,
@@ -143,10 +151,27 @@ impl VTable for RLEVTable {
             len,
         )
     }
+
+    fn execute_parent(
+        array: &Self::Array,
+        parent: &ArrayRef,
+        child_idx: usize,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<ArrayRef>> {
+        PARENT_KERNELS.execute(array, parent, child_idx, ctx)
+    }
+
+    fn execute(array: &Self::Array, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
+        Ok(rle_decompress(array, ctx)?.into_array())
+    }
 }
 
 #[derive(Debug)]
 pub struct RLEVTable;
+
+impl RLEVTable {
+    pub const ID: ArrayId = ArrayId::new_ref("fastlanes.rle");
+}
 
 #[cfg(test)]
 mod tests {

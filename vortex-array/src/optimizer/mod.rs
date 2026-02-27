@@ -39,20 +39,16 @@ fn try_optimize(array: &ArrayRef) -> VortexResult<Option<ArrayRef>> {
         }
         loop_counter += 1;
 
-        if let Some(new_array) = current_array.encoding().as_dyn().reduce(&current_array)? {
+        if let Some(new_array) = current_array.vtable().reduce(&current_array)? {
             current_array = new_array;
             any_optimizations = true;
             continue;
         }
 
         // Apply parent reduction rules to each child in the context of the current array.
+        // Its important to take all children here, as `current_array` can change inside the loop.
         for (idx, child) in current_array.children().iter().enumerate() {
-            if let Some(new_array) =
-                child
-                    .encoding()
-                    .as_dyn()
-                    .reduce_parent(child, &current_array, idx)?
-            {
+            if let Some(new_array) = child.vtable().reduce_parent(child, &current_array, idx)? {
                 // If the parent was replaced, then we attempt to reduce it again.
                 current_array = new_array;
                 any_optimizations = true;

@@ -1,62 +1,65 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-mod binary_numeric;
 mod cast;
 mod compare;
 mod fill_null;
 mod is_constant;
 mod is_sorted;
 mod like;
+mod mask;
 mod min_max;
+pub(crate) mod rules;
+mod slice;
 
 use vortex_error::VortexResult;
 use vortex_mask::Mask;
 
 use super::DictArray;
 use super::DictVTable;
+use super::TakeExecute;
 use crate::Array;
 use crate::ArrayRef;
+use crate::ExecutionCtx;
 use crate::IntoArray;
-use crate::compute::FilterKernel;
-use crate::compute::FilterKernelAdapter;
-use crate::compute::TakeKernel;
-use crate::compute::TakeKernelAdapter;
-use crate::compute::filter;
-use crate::compute::take;
-use crate::register_kernel;
+use crate::arrays::filter::FilterReduce;
 
-impl TakeKernel for DictVTable {
-    fn take(&self, array: &DictArray, indices: &dyn Array) -> VortexResult<ArrayRef> {
-        let codes = take(array.codes(), indices)?;
+impl TakeExecute for DictVTable {
+    fn take(
+        array: &DictArray,
+        indices: &dyn Array,
+        _ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<ArrayRef>> {
+        let codes = array
+            .codes()
+            .take(indices.to_array())?
+            .to_canonical()?
+            .into_array();
         // SAFETY: selecting codes doesn't change the invariants of DictArray
         // Preserve all_values_referenced since taking codes doesn't affect which values are referenced
-        Ok(unsafe { DictArray::new_unchecked(codes, array.values().clone()).into_array() })
+        Ok(Some(unsafe {
+            DictArray::new_unchecked(codes, array.values().clone()).into_array()
+        }))
     }
 }
 
-register_kernel!(TakeKernelAdapter(DictVTable).lift());
-
-impl FilterKernel for DictVTable {
-    fn filter(&self, array: &DictArray, mask: &Mask) -> VortexResult<ArrayRef> {
-        let codes = filter(array.codes(), mask)?;
+impl FilterReduce for DictVTable {
+    fn filter(array: &DictArray, mask: &Mask) -> VortexResult<Option<ArrayRef>> {
+        let codes = array.codes().filter(mask.clone())?;
 
         // SAFETY: filtering codes doesn't change invariants
         // Preserve all_values_referenced since filtering codes doesn't affect which values are referenced
-        unsafe { Ok(DictArray::new_unchecked(codes, array.values().clone()).into_array()) }
+        Ok(Some(unsafe {
+            DictArray::new_unchecked(codes, array.values().clone()).into_array()
+        }))
     }
 }
-
-register_kernel!(FilterKernelAdapter(DictVTable).lift());
 
 #[cfg(test)]
 mod test {
     #[allow(unused_imports)]
     use itertools::Itertools;
     use vortex_buffer::buffer;
-    use vortex_dtype::DType;
-    use vortex_dtype::Nullability;
-    use vortex_dtype::PType::I32;
 
     use crate::Array;
     use crate::ArrayRef;
@@ -69,13 +72,14 @@ mod test {
     use crate::arrays::VarBinViewArray;
     use crate::assert_arrays_eq;
     use crate::builders::dict::dict_encode;
-    use crate::compute::Operator;
-    use crate::compute::compare;
+    use crate::builtins::ArrayBuiltins;
     use crate::compute::conformance::filter::test_filter_conformance;
     use crate::compute::conformance::mask::test_mask_conformance;
     use crate::compute::conformance::take::test_take_conformance;
-    use crate::compute::take;
-
+    use crate::dtype::DType;
+    use crate::dtype::Nullability;
+    use crate::dtype::PType::I32;
+    use crate::scalar_fn::fns::operators::Operator;
     #[test]
     fn canonicalise_nullable_primitive() {
         let values: Vec<Option<i32>> = (0..65)
@@ -146,14 +150,16 @@ mod test {
             Some(5),
         ]);
         let dict = dict_encode(reference.as_ref()).unwrap();
-        dict.slice(1..4)
+        dict.slice(1..4).unwrap()
     }
 
     #[test]
     fn compare_sliced_dict() {
         use crate::arrays::BoolArray;
         let sliced = sliced_dict_array();
-        let compared = compare(&sliced, ConstantArray::new(42, 3).as_ref(), Operator::Eq).unwrap();
+        let compared = sliced
+            .binary(ConstantArray::new(42, 3).to_array(), Operator::Eq)
+            .unwrap();
 
         let expected = BoolArray::from_iter([Some(false), None, Some(true)]);
         assert_arrays_eq!(compared, expected.to_array());
@@ -220,12 +226,10 @@ mod test {
         let array = dict_encode(buffer![1, 2].into_array().as_ref()).unwrap();
 
         assert_eq!(
-            take(
-                array.as_ref(),
-                PrimitiveArray::from_option_iter([Option::<i32>::None]).as_ref()
-            )
-            .unwrap()
-            .dtype(),
+            array
+                .take(PrimitiveArray::from_option_iter([Option::<i32>::None]).to_array())
+                .unwrap()
+                .dtype(),
             &DType::Primitive(I32, Nullability::Nullable)
         );
     }
@@ -263,8 +267,6 @@ mod test {
 mod tests {
     use rstest::rstest;
     use vortex_buffer::buffer;
-    use vortex_dtype::DType;
-    use vortex_dtype::Nullability;
 
     use crate::IntoArray;
     use crate::arrays::PrimitiveArray;
@@ -272,6 +274,8 @@ mod tests {
     use crate::arrays::dict::DictArray;
     use crate::builders::dict::dict_encode;
     use crate::compute::conformance::consistency::test_array_consistency;
+    use crate::dtype::DType;
+    use crate::dtype::Nullability;
 
     #[rstest]
     // Primitive arrays

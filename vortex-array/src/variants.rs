@@ -3,19 +3,18 @@
 
 //! This module defines extension functionality specific to each Vortex DType.
 use std::cmp::Ordering;
-use std::sync::Arc;
 
-use vortex_dtype::DType;
-use vortex_dtype::ExtDType;
-use vortex_dtype::FieldNames;
-use vortex_dtype::PType;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_panic;
-use vortex_scalar::PValue;
 
 use crate::Array;
 use crate::compute::sum;
+use crate::dtype::DType;
+use crate::dtype::FieldNames;
+use crate::dtype::PType;
+use crate::dtype::extension::ExtDTypeRef;
+use crate::scalar::PValue;
 use crate::search_sorted::IndexOrd;
 
 impl dyn Array + '_ {
@@ -83,7 +82,7 @@ impl dyn Array + '_ {
     }
 }
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub struct NullTyped<'a>(&'a dyn Array);
 
 pub struct BoolTyped<'a>(&'a dyn Array);
@@ -109,23 +108,28 @@ impl PrimitiveTyped<'_> {
     }
 
     /// Return the primitive value at the given index.
-    pub fn value(&self, idx: usize) -> Option<PValue> {
-        self.0.is_valid(idx).then(|| self.value_unchecked(idx))
+    pub fn value(&self, idx: usize) -> VortexResult<Option<PValue>> {
+        self.0
+            .is_valid(idx)?
+            .then(|| self.value_unchecked(idx))
+            .transpose()
     }
 
     /// Return the primitive value at the given index, ignoring nullability.
-    pub fn value_unchecked(&self, idx: usize) -> PValue {
-        self.0
-            .scalar_at(idx)
+    pub fn value_unchecked(&self, idx: usize) -> VortexResult<PValue> {
+        Ok(self
+            .0
+            .scalar_at(idx)?
             .as_primitive()
             .pvalue()
-            .unwrap_or_else(|| PValue::zero(self.ptype()))
+            .unwrap_or_else(|| PValue::zero(&self.ptype())))
     }
 }
 
 impl IndexOrd<Option<PValue>> for PrimitiveTyped<'_> {
-    fn index_cmp(&self, idx: usize, elem: &Option<PValue>) -> Option<Ordering> {
-        self.value(idx).partial_cmp(elem)
+    fn index_cmp(&self, idx: usize, elem: &Option<PValue>) -> VortexResult<Option<Ordering>> {
+        let value = self.value(idx)?;
+        Ok(value.partial_cmp(elem))
     }
 
     fn index_len(&self) -> usize {
@@ -135,9 +139,10 @@ impl IndexOrd<Option<PValue>> for PrimitiveTyped<'_> {
 
 // TODO(ngates): add generics to the `value` function and implement this over T.
 impl IndexOrd<PValue> for PrimitiveTyped<'_> {
-    fn index_cmp(&self, idx: usize, elem: &PValue) -> Option<Ordering> {
-        assert!(self.0.all_valid());
-        self.value_unchecked(idx).partial_cmp(elem)
+    fn index_cmp(&self, idx: usize, elem: &PValue) -> VortexResult<Option<Ordering>> {
+        assert!(self.0.all_valid()?);
+        let value = self.value_unchecked(idx)?;
+        Ok(value.partial_cmp(elem))
     }
 
     fn index_len(&self) -> usize {
@@ -145,13 +150,13 @@ impl IndexOrd<PValue> for PrimitiveTyped<'_> {
     }
 }
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub struct Utf8Typed<'a>(&'a dyn Array);
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub struct BinaryTyped<'a>(&'a dyn Array);
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub struct DecimalTyped<'a>(&'a dyn Array);
 
 pub struct StructTyped<'a>(&'a dyn Array);
@@ -176,14 +181,14 @@ impl StructTyped<'_> {
     }
 }
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub struct ListTyped<'a>(&'a dyn Array);
 
 pub struct ExtensionTyped<'a>(&'a dyn Array);
 
 impl ExtensionTyped<'_> {
     /// Returns the extension logical [`DType`].
-    pub fn ext_dtype(&self) -> &Arc<ExtDType> {
+    pub fn ext_dtype(&self) -> &ExtDTypeRef {
         let DType::Extension(ext_dtype) = self.0.dtype() else {
             vortex_panic!("Expected ExtDType")
         };

@@ -5,25 +5,24 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use vortex::array::ToCanonical;
-use vortex::array::VectorExecutor;
+use vortex::array::Array;
+use vortex::array::ExecutionCtx;
 use vortex::array::arrays::ListArray;
+use vortex::array::arrays::ListArrayParts;
 use vortex::array::arrays::PrimitiveArray;
-use vortex::array::vtable::ValidityHelper;
+use vortex::array::match_each_integer_ptype;
 use vortex::dtype::IntegerPType;
-use vortex::dtype::PTypeDowncastExt;
-use vortex::dtype::match_each_integer_ptype;
 use vortex::error::VortexResult;
 use vortex::error::vortex_err;
 use vortex::mask::Mask;
-use vortex::session::VortexSession;
-use vortex_vector::primitive::PVector;
 
 use super::ConversionCache;
+use super::all_invalid;
 use super::new_array_exporter_with_flatten;
-use super::new_array_vector_exporter_with_flatten;
 use crate::cpp;
+use crate::duckdb::LogicalType;
 use crate::duckdb::Vector;
+use crate::duckdb::VectorRef;
 use crate::exporter::ColumnExporter;
 
 struct ListExporter<O> {
@@ -41,14 +40,27 @@ struct ListExporter<O> {
 }
 
 pub(crate) fn new_exporter(
-    array: &ListArray,
+    array: ListArray,
     cache: &ConversionCache,
+    ctx: &mut ExecutionCtx,
 ) -> VortexResult<Box<dyn ColumnExporter>> {
+    let array_len = array.len();
     // Cache an `elements` vector up front so that future exports can reference it.
-    let elements = array.elements();
+    let ListArrayParts {
+        elements,
+        offsets,
+        validity,
+        dtype,
+    } = array.into_parts();
     let num_elements = elements.len();
+    let validity = validity.to_array(array_len).execute::<Mask>(ctx)?;
 
-    let values_key = Arc::as_ptr(elements).addr();
+    if validity.all_false() {
+        let ltype = LogicalType::try_from(dtype)?;
+        return Ok(all_invalid::new_exporter(array_len, &ltype));
+    }
+
+    let values_key = Arc::as_ptr(&elements).addr();
     // Check if we have a cached vector and extract it if we do.
     let cached_elements = cache
         .values_cache
@@ -59,28 +71,29 @@ pub(crate) fn new_exporter(
         Some(elements) => elements,
         None => {
             // We have no cached the vector yet, so create a new DuckDB vector for the elements.
-            let mut duckdb_elements =
-                Vector::with_capacity(elements.dtype().try_into()?, elements.len());
-            let elements_exporter = new_array_exporter_with_flatten(array.elements(), cache, true)?;
+            let elements_type: LogicalType = elements.dtype().try_into()?;
+            let mut duckdb_elements = Vector::with_capacity(&elements_type, num_elements);
+            let elements_exporter =
+                new_array_exporter_with_flatten(elements.clone(), cache, ctx, true)?;
 
-            if !elements.is_empty() {
-                elements_exporter.export(0, elements.len(), &mut duckdb_elements)?;
+            if num_elements != 0 {
+                elements_exporter.export(0, num_elements, &mut duckdb_elements, ctx)?;
             }
 
             let shared_elements = Arc::new(Mutex::new(duckdb_elements));
             cache
                 .values_cache
-                .insert(values_key, (elements.clone(), shared_elements.clone()));
+                .insert(values_key, (elements, shared_elements.clone()));
 
             shared_elements
         }
     };
 
-    let offsets = array.offsets().to_primitive();
+    let offsets = offsets.execute::<PrimitiveArray>(ctx)?;
 
     let boxed = match_each_integer_ptype!(offsets.ptype(), |O| {
         Box::new(ListExporter {
-            validity: array.validity_mask(),
+            validity,
             duckdb_elements: shared_elements,
             offsets,
             num_elements,
@@ -92,7 +105,13 @@ pub(crate) fn new_exporter(
 }
 
 impl<O: IntegerPType> ColumnExporter for ListExporter<O> {
-    fn export(&self, offset: usize, len: usize, vector: &mut Vector) -> VortexResult<()> {
+    fn export(
+        &self,
+        offset: usize,
+        len: usize,
+        vector: &mut VectorRef,
+        _ctx: &mut ExecutionCtx,
+    ) -> VortexResult<()> {
         // Verify that offset + len doesn't exceed the validity mask length.
         assert!(
             offset + len <= self.validity.len(),
@@ -129,123 +148,7 @@ impl<O: IntegerPType> ColumnExporter for ListExporter<O> {
             duckdb_list_views[i] = cpp::duckdb_list_entry { offset, length };
         }
 
-        let mut child = vector.list_vector_get_child();
-        child.reference(&self.duckdb_elements.lock());
-
-        vector.list_vector_set_size(self.num_elements as u64)?;
-
-        Ok(())
-    }
-}
-
-struct ListVectorExporter<O> {
-    validity: Mask,
-    /// We cache the child elements of our list array so that we don't have to export it every time,
-    /// and we also share it across any other exporters who want to export this array.
-    ///
-    /// Note that we are trading less compute for more memory here, as we will export the entire
-    /// array in the constructor of the exporter (`new_exporter`) even if some of the elements are
-    /// unreachable.
-    duckdb_elements: Arc<Mutex<Vector>>,
-    offsets: PVector<O>,
-    num_elements: usize,
-}
-
-pub(crate) fn new_vector_exporter(
-    array: &ListArray,
-    cache: &ConversionCache,
-    session: &VortexSession,
-) -> VortexResult<Box<dyn ColumnExporter>> {
-    // Cache an `elements` vector up front so that future exports can reference it.
-    let elements = array.elements();
-    let num_elements = elements.len();
-
-    let values_key = Arc::as_ptr(elements).addr();
-    // Check if we have a cached vector and extract it if we do.
-    let cached_elements = cache
-        .values_cache
-        .get(&values_key)
-        .map(|entry| entry.value().1.clone());
-
-    let shared_elements = match cached_elements {
-        Some(elements) => elements,
-        None => {
-            // We have no cached the vector yet, so create a new DuckDB vector for the elements.
-            let mut duckdb_elements =
-                Vector::with_capacity(elements.dtype().try_into()?, elements.len());
-            let elements_exporter = new_array_vector_exporter_with_flatten(
-                array.elements().clone(),
-                cache,
-                session,
-                true,
-            )?;
-
-            if !elements.is_empty() {
-                elements_exporter.export(0, elements.len(), &mut duckdb_elements)?;
-            }
-
-            let shared_elements = Arc::new(Mutex::new(duckdb_elements));
-            cache
-                .values_cache
-                .insert(values_key, (elements.clone(), shared_elements.clone()));
-
-            shared_elements
-        }
-    };
-
-    let offsets = array.offsets().execute_vector(session)?.into_primitive();
-
-    let boxed = match_each_integer_ptype!(offsets.ptype(), |O| {
-        Box::new(ListVectorExporter {
-            validity: array.validity().to_mask(array.len()),
-            duckdb_elements: shared_elements,
-            offsets: offsets.downcast::<O>(),
-            num_elements,
-        }) as Box<dyn ColumnExporter>
-    });
-
-    Ok(boxed)
-}
-
-impl<O: IntegerPType> ColumnExporter for ListVectorExporter<O> {
-    fn export(&self, offset: usize, len: usize, vector: &mut Vector) -> VortexResult<()> {
-        // Verify that offset + len doesn't exceed the validity mask length.
-        assert!(
-            offset + len <= self.validity.len(),
-            "Export range [{}, {}) exceeds validity mask length {}",
-            offset,
-            offset + len,
-            self.validity.len()
-        );
-
-        // Set validity if necessary.
-        if unsafe { vector.set_validity(&self.validity, offset, len) } {
-            // All values are null, so no point copying the data.
-            return Ok(());
-        }
-
-        let offsets = &self.offsets.as_ref()[offset..offset + len + 1];
-        debug_assert_eq!(offsets.len(), len + 1);
-
-        // SAFETY: TODO(connor): Pretty sure that `export` needs to be `unsafe`.
-        let duckdb_list_views: &mut [cpp::duckdb_list_entry] =
-            unsafe { vector.as_slice_mut::<cpp::duckdb_list_entry>(len) };
-        debug_assert_eq!(duckdb_list_views.len(), len);
-
-        for i in 0..len {
-            let offset = offsets[i]
-                .to_u64()
-                .ok_or_else(|| vortex_err!("somehow unable to convert an offset to u64"))?;
-            let length = (offsets[i + 1] - offsets[i])
-                .to_u64()
-                .ok_or_else(|| vortex_err!("somehow unable to convert an offset to u64"))?;
-
-            debug_assert!(offset + length <= self.num_elements as u64);
-
-            duckdb_list_views[i] = cpp::duckdb_list_entry { offset, length };
-        }
-
-        let mut child = vector.list_vector_get_child();
+        let child = vector.list_vector_get_child_mut();
         child.reference(&self.duckdb_elements.lock());
 
         vector.list_vector_set_size(self.num_elements as u64)?;
@@ -262,8 +165,10 @@ mod tests {
     use vortex::buffer::Buffer;
     use vortex::buffer::buffer;
     use vortex::error::VortexExpect;
+    use vortex_array::VortexSessionExecute;
 
     use super::*;
+    use crate::SESSION;
     use crate::duckdb::DataChunk;
     use crate::duckdb::LogicalType;
     use crate::exporter::new_array_exporter;
@@ -281,17 +186,18 @@ mod tests {
         .into_array();
 
         let list_type = LogicalType::list_type(LogicalType::int32())
-            .vortex_expect("LogicalType creation should succeed for test data");
+            .vortex_expect("LogicalTypeRef creation should succeed for test data");
         let mut chunk = DataChunk::new([list_type]);
 
-        new_array_exporter(&list, &ConversionCache::default())
+        let mut ctx = SESSION.create_execution_ctx();
+        new_array_exporter(list, &ConversionCache::default(), &mut ctx)
             .unwrap()
-            .export(0, 0, &mut chunk.get_vector(0))
+            .export(0, 0, chunk.get_vector_mut(0), &mut ctx)
             .unwrap();
         chunk.set_len(0);
 
         assert_eq!(
-            format!("{}", String::try_from(&chunk).unwrap()),
+            format!("{}", String::try_from(&*chunk).unwrap()),
             r#"Chunk - [1 Columns]
 - FLAT INTEGER[]: 0 = [ ]
 "#
@@ -316,17 +222,18 @@ mod tests {
         .into_array();
 
         let list_type = LogicalType::list_type(LogicalType::varchar())
-            .vortex_expect("LogicalType creation should succeed for test data");
+            .vortex_expect("LogicalTypeRef creation should succeed for test data");
         let mut chunk = DataChunk::new([list_type]);
 
-        new_array_exporter(&list, &ConversionCache::default())
+        let mut ctx = SESSION.create_execution_ctx();
+        new_array_exporter(list, &ConversionCache::default(), &mut ctx)
             .unwrap()
-            .export(0, 4, &mut chunk.get_vector(0))
+            .export(0, 4, chunk.get_vector_mut(0), &mut ctx)
             .unwrap();
         chunk.set_len(4);
 
         assert_eq!(
-            format!("{}", String::try_from(&chunk).unwrap()),
+            format!("{}", String::try_from(&*chunk).unwrap()),
             r#"Chunk - [1 Columns]
 - FLAT VARCHAR[]: 4 = [ [abc], [def], NULL, [ghi]]
 "#

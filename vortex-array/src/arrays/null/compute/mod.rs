@@ -5,13 +5,14 @@ mod cast;
 mod filter;
 mod mask;
 mod min_max;
+pub(crate) mod rules;
+mod slice;
 mod take;
 
 #[cfg(test)]
 mod test {
     use rstest::rstest;
     use vortex_buffer::buffer;
-    use vortex_dtype::DType;
     use vortex_mask::Mask;
 
     use crate::IntoArray;
@@ -21,33 +22,34 @@ mod test {
     use crate::compute::conformance::filter::test_filter_conformance;
     use crate::compute::conformance::mask::test_mask_conformance;
     use crate::compute::conformance::take::test_take_conformance;
-    use crate::compute::take;
+    use crate::dtype::DType;
 
     #[test]
     fn test_slice_nulls() {
         let nulls = NullArray::new(10);
-        let sliced = nulls.slice(0..4).to_null();
+        let sliced = nulls.slice(0..4).unwrap().to_null();
 
         assert_eq!(sliced.len(), 4);
-        assert!(matches!(sliced.validity_mask(), Mask::AllFalse(4)));
+        assert!(matches!(sliced.validity_mask().unwrap(), Mask::AllFalse(4)));
     }
 
     #[test]
     fn test_take_nulls() {
         let nulls = NullArray::new(10);
-        let taken = take(nulls.as_ref(), &buffer![0u64, 2, 4, 6, 8].into_array())
+        let taken = nulls
+            .take(buffer![0u64, 2, 4, 6, 8].into_array())
             .unwrap()
             .to_null();
 
         assert_eq!(taken.len(), 5);
-        assert!(matches!(taken.validity_mask(), Mask::AllFalse(5)));
+        assert!(matches!(taken.validity_mask().unwrap(), Mask::AllFalse(5)));
     }
 
     #[test]
     fn test_scalar_at_nulls() {
         let nulls = NullArray::new(10);
 
-        let scalar = nulls.scalar_at(0);
+        let scalar = nulls.scalar_at(0).unwrap();
         assert!(scalar.is_null());
         assert_eq!(scalar.dtype().clone(), DType::Null);
     }

@@ -2,22 +2,27 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use vortex_buffer::Buffer;
-use vortex_dtype::DType;
-use vortex_dtype::NativePType;
-use vortex_dtype::PType;
+use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_panic;
 
 use crate::ToCanonical;
 use crate::arrays::PrimitiveArray;
-use crate::compute::cast;
+use crate::builtins::ArrayBuiltins;
 use crate::compute::min_max;
+use crate::dtype::DType;
+use crate::dtype::NativePType;
+use crate::dtype::PType;
 use crate::vtable::ValidityHelper;
 
 impl PrimitiveArray {
     /// Return a slice of the array's buffer.
     ///
     /// NOTE: these values may be nonsense if the validity buffer indicates that the value is null.
+    ///
+    /// # Panic
+    ///
+    /// This operation will panic if the array is not backed by host memory.
     pub fn as_slice<T: NativePType>(&self) -> &[T] {
         if T::PTYPE != self.ptype() {
             vortex_panic!(
@@ -26,11 +31,15 @@ impl PrimitiveArray {
                 self.ptype()
             )
         }
-        let raw_slice = self.byte_buffer().as_ptr();
+
+        let byte_buffer = self
+            .buffer
+            .as_host_opt()
+            .vortex_expect("as_slice must be called on host buffer");
+        let raw_slice = byte_buffer.as_ptr();
+
         // SAFETY: alignment of Buffer is checked on construction
-        unsafe {
-            std::slice::from_raw_parts(raw_slice.cast(), self.byte_buffer().len() / size_of::<T>())
-        }
+        unsafe { std::slice::from_raw_parts(raw_slice.cast(), byte_buffer.len() / size_of::<T>()) }
     }
 
     pub fn reinterpret_cast(&self, ptype: PType) -> Self {
@@ -44,7 +53,11 @@ impl PrimitiveArray {
             "can't reinterpret cast between integers of two different widths"
         );
 
-        PrimitiveArray::from_byte_buffer(self.byte_buffer().clone(), ptype, self.validity().clone())
+        PrimitiveArray::from_buffer_handle(
+            self.buffer_handle().clone(),
+            ptype,
+            self.validity().clone(),
+        )
     }
 
     /// Narrow the array to the smallest possible integer type that can represent all values.
@@ -62,62 +75,64 @@ impl PrimitiveArray {
 
         // If we can't cast to i64, then leave the array as its original type.
         // It's too big to downcast anyway.
-        let Ok(min) = min_max.min.cast(&PType::I64.into()).and_then(i64::try_from) else {
+        let Ok(min) = min_max
+            .min
+            .cast(&PType::I64.into())
+            .and_then(|s| i64::try_from(&s))
+        else {
             return Ok(self.clone());
         };
-        let Ok(max) = min_max.max.cast(&PType::I64.into()).and_then(i64::try_from) else {
+        let Ok(max) = min_max
+            .max
+            .cast(&PType::I64.into())
+            .and_then(|s| i64::try_from(&s))
+        else {
             return Ok(self.clone());
         };
 
         if min < 0 || max < 0 {
             // Signed
             if min >= i8::MIN as i64 && max <= i8::MAX as i64 {
-                return Ok(cast(
-                    self.as_ref(),
-                    &DType::Primitive(PType::I8, self.dtype().nullability()),
-                )?
-                .to_primitive());
+                return Ok(self
+                    .to_array()
+                    .cast(DType::Primitive(PType::I8, self.dtype().nullability()))?
+                    .to_primitive());
             }
 
             if min >= i16::MIN as i64 && max <= i16::MAX as i64 {
-                return Ok(cast(
-                    self.as_ref(),
-                    &DType::Primitive(PType::I16, self.dtype().nullability()),
-                )?
-                .to_primitive());
+                return Ok(self
+                    .to_array()
+                    .cast(DType::Primitive(PType::I16, self.dtype().nullability()))?
+                    .to_primitive());
             }
 
             if min >= i32::MIN as i64 && max <= i32::MAX as i64 {
-                return Ok(cast(
-                    self.as_ref(),
-                    &DType::Primitive(PType::I32, self.dtype().nullability()),
-                )?
-                .to_primitive());
+                return Ok(self
+                    .to_array()
+                    .cast(DType::Primitive(PType::I32, self.dtype().nullability()))?
+                    .to_primitive());
             }
         } else {
             // Unsigned
             if max <= u8::MAX as i64 {
-                return Ok(cast(
-                    self.as_ref(),
-                    &DType::Primitive(PType::U8, self.dtype().nullability()),
-                )?
-                .to_primitive());
+                return Ok(self
+                    .to_array()
+                    .cast(DType::Primitive(PType::U8, self.dtype().nullability()))?
+                    .to_primitive());
             }
 
             if max <= u16::MAX as i64 {
-                return Ok(cast(
-                    self.as_ref(),
-                    &DType::Primitive(PType::U16, self.dtype().nullability()),
-                )?
-                .to_primitive());
+                return Ok(self
+                    .to_array()
+                    .cast(DType::Primitive(PType::U16, self.dtype().nullability()))?
+                    .to_primitive());
             }
 
             if max <= u32::MAX as i64 {
-                return Ok(cast(
-                    self.as_ref(),
-                    &DType::Primitive(PType::U32, self.dtype().nullability()),
-                )?
-                .to_primitive());
+                return Ok(self
+                    .to_array()
+                    .cast(DType::Primitive(PType::U32, self.dtype().nullability()))?
+                    .to_primitive());
             }
         }
 
@@ -130,11 +145,11 @@ mod tests {
     use rstest::rstest;
     use vortex_buffer::Buffer;
     use vortex_buffer::buffer;
-    use vortex_dtype::DType;
-    use vortex_dtype::Nullability;
-    use vortex_dtype::PType;
 
     use crate::arrays::PrimitiveArray;
+    use crate::dtype::DType;
+    use crate::dtype::Nullability;
+    use crate::dtype::PType;
     use crate::validity::Validity;
 
     #[test]

@@ -3,31 +3,32 @@
 
 use std::ops::Range;
 
-use vortex_dtype::IntegerPType;
-use vortex_dtype::NativePType;
-use vortex_dtype::UnsignedPType;
-use vortex_dtype::match_each_integer_ptype;
-use vortex_dtype::match_each_native_ptype;
+use vortex_error::VortexResult;
 
-use crate::ToCanonical;
+use crate::Array;
 use crate::arrays::PrimitiveArray;
+use crate::dtype::IntegerPType;
+use crate::dtype::NativePType;
+use crate::dtype::UnsignedPType;
+use crate::match_each_integer_ptype;
+use crate::match_each_native_ptype;
 use crate::patches::PATCH_CHUNK_SIZE;
 use crate::patches::Patches;
 use crate::validity::Validity;
 use crate::vtable::ValidityHelper;
 
 impl PrimitiveArray {
-    pub fn patch(self, patches: &Patches) -> Self {
-        let patch_indices = patches.indices().to_primitive();
-        let patch_values = patches.values().to_primitive();
+    pub fn patch(self, patches: &Patches) -> VortexResult<Self> {
+        let patch_indices = patches.indices().to_canonical()?.into_primitive();
+        let patch_values = patches.values().to_canonical()?.into_primitive();
 
         let patched_validity = self.validity().clone().patch(
             self.len(),
             patches.offset(),
             patch_indices.as_ref(),
             patch_values.validity(),
-        );
-        match_each_integer_ptype!(patch_indices.ptype(), |I| {
+        )?;
+        Ok(match_each_integer_ptype!(patch_indices.ptype(), |I| {
             match_each_native_ptype!(self.ptype(), |T| {
                 self.patch_typed::<T, I>(
                     patch_indices,
@@ -36,7 +37,7 @@ impl PrimitiveArray {
                     patched_validity,
                 )
             })
-        })
+        }))
     }
 
     fn patch_typed<T, I>(
@@ -130,12 +131,16 @@ mod tests {
 
     use super::*;
     use crate::ToCanonical;
+    use crate::assert_arrays_eq;
     use crate::validity::Validity;
 
     #[test]
     fn patch_sliced() {
         let input = PrimitiveArray::new(buffer![2u32; 10], Validity::AllValid);
-        let sliced = input.slice(2..8);
-        assert_eq!(sliced.to_primitive().as_slice::<u32>(), &[2u32; 6]);
+        let sliced = input.slice(2..8).unwrap();
+        assert_arrays_eq!(
+            sliced.to_primitive(),
+            PrimitiveArray::new(buffer![2u32; 6], Validity::AllValid)
+        );
     }
 }

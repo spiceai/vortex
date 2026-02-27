@@ -4,10 +4,7 @@
 //! This module contains the VTable definitions for a Vortex encoding.
 
 mod array;
-mod canonical;
-mod compute;
 mod dyn_;
-mod encode;
 mod operations;
 mod validity;
 mod visitor;
@@ -16,22 +13,20 @@ use std::fmt::Debug;
 use std::ops::Deref;
 
 pub use array::*;
-pub use canonical::*;
-pub use compute::*;
 pub use dyn_::*;
-pub use encode::*;
 pub use operations::*;
 pub use validity::*;
 pub use visitor::*;
-use vortex_dtype::DType;
 use vortex_error::VortexResult;
-use vortex_vector::Vector;
+use vortex_session::VortexSession;
 
 use crate::Array;
 use crate::ArrayRef;
+use crate::Canonical;
 use crate::IntoArray;
-use crate::VectorExecutor;
 use crate::buffer::BufferHandle;
+use crate::builders::ArrayBuilder;
+use crate::dtype::DType;
 use crate::executor::ExecutionCtx;
 use crate::serde::ArrayChildren;
 
@@ -40,11 +35,8 @@ use crate::serde::ArrayChildren;
 /// The logic is split across several "VTable" traits to enable easier code organization than
 /// simply lumping everything into a single trait.
 ///
-/// Some of these vtables are optional, such as the [`ComputeVTable`] and [`EncodeVTable`],
-/// which can be disabled by assigning to the [`NotSupported`] type.
-///
 /// From this [`VTable`] trait, we derive implementations for the sealed [`Array`] and [`DynVTable`]
-/// traits via the [`crate::ArrayAdapter`] and [`ArrayVTableAdapter`] types respectively.
+/// traits.
 ///
 /// The functions defined in these vtable traits will typically document their pre- and
 /// post-conditions. The pre-conditions are validated inside the [`Array`] and [`DynVTable`]
@@ -56,24 +48,12 @@ pub trait VTable: 'static + Sized + Send + Sync + Debug {
     type Metadata: Debug;
 
     type ArrayVTable: BaseArrayVTable<Self>;
-    type CanonicalVTable: CanonicalVTable<Self>;
     type OperationsVTable: OperationsVTable<Self>;
     type ValidityVTable: ValidityVTable<Self>;
     type VisitorVTable: VisitorVTable<Self>;
 
-    /// Optionally enable implementing dynamic compute dispatch for this encoding.
-    /// Can be disabled by assigning to the [`NotSupported`] type.
-    type ComputeVTable: ComputeVTable<Self>;
-    /// Optionally enable the [`EncodeVTable`] for this encoding. This allows it to partake in
-    /// compression.
-    /// Can be disabled by assigning to the [`NotSupported`] type.
-    type EncodeVTable: EncodeVTable<Self>;
-
-    /// Returns the ID of the encoding.
-    fn id(&self) -> ArrayId;
-
-    /// Returns the encoding for the array.
-    fn encoding(array: &Self::Array) -> ArrayVTable;
+    /// Returns the ID of the array.
+    fn id(array: &Self::Array) -> ArrayId;
 
     /// Exports metadata for an array.
     ///
@@ -87,8 +67,32 @@ pub trait VTable: 'static + Sized + Send + Sync + Debug {
     /// Return `None` if the array cannot be serialized.
     fn serialize(metadata: Self::Metadata) -> VortexResult<Option<Vec<u8>>>;
 
-    /// Deserialize metadata from a byte buffer.
-    fn deserialize(bytes: &[u8]) -> VortexResult<Self::Metadata>;
+    /// Deserialize array metadata from a byte buffer.
+    ///
+    /// To reduce the serialized form, arrays do not store their own DType and length. Instead,
+    /// this is passed down from the parent array during deserialization. These properties are
+    /// exposed here for use during deserialization.
+    fn deserialize(
+        bytes: &[u8],
+        _dtype: &DType,
+        _len: usize,
+        _buffers: &[BufferHandle],
+        _session: &VortexSession,
+    ) -> VortexResult<Self::Metadata>;
+
+    /// Writes the array into a canonical builder.
+    ///
+    /// ## Post-conditions
+    /// - The length of the builder is incremented by the length of the input array.
+    fn append_to_builder(
+        array: &Self::Array,
+        builder: &mut dyn ArrayBuilder,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<()> {
+        let canonical = array.to_array().execute::<Canonical>(ctx)?;
+        builder.extend_from_array(canonical.as_ref());
+        Ok(())
+    }
 
     /// Build an array from components.
     ///
@@ -123,7 +127,6 @@ pub trait VTable: 'static + Sized + Send + Sync + Debug {
     /// * Running UTF-8 validation for any buffers that are expected to hold flat UTF-8 data
     // TODO(ngates): take the parts by ownership, since most arrays need them anyway
     fn build(
-        &self,
         dtype: &DType,
         len: usize,
         metadata: &Self::Metadata,
@@ -135,24 +138,32 @@ pub trait VTable: 'static + Sized + Send + Sync + Debug {
     /// of children must be expected.
     fn with_children(array: &mut Self::Array, children: Vec<ArrayRef>) -> VortexResult<()>;
 
-    /// Execute this array to produce a [`Vector`].
+    /// Execute this array to produce an [`ArrayRef`].
     ///
-    /// The returned [`Vector`] must be the appropriate one for the array's logical
-    /// type (they are one-to-one with Vortex `DType`s), and should respect the output nullability
-    /// of the array.
+    /// Array execution is designed such that repeated execution of an array will eventually
+    /// converge to a canonical representation. Implementations of this function should therefore
+    /// ensure they make progress towards that goal.
     ///
-    /// Debug builds will panic if the returned vector is of the wrong type, wrong length, or
+    /// This includes fully evaluating the array, such us decoding run-end encoding, or executing
+    /// one of the array's children and re-building the array with the executed child.
+    ///
+    /// It is recommended to only perform a single step of execution per call to this function,
+    /// such that surrounding arrays have an opportunity to perform their own parent reduction
+    /// or execution logic.
+    ///
+    /// The returned array must be logically equivalent to the input array. In other words, the
+    /// recursively canonicalized forms of both arrays must be equal.
+    ///
+    /// Debug builds will panic if the returned array is of the wrong type, wrong length, or
     /// incorrectly contains null values.
     ///
-    /// Implementations should recursively call [`crate::executor::VectorExecutor::execute`] on
-    /// child arrays as needed.
-    fn execute(array: &Self::Array, ctx: &mut ExecutionCtx) -> VortexResult<Vector> {
-        // TODO(ngates): convert arrays to canonicalize over vectors.
-        let canonical = Self::CanonicalVTable::canonicalize(array);
-        canonical.into_array().execute_vector(ctx.session())
-    }
+    // TODO(ngates): in the future, we may pass a "target encoding hint" such that this array
+    //  can produce a more optimal representation for the parent. This could be used to preserve
+    //  varbin vs varbinview or list vs listview encodings when the parent knows it prefers
+    //  one representation over another, such as when exporting to a specific Arrow array.
+    fn execute(array: &Self::Array, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef>;
 
-    /// Attempt to execute the parent of this array to produce a [`Vector`].
+    /// Attempt to execute the parent of this array.
     ///
     /// This function allows arrays to plug in specialized execution logic for their parent. For
     /// example, strings compressed as FSST arrays can implement a custom equality comparison when
@@ -164,7 +175,7 @@ pub trait VTable: 'static + Sized + Send + Sync + Debug {
         parent: &ArrayRef,
         child_idx: usize,
         ctx: &mut ExecutionCtx,
-    ) -> VortexResult<Option<Vector>> {
+    ) -> VortexResult<Option<ArrayRef>> {
         _ = (array, parent, child_idx, ctx);
         Ok(None)
     }

@@ -10,8 +10,8 @@ use std::sync::Arc;
 use arcref::ArcRef;
 use itertools::Itertools;
 use vortex_array::SerializeMetadata;
-use vortex_dtype::DType;
-use vortex_dtype::FieldName;
+use vortex_array::dtype::DType;
+use vortex_array::dtype::FieldName;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
@@ -61,14 +61,6 @@ pub trait Layout: 'static + Send + Sync + Debug + private::Sealed {
 
     /// Get the segment IDs for this layout.
     fn segment_ids(&self) -> Vec<SegmentId>;
-
-    #[cfg(gpu_unstable)]
-    fn new_gpu_reader(
-        &self,
-        name: Arc<str>,
-        segment_source: Arc<dyn SegmentSource>,
-        ctx: Arc<cudarc::driver::CudaContext>,
-    ) -> VortexResult<crate::gpu::GpuLayoutReaderRef>;
 
     fn new_reader(
         &self,
@@ -313,16 +305,6 @@ impl<V: VTable> Layout for LayoutAdapter<V> {
         V::segment_ids(&self.0)
     }
 
-    #[cfg(gpu_unstable)]
-    fn new_gpu_reader(
-        &self,
-        name: Arc<str>,
-        segment_source: Arc<dyn SegmentSource>,
-        ctx: Arc<cudarc::driver::CudaContext>,
-    ) -> VortexResult<crate::gpu::GpuLayoutReaderRef> {
-        V::new_gpu_reader(&self.0, name, segment_source, ctx)
-    }
-
     fn new_reader(
         &self,
         name: Arc<str>,
@@ -344,6 +326,7 @@ mod private {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use vortex_array::ArrayContext;
 
     use super::*;
 
@@ -488,10 +471,9 @@ mod tests {
 
     #[test]
     fn test_struct_layout_display() {
-        use vortex_array::ArrayContext;
-        use vortex_dtype::Nullability::NonNullable;
-        use vortex_dtype::PType;
-        use vortex_dtype::StructFields;
+        use vortex_array::dtype::Nullability::NonNullable;
+        use vortex_array::dtype::PType;
+        use vortex_array::dtype::StructFields;
 
         use crate::IntoLayout;
         use crate::layouts::chunked::ChunkedLayout;

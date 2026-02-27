@@ -6,17 +6,18 @@ use itertools::Itertools;
 use num_traits::PrimInt;
 use vortex_array::IntoArray;
 use vortex_array::arrays::PrimitiveArray;
+use vortex_array::buffer::BufferHandle;
+use vortex_array::dtype::IntegerPType;
+use vortex_array::dtype::NativePType;
+use vortex_array::dtype::PType;
+use vortex_array::match_each_integer_ptype;
+use vortex_array::match_each_unsigned_integer_ptype;
 use vortex_array::patches::Patches;
 use vortex_array::validity::Validity;
 use vortex_array::vtable::ValidityHelper;
 use vortex_buffer::Buffer;
 use vortex_buffer::BufferMut;
 use vortex_buffer::ByteBuffer;
-use vortex_dtype::IntegerPType;
-use vortex_dtype::NativePType;
-use vortex_dtype::PType;
-use vortex_dtype::match_each_integer_ptype;
-use vortex_dtype::match_each_unsigned_integer_ptype;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
@@ -49,7 +50,7 @@ pub fn bitpack_encode(
             array.statistics().compute_min::<P>().unwrap_or_default() < 0
         });
         if has_negative_values {
-            vortex_bail!("cannot bitpack_encode array containing negative integers")
+            vortex_bail!(InvalidArgument: "cannot bitpack_encode array containing negative integers")
         }
     }
 
@@ -58,7 +59,7 @@ pub fn bitpack_encode(
     if bit_width >= array.ptype().bit_width() as u8 {
         // Nothing we can do
         vortex_bail!(
-            "Cannot pack - specified bit width {bit_width} >= {}",
+            InvalidArgument: "Cannot pack - specified bit width {bit_width} >= {}",
             array.ptype().bit_width()
         )
     }
@@ -71,17 +72,22 @@ pub fn bitpack_encode(
         .flatten();
 
     // SAFETY: all components validated above
-    unsafe {
-        Ok(BitPackedArray::new_unchecked(
-            packed,
+    let bitpacked = unsafe {
+        BitPackedArray::new_unchecked(
+            BufferHandle::new_host(packed),
             array.dtype().clone(),
             array.validity().clone(),
             patches,
             bit_width,
             array.len(),
             0,
-        ))
-    }
+        )
+    };
+    bitpacked
+        .stats_set
+        .to_ref(bitpacked.as_ref())
+        .inherit_from(array.statistics());
+    Ok(bitpacked)
 }
 
 /// Bitpack an array into the specified bit-width without checking statistics.
@@ -100,17 +106,22 @@ pub unsafe fn bitpack_encode_unchecked(
     let packed = unsafe { bitpack_unchecked(&array, bit_width)? };
 
     // SAFETY: checked by bitpack_unchecked
-    unsafe {
-        Ok(BitPackedArray::new_unchecked(
-            packed,
+    let bitpacked = unsafe {
+        BitPackedArray::new_unchecked(
+            BufferHandle::new_host(packed),
             array.dtype().clone(),
             array.validity().clone(),
             None,
             bit_width,
             array.len(),
             0,
-        ))
-    }
+        )
+    };
+    bitpacked
+        .stats_set
+        .to_ref(bitpacked.as_ref())
+        .inherit_from(array.statistics());
+    Ok(bitpacked)
 }
 
 /// Bitpack a [PrimitiveArray] to the given width.
@@ -200,7 +211,7 @@ pub fn gather_patches(
     };
 
     let array_len = parray.len();
-    let validity_mask = parray.validity_mask();
+    let validity_mask = parray.validity_mask()?;
 
     let patches = if array_len < u8::MAX as usize {
         match_each_integer_ptype!(parray.ptype(), |T| {
@@ -210,7 +221,7 @@ pub fn gather_patches(
                 num_exceptions_hint,
                 patch_validity,
                 validity_mask,
-            )
+            )?
         })
     } else if array_len < u16::MAX as usize {
         match_each_integer_ptype!(parray.ptype(), |T| {
@@ -220,7 +231,7 @@ pub fn gather_patches(
                 num_exceptions_hint,
                 patch_validity,
                 validity_mask,
-            )
+            )?
         })
     } else if array_len < u32::MAX as usize {
         match_each_integer_ptype!(parray.ptype(), |T| {
@@ -230,7 +241,7 @@ pub fn gather_patches(
                 num_exceptions_hint,
                 patch_validity,
                 validity_mask,
-            )
+            )?
         })
     } else {
         match_each_integer_ptype!(parray.ptype(), |T| {
@@ -240,7 +251,7 @@ pub fn gather_patches(
                 num_exceptions_hint,
                 patch_validity,
                 validity_mask,
-            )
+            )?
         })
     };
 
@@ -253,7 +264,7 @@ fn gather_patches_impl<T, P>(
     num_exceptions_hint: usize,
     patch_validity: Validity,
     validity_mask: Mask,
-) -> Option<Patches>
+) -> VortexResult<Option<Patches>>
 where
     T: PrimInt + NativePType,
     P: IntegerPType,
@@ -278,15 +289,17 @@ where
         }
     }
 
-    (!indices.is_empty()).then(|| {
-        Patches::new(
+    if indices.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(Patches::new(
             data.len(),
             0,
             indices.into_array(),
             PrimitiveArray::new(values, patch_validity).into_array(),
             Some(chunk_offsets.into_array()),
-        )
-    })
+        )?))
+    }
 }
 
 pub fn bit_width_histogram(array: &PrimitiveArray) -> VortexResult<Vec<usize>> {
@@ -300,7 +313,7 @@ fn bit_width_histogram_typed<T: NativePType + PrimInt>(
         |v: T| (8 * size_of::<T>()) - (PrimInt::leading_zeros(v) as usize);
 
     let mut bit_widths = vec![0usize; size_of::<T>() * 8 + 1];
-    match array.validity_mask().bit_buffer() {
+    match array.validity_mask()?.bit_buffer() {
         AllOr::All => {
             // All values are valid.
             for v in array.as_slice::<T>() {
@@ -365,7 +378,7 @@ fn bytes_per_exception(ptype: PType) -> usize {
     ptype.byte_width() + 4
 }
 
-#[cfg(feature = "test-harness")]
+#[cfg(feature = "_test-harness")]
 pub mod test_harness {
     use rand::Rng as _;
     use rand::rngs::StdRng;
@@ -408,18 +421,26 @@ pub mod test_harness {
 
 #[cfg(test)]
 mod test {
+    use std::sync::LazyLock;
+
     use rand::SeedableRng;
     use rand::rngs::StdRng;
     use vortex_array::ToCanonical;
+    use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::ChunkedArray;
     use vortex_array::assert_arrays_eq;
     use vortex_array::builders::ArrayBuilder;
     use vortex_array::builders::PrimitiveBuilder;
+    use vortex_array::session::ArraySession;
     use vortex_buffer::Buffer;
     use vortex_error::VortexError;
+    use vortex_session::VortexSession;
 
     use super::*;
     use crate::bitpack_compress::test_harness::make_array;
+
+    static SESSION: LazyLock<VortexSession> =
+        LazyLock::new(|| VortexSession::empty().with::<ArraySession>());
 
     #[test]
     fn test_best_bit_width() {
@@ -446,6 +467,7 @@ mod test {
             (0..(1 << 4)).collect::<Vec<_>>(),
             compressed
                 .validity_mask()
+                .unwrap()
                 .to_bit_buffer()
                 .set_indices()
                 .collect::<Vec<_>>()
@@ -463,7 +485,7 @@ mod test {
     }
 
     #[test]
-    fn canonicalize_chunked_of_bitpacked() {
+    fn canonicalize_chunked_of_bitpacked() -> VortexResult<()> {
         let mut rng = StdRng::seed_from_u64(0);
 
         let chunks = (0..10)
@@ -474,17 +496,21 @@ mod test {
         let into_ca = chunked.clone().to_primitive();
         let mut primitive_builder =
             PrimitiveBuilder::<i32>::with_capacity(chunked.dtype().nullability(), 10 * 100);
-        chunked.clone().append_to_builder(&mut primitive_builder);
+        chunked
+            .clone()
+            .append_to_builder(&mut primitive_builder, &mut SESSION.create_execution_ctx())?;
         let ca_into = primitive_builder.finish();
 
-        assert_arrays_eq!(into_ca, ca_into.to_primitive());
+        assert_arrays_eq!(into_ca, ca_into);
 
         let mut primitive_builder =
             PrimitiveBuilder::<i32>::with_capacity(chunked.dtype().nullability(), 10 * 100);
         primitive_builder.extend_from_array(&chunked);
         let ca_into = primitive_builder.finish();
 
-        assert_arrays_eq!(into_ca, ca_into.to_primitive());
+        assert_arrays_eq!(into_ca, ca_into);
+
+        Ok(())
     }
 
     #[test]

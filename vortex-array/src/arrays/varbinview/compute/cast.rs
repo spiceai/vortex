@@ -1,20 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use vortex_dtype::DType;
 use vortex_error::VortexResult;
 
 use crate::ArrayRef;
 use crate::IntoArray;
 use crate::arrays::VarBinViewArray;
 use crate::arrays::VarBinViewVTable;
-use crate::compute::CastKernel;
-use crate::compute::CastKernelAdapter;
-use crate::register_kernel;
+use crate::dtype::DType;
+use crate::scalar_fn::fns::cast::CastReduce;
 use crate::vtable::ValidityHelper;
 
-impl CastKernel for VarBinViewVTable {
-    fn cast(&self, array: &VarBinViewArray, dtype: &DType) -> VortexResult<Option<ArrayRef>> {
+impl CastReduce for VarBinViewVTable {
+    fn cast(array: &VarBinViewArray, dtype: &DType) -> VortexResult<Option<ArrayRef>> {
         if !array.dtype().eq_ignore_nullability(dtype) {
             return Ok(None);
         }
@@ -29,8 +27,8 @@ impl CastKernel for VarBinViewVTable {
         // SAFETY: casting just changes the DType, does not affect invariants on views/buffers.
         unsafe {
             Ok(Some(
-                VarBinViewArray::new_unchecked(
-                    array.views().clone(),
+                VarBinViewArray::new_handle_unchecked(
+                    array.views_handle().clone(),
                     array.buffers().clone(),
                     new_dtype,
                     new_validity,
@@ -41,17 +39,15 @@ impl CastKernel for VarBinViewVTable {
     }
 }
 
-register_kernel!(CastKernelAdapter(VarBinViewVTable).lift());
-
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
-    use vortex_dtype::DType;
-    use vortex_dtype::Nullability;
 
     use crate::arrays::VarBinViewArray;
-    use crate::compute::cast;
+    use crate::builtins::ArrayBuiltins;
     use crate::compute::conformance::cast::test_cast_conformance;
+    use crate::dtype::DType;
+    use crate::dtype::Nullability;
 
     #[rstest]
     #[case(
@@ -73,7 +69,7 @@ mod tests {
     fn try_cast_varbin_nullable(#[case] source: DType, #[case] target: DType) {
         let varbin = VarBinViewArray::from_iter(vec![Some("a"), Some("b"), Some("c")], source);
 
-        let res = cast(varbin.as_ref(), &target);
+        let res = varbin.to_array().cast(target.clone());
         assert_eq!(res.unwrap().dtype(), &target);
     }
 
@@ -85,7 +81,7 @@ mod tests {
     fn try_cast_varbin_fail(#[case] source: DType) {
         let non_nullable_source = source.as_nonnullable();
         let varbin = VarBinViewArray::from_iter(vec![Some("a"), Some("b"), None], source);
-        cast(varbin.as_ref(), &non_nullable_source).unwrap();
+        varbin.to_array().cast(non_nullable_source).unwrap();
     }
 
     #[rstest]

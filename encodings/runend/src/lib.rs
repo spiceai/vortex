@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+#[cfg(feature = "arbitrary")]
+mod arbitrary;
+#[cfg(feature = "arbitrary")]
+pub use arbitrary::ArbitraryRunEndArray;
 pub use array::*;
 pub use iter::trimmed_ends_iter;
 
@@ -10,12 +14,12 @@ mod arrow;
 pub mod compress;
 mod compute;
 mod iter;
+mod kernel;
 mod ops;
 mod rules;
 
 #[doc(hidden)]
 pub mod _benchmarking {
-    pub use compute::filter::filter_run_end;
     pub use compute::take::take_indices_unchecked;
 
     use super::*;
@@ -23,56 +27,37 @@ pub mod _benchmarking {
 
 use vortex_array::ArrayBufferVisitor;
 use vortex_array::ArrayChildVisitor;
-use vortex_array::Canonical;
 use vortex_array::session::ArraySessionExt;
-use vortex_array::vtable::ArrayVTableExt;
-use vortex_array::vtable::EncodeVTable;
 use vortex_array::vtable::VisitorVTable;
-use vortex_error::VortexResult;
 use vortex_session::VortexSession;
-
-use crate::compress::runend_encode;
-
-impl EncodeVTable<RunEndVTable> for RunEndVTable {
-    fn encode(
-        _vtable: &RunEndVTable,
-        canonical: &Canonical,
-        _like: Option<&RunEndArray>,
-    ) -> VortexResult<Option<RunEndArray>> {
-        let parray = canonical.clone().into_primitive();
-        let (ends, values) = runend_encode(&parray);
-        // SAFETY: runend_decode implementation must return valid RunEndArray
-        //  components.
-        unsafe {
-            Ok(Some(RunEndArray::new_unchecked(
-                ends.to_array(),
-                values,
-                0,
-                parray.len(),
-            )))
-        }
-    }
-}
 
 impl VisitorVTable<RunEndVTable> for RunEndVTable {
     fn visit_buffers(_array: &RunEndArray, _visitor: &mut dyn ArrayBufferVisitor) {}
+
+    fn nbuffers(_array: &RunEndArray) -> usize {
+        0
+    }
 
     fn visit_children(array: &RunEndArray, visitor: &mut dyn ArrayChildVisitor) {
         visitor.visit_child("ends", array.ends());
         visitor.visit_child("values", array.values());
     }
+
+    fn nchildren(_array: &RunEndArray) -> usize {
+        2
+    }
 }
 
 /// Initialize run-end encoding in the given session.
 pub fn initialize(session: &mut VortexSession) {
-    session.arrays().register(RunEndVTable.as_vtable());
+    session.arrays().register(RunEndVTable::ID, RunEndVTable);
 }
 
 #[cfg(test)]
 mod tests {
     use vortex_array::ProstMetadata;
+    use vortex_array::dtype::PType;
     use vortex_array::test_harness::check_metadata;
-    use vortex_dtype::PType;
 
     use crate::RunEndMetadata;
 

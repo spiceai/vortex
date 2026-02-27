@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use vortex::array::ToCanonical;
+use vortex::array::Canonical;
+use vortex::array::ExecutionCtx;
 use vortex::array::arrays::TemporalArray;
 use vortex::error::VortexResult;
-use vortex::session::VortexSession;
 
-use crate::duckdb::Vector;
+use crate::duckdb::VectorRef;
 use crate::exporter::ColumnExporter;
 use crate::exporter::primitive;
 
@@ -14,28 +14,31 @@ struct TemporalExporter {
     storage_type_exporter: Box<dyn ColumnExporter>,
 }
 
-pub(crate) fn new_exporter(array: &TemporalArray) -> VortexResult<Box<dyn ColumnExporter>> {
-    Ok(Box::new(TemporalExporter {
-        storage_type_exporter: primitive::new_exporter(
-            &array.temporal_values().clone().to_primitive(),
-        )?,
-    }))
-}
-
 impl ColumnExporter for TemporalExporter {
-    fn export(&self, offset: usize, len: usize, vector: &mut Vector) -> VortexResult<()> {
-        self.storage_type_exporter.export(offset, len, vector)
+    fn export(
+        &self,
+        offset: usize,
+        len: usize,
+        vector: &mut VectorRef,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<()> {
+        self.storage_type_exporter.export(offset, len, vector, ctx)
     }
 }
 
-pub(crate) fn new_vector_exporter(
+// TODO(joe): into_parts
+pub(crate) fn new_exporter(
     array: TemporalArray,
-    session: &VortexSession,
+    ctx: &mut ExecutionCtx,
 ) -> VortexResult<Box<dyn ColumnExporter>> {
     Ok(Box::new(TemporalExporter {
-        storage_type_exporter: primitive::new_vector_exporter(
-            array.temporal_values().clone(),
-            session,
+        storage_type_exporter: primitive::new_exporter(
+            array
+                .temporal_values()
+                .clone()
+                .execute::<Canonical>(ctx)?
+                .into_primitive(),
+            ctx,
         )?,
     }))
 }
@@ -46,8 +49,10 @@ mod tests {
     use vortex::array::arrays::PrimitiveArray;
     use vortex::array::arrays::TemporalArray;
     use vortex::buffer::buffer;
-    use vortex::dtype::datetime::TimeUnit;
+    use vortex::extension::datetime::TimeUnit;
+    use vortex_array::VortexSessionExecute;
 
+    use crate::SESSION;
     use crate::cpp;
     use crate::duckdb::DataChunk;
     use crate::duckdb::LogicalType;
@@ -62,15 +67,16 @@ mod tests {
         );
         let mut chunk =
             DataChunk::new([LogicalType::new(cpp::duckdb_type::DUCKDB_TYPE_TIMESTAMP_S)]);
+        let mut ctx = SESSION.create_execution_ctx();
 
-        new_exporter(&arr)
+        new_exporter(arr, &mut ctx)
             .unwrap()
-            .export(1, 5, &mut chunk.get_vector(0))
+            .export(1, 5, chunk.get_vector_mut(0), &mut ctx)
             .unwrap();
         chunk.set_len(2);
 
         assert_eq!(
-            format!("{}", String::try_from(&chunk).unwrap()),
+            format!("{}", String::try_from(&*chunk).unwrap()),
             r#"Chunk - [1 Columns]
 - FLAT TIMESTAMP_S: 2 = [ 2025-06-18 16:43:45, 2025-06-18 16:43:46]
 "#
@@ -86,15 +92,16 @@ mod tests {
             None,
         );
         let mut chunk = DataChunk::new([LogicalType::new(cpp::duckdb_type::DUCKDB_TYPE_TIMESTAMP)]);
+        let mut ctx = SESSION.create_execution_ctx();
 
-        new_exporter(&arr)
+        new_exporter(arr, &mut ctx)
             .unwrap()
-            .export(1, 5, &mut chunk.get_vector(0))
+            .export(1, 5, chunk.get_vector_mut(0), &mut ctx)
             .unwrap();
         chunk.set_len(4);
 
         assert_eq!(
-            format!("{}", String::try_from(&chunk).unwrap()),
+            format!("{}", String::try_from(&*chunk).unwrap()),
             r#"Chunk - [1 Columns]
 - FLAT TIMESTAMP: 4 = [ 2025-06-18 16:46:29.000001, 2025-06-18 16:46:30.000001, 2025-06-18 16:46:31.000001, 2025-06-18 16:46:32.000001]
 "#
@@ -109,16 +116,17 @@ mod tests {
         );
 
         let mut chunk = DataChunk::new([LogicalType::try_from(arr.dtype()).unwrap()]);
+        let mut ctx = SESSION.create_execution_ctx();
 
-        new_exporter(&arr)
+        new_exporter(arr, &mut ctx)
             .unwrap()
-            .export(1, 5, &mut chunk.get_vector(0))
+            .export(1, 5, chunk.get_vector_mut(0), &mut ctx)
             .unwrap();
 
         chunk.set_len(4);
 
         assert_eq!(
-            format!("{}", String::try_from(&chunk).unwrap()),
+            format!("{}", String::try_from(&*chunk).unwrap()),
             r#"Chunk - [1 Columns]
 - FLAT TIME: 4 = [ 00:00:02, 00:00:03, 00:00:04, 00:00:05]
 "#

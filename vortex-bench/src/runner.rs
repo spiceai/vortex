@@ -253,7 +253,7 @@ impl SqlBenchmarkRunner {
     ) -> anyhow::Result<()>
     where
         S: FnMut(Format) -> anyhow::Result<Ctx>,
-        E: FnMut(&mut Ctx, &str) -> anyhow::Result<(usize, Option<Duration>)>,
+        E: FnMut(&mut Ctx, usize, Format, &str) -> anyhow::Result<(usize, Option<Duration>)>,
     {
         let bar_length = queries.len() * self.formats.len();
         let progress_bar = if self.hide_progress_bar || bar_length == 0 {
@@ -269,8 +269,8 @@ impl SqlBenchmarkRunner {
                 let query_idx = *query_idx;
                 tracing::debug!(%format, query_idx, "Running query");
                 self.run_query(query_idx, format, iterations, || {
-                    let (row_count, timing) =
-                        execute(&mut ctx, query.as_str()).unwrap_or_else(|err| {
+                    let (row_count, timing) = execute(&mut ctx, query_idx, format, query.as_str())
+                        .unwrap_or_else(|err| {
                             vortex_panic!("query {query_idx} failed: {err}");
                         });
                     (row_count, timing)
@@ -306,6 +306,7 @@ impl SqlBenchmarkRunner {
         S: Fn(Format) -> SFut,
         SFut: Future<Output = anyhow::Result<Ctx>>,
         E: for<'c> FnMut(
+            usize,
             &'c Ctx,
             &'c str,
         ) -> Pin<
@@ -334,8 +335,9 @@ impl SqlBenchmarkRunner {
 
                 for _ in 0..iterations {
                     let start = Instant::now();
-                    let (row_count, timing, iter_result) =
-                        execute(&ctx, query.as_str()).await.unwrap_or_else(|err| {
+                    let (row_count, timing, iter_result) = execute(query_idx, &ctx, query.as_str())
+                        .await
+                        .unwrap_or_else(|err| {
                             vortex_panic!("query {query_idx} failed: {err}");
                         });
                     let elapsed = timing.unwrap_or_else(|| start.elapsed());

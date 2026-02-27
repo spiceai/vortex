@@ -22,6 +22,7 @@
 #![deny(clippy::missing_safety_doc)]
 #![deny(missing_docs)]
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use clap::CommandFactory;
@@ -31,7 +32,11 @@ use vortex::session::VortexSession;
 
 pub mod browse;
 pub mod convert;
+pub mod datafusion_helper;
 pub mod inspect;
+pub mod query;
+pub mod segment_tree;
+pub mod segments;
 pub mod tree;
 
 #[derive(clap::Parser)]
@@ -51,31 +56,54 @@ enum Commands {
     Browse { file: PathBuf },
     /// Inspect Vortex file footer and metadata
     Inspect(inspect::InspectArgs),
+    /// Execute a SQL query against a Vortex file using DataFusion
+    Query(query::QueryArgs),
+    /// Display segment information for a Vortex file
+    Segments(segments::SegmentsArgs),
 }
 
 impl Commands {
     fn file_path(&self) -> &PathBuf {
         match self {
             Commands::Tree(args) => match &args.mode {
-                tree::TreeMode::Array { file } => file,
+                tree::TreeMode::Array { file, .. } => file,
                 tree::TreeMode::Layout { file, .. } => file,
             },
             Commands::Browse { file } => file,
             Commands::Convert(flags) => &flags.file,
             Commands::Inspect(args) => &args.file,
+            Commands::Query(args) => &args.file,
+            Commands::Segments(args) => &args.file,
         }
     }
 }
 
 /// Main entrypoint for `vx` that launches a [`VortexSession`].
 ///
+/// Parses arguments from [`std::env::args_os`]. See [`launch_from`] to supply explicit arguments.
+///
 /// # Errors
 ///
 /// Raises any errors from subcommands.
 pub async fn launch(session: &VortexSession) -> anyhow::Result<()> {
-    env_logger::init();
+    launch_from(session, std::env::args_os()).await
+}
 
-    let cli = Cli::parse();
+/// Launch `vx` with explicit command-line arguments.
+///
+/// This is useful when embedding the TUI inside another process (e.g. Python) where
+/// [`std::env::args`] may not reflect the intended arguments.
+///
+/// # Errors
+///
+/// Raises any errors from subcommands.
+pub async fn launch_from(
+    session: &VortexSession,
+    args: impl IntoIterator<Item = impl Into<OsString> + Clone>,
+) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+
+    let cli = Cli::parse_from(args);
 
     let path = cli.command.file_path();
     if !std::fs::exists(path)? {
@@ -95,6 +123,8 @@ pub async fn launch(session: &VortexSession) -> anyhow::Result<()> {
         Commands::Convert(flags) => convert::exec_convert(session, flags).await?,
         Commands::Browse { file } => browse::exec_tui(session, file).await?,
         Commands::Inspect(args) => inspect::exec_inspect(session, args).await?,
+        Commands::Query(args) => query::exec_query(session, args).await?,
+        Commands::Segments(args) => segments::exec_segments(session, args).await?,
     };
 
     Ok(())

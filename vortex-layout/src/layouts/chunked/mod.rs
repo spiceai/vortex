@@ -9,7 +9,7 @@ use std::sync::Arc;
 use vortex_array::ArrayContext;
 use vortex_array::DeserializeMetadata;
 use vortex_array::EmptyMetadata;
-use vortex_dtype::DType;
+use vortex_array::dtype::DType;
 use vortex_error::VortexResult;
 use vortex_session::VortexSession;
 
@@ -83,23 +83,6 @@ impl VTable for ChunkedVTable {
         )))
     }
 
-    #[cfg(gpu_unstable)]
-    fn new_gpu_reader(
-        layout: &Self::Layout,
-        name: Arc<str>,
-        segment_source: Arc<dyn SegmentSource>,
-        ctx: Arc<cudarc::driver::CudaContext>,
-    ) -> VortexResult<crate::gpu::GpuLayoutReaderRef> {
-        Ok(Arc::new(
-            crate::gpu::layouts::chunked::GpuChunkedLayoutReader::new(
-                layout.clone(),
-                name,
-                segment_source,
-                ctx,
-            ),
-        ))
-    }
-
     fn build(
         _encoding: &Self::Encoding,
         dtype: &DType,
@@ -107,7 +90,7 @@ impl VTable for ChunkedVTable {
         _metadata: &<Self::Metadata as DeserializeMetadata>::Output,
         _segment_ids: Vec<SegmentId>,
         children: &dyn LayoutChildren,
-        _ctx: ArrayContext,
+        _ctx: &ArrayContext,
     ) -> VortexResult<Self::Layout> {
         Ok(ChunkedLayout::new(
             row_count,

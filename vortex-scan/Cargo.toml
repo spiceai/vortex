@@ -21,7 +21,6 @@ arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 vortex-array = { workspace = true }
 vortex-buffer = { workspace = true }
-vortex-dtype = { workspace = true }
 vortex-error = { workspace = true }
 vortex-io = { workspace = true }
 vortex-layout = { workspace = true }
@@ -29,20 +28,17 @@ vortex-mask = { workspace = true }
 vortex-metrics = { workspace = true }
 vortex-session = { workspace = true }
 
+async-trait = { workspace = true }
 bit-vec = { workspace = true }
 futures = { workspace = true }
 itertools = { workspace = true }
 parking_lot = { workspace = true }
-roaring = { workspace = true, optional = true }
+roaring = { workspace = true }
 sketches-ddsketch = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-vortex-layout = { workspace = true, features = ["test-harness"] }
-
-[features]
-default = []
-roaring = ["dep:roaring"]
+vortex-layout = { workspace = true, features = ["_test-harness"] }
 
 [lints]
 workspace = true

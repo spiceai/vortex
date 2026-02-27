@@ -38,7 +38,6 @@ use vortex::array::arrays::PrimitiveArray;
 use vortex::array::arrays::StructArray;
 use vortex::array::arrays::VarBinArray;
 use vortex::array::validity::Validity;
-use vortex::compressor::CompactCompressor;
 use vortex::dtype::DType;
 use vortex::dtype::Nullability;
 use vortex::file::WriteStrategyBuilder;
@@ -92,7 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 
 /// Simulates application activity with various log levels and spans
-#[expect(clippy::cognitive_complexity)]
+#[allow(clippy::cognitive_complexity)]
 async fn simulate_application_activity(user_id: u32) {
     // Simulate HTTP request handling
     let request_span = span!(
@@ -386,10 +385,10 @@ async fn write_batch_to_vortex(
     let file_path = output_dir.join(format!("traces_{:04}.vortex", file_index));
     let mut file = tokio::fs::File::create(&file_path).await?;
 
-    // Use the write-optimized CompactCompressor for the telemetry files.
+    // Use compact encodings (Pco + Zstd) for the telemetry files.
     let write_opts = session.write_options().with_strategy(
-        WriteStrategyBuilder::new()
-            .with_compressor(CompactCompressor::default())
+        WriteStrategyBuilder::default()
+            .with_compact_encodings()
             .build(),
     );
 
@@ -422,7 +421,7 @@ async fn read_trace_files(
             file_count += 1;
 
             // Read the file
-            let reader = session.open_options().open(path.clone()).await?;
+            let reader = session.open_options().open_path(path.clone()).await?;
             let array = reader.scan()?.into_array_stream()?.read_all().await?;
 
             total_events += array.len();

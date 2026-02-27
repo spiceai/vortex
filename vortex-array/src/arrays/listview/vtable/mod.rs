@@ -1,41 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::sync::Arc;
-
-use vortex_dtype::DType;
-use vortex_dtype::Nullability;
-use vortex_dtype::PType;
+use kernel::PARENT_KERNELS;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
-use vortex_vector::Vector;
-use vortex_vector::listview::ListViewVector;
+use vortex_session::VortexSession;
 
 use crate::ArrayRef;
 use crate::DeserializeMetadata;
+use crate::ExecutionCtx;
 use crate::ProstMetadata;
 use crate::SerializeMetadata;
-use crate::VectorExecutor;
 use crate::arrays::ListViewArray;
-use crate::arrays::listview::vtable::rules::PARENT_RULES;
+use crate::arrays::listview::compute::rules::PARENT_RULES;
 use crate::buffer::BufferHandle;
-use crate::executor::ExecutionCtx;
+use crate::dtype::DType;
+use crate::dtype::Nullability;
+use crate::dtype::PType;
 use crate::serde::ArrayChildren;
 use crate::validity::Validity;
 use crate::vtable;
 use crate::vtable::ArrayId;
-use crate::vtable::ArrayVTable;
-use crate::vtable::ArrayVTableExt;
-use crate::vtable::NotSupported;
 use crate::vtable::VTable;
 use crate::vtable::ValidityVTableFromValidityHelper;
 
 mod array;
-mod canonical;
+mod kernel;
 mod operations;
-mod rules;
 mod validity;
 mod visitor;
 
@@ -43,6 +36,10 @@ vtable!(ListView);
 
 #[derive(Debug)]
 pub struct ListViewVTable;
+
+impl ListViewVTable {
+    pub const ID: ArrayId = ArrayId::new_ref("vortex.listview");
+}
 
 #[derive(Clone, prost::Message)]
 pub struct ListViewMetadata {
@@ -60,19 +57,12 @@ impl VTable for ListViewVTable {
     type Metadata = ProstMetadata<ListViewMetadata>;
 
     type ArrayVTable = Self;
-    type CanonicalVTable = Self;
     type OperationsVTable = Self;
     type ValidityVTable = ValidityVTableFromValidityHelper;
     type VisitorVTable = Self;
-    type ComputeVTable = NotSupported;
-    type EncodeVTable = NotSupported;
 
-    fn id(&self) -> ArrayId {
-        ArrayId::new_ref("vortex.listview")
-    }
-
-    fn encoding(_array: &Self::Array) -> ArrayVTable {
-        ListViewVTable.as_vtable()
+    fn id(_array: &Self::Array) -> ArrayId {
+        Self::ID
     }
 
     fn metadata(array: &ListViewArray) -> VortexResult<Self::Metadata> {
@@ -87,13 +77,18 @@ impl VTable for ListViewVTable {
         Ok(Some(metadata.serialize()))
     }
 
-    fn deserialize(bytes: &[u8]) -> VortexResult<Self::Metadata> {
+    fn deserialize(
+        bytes: &[u8],
+        _dtype: &DType,
+        _len: usize,
+        _buffers: &[BufferHandle],
+        _session: &VortexSession,
+    ) -> VortexResult<Self::Metadata> {
         let metadata = <Self::Metadata as DeserializeMetadata>::deserialize(bytes)?;
         Ok(ProstMetadata(metadata))
     }
 
     fn build(
-        &self,
         dtype: &DType,
         len: usize,
         metadata: &Self::Metadata,
@@ -173,21 +168,8 @@ impl VTable for ListViewVTable {
         Ok(())
     }
 
-    fn execute(array: &Self::Array, ctx: &mut ExecutionCtx) -> VortexResult<Vector> {
-        let elements = array.elements().execute(ctx)?;
-        let offsets = array.offsets().execute(ctx)?;
-        let sizes = array.sizes().execute(ctx)?;
-        let validity_mask = array.validity_mask();
-
-        Ok(unsafe {
-            ListViewVector::new_unchecked(
-                Arc::new(elements),
-                offsets.into_primitive(),
-                sizes.into_primitive(),
-                validity_mask,
-            )
-        }
-        .into())
+    fn execute(array: &Self::Array, _ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
+        Ok(array.to_array())
     }
 
     fn reduce_parent(
@@ -196,5 +178,14 @@ impl VTable for ListViewVTable {
         child_idx: usize,
     ) -> VortexResult<Option<ArrayRef>> {
         PARENT_RULES.evaluate(array, parent, child_idx)
+    }
+
+    fn execute_parent(
+        array: &Self::Array,
+        parent: &ArrayRef,
+        child_idx: usize,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<ArrayRef>> {
+        PARENT_KERNELS.execute(array, parent, child_idx, ctx)
     }
 }

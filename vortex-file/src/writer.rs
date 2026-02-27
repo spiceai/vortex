@@ -14,8 +14,10 @@ use futures::future::LocalBoxFuture;
 use futures::future::ready;
 use futures::pin_mut;
 use futures::select;
+use itertools::Itertools;
 use vortex_array::ArrayContext;
 use vortex_array::ArrayRef;
+use vortex_array::dtype::DType;
 use vortex_array::expr::stats::Stat;
 use vortex_array::iter::ArrayIterator;
 use vortex_array::iter::ArrayIteratorExt;
@@ -26,7 +28,6 @@ use vortex_array::stream::ArrayStreamAdapter;
 use vortex_array::stream::ArrayStreamExt;
 use vortex_array::stream::SendableArrayStream;
 use vortex_buffer::ByteBuffer;
-use vortex_dtype::DType;
 use vortex_error::VortexError;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
@@ -71,7 +72,7 @@ pub trait WriteOptionsSessionExt: SessionExt {
         let maybe_write_strategy_builder = self.get_opt::<WriteStrategyBuilder>();
         let strategy = maybe_write_strategy_builder
             .map(|opt| opt.clone().build())
-            .unwrap_or_else(|| WriteStrategyBuilder::new().build());
+            .unwrap_or_else(|| WriteStrategyBuilder::default().build());
 
         VortexWriteOptions {
             session: self.session(),
@@ -88,8 +89,8 @@ impl VortexWriteOptions {
     /// Create a new [`VortexWriteOptions`] with the given session.
     pub fn new(session: VortexSession) -> Self {
         VortexWriteOptions {
+            strategy: WriteStrategyBuilder::default().build(),
             session,
-            strategy: WriteStrategyBuilder::new().build(),
             exclude_dtype: false,
             file_statistics: PRUNING_STATS.to_vec(),
             max_variable_length_statistics_size: 64,
@@ -149,7 +150,9 @@ impl VortexWriteOptions {
         // serialised array order is deterministic. The serialisation of arrays are done
         // parallel and with an empty context they can register their encodings to the context
         // in different order, changing the written bytes from run to run.
-        let ctx = ArrayContext::from_registry_sorted(self.session.arrays().registry());
+        let ctx = ArrayContext::new(self.session.arrays().registry().ids().sorted().collect())
+            // Configure a registry just to ensure only known encodings are interned.
+            .with_registry(self.session.arrays().registry().clone());
         let dtype = stream.dtype().clone();
 
         let (mut ptr, eof) = SequenceId::root().split();
@@ -201,13 +204,16 @@ impl VortexWriteOptions {
         let (layout, segment_specs) = layout_fut.await?;
 
         // Assemble the Footer object now that we have all the segments.
-        let footer = Footer::new(
+        let mut footer = Footer::new(
             layout.clone(),
             segment_specs,
             if self.file_statistics.is_empty() {
                 None
             } else {
-                Some(FileStatistics(file_stats.stats_sets().into()))
+                Some(FileStatistics::new_with_dtype(
+                    file_stats.stats_sets().into(),
+                    &dtype,
+                ))
             },
             ctx,
         );
@@ -219,6 +225,11 @@ impl VortexWriteOptions {
             .with_offset(position)
             .with_exclude_dtype(self.exclude_dtype)
             .serialize()?;
+
+        // Update the approx footer size in the footer object, so it can be used for caching and
+        // memory management in the future.
+        footer = footer.with_approx_byte_size(footer_buffers.iter().map(|b| b.len()).sum());
+
         for buffer in footer_buffers {
             position += buffer.len() as u64;
             write.write_all(buffer).await?;
@@ -458,7 +469,7 @@ impl WriteSummary {
         self.size
     }
 
-    /// The footer of the written Vortex file.
+    /// The total number of rows in the written Vortex file.
     pub fn row_count(&self) -> u64 {
         self.footer.row_count()
     }
@@ -475,7 +486,7 @@ mod tests {
         assert!(fetched_write_strategy.is_none());
         drop(fetched_write_strategy);
 
-        let session = session.set(WriteStrategyBuilder::new());
+        let session = session.set(WriteStrategyBuilder::default());
         let fetched_write_strategy = session.get_opt::<WriteStrategyBuilder>();
         assert!(fetched_write_strategy.is_some());
     }

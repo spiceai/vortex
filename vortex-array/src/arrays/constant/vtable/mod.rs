@@ -3,35 +3,29 @@
 
 use std::fmt::Debug;
 
-use vortex_dtype::DType;
 use vortex_error::VortexResult;
-use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
-use vortex_scalar::Scalar;
-use vortex_scalar::ScalarValue;
-use vortex_vector::ScalarOps;
-use vortex_vector::Vector;
-use vortex_vector::VectorMutOps;
+use vortex_session::VortexSession;
 
 use crate::ArrayRef;
 use crate::EmptyMetadata;
+use crate::ExecutionCtx;
+use crate::IntoArray;
 use crate::arrays::ConstantArray;
-use crate::arrays::constant::vtable::rules::PARENT_RULES;
+use crate::arrays::constant::compute::rules::PARENT_RULES;
+use crate::arrays::constant::vtable::canonical::constant_canonicalize;
 use crate::buffer::BufferHandle;
-use crate::executor::ExecutionCtx;
+use crate::dtype::DType;
+use crate::scalar::Scalar;
+use crate::scalar::ScalarValue;
 use crate::serde::ArrayChildren;
 use crate::vtable;
 use crate::vtable::ArrayId;
-use crate::vtable::ArrayVTable;
-use crate::vtable::ArrayVTableExt;
-use crate::vtable::NotSupported;
 use crate::vtable::VTable;
 
 mod array;
-mod canonical;
-mod encode;
+pub(crate) mod canonical;
 mod operations;
-mod rules;
 mod validity;
 mod visitor;
 
@@ -40,26 +34,22 @@ vtable!(Constant);
 #[derive(Debug)]
 pub struct ConstantVTable;
 
+impl ConstantVTable {
+    pub const ID: ArrayId = ArrayId::new_ref("vortex.constant");
+}
+
 impl VTable for ConstantVTable {
     type Array = ConstantArray;
 
     type Metadata = EmptyMetadata;
 
     type ArrayVTable = Self;
-    type CanonicalVTable = Self;
     type OperationsVTable = Self;
     type ValidityVTable = Self;
     type VisitorVTable = Self;
-    // TODO(ngates): implement a compute kernel for elementwise operations
-    type ComputeVTable = NotSupported;
-    type EncodeVTable = Self;
 
-    fn id(&self) -> ArrayId {
-        ArrayId::new_ref("vortex.constant")
-    }
-
-    fn encoding(_array: &Self::Array) -> ArrayVTable {
-        ConstantVTable.as_vtable()
+    fn id(_array: &Self::Array) -> ArrayId {
+        Self::ID
     }
 
     fn metadata(_array: &ConstantArray) -> VortexResult<Self::Metadata> {
@@ -67,27 +57,38 @@ impl VTable for ConstantVTable {
     }
 
     fn serialize(_metadata: Self::Metadata) -> VortexResult<Option<Vec<u8>>> {
-        Ok(Some(vec![]))
+        Ok(Some(Vec::new()))
     }
 
-    fn deserialize(_buffer: &[u8]) -> VortexResult<Self::Metadata> {
+    fn deserialize(
+        _bytes: &[u8],
+        _dtype: &DType,
+        _len: usize,
+        _buffers: &[BufferHandle],
+        _session: &VortexSession,
+    ) -> VortexResult<Self::Metadata> {
         Ok(EmptyMetadata)
     }
 
     fn build(
-        &self,
         dtype: &DType,
         len: usize,
         _metadata: &Self::Metadata,
         buffers: &[BufferHandle],
         _children: &dyn ArrayChildren,
     ) -> VortexResult<ConstantArray> {
-        if buffers.len() != 1 {
-            vortex_bail!("Expected 1 buffer, got {}", buffers.len());
-        }
-        let buffer = buffers[0].clone().try_to_bytes()?;
-        let sv = ScalarValue::from_protobytes(&buffer)?;
-        let scalar = Scalar::new(dtype.clone(), sv);
+        vortex_ensure!(
+            buffers.len() == 1,
+            "Expected 1 buffer, got {}",
+            buffers.len()
+        );
+
+        let buffer = buffers[0].clone().try_to_host_sync()?;
+        let bytes: &[u8] = buffer.as_ref();
+
+        let scalar_value = ScalarValue::from_proto_bytes(bytes, dtype)?;
+        let scalar = Scalar::try_new(dtype.clone(), scalar_value)?;
+
         Ok(ConstantArray::new(scalar, len))
     }
 
@@ -100,15 +101,15 @@ impl VTable for ConstantVTable {
         Ok(())
     }
 
-    fn execute(array: &Self::Array, _ctx: &mut ExecutionCtx) -> VortexResult<Vector> {
-        Ok(array.scalar.to_vector_scalar().repeat(array.len).freeze())
-    }
-
     fn reduce_parent(
         array: &Self::Array,
         parent: &ArrayRef,
         child_idx: usize,
     ) -> VortexResult<Option<ArrayRef>> {
         PARENT_RULES.evaluate(array, parent, child_idx)
+    }
+
+    fn execute(array: &Self::Array, _ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
+        Ok(constant_canonicalize(array)?.into_array())
     }
 }

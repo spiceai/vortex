@@ -2,8 +2,18 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 mod array;
-mod rules;
-mod vtable;
+pub use array::FilterArray;
+pub use array::FilterArrayParts;
 
-pub use array::*;
-pub use vtable::*;
+mod execute;
+
+mod kernel;
+pub use kernel::FilterExecuteAdaptor;
+pub use kernel::FilterKernel;
+pub use kernel::FilterReduce;
+pub use kernel::FilterReduceAdaptor;
+
+mod rules;
+
+mod vtable;
+pub use vtable::FilterVTable;

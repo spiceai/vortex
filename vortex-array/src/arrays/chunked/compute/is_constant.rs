@@ -32,7 +32,7 @@ impl IsConstantKernel for ChunkedVTable {
             Some(true) => {}
         }
 
-        let first_value = first_chunk.scalar_at(0).into_nullable();
+        let first_value = first_chunk.scalar_at(0)?.into_nullable();
 
         for chunk in chunks {
             match is_constant_opts(chunk, opts)? {
@@ -42,7 +42,7 @@ impl IsConstantKernel for ChunkedVTable {
                 Some(true) => {}
             }
 
-            if first_value != chunk.scalar_at(0).into_nullable() {
+            if first_value != chunk.scalar_at(0)?.into_nullable() {
                 return Ok(Some(false));
             }
         }
@@ -57,13 +57,13 @@ register_kernel!(IsConstantKernelAdapter(ChunkedVTable).lift());
 mod tests {
     use vortex_buffer::Buffer;
     use vortex_buffer::buffer;
-    use vortex_dtype::DType;
-    use vortex_dtype::Nullability;
-    use vortex_dtype::PType;
 
     use crate::Array;
     use crate::IntoArray;
     use crate::arrays::ChunkedArray;
+    use crate::dtype::DType;
+    use crate::dtype::Nullability;
+    use crate::dtype::PType;
 
     #[test]
     fn empty_chunk_is_constant() {

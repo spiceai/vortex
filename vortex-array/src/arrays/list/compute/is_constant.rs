@@ -2,15 +2,16 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use vortex_error::VortexResult;
-use vortex_scalar::NumericOperator;
 
 use crate::arrays::ListArray;
 use crate::arrays::ListVTable;
+use crate::builtins::ArrayBuiltins;
 use crate::compute::IsConstantKernel;
 use crate::compute::IsConstantKernelAdapter;
 use crate::compute::IsConstantOpts;
-use crate::compute::numeric;
+use crate::compute::is_constant;
 use crate::register_kernel;
+use crate::scalar_fn::fns::operators::Operator;
 
 const SMALL_ARRAY_THRESHOLD: usize = 64;
 
@@ -24,9 +25,9 @@ impl IsConstantKernel for ListVTable {
 
         // We can first quickly check if all of the list lengths are equal. If not, then we know the
         // array cannot be constant.
-        let first_list_len = array.offset_at(1) - array.offset_at(0);
+        let first_list_len = array.offset_at(1)? - array.offset_at(0)?;
         for i in 1..manual_check_until {
-            let current_list_len = array.offset_at(i + 1) - array.offset_at(i);
+            let current_list_len = array.offset_at(i + 1)? - array.offset_at(i)?;
             if current_list_len != first_list_len {
                 return Ok(Some(false));
             }
@@ -41,13 +42,13 @@ impl IsConstantKernel for ListVTable {
         // If the array is long, do an optimistic check on the remainder of the list lengths.
         if array.len() > SMALL_ARRAY_THRESHOLD {
             // check the rest of the element lengths
-            let start_offsets = array.offsets().slice(SMALL_ARRAY_THRESHOLD..array.len());
+            let start_offsets = array.offsets().slice(SMALL_ARRAY_THRESHOLD..array.len())?;
             let end_offsets = array
                 .offsets()
-                .slice(SMALL_ARRAY_THRESHOLD + 1..array.len() + 1);
-            let list_lengths = numeric(&end_offsets, &start_offsets, NumericOperator::Sub)?;
+                .slice(SMALL_ARRAY_THRESHOLD + 1..array.len() + 1)?;
+            let list_lengths = end_offsets.binary(start_offsets, Operator::Sub)?;
 
-            if !list_lengths.is_constant() {
+            if !is_constant(&list_lengths)?.unwrap_or_default() {
                 return Ok(Some(false));
             }
         }
@@ -56,11 +57,11 @@ impl IsConstantKernel for ListVTable {
             array.len() > 1,
             "precondition for `is_constant` is incorrect"
         );
-        let first_scalar = array.scalar_at(0); // We checked the array length above.
+        let first_scalar = array.scalar_at(0)?; // We checked the array length above.
 
         // All lists have the same length, so compare the actual list contents.
         for i in 1..array.len() {
-            let current_scalar = array.scalar_at(i);
+            let current_scalar = array.scalar_at(i)?;
             if current_scalar != first_scalar {
                 return Ok(Some(false));
             }
@@ -77,13 +78,13 @@ mod tests {
 
     use rstest::rstest;
     use vortex_buffer::buffer;
-    use vortex_dtype::FieldNames;
 
     use crate::IntoArray;
     use crate::arrays::ListArray;
     use crate::arrays::PrimitiveArray;
     use crate::arrays::StructArray;
     use crate::compute::is_constant;
+    use crate::dtype::FieldNames;
     use crate::validity::Validity;
 
     #[test]
@@ -107,7 +108,11 @@ mod tests {
                 .unwrap()
                 .unwrap()
         );
-        assert!(struct_of_lists.is_constant());
+        assert!(
+            is_constant(struct_of_lists.as_ref())
+                .unwrap()
+                .unwrap_or_default()
+        );
     }
 
     #[rstest]

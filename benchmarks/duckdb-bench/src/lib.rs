@@ -17,17 +17,22 @@ use vortex_bench::generate_duckdb_registration_sql;
 use vortex_duckdb::duckdb::Config;
 use vortex_duckdb::duckdb::Connection;
 use vortex_duckdb::duckdb::Database;
-use vortex_duckdb::register_extension_options;
 
 /// DuckDB context for benchmarks.
 pub struct DuckClient {
-    pub db: Database,
-    pub connection: Connection,
+    db: Option<Database>,
+    connection: Option<Connection>,
     pub db_path: PathBuf,
     pub threads: Option<usize>,
 }
 
 impl DuckClient {
+    pub fn connection(&self) -> &Connection {
+        self.connection
+            .as_ref()
+            .vortex_expect("DuckClient connection accessed after close")
+    }
+
     /// Create a new DuckDB context with a database at `{data_url}/{format}/duckdb.db`.
     pub fn new(
         benchmark: &dyn Benchmark,
@@ -56,8 +61,8 @@ impl DuckClient {
         let (db, connection) = Self::open_and_setup_database(Some(db_path.clone()), threads)?;
 
         Ok(Self {
-            db,
-            connection,
+            db: Some(db),
+            connection: Some(connection),
             db_path,
             threads,
         })
@@ -67,10 +72,12 @@ impl DuckClient {
         path: Option<PathBuf>,
         threads: Option<usize>,
     ) -> Result<(Database, Connection)> {
-        let config = Config::new().vortex_expect("failed to create duckdb config");
+        let mut config = Config::new().vortex_expect("failed to create duckdb config");
 
-        // Register Vortex extension options before creating connection
-        register_extension_options(&config);
+        // Set DuckDB thread count if specified
+        if let Some(thread_count) = threads {
+            config.set("threads", &format!("{}", thread_count))?;
+        }
 
         let db = match path {
             Some(path) => Database::open_with_config(path, config),
@@ -78,7 +85,7 @@ impl DuckClient {
         }?;
 
         let connection = db.connect()?;
-        vortex_duckdb::register_table_functions(&connection)?;
+        vortex_duckdb::initialize(&db)?;
 
         // Enable Parquet metadata cache for all benchmark runs.
         //
@@ -91,31 +98,22 @@ impl DuckClient {
         // parquet_metadata_cache" when running DuckDB in debug mode.
         connection.query("SET parquet_metadata_cache = true")?;
 
-        // Set vortex_max_threads if specified
-        if let Some(thread_count) = threads {
-            connection.query(&format!("SET vortex_max_threads = {}", thread_count))?;
-        }
-
         Ok((db, connection))
     }
 
     pub fn reopen(&mut self) -> Result<()> {
-        // take ownership of the connection & database
-        let mut connection = unsafe { Connection::borrow(self.connection.as_ptr()) };
-        std::mem::swap(&mut self.connection, &mut connection);
-        let mut db = unsafe { Database::borrow(self.db.as_ptr()) };
-        std::mem::swap(&mut self.db, &mut db);
+        // Close the old database before opening a new one on the same file path.
+        // DuckDB cannot have two instances on the same file simultaneously — the new
+        // instance may read an inconsistent state, causing deserialization
+        // errors. Drop connection before database (connection depends on database).
+        self.connection.take();
+        self.db.take();
 
-        // drop the connection, then the database (order might be important?)
-        // NB: self.db and self.connection will be dangling pointers, which we'll fix below
-        drop(connection);
-        drop(db);
-
-        let (mut db, mut connection) =
+        let (db, connection) =
             Self::open_and_setup_database(Some(self.db_path.clone()), self.threads)?;
 
-        std::mem::swap(&mut self.connection, &mut connection);
-        std::mem::swap(&mut self.db, &mut db);
+        self.db = Some(db);
+        self.connection = Some(connection);
 
         Ok(())
     }
@@ -128,8 +126,8 @@ impl DuckClient {
         let db_path = dir.join("duckdb.db");
         let (db, connection) = Self::open_and_setup_database(Some(db_path.clone()), None)?;
         Ok(Self {
-            db,
-            connection,
+            db: Some(db),
+            connection: Some(connection),
             db_path,
             threads: None,
         })
@@ -141,7 +139,7 @@ impl DuckClient {
     pub fn execute_query(&self, query: &str) -> Result<(usize, Option<Duration>)> {
         trace!("execute duckdb query: {query}");
         let time_instant = Instant::now();
-        let result = self.connection.query(query)?;
+        let result = self.connection().query(query)?;
         let query_time = time_instant.elapsed();
 
         let row_count = usize::try_from(result.row_count()).vortex_expect("row count overflow");

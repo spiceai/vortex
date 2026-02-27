@@ -2,66 +2,64 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::iter;
-use std::ops::Deref;
 
 use num_traits::AsPrimitive;
 use vortex_buffer::Buffer;
-use vortex_dtype::match_each_integer_ptype;
 use vortex_error::VortexResult;
 use vortex_mask::AllOr;
 use vortex_mask::Mask;
-use vortex_vector::binaryview::BinaryView;
 
 use crate::Array;
 use crate::ArrayRef;
 use crate::IntoArray;
 use crate::ToCanonical;
+use crate::arrays::BinaryView;
+use crate::arrays::TakeExecute;
 use crate::arrays::VarBinViewArray;
 use crate::arrays::VarBinViewVTable;
-use crate::compute::TakeKernel;
-use crate::compute::TakeKernelAdapter;
-use crate::register_kernel;
+use crate::buffer::BufferHandle;
+use crate::executor::ExecutionCtx;
+use crate::match_each_integer_ptype;
 use crate::vtable::ValidityHelper;
 
-/// Take involves creating a new array that references the old array, just with the given set of views.
-impl TakeKernel for VarBinViewVTable {
-    fn take(&self, array: &VarBinViewArray, indices: &dyn Array) -> VortexResult<ArrayRef> {
-        // Compute the new validity.
+impl TakeExecute for VarBinViewVTable {
+    /// Take involves creating a new array that references the old array, just with the given set of views.
+    fn take(
+        array: &VarBinViewArray,
+        indices: &dyn Array,
+        _ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<ArrayRef>> {
         let validity = array.validity().take(indices)?;
         let indices = indices.to_primitive();
 
+        let indices_mask = indices.validity_mask()?;
         let views_buffer = match_each_integer_ptype!(indices.ptype(), |I| {
-            take_views(
-                array.views(),
-                indices.as_slice::<I>(),
-                &indices.validity_mask(),
-            )
+            take_views(array.views(), indices.as_slice::<I>(), &indices_mask)
         });
 
         // SAFETY: taking all components at same indices maintains invariants
         unsafe {
-            Ok(VarBinViewArray::new_unchecked(
-                views_buffer,
-                array.buffers().clone(),
-                array
-                    .dtype()
-                    .union_nullability(indices.dtype().nullability()),
-                validity,
-            )
-            .into_array())
+            Ok(Some(
+                VarBinViewArray::new_handle_unchecked(
+                    BufferHandle::new_host(views_buffer.into_byte_buffer()),
+                    array.buffers().clone(),
+                    array
+                        .dtype()
+                        .union_nullability(indices.dtype().nullability()),
+                    validity,
+                )
+                .into_array(),
+            ))
         }
     }
 }
 
-register_kernel!(TakeKernelAdapter(VarBinViewVTable).lift());
-
 fn take_views<I: AsPrimitive<usize>>(
-    views: &Buffer<BinaryView>,
+    views_ref: &[BinaryView],
     indices: &[I],
     mask: &Mask,
 ) -> Buffer<BinaryView> {
     // NOTE(ngates): this deref is not actually trivial, so we run it once.
-    let views_ref = views.deref();
     // We do not use iter_bools directly, since the resulting dyn iterator cannot
     // implement TrustedLen.
     match mask.bit_buffer() {
@@ -89,8 +87,6 @@ mod tests {
     use rstest::rstest;
     use vortex_buffer::BitBuffer;
     use vortex_buffer::buffer;
-    use vortex_dtype::DType;
-    use vortex_dtype::Nullability::NonNullable;
 
     use crate::IntoArray;
     use crate::accessor::ArrayAccessor;
@@ -99,7 +95,8 @@ mod tests {
     use crate::arrays::VarBinViewArray;
     use crate::canonical::ToCanonical;
     use crate::compute::conformance::take::test_take_conformance;
-    use crate::compute::take;
+    use crate::dtype::DType;
+    use crate::dtype::Nullability::NonNullable;
     use crate::validity::Validity;
 
     #[test]
@@ -113,7 +110,7 @@ mod tests {
             Some("six"),
         ]);
 
-        let taken = take(arr.as_ref(), &buffer![0, 3].into_array()).unwrap();
+        let taken = arr.take(buffer![0, 3].into_array()).unwrap();
 
         assert!(taken.dtype().is_nullable());
         assert_eq!(
@@ -134,7 +131,7 @@ mod tests {
             Validity::from(BitBuffer::from(vec![true, false])),
         );
 
-        let taken = take(arr.as_ref(), indices.as_ref()).unwrap();
+        let taken = arr.take(indices.to_array()).unwrap();
 
         assert!(taken.dtype().is_nullable());
         assert_eq!(

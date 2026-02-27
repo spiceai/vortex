@@ -13,10 +13,10 @@ use vortex_array::arrays::ListViewArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::StructArray;
 use vortex_array::arrays::VarBinViewArray;
+use vortex_array::dtype::DType;
+use vortex_array::match_each_decimal_value_type;
+use vortex_array::match_each_native_ptype;
 use vortex_array::validity::Validity;
-use vortex_dtype::DType;
-use vortex_dtype::match_each_decimal_value_type;
-use vortex_dtype::match_each_native_ptype;
 use vortex_error::VortexResult;
 
 #[allow(clippy::unnecessary_fallible_conversions)]
@@ -26,7 +26,7 @@ pub fn slice_canonical_array(
     stop: usize,
 ) -> VortexResult<ArrayRef> {
     let validity = if array.dtype().is_nullable() {
-        let bool_buff = array.validity_mask().to_bit_buffer();
+        let bool_buff = array.validity_mask()?.to_bit_buffer();
         Validity::from(bool_buff.slice(start..stop))
     } else {
         Validity::NonNullable
@@ -35,16 +35,17 @@ pub fn slice_canonical_array(
     match array.dtype() {
         DType::Bool(_) => {
             let bool_array = array.to_bool();
-            let sliced_bools = bool_array.bit_buffer().slice(start..stop);
-            Ok(BoolArray::from_bit_buffer(sliced_bools, validity).into_array())
+            let sliced_bools = bool_array.to_bit_buffer().slice(start..stop);
+            Ok(BoolArray::new(sliced_bools, validity).into_array())
         }
         DType::Primitive(p, _) => {
             let primitive_array = array.to_primitive();
             match_each_native_ptype!(p, |P| {
-                Ok(
-                    PrimitiveArray::new(primitive_array.buffer::<P>().slice(start..stop), validity)
-                        .into_array(),
+                Ok(PrimitiveArray::new(
+                    primitive_array.to_buffer::<P>().slice(start..stop),
+                    validity,
                 )
+                .into_array())
             })
         }
         DType::Utf8(_) | DType::Binary(_) => {
@@ -60,7 +61,7 @@ pub fn slice_canonical_array(
         DType::Struct(..) => {
             let struct_array = array.to_struct();
             let sliced_children = struct_array
-                .fields()
+                .unmasked_fields()
                 .iter()
                 .map(|c| slice_canonical_array(c, start, stop))
                 .collect::<VortexResult<Vec<_>>>()?;

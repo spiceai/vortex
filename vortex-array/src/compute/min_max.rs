@@ -4,13 +4,9 @@
 use std::sync::LazyLock;
 
 use arcref::ArcRef;
-use vortex_dtype::DType;
-use vortex_dtype::Nullability;
-use vortex_dtype::StructFields;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
-use vortex_scalar::Scalar;
 
 use crate::Array;
 use crate::arrays::ConstantVTable;
@@ -20,10 +16,17 @@ use crate::compute::InvocationArgs;
 use crate::compute::Kernel;
 use crate::compute::Output;
 use crate::compute::UnaryArgs;
+use crate::dtype::DType;
+use crate::dtype::FieldNames;
+use crate::dtype::Nullability;
+use crate::dtype::StructFields;
 use crate::expr::stats::Precision;
 use crate::expr::stats::Stat;
 use crate::expr::stats::StatsProvider;
+use crate::scalar::Scalar;
 use crate::vtable::VTable;
+
+static NAMES: LazyLock<FieldNames> = LazyLock::new(|| FieldNames::from(["min", "max"]));
 
 static MIN_MAX_FN: LazyLock<ComputeFn> = LazyLock::new(|| {
     let compute = ComputeFn::new("min_max".into(), ArcRef::new_ref(&MinMax));
@@ -99,13 +102,17 @@ impl ComputeFnVTable for MinMax {
                     array.encoding_id()
                 );
 
-                // Update the stats set with the computed min/max
-                array
-                    .statistics()
-                    .set(Stat::Min, Precision::Exact(min.value().clone()));
-                array
-                    .statistics()
-                    .set(Stat::Max, Precision::Exact(max.value().clone()));
+                // Update the stats set with the computed min/max.
+                if let Some(min_value) = min.value() {
+                    array
+                        .statistics()
+                        .set(Stat::Min, Precision::Exact(min_value.clone()));
+                }
+                if let Some(max_value) = max.value() {
+                    array
+                        .statistics()
+                        .set(Stat::Max, Precision::Exact(max_value.clone()));
+                }
 
                 // Return the min/max as a struct scalar
                 Ok(Scalar::struct_(return_dtype, vec![min, max]).into())
@@ -120,7 +127,7 @@ impl ComputeFnVTable for MinMax {
         // that the array is all null or empty.
         Ok(DType::Struct(
             StructFields::new(
-                ["min", "max"].into(),
+                NAMES.clone(),
                 vec![
                     array.dtype().as_nonnullable(),
                     array.dtype().as_nonnullable(),
@@ -143,7 +150,7 @@ fn min_max_impl(
     array: &dyn Array,
     kernels: &[ArcRef<dyn Kernel>],
 ) -> VortexResult<Option<MinMaxResult>> {
-    if array.is_empty() || array.valid_count() == 0 {
+    if array.is_empty() || array.valid_count()? == 0 {
         return Ok(None);
     }
 
@@ -177,12 +184,9 @@ fn min_max_impl(
             return MinMaxResult::from_scalar(output.unwrap_scalar()?);
         }
     }
-    if let Some(output) = array.invoke(&MIN_MAX_FN, &args)? {
-        return MinMaxResult::from_scalar(output.unwrap_scalar()?);
-    }
 
     if !array.is_canonical() {
-        let array = array.to_canonical();
+        let array = array.to_canonical()?;
         return min_max(array.as_ref());
     }
 
@@ -216,7 +220,7 @@ impl<V: VTable + MinMaxKernel> Kernel for MinMaxKernelAdapter<V> {
         let non_nullable_dtype = array.dtype().as_nonnullable();
         let dtype = DType::Struct(
             StructFields::new(
-                ["min", "max"].into(),
+                NAMES.clone(),
                 vec![non_nullable_dtype.clone(), non_nullable_dtype],
             ),
             Nullability::Nullable,
@@ -254,7 +258,7 @@ mod tests {
 
     #[test]
     fn test_bool_max() {
-        let p = BoolArray::from_bit_buffer(
+        let p = BoolArray::new(
             BitBuffer::from([true, true, true].as_slice()),
             Validity::NonNullable,
         );
@@ -266,7 +270,7 @@ mod tests {
             })
         );
 
-        let p = BoolArray::from_bit_buffer(
+        let p = BoolArray::new(
             BitBuffer::from([false, false, false].as_slice()),
             Validity::NonNullable,
         );
@@ -278,7 +282,7 @@ mod tests {
             })
         );
 
-        let p = BoolArray::from_bit_buffer(
+        let p = BoolArray::new(
             BitBuffer::from([false, true, false].as_slice()),
             Validity::NonNullable,
         );

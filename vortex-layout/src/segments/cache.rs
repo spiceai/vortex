@@ -14,7 +14,9 @@ use vortex_buffer::ByteBuffer;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_metrics::Counter;
-use vortex_metrics::VortexMetrics;
+use vortex_metrics::Label;
+use vortex_metrics::MetricBuilder;
+use vortex_metrics::MetricsRegistry;
 
 use crate::segments::SegmentFuture;
 use crate::segments::SegmentId;
@@ -73,40 +75,51 @@ impl SegmentCache for MokaSegmentCache {
     }
 }
 
-pub struct SegmentCacheMetrics<C> {
+/// Wrapper for [`SegmentCache`] that tracks its hit rate.
+pub struct InstrumentedSegmentCache<C> {
     segment_cache: C,
 
-    hits: Arc<Counter>,
-    misses: Arc<Counter>,
-    stores: Arc<Counter>,
+    hits: Counter,
+    misses: Counter,
+    stores: Counter,
 }
 
-impl<C: SegmentCache> SegmentCacheMetrics<C> {
-    pub fn new(segment_cache: C, metrics: VortexMetrics) -> Self {
+impl<C: SegmentCache> InstrumentedSegmentCache<C> {
+    pub fn new(
+        segment_cache: C,
+        metrics_registry: &dyn MetricsRegistry,
+        labels: Vec<Label>,
+    ) -> Self {
         Self {
             segment_cache,
-            hits: metrics.counter("vortex.file.segments.cache.hits"),
-            misses: metrics.counter("vortex.file.segments.cache.misses"),
-            stores: metrics.counter("vortex.file.segments.cache.stores"),
+            hits: MetricBuilder::new(metrics_registry)
+                .add_labels(labels.clone())
+                .counter("vortex.file.segments.cache.hits"),
+            misses: MetricBuilder::new(metrics_registry)
+                .add_labels(labels.clone())
+                .counter("vortex.file.segments.cache.misses"),
+            stores: MetricBuilder::new(metrics_registry)
+                .add_labels(labels)
+                .counter("vortex.file.segments.cache.stores"),
         }
     }
 }
 
 #[async_trait]
-impl<C: SegmentCache> SegmentCache for SegmentCacheMetrics<C> {
+impl<C: SegmentCache> SegmentCache for InstrumentedSegmentCache<C> {
     async fn get(&self, id: SegmentId) -> VortexResult<Option<ByteBuffer>> {
         let result = self.segment_cache.get(id).await?;
         if result.is_some() {
-            self.hits.inc()
+            self.hits.add(1);
         } else {
-            self.misses.inc()
+            self.misses.add(1);
         }
         Ok(result)
     }
 
     async fn put(&self, id: SegmentId, buffer: ByteBuffer) -> VortexResult<()> {
         self.segment_cache.put(id, buffer).await?;
-        self.stores.inc();
+        self.stores.add(1);
         Ok(())
     }
 }
@@ -130,11 +143,11 @@ impl SegmentSource for SegmentCacheSourceAdapter {
         async move {
             if let Ok(Some(segment)) = cache.get(id).await {
                 tracing::debug!("Resolved segment {} from cache", id);
-                return Ok(BufferHandle::Host(segment));
+                return Ok(BufferHandle::new_host(segment));
             }
             let result = delegate.await?;
             // Cache only CPU buffers; device buffers are not cached.
-            if let BufferHandle::Host(ref buffer) = result
+            if let Some(buffer) = result.as_host_opt()
                 && let Err(e) = cache.put(id, buffer.clone()).await
             {
                 tracing::warn!("Failed to store segment {} in cache: {}", id, e);

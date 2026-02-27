@@ -22,7 +22,6 @@ use crate::runtime::AbortHandleRef;
 use crate::runtime::BlockingRuntime;
 use crate::runtime::Executor;
 use crate::runtime::Handle;
-use crate::runtime::IoTask;
 use crate::runtime::smol::SmolAbortHandle;
 /// A runtime that drives all work on the current thread.
 ///
@@ -45,7 +44,6 @@ struct Sender {
     scheduling: kanal::Sender<SpawnAsync<'static>>,
     cpu: kanal::Sender<SpawnSync<'static>>,
     blocking: kanal::Sender<SpawnSync<'static>>,
-    io: kanal::Sender<IoTask>,
 }
 
 impl Sender {
@@ -53,7 +51,6 @@ impl Sender {
         let (scheduling_send, scheduling_recv) = kanal::unbounded::<SpawnAsync>();
         let (cpu_send, cpu_recv) = kanal::unbounded::<SpawnSync>();
         let (blocking_send, blocking_recv) = kanal::unbounded::<SpawnSync>();
-        let (io_send, io_recv) = kanal::unbounded::<IoTask>();
 
         // We pass weak references to the local execution into the async tasks such that the task's
         // reference doesn't keep the execution alive after the runtime is dropped.
@@ -108,23 +105,10 @@ impl Sender {
             })
             .detach();
 
-        // Drive I/O tasks.
-        let weak_local2 = weak_local;
-        local
-            .spawn(async move {
-                while let Ok(task) = io_recv.as_async().recv().await {
-                    if let Some(local) = weak_local2.upgrade() {
-                        local.spawn(task.source.drive_local(task.stream)).detach();
-                    }
-                }
-            })
-            .detach();
-
         Self {
             scheduling: scheduling_send,
             cpu: cpu_send,
             blocking: blocking_send,
-            io: io_send,
         }
     }
 }
@@ -160,7 +144,7 @@ impl Executor for Sender {
         })
     }
 
-    fn spawn_blocking(&self, work: Box<dyn FnOnce() + Send + 'static>) -> AbortHandleRef {
+    fn spawn_blocking_io(&self, work: Box<dyn FnOnce() + Send + 'static>) -> AbortHandleRef {
         let (send, recv) = oneshot::channel();
         if let Err(e) = self.blocking.send(SpawnSync {
             sync: work,
@@ -171,12 +155,6 @@ impl Executor for Sender {
         Box::new(LazyAbortHandle {
             task: Mutex::new(recv),
         })
-    }
-
-    fn spawn_io(&self, task: IoTask) {
-        if let Err(e) = self.io.send(task) {
-            vortex_panic!("Executor missing: {}", e);
-        }
     }
 }
 

@@ -1,71 +1,38 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::ops::Range;
+use vortex_error::VortexResult;
 
-use vortex_buffer::Buffer;
-use vortex_dtype::DecimalDType;
-use vortex_dtype::NativeDecimalType;
-use vortex_dtype::match_each_decimal_value_type;
-use vortex_scalar::DecimalValue;
-use vortex_scalar::Scalar;
-
-use crate::ArrayRef;
-use crate::IntoArray;
 use crate::arrays::DecimalArray;
 use crate::arrays::DecimalVTable;
-use crate::validity::Validity;
+use crate::match_each_decimal_value_type;
+use crate::scalar::DecimalValue;
+use crate::scalar::Scalar;
 use crate::vtable::OperationsVTable;
 
 impl OperationsVTable<DecimalVTable> for DecimalVTable {
-    fn slice(array: &DecimalArray, range: Range<usize>) -> ArrayRef {
-        match_each_decimal_value_type!(array.values_type(), |D| {
-            slice_typed(
-                array.buffer::<D>(),
-                range,
-                array.decimal_dtype(),
-                array.validity.clone(),
-            )
-        })
-    }
-
-    fn scalar_at(array: &DecimalArray, index: usize) -> Scalar {
-        match_each_decimal_value_type!(array.values_type(), |D| {
+    fn scalar_at(array: &DecimalArray, index: usize) -> VortexResult<Scalar> {
+        Ok(match_each_decimal_value_type!(array.values_type(), |D| {
             Scalar::decimal(
                 DecimalValue::from(array.buffer::<D>()[index]),
                 array.decimal_dtype(),
                 array.dtype().nullability(),
             )
-        })
+        }))
     }
-}
-
-fn slice_typed<T: NativeDecimalType>(
-    values: Buffer<T>,
-    range: Range<usize>,
-    decimal_dtype: DecimalDType,
-    validity: Validity,
-) -> ArrayRef {
-    let sliced = values.slice(range.clone());
-    let validity = validity.slice(range);
-    // SAFETY: Slicing preserves all DecimalArray invariants:
-    // - Buffer is correctly typed and sized from the slice operation.
-    // - Decimal dtype is preserved from the parent array.
-    // - Validity is correctly sliced to match the new length.
-    unsafe { DecimalArray::new_unchecked(sliced, decimal_dtype, validity) }.into_array()
 }
 
 #[cfg(test)]
 mod tests {
     use vortex_buffer::buffer;
-    use vortex_dtype::DecimalDType;
-    use vortex_dtype::Nullability;
-    use vortex_scalar::DecimalValue;
-    use vortex_scalar::Scalar;
 
     use crate::Array;
     use crate::arrays::DecimalArray;
     use crate::arrays::DecimalVTable;
+    use crate::dtype::DecimalDType;
+    use crate::dtype::Nullability;
+    use crate::scalar::DecimalValue;
+    use crate::scalar::Scalar;
     use crate::validity::Validity;
 
     #[test]
@@ -77,7 +44,7 @@ mod tests {
         )
         .to_array();
 
-        let sliced = array.slice(1..3);
+        let sliced = array.slice(1..3).unwrap();
         assert_eq!(sliced.len(), 2);
 
         let decimal = sliced.as_::<DecimalVTable>();
@@ -93,7 +60,7 @@ mod tests {
         )
         .to_array();
 
-        let sliced = array.slice(1..3);
+        let sliced = array.slice(1..3).unwrap();
         assert_eq!(sliced.len(), 2);
     }
 
@@ -106,7 +73,7 @@ mod tests {
         );
 
         assert_eq!(
-            array.scalar_at(0),
+            array.scalar_at(0).unwrap(),
             Scalar::decimal(
                 DecimalValue::I128(100),
                 DecimalDType::new(3, 2),

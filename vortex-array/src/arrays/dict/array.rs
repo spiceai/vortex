@@ -2,18 +2,17 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use vortex_buffer::BitBuffer;
-use vortex_dtype::DType;
-use vortex_dtype::PType;
-use vortex_dtype::match_each_integer_ptype;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
 use vortex_mask::AllOr;
 
-use crate::Array;
 use crate::ArrayRef;
 use crate::ToCanonical;
+use crate::dtype::DType;
+use crate::dtype::PType;
+use crate::match_each_integer_ptype;
 use crate::stats::ArrayStats;
 
 #[derive(Clone, prost::Message)]
@@ -44,6 +43,12 @@ pub struct DictArray {
     /// In case this is incorrect never use this to enable memory unsafe behaviour just semantically
     /// incorrect behaviour.
     pub(super) all_values_referenced: bool,
+}
+
+pub struct DictArrayParts {
+    pub codes: ArrayRef,
+    pub values: ArrayRef,
+    pub dtype: DType,
 }
 
 impl DictArray {
@@ -98,25 +103,29 @@ impl DictArray {
 
     /// Build a new `DictArray` from its components, `codes` and `values`.
     ///
-    /// The codes must be unsigned integers, and may be nullable. Values can be any type, and
-    /// may also be nullable. This mirrors the nullability of the Arrow `DictionaryArray`.
+    /// The codes must be integers, and may be nullable. Values can be any
+    /// type, and may also be nullable. This mirrors the nullability of the Arrow `DictionaryArray`.
     ///
     /// # Errors
     ///
-    /// The `codes` **must** be unsigned integers, and the maximum code must be less than the length
+    /// The `codes` **must** be integers, and the maximum code must be less than the length
     /// of the `values` array. Otherwise, this constructor returns an error.
     ///
     /// It is an error to provide a nullable `codes` with non-nullable `values`.
     pub fn try_new(codes: ArrayRef, values: ArrayRef) -> VortexResult<Self> {
-        if !codes.dtype().is_unsigned_int() {
-            vortex_bail!(MismatchedTypes: "unsigned int", codes.dtype());
+        if !codes.dtype().is_int() {
+            vortex_bail!(MismatchedTypes: "int", codes.dtype());
         }
 
         Ok(unsafe { Self::new_unchecked(codes, values) })
     }
 
-    pub fn into_parts(self) -> (ArrayRef, ArrayRef) {
-        (self.codes, self.values)
+    pub fn into_parts(self) -> DictArrayParts {
+        DictArrayParts {
+            codes: self.codes,
+            values: self.values,
+            dtype: self.dtype,
+        }
     }
 
     #[inline]
@@ -147,6 +156,11 @@ impl DictArray {
     /// This is primarily useful for testing and debugging.
     pub fn validate_all_values_referenced(&self) -> VortexResult<()> {
         if self.all_values_referenced {
+            // Skip host-only validation when codes are not host-resident.
+            if !self.codes().is_host() {
+                return Ok(());
+            }
+
             let referenced_mask = self.compute_referenced_values_mask(true)?;
             let all_referenced = referenced_mask.iter().all(|v| v);
 
@@ -167,7 +181,7 @@ impl DictArray {
     ///
     /// This is useful for operations like min/max that need to ignore unreferenced values.
     pub fn compute_referenced_values_mask(&self, referenced: bool) -> VortexResult<BitBuffer> {
-        let codes_validity = self.codes().validity_mask();
+        let codes_validity = self.codes().validity_mask()?;
         let codes_primitive = self.codes().to_primitive();
         let values_len = self.values().len();
 
@@ -180,7 +194,11 @@ impl DictArray {
         match codes_validity.bit_buffer() {
             AllOr::All => {
                 match_each_integer_ptype!(codes_primitive.ptype(), |P| {
-                    #[allow(clippy::cast_possible_truncation)]
+                    #[allow(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss,
+                        reason = "codes are non-negative indices; a negative signed code would wrap to a large usize and panic on the bounds-checked array index"
+                    )]
                     for &code in codes_primitive.as_slice::<P>().iter() {
                         values_vec[code as usize] = referenced_value;
                     }
@@ -191,7 +209,11 @@ impl DictArray {
                 match_each_integer_ptype!(codes_primitive.ptype(), |P| {
                     let codes = codes_primitive.as_slice::<P>();
 
-                    #[allow(clippy::cast_possible_truncation)]
+                    #[allow(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss,
+                        reason = "codes are non-negative indices; a negative signed code would wrap to a large usize and panic on the bounds-checked array index"
+                    )]
                     buf.set_indices().for_each(|idx| {
                         values_vec[codes[idx] as usize] = referenced_value;
                     })
@@ -214,24 +236,27 @@ mod test {
     use rand::prelude::StdRng;
     use vortex_buffer::BitBuffer;
     use vortex_buffer::buffer;
-    use vortex_dtype::DType;
-    use vortex_dtype::NativePType;
-    use vortex_dtype::Nullability::NonNullable;
-    use vortex_dtype::PType;
-    use vortex_dtype::UnsignedPType;
     use vortex_error::VortexExpect;
+    use vortex_error::VortexResult;
     use vortex_error::vortex_panic;
     use vortex_mask::AllOr;
 
     use crate::Array;
     use crate::ArrayRef;
     use crate::IntoArray;
+    use crate::LEGACY_SESSION;
     use crate::ToCanonical;
+    use crate::VortexSessionExecute;
     use crate::arrays::ChunkedArray;
     use crate::arrays::PrimitiveArray;
     use crate::arrays::dict::DictArray;
     use crate::assert_arrays_eq;
     use crate::builders::builder_with_capacity;
+    use crate::dtype::DType;
+    use crate::dtype::NativePType;
+    use crate::dtype::Nullability::NonNullable;
+    use crate::dtype::PType;
+    use crate::dtype::UnsignedPType;
     use crate::validity::Validity;
 
     #[test]
@@ -245,7 +270,7 @@ mod test {
             PrimitiveArray::new(buffer![3, 6, 9], Validity::AllValid).into_array(),
         )
         .unwrap();
-        let mask = dict.validity_mask();
+        let mask = dict.validity_mask().unwrap();
         let AllOr::Some(indices) = mask.indices() else {
             vortex_panic!("Expected indices from mask")
         };
@@ -263,7 +288,7 @@ mod test {
             .into_array(),
         )
         .unwrap();
-        let mask = dict.validity_mask();
+        let mask = dict.validity_mask().unwrap();
         let AllOr::Some(indices) = mask.indices() else {
             vortex_panic!("Expected indices from mask")
         };
@@ -285,7 +310,7 @@ mod test {
             .into_array(),
         )
         .unwrap();
-        let mask = dict.validity_mask();
+        let mask = dict.validity_mask().unwrap();
         let AllOr::Some(indices) = mask.indices() else {
             vortex_panic!("Expected indices from mask")
         };
@@ -303,7 +328,7 @@ mod test {
             PrimitiveArray::new(buffer![3, 6, 9], Validity::NonNullable).into_array(),
         )
         .unwrap();
-        let mask = dict.validity_mask();
+        let mask = dict.validity_mask().unwrap();
         let AllOr::Some(indices) = mask.indices() else {
             vortex_panic!("Expected indices from mask")
         };
@@ -340,7 +365,7 @@ mod test {
     }
 
     #[test]
-    fn test_dict_array_from_primitive_chunks() {
+    fn test_dict_array_from_primitive_chunks() -> VortexResult<()> {
         let len = 2;
         let chunk_count = 2;
         let array = make_dict_primitive_chunks::<u64, u64>(len, 2, chunk_count);
@@ -349,12 +374,15 @@ mod test {
             &DType::Primitive(PType::U64, NonNullable),
             len * chunk_count,
         );
-        array.clone().append_to_builder(builder.as_mut());
+        array
+            .clone()
+            .append_to_builder(builder.as_mut(), &mut LEGACY_SESSION.create_execution_ctx())?;
 
         let into_prim = array.to_primitive();
         let prim_into = builder.finish_into_canonical().into_primitive();
 
         assert_arrays_eq!(into_prim, prim_into);
+        Ok(())
     }
 
     #[cfg_attr(miri, ignore)]

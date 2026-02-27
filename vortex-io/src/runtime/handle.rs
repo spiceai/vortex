@@ -9,23 +9,10 @@ use std::task::Poll;
 use std::task::ready;
 
 use futures::FutureExt;
-use futures::StreamExt;
-use futures::channel::mpsc;
-#[cfg(not(feature = "tokio"))]
-use oneshot;
-// Prefer tokio::sync::oneshot when tokio feature is enabled
-#[cfg(feature = "tokio")]
-use tokio::sync::oneshot;
-use vortex_error::VortexResult;
 use vortex_error::vortex_panic;
-use vortex_metrics::VortexMetrics;
 
-use crate::file::FileRead;
-use crate::file::IntoReadSource;
-use crate::file::IoRequestStream;
 use crate::runtime::AbortHandleRef;
 use crate::runtime::Executor;
-use crate::runtime::IoTask;
 
 /// A handle to an active Vortex runtime.
 ///
@@ -40,7 +27,7 @@ pub struct Handle {
 }
 
 impl Handle {
-    pub(crate) fn new(runtime: Weak<dyn Executor>) -> Self {
+    pub fn new(runtime: Weak<dyn Executor>) -> Self {
         Self { runtime }
     }
 
@@ -136,7 +123,7 @@ impl Handle {
         R: Send + 'static,
     {
         let (send, recv) = oneshot::channel();
-        let abort_handle = self.runtime().spawn_blocking(Box::new(move || {
+        let abort_handle = self.runtime().spawn_blocking_io(Box::new(move || {
             // Optimistically avoid the work if the result won't be used.
             if !send.is_closed() {
                 // Task::detach allows the receiver to be dropped, so we ignore send errors.
@@ -147,26 +134,6 @@ impl Handle {
             recv,
             abort_handle: Some(abort_handle),
         }
-    }
-
-    /// Open a file for I/O on this runtime.
-    pub fn open_read<S: IntoReadSource>(
-        &self,
-        source: S,
-        metrics: VortexMetrics,
-    ) -> VortexResult<FileRead> {
-        let source = source.into_read_source(self.clone())?;
-
-        let (send, recv) = mpsc::unbounded();
-
-        let read = FileRead::new(source.uri().clone(), source.size(), send);
-
-        let stream =
-            IoRequestStream::new(StreamExt::boxed(recv), source.coalesce_window(), metrics).boxed();
-
-        self.runtime().spawn_io(IoTask::new(source, stream));
-
-        Ok(read)
     }
 }
 

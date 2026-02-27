@@ -26,13 +26,9 @@ prost = { workspace = true }
 rand = { workspace = true, optional = true }
 vortex-array = { workspace = true }
 vortex-buffer = { workspace = true }
-vortex-compute = { workspace = true }
-vortex-dtype = { workspace = true }
 vortex-error = { workspace = true }
 vortex-mask = { workspace = true }
-vortex-scalar = { workspace = true }
 vortex-session = { workspace = true }
-vortex-vector = { workspace = true }
 
 [dev-dependencies]
 divan = { workspace = true }
@@ -40,26 +36,22 @@ itertools = { workspace = true }
 rand = { workspace = true }
 rstest = { workspace = true }
 vortex-alp = { path = "../alp" }
-vortex-array = { workspace = true, features = ["test-harness"] }
-vortex-fastlanes = { path = ".", features = ["test-harness"] }
+vortex-array = { workspace = true, features = ["_test-harness"] }
+vortex-fastlanes = { path = ".", features = ["_test-harness"] }
 
 [features]
-test-harness = ["dep:rand"]
+_test-harness = ["dep:rand"]
 
 [[bench]]
 name = "bitpacking_take"
 harness = false
 
 [[bench]]
-name = "bitpacking_decompress_selection"
-harness = false
-
-[[bench]]
 name = "canonicalize_bench"
 harness = false
-required-features = ["test-harness"]
+required-features = ["_test-harness"]
 
 [[bench]]
 name = "compute_between"
 harness = false
-required-features = ["test-harness"]
+required-features = ["_test-harness"]

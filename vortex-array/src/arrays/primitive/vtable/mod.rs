@@ -1,43 +1,36 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use vortex_buffer::Alignment;
-use vortex_buffer::Buffer;
-use vortex_dtype::DType;
-use vortex_dtype::PType;
-use vortex_dtype::match_each_native_ptype;
+use kernel::PARENT_KERNELS;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
-use vortex_vector::primitive::PVector;
 
 use crate::ArrayRef;
 use crate::EmptyMetadata;
+use crate::ExecutionCtx;
 use crate::arrays::PrimitiveArray;
 use crate::buffer::BufferHandle;
-use crate::executor::ExecutionCtx;
+use crate::dtype::DType;
+use crate::dtype::PType;
 use crate::serde::ArrayChildren;
 use crate::validity::Validity;
 use crate::vtable;
-use crate::vtable::ArrayVTableExt;
-use crate::vtable::NotSupported;
 use crate::vtable::VTable;
 use crate::vtable::ValidityVTableFromValidityHelper;
 
 mod array;
-mod canonical;
+mod kernel;
 mod operations;
-pub mod rules;
 mod validity;
 mod visitor;
 
-pub use rules::PrimitiveMaskedValidityRule;
-use vortex_vector::Vector;
+use vortex_buffer::Alignment;
+use vortex_session::VortexSession;
 
-use crate::arrays::primitive::vtable::rules::RULES;
+use crate::arrays::primitive::compute::rules::RULES;
 use crate::vtable::ArrayId;
-use crate::vtable::ArrayVTable;
 
 vtable!(Primitive);
 
@@ -47,19 +40,12 @@ impl VTable for PrimitiveVTable {
     type Metadata = EmptyMetadata;
 
     type ArrayVTable = Self;
-    type CanonicalVTable = Self;
     type OperationsVTable = Self;
     type ValidityVTable = ValidityVTableFromValidityHelper;
     type VisitorVTable = Self;
-    type ComputeVTable = NotSupported;
-    type EncodeVTable = NotSupported;
 
-    fn id(&self) -> ArrayId {
-        ArrayId::new_ref("vortex.primitive")
-    }
-
-    fn encoding(_array: &Self::Array) -> ArrayVTable {
-        PrimitiveVTable.as_vtable()
+    fn id(_array: &Self::Array) -> ArrayId {
+        Self::ID
     }
 
     fn metadata(_array: &PrimitiveArray) -> VortexResult<Self::Metadata> {
@@ -70,12 +56,17 @@ impl VTable for PrimitiveVTable {
         Ok(Some(vec![]))
     }
 
-    fn deserialize(_buffer: &[u8]) -> VortexResult<Self::Metadata> {
+    fn deserialize(
+        _bytes: &[u8],
+        _dtype: &DType,
+        _len: usize,
+        _buffers: &[BufferHandle],
+        _session: &VortexSession,
+    ) -> VortexResult<Self::Metadata> {
         Ok(EmptyMetadata)
     }
 
     fn build(
-        &self,
         dtype: &DType,
         len: usize,
         _metadata: &Self::Metadata,
@@ -85,7 +76,7 @@ impl VTable for PrimitiveVTable {
         if buffers.len() != 1 {
             vortex_bail!("Expected 1 buffer, got {}", buffers.len());
         }
-        let buffer = buffers[0].clone().try_to_bytes()?;
+        let buffer = buffers[0].clone();
 
         let validity = if children.is_empty() {
             Validity::from(dtype.nullability())
@@ -98,12 +89,11 @@ impl VTable for PrimitiveVTable {
 
         let ptype = PType::try_from(dtype)?;
 
-        if !buffer.is_aligned(Alignment::new(ptype.byte_width())) {
-            vortex_bail!(
-                "Buffer is not aligned to {}-byte boundary",
-                ptype.byte_width()
-            );
-        }
+        vortex_ensure!(
+            buffer.is_aligned_to(Alignment::new(ptype.byte_width())),
+            "Misaligned buffer cannot be used to build PrimitiveArray of {ptype}"
+        );
+
         if buffer.len() != ptype.byte_width() * len {
             vortex_bail!(
                 "Buffer length {} does not match expected length {} for {}, {}",
@@ -114,16 +104,19 @@ impl VTable for PrimitiveVTable {
             );
         }
 
-        match_each_native_ptype!(ptype, |P| {
-            let buffer = Buffer::<P>::from_byte_buffer(buffer);
-            Ok(PrimitiveArray::new(buffer, validity))
-        })
-    }
+        vortex_ensure!(
+            buffer.is_aligned_to(Alignment::new(ptype.byte_width())),
+            "PrimitiveArray::build: Buffer (align={}) must be aligned to {}",
+            buffer.alignment(),
+            ptype.byte_width()
+        );
 
-    fn execute(array: &Self::Array, _ctx: &mut ExecutionCtx) -> VortexResult<Vector> {
-        Ok(match_each_native_ptype!(array.ptype(), |T| {
-            PVector::new(array.buffer::<T>(), array.validity_mask()).into()
-        }))
+        // SAFETY: checked ahead of time
+        unsafe {
+            Ok(PrimitiveArray::new_unchecked_from_handle(
+                buffer, ptype, validity,
+            ))
+        }
     }
 
     fn with_children(array: &mut Self::Array, children: Vec<ArrayRef>) -> VortexResult<()> {
@@ -142,6 +135,10 @@ impl VTable for PrimitiveVTable {
         Ok(())
     }
 
+    fn execute(array: &Self::Array, _ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
+        Ok(array.to_array())
+    }
+
     fn reduce_parent(
         array: &Self::Array,
         parent: &ArrayRef,
@@ -149,7 +146,20 @@ impl VTable for PrimitiveVTable {
     ) -> VortexResult<Option<ArrayRef>> {
         RULES.evaluate(array, parent, child_idx)
     }
+
+    fn execute_parent(
+        array: &Self::Array,
+        parent: &ArrayRef,
+        child_idx: usize,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<ArrayRef>> {
+        PARENT_KERNELS.execute(array, parent, child_idx, ctx)
+    }
 }
 
 #[derive(Debug)]
 pub struct PrimitiveVTable;
+
+impl PrimitiveVTable {
+    pub const ID: ArrayId = ArrayId::new_ref("vortex.primitive");
+}

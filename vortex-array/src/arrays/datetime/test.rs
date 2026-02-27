@@ -1,16 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright the Vortex contributors
+// SPDX-FileCopyrightText: Copyright the Vortex contributorsuse crate::dtype::Nullability;
 
 use rstest::rstest;
 use vortex_buffer::buffer;
-use vortex_dtype::datetime::TemporalMetadata;
-use vortex_dtype::datetime::TimeUnit;
+use vortex_error::VortexResult;
 
 use crate::IntoArray;
 use crate::ToCanonical;
 use crate::array::Array;
 use crate::arrays::PrimitiveArray;
 use crate::arrays::TemporalArray;
+use crate::assert_arrays_eq;
+use crate::expr::gt;
+use crate::expr::lit;
+use crate::expr::root;
+use crate::extension::datetime::TemporalMetadata;
+use crate::extension::datetime::TimeUnit;
+use crate::extension::datetime::Timestamp;
+use crate::extension::datetime::TimestampOptions;
+use crate::scalar::Scalar;
 use crate::validity::Validity;
 use crate::vtable::ValidityHelper;
 
@@ -18,9 +26,11 @@ macro_rules! test_temporal_roundtrip {
     ($prim:ty, $constructor:expr, $unit:expr) => {{
         let array = buffer![100 as $prim].into_array();
         let temporal: TemporalArray = $constructor(array, $unit);
-        let prims = temporal.temporal_values().to_primitive();
 
-        assert_eq!(prims.as_slice::<$prim>(), vec![100 as $prim].as_slice(),);
+        assert_arrays_eq!(
+            temporal.temporal_values(),
+            PrimitiveArray::from_iter([100 as $prim])
+        );
         assert_eq!(temporal.temporal_metadata().time_unit(), $unit);
     }};
 }
@@ -142,15 +152,17 @@ fn test_timestamp() {
         TimeUnit::Microseconds,
         TimeUnit::Nanoseconds,
     ] {
-        for tz in [Some("UTC".to_string()), None] {
+        for tz in [Some("UTC".into()), None] {
             let temporal_array =
                 TemporalArray::new_timestamp(ts_array.to_array(), unit, tz.clone());
 
-            let values = temporal_array.temporal_values().to_primitive();
-            assert_eq!(values.as_slice::<i64>(), vec![100i64].as_slice());
+            assert_arrays_eq!(
+                temporal_array.temporal_values(),
+                PrimitiveArray::from_iter([100i64])
+            );
             assert_eq!(
                 temporal_array.temporal_metadata(),
-                &TemporalMetadata::Timestamp(unit, tz)
+                TemporalMetadata::Timestamp(&unit, &tz)
             );
         }
     }
@@ -180,13 +192,37 @@ fn test_validity_preservation(#[case] validity: Validity) {
         validity.clone(),
     )
     .into_array();
-    let temporal_array = TemporalArray::new_timestamp(
-        milliseconds,
-        TimeUnit::Milliseconds,
-        Some("UTC".to_string()),
-    );
+    let temporal_array =
+        TemporalArray::new_timestamp(milliseconds, TimeUnit::Milliseconds, Some("UTC".into()));
     assert_eq!(
         temporal_array.temporal_values().to_primitive().validity(),
         &validity
     );
+}
+
+#[test]
+fn test222() -> VortexResult<()> {
+    // Write file with MILLISECONDS timestamps
+    let ts_array = PrimitiveArray::from_iter(vec![1704067200000i64, 1704153600000, 1704240000000])
+        .into_array();
+    let temporal = TemporalArray::new_timestamp(ts_array, TimeUnit::Milliseconds, None);
+
+    // Read with SECONDS filter scalar
+    let filter_expr = gt(
+        root(),
+        lit(Scalar::extension::<Timestamp>(
+            TimestampOptions {
+                unit: TimeUnit::Seconds,
+                tz: None,
+            },
+            Scalar::from(1704153600i64),
+        )),
+    );
+
+    let _result = temporal.as_ref().apply(&filter_expr);
+
+    // let err = result.is_err().unwrap();
+    // println!("Expected error: {}", err);
+
+    Ok(())
 }

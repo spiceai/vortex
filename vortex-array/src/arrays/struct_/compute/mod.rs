@@ -2,10 +2,11 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 mod cast;
-mod filter;
 mod is_constant;
 mod mask;
 mod min_max;
+pub(crate) mod rules;
+mod slice;
 mod take;
 mod zip;
 
@@ -16,48 +17,36 @@ mod tests {
     use rstest::rstest;
     use vortex_buffer::BitBuffer;
     use vortex_buffer::buffer;
-    use vortex_dtype::DType;
-    use vortex_dtype::FieldNames;
-    use vortex_dtype::Nullability;
-    use vortex_dtype::PType;
-    use vortex_dtype::StructFields;
     use vortex_error::VortexExpect;
-    use vortex_mask::Mask;
 
     use crate::Array;
+    use crate::Canonical;
     use crate::IntoArray as _;
+    use crate::LEGACY_SESSION;
+    use crate::VortexSessionExecute;
     use crate::arrays::BoolArray;
     use crate::arrays::PrimitiveArray;
     use crate::arrays::StructArray;
     use crate::arrays::VarBinArray;
     use crate::assert_arrays_eq;
-    use crate::compute::cast;
+    use crate::builtins::ArrayBuiltins;
     use crate::compute::conformance::consistency::test_array_consistency;
-    use crate::compute::conformance::filter::test_filter_conformance;
     use crate::compute::conformance::mask::test_mask_conformance;
     use crate::compute::conformance::take::test_take_conformance;
-    use crate::compute::filter;
     use crate::compute::is_constant;
-    use crate::compute::take;
+    use crate::dtype::DType;
+    use crate::dtype::FieldNames;
+    use crate::dtype::Nullability;
+    use crate::dtype::PType;
+    use crate::dtype::StructFields;
     use crate::validity::Validity;
-
-    #[test]
-    fn filter_empty_struct() {
-        let struct_arr =
-            StructArray::try_new(FieldNames::empty(), vec![], 10, Validity::NonNullable).unwrap();
-        let mask = vec![
-            false, true, false, true, false, true, false, true, false, true,
-        ];
-        let filtered = filter(struct_arr.as_ref(), &Mask::from_iter(mask)).unwrap();
-        assert_eq!(filtered.len(), 5);
-    }
 
     #[test]
     fn take_empty_struct() {
         let struct_arr =
             StructArray::try_new(FieldNames::empty(), vec![], 10, Validity::NonNullable).unwrap();
         let indices = PrimitiveArray::from_option_iter([Some(1), None]);
-        let taken = take(struct_arr.as_ref(), indices.as_ref()).unwrap();
+        let taken = struct_arr.take(indices.to_array()).unwrap();
 
         assert_arrays_eq!(
             taken,
@@ -71,12 +60,41 @@ mod tests {
     }
 
     #[test]
+    fn take_empty_struct_with_nullable_indices() {
+        let struct_arr = StructArray::try_from_iter_with_validity(
+            [("a", BoolArray::from_iter(Vec::<bool>::new()).into_array())],
+            Validity::AllValid,
+        )
+        .unwrap();
+        let indices = PrimitiveArray::from_option_iter([Option::<u64>::None]);
+        let taken = struct_arr
+            .take(indices.to_array())
+            .unwrap()
+            .execute::<Canonical>(&mut LEGACY_SESSION.create_execution_ctx())
+            .unwrap();
+        assert_eq!(taken.len(), 1);
+        assert!(taken.into_array().all_invalid().unwrap());
+    }
+
+    #[test]
+    fn take_empty_primitive_with_nullable_indices() {
+        let arr = PrimitiveArray::from_iter(Vec::<u64>::new());
+        let indices = PrimitiveArray::from_option_iter([Option::<u64>::None]);
+        let taken = arr
+            .take(indices.to_array())
+            .unwrap()
+            .execute::<Canonical>(&mut LEGACY_SESSION.create_execution_ctx())
+            .unwrap();
+        assert_eq!(taken.len(), 1);
+    }
+
+    #[test]
     fn take_field_struct() {
         let struct_arr =
             StructArray::from_fields(&[("a", PrimitiveArray::from_iter(0..10).to_array())])
                 .unwrap();
         let indices = PrimitiveArray::from_option_iter([Some(1), None]);
-        let taken = take(struct_arr.as_ref(), indices.as_ref()).unwrap();
+        let taken = struct_arr.take(indices.to_array()).unwrap();
         assert_arrays_eq!(
             taken,
             StructArray::try_from_iter_with_validity(
@@ -85,14 +103,6 @@ mod tests {
             )
             .unwrap()
         );
-    }
-
-    #[test]
-    fn filter_empty_struct_with_empty_filter() {
-        let struct_arr =
-            StructArray::try_new(FieldNames::empty(), vec![], 0, Validity::NonNullable).unwrap();
-        let filtered = filter(struct_arr.as_ref(), &Mask::from_iter::<[bool; 0]>([])).unwrap();
-        assert_eq!(filtered.len(), 0);
     }
 
     #[test]
@@ -139,49 +149,6 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_empty_struct() {
-        test_filter_conformance(
-            StructArray::try_new(FieldNames::empty(), vec![], 5, Validity::NonNullable)
-                .unwrap()
-                .as_ref(),
-        );
-    }
-
-    #[test]
-    fn test_filter_complex_struct() {
-        let xs = buffer![0i64, 1, 2, 3, 4].into_array();
-        let ys = VarBinArray::from_iter(
-            [Some("a"), Some("b"), None, Some("d"), None],
-            DType::Utf8(Nullable),
-        )
-        .into_array();
-        let zs =
-            BoolArray::from_iter([Some(true), Some(true), None, None, Some(false)]).into_array();
-
-        test_filter_conformance(
-            StructArray::try_new(
-                ["xs", "ys", "zs"].into(),
-                vec![
-                    StructArray::try_new(
-                        ["left", "right"].into(),
-                        vec![xs.clone(), xs],
-                        5,
-                        Validity::NonNullable,
-                    )
-                    .unwrap()
-                    .into_array(),
-                    ys,
-                    zs,
-                ],
-                5,
-                Validity::NonNullable,
-            )
-            .unwrap()
-            .as_ref(),
-        );
-    }
-
-    #[test]
     fn test_cast_empty_struct() {
         let array = StructArray::try_new(FieldNames::default(), vec![], 5, Validity::NonNullable)
             .unwrap()
@@ -190,12 +157,12 @@ mod tests {
             StructFields::new(FieldNames::default(), vec![]),
             NonNullable,
         );
-        let casted = cast(&array, &non_nullable_dtype).unwrap();
+        let casted = array.cast(non_nullable_dtype.clone()).unwrap();
         assert_eq!(casted.dtype(), &non_nullable_dtype);
 
         let nullable_dtype =
             DType::Struct(StructFields::new(FieldNames::default(), vec![]), Nullable);
-        let casted = cast(&array, &nullable_dtype).unwrap();
+        let casted = array.cast(nullable_dtype.clone()).unwrap();
         assert_eq!(casted.dtype(), &nullable_dtype);
     }
 
@@ -203,7 +170,7 @@ mod tests {
     fn test_cast_complex_struct() {
         let xs = PrimitiveArray::from_option_iter([Some(0i64), Some(1), Some(2), Some(3), Some(4)]);
         let ys = VarBinArray::from_vec(vec!["a", "b", "c", "d", "e"], DType::Utf8(Nullable));
-        let zs = BoolArray::from_bit_buffer(
+        let zs = BoolArray::new(
             BitBuffer::from_iter([true, true, false, false, true]),
             Validity::AllValid,
         );
@@ -228,7 +195,9 @@ mod tests {
         .into_array();
 
         let top_level_non_nullable = fully_nullable_array.dtype().as_nonnullable();
-        let casted = cast(&fully_nullable_array, &top_level_non_nullable).unwrap();
+        let casted = fully_nullable_array
+            .cast(top_level_non_nullable.clone())
+            .unwrap();
         assert_eq!(casted.dtype(), &top_level_non_nullable);
 
         let non_null_xs_right = DType::Struct(
@@ -251,7 +220,9 @@ mod tests {
             ),
             Nullable,
         );
-        let casted = cast(&fully_nullable_array, &non_null_xs_right).unwrap();
+        let casted = fully_nullable_array
+            .cast(non_null_xs_right.clone())
+            .unwrap();
         assert_eq!(casted.dtype(), &non_null_xs_right);
 
         let non_null_xs = DType::Struct(
@@ -274,7 +245,7 @@ mod tests {
             ),
             Nullable,
         );
-        let casted = cast(&fully_nullable_array, &non_null_xs).unwrap();
+        let casted = fully_nullable_array.cast(non_null_xs.clone()).unwrap();
         assert_eq!(casted.dtype(), &non_null_xs);
     }
 

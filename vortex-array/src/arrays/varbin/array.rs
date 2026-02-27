@@ -2,11 +2,8 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use num_traits::AsPrimitive;
+use vortex_buffer::Buffer;
 use vortex_buffer::ByteBuffer;
-use vortex_dtype::DType;
-use vortex_dtype::IntegerPType;
-use vortex_dtype::Nullability;
-use vortex_dtype::match_each_integer_ptype;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
@@ -14,15 +11,21 @@ use vortex_error::vortex_err;
 
 use crate::Array;
 use crate::ArrayRef;
+use crate::IntoArray;
 use crate::ToCanonical;
 use crate::arrays::varbin::builder::VarBinBuilder;
+use crate::buffer::BufferHandle;
+use crate::dtype::DType;
+use crate::dtype::IntegerPType;
+use crate::dtype::Nullability;
+use crate::match_each_integer_ptype;
 use crate::stats::ArrayStats;
 use crate::validity::Validity;
 
 #[derive(Clone, Debug)]
 pub struct VarBinArray {
     pub(super) dtype: DType,
-    pub(super) bytes: ByteBuffer,
+    pub(super) bytes: BufferHandle,
     pub(super) offsets: ArrayRef,
     pub(super) validity: Validity,
     pub(super) stats_set: ArrayStats,
@@ -39,6 +42,21 @@ impl VarBinArray {
         Self::try_new(offsets, bytes, dtype, validity).vortex_expect("VarBinArray new")
     }
 
+    /// Creates a new [`VarBinArray`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the provided components do not satisfy the invariants documented
+    /// in [`VarBinArray::new_unchecked`].
+    pub fn new_from_handle(
+        offset: ArrayRef,
+        bytes: BufferHandle,
+        dtype: DType,
+        validity: Validity,
+    ) -> Self {
+        Self::try_new_from_handle(offset, bytes, dtype, validity).vortex_expect("VarBinArray new")
+    }
+
     /// Constructs a new `VarBinArray`.
     ///
     /// See [`VarBinArray::new_unchecked`] for more information.
@@ -53,10 +71,32 @@ impl VarBinArray {
         dtype: DType,
         validity: Validity,
     ) -> VortexResult<Self> {
+        let bytes = BufferHandle::new_host(bytes);
         Self::validate(&offsets, &bytes, &dtype, &validity)?;
 
         // SAFETY: validate ensures all invariants are met.
-        Ok(unsafe { Self::new_unchecked(offsets, bytes, dtype, validity) })
+        Ok(unsafe { Self::new_unchecked_from_handle(offsets, bytes, dtype, validity) })
+    }
+
+    /// Constructs a new `VarBinArray` from a `BufferHandle` of memory that may exist
+    /// on the CPU or GPU.
+    ///
+    /// See [`VarBinArray::new_unchecked`] for more information.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the provided components do not satisfy the invariants documented in
+    /// [`VarBinArray::new_unchecked`].
+    pub fn try_new_from_handle(
+        offsets: ArrayRef,
+        bytes: BufferHandle,
+        dtype: DType,
+        validity: Validity,
+    ) -> VortexResult<Self> {
+        Self::validate(&offsets, &bytes, &dtype, &validity)?;
+
+        // SAFETY: validate ensures all invariants are met.
+        Ok(unsafe { Self::new_unchecked_from_handle(offsets, bytes, dtype, validity) })
     }
 
     /// Creates a new [`VarBinArray`] without validation from these components:
@@ -93,6 +133,25 @@ impl VarBinArray {
         dtype: DType,
         validity: Validity,
     ) -> Self {
+        // SAFETY: `new_unchecked_from_handle` has same invariants which should be checked
+        //  by caller.
+        unsafe {
+            Self::new_unchecked_from_handle(offsets, BufferHandle::new_host(bytes), dtype, validity)
+        }
+    }
+
+    /// Creates a new [`VarBinArray`] without validation from its components, with string data
+    /// stored in a `BufferHandle` (CPU or GPU).
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure all the invariants documented in `new_unchecked` are satisfied.
+    pub unsafe fn new_unchecked_from_handle(
+        offsets: ArrayRef,
+        bytes: BufferHandle,
+        dtype: DType,
+        validity: Validity,
+    ) -> Self {
         #[cfg(debug_assertions)]
         Self::validate(&offsets, &bytes, &dtype, &validity)
             .vortex_expect("[Debug Assertion]: Invalid `VarBinArray` parameters");
@@ -111,7 +170,7 @@ impl VarBinArray {
     /// This function checks all the invariants required by [`VarBinArray::new_unchecked`].
     pub fn validate(
         offsets: &dyn Array,
-        bytes: &ByteBuffer,
+        bytes: &BufferHandle,
         dtype: &DType,
         validity: &Validity,
     ) -> VortexResult<()> {
@@ -130,7 +189,7 @@ impl VarBinArray {
         // Check nullability matches
         vortex_ensure!(
             dtype.is_nullable() != (validity == &Validity::NonNullable),
-            "incorrect validity {:?} for dtype {}",
+            InvalidArgument: "incorrect validity {:?} for dtype {}",
             validity,
             dtype
         );
@@ -138,25 +197,25 @@ impl VarBinArray {
         // Check offsets has at least one element
         vortex_ensure!(
             !offsets.is_empty(),
-            "Offsets must have at least one element"
+            InvalidArgument: "Offsets must have at least one element"
         );
 
-        // Check offsets are sorted
-        if let Some(is_sorted) = offsets.statistics().compute_is_sorted() {
-            vortex_ensure!(is_sorted, "offsets must be sorted");
+        // Skip host-only validation when offsets/bytes are not host-resident.
+        if offsets.is_host() && bytes.is_on_host() {
+            let last_offset = offsets
+                .scalar_at(offsets.len() - 1)?
+                .as_primitive()
+                .as_::<usize>()
+                .ok_or_else(
+                    || vortex_err!(InvalidArgument: "Last offset must be convertible to usize"),
+                )?;
+            vortex_ensure!(
+                last_offset <= bytes.len(),
+                InvalidArgument: "Last offset {} exceeds bytes length {}",
+                last_offset,
+                bytes.len()
+            );
         }
-
-        let last_offset = offsets
-            .scalar_at(offsets.len() - 1)
-            .as_primitive()
-            .as_::<usize>()
-            .ok_or_else(|| vortex_err!("Last offset must be convertible to usize"))?;
-        vortex_ensure!(
-            last_offset <= bytes.len(),
-            "Last offset {} exceeds bytes length {}",
-            last_offset,
-            bytes.len()
-        );
 
         // Check validity length
         if let Some(validity_len) = validity.maybe_len() {
@@ -168,8 +227,12 @@ impl VarBinArray {
             );
         }
 
-        // Validate UTF-8 for Utf8 dtype
-        if matches!(dtype, DType::Utf8(_)) {
+        // Validate UTF-8 for Utf8 dtype. Skip when offsets/bytes are not host-resident.
+        if offsets.is_host()
+            && bytes.is_on_host()
+            && matches!(dtype, DType::Utf8(_))
+            && let Some(bytes) = bytes.as_host_opt()
+        {
             let primitive_offsets = offsets.to_primitive();
             match_each_integer_ptype!(primitive_offsets.dtype().as_ptype(), |O| {
                 let offsets_slice = primitive_offsets.as_slice::<O>();
@@ -178,7 +241,7 @@ impl VarBinArray {
                     .map(|o| (o[0].as_(), o[1].as_()))
                     .enumerate()
                 {
-                    if validity.is_null(i) {
+                    if validity.is_null(i)? {
                         continue;
                     }
 
@@ -210,6 +273,12 @@ impl VarBinArray {
     /// unless they're resolving values via the offset child array.
     #[inline]
     pub fn bytes(&self) -> &ByteBuffer {
+        self.bytes.as_host()
+    }
+
+    /// Access the value bytes buffer handle.
+    #[inline]
+    pub fn bytes_handle(&self) -> &BufferHandle {
         &self.bytes
     }
 
@@ -283,9 +352,10 @@ impl VarBinArray {
             self.len()
         );
 
-        self.offsets()
+        (&self
+            .offsets()
             .scalar_at(index)
-            .as_ref()
+            .vortex_expect("offsets must support scalar_at"))
             .try_into()
             .vortex_expect("Failed to convert offset to usize")
     }
@@ -302,8 +372,41 @@ impl VarBinArray {
 
     /// Consumes self, returning a tuple containing the `DType`, the `bytes` array,
     /// the `offsets` array, and the `validity`.
-    pub fn into_parts(self) -> (DType, ByteBuffer, ArrayRef, Validity) {
+    pub fn into_parts(self) -> (DType, BufferHandle, ArrayRef, Validity) {
         (self.dtype, self.bytes, self.offsets, self.validity)
+    }
+}
+
+impl VarBinArray {
+    /// Return an array containing the same data, but where the internal `offsets` start at zero
+    /// and all wasted space in the bytes child has been clipped.
+    #[doc(hidden)]
+    pub fn zero_offsets(self) -> Self {
+        if self.is_empty() {
+            return self;
+        }
+
+        let first = self.offset_at(0);
+
+        let bytes = self.sliced_bytes();
+        let dtype = self.dtype;
+        let validity = self.validity;
+        let offsets = self.offsets;
+
+        let offsets = if first == 0 {
+            offsets
+        } else {
+            let offsets = offsets.to_primitive();
+            match_each_integer_ptype!(offsets.ptype(), |P| {
+                let offsets = offsets.as_slice::<P>();
+                let buffer: Buffer<P> = offsets.iter().map(|index| index - offsets[0]).collect();
+                buffer.into_array()
+            })
+        };
+
+        // SAFETY: we make the first offset start at zero, and slice the bytes accordingly,
+        //  so all offsets stay valid.
+        unsafe { Self::new_unchecked(offsets, bytes, dtype, validity) }
     }
 }
 

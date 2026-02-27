@@ -7,9 +7,6 @@ use std::mem;
 use rustc_hash::FxBuildHasher;
 use vortex_buffer::BitBufferMut;
 use vortex_buffer::BufferMut;
-use vortex_dtype::NativePType;
-use vortex_dtype::Nullability;
-use vortex_dtype::UnsignedPType;
 use vortex_error::vortex_panic;
 use vortex_utils::aliases::hash_map::Entry;
 use vortex_utils::aliases::hash_map::HashMap;
@@ -23,6 +20,10 @@ use crate::ToCanonical;
 use crate::accessor::ArrayAccessor;
 use crate::arrays::NativeValue;
 use crate::arrays::PrimitiveArray;
+use crate::dtype::NativePType;
+use crate::dtype::Nullability;
+use crate::dtype::PType;
+use crate::dtype::UnsignedPType;
 use crate::validity::Validity;
 
 pub fn primitive_dict_builder<T: NativePType>(
@@ -144,6 +145,10 @@ where
             Validity::from_bit_buffer(mem::take(&mut self.values_nulls).freeze(), self.nullability),
         )
         .into_array()
+    }
+
+    fn codes_ptype(&self) -> PType {
+        Code::PTYPE
     }
 }
 

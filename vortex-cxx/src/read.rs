@@ -46,7 +46,7 @@ impl VortexFile {
 /// File operations - using blocking operations for simplicity
 /// TODO(xinyu): object store (see vortex-ffi)
 pub(crate) fn open_file(path: &str) -> Result<Box<VortexFile>> {
-    let file = RUNTIME.block_on(SESSION.open_options().open(std::path::Path::new(path)))?;
+    let file = RUNTIME.block_on(SESSION.open_options().open_path(std::path::Path::new(path)))?;
     Ok(Box::new(VortexFile { inner: file }))
 }
 
@@ -95,7 +95,7 @@ impl VortexScanBuilder {
     }
 
     pub(crate) fn with_limit(&mut self, limit: usize) {
-        take_mut::take(&mut self.inner, |inner| inner.with_limit(limit));
+        take_mut::take(&mut self.inner, |inner| inner.with_limit(limit as u64));
     }
 
     pub(crate) unsafe fn with_output_schema(&mut self, output_schema: *mut u8) -> Result<()> {

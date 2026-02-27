@@ -8,15 +8,12 @@ use std::sync::Arc;
 use vortex_buffer::BitBufferMut;
 use vortex_buffer::BufferMut;
 use vortex_buffer::ByteBufferMut;
-use vortex_dtype::DType;
-use vortex_dtype::UnsignedPType;
 use vortex_error::VortexExpect;
 use vortex_error::vortex_panic;
 use vortex_utils::aliases::hash_map::DefaultHashBuilder;
 use vortex_utils::aliases::hash_map::HashTable;
 use vortex_utils::aliases::hash_map::HashTableEntry;
 use vortex_utils::aliases::hash_map::RandomState;
-use vortex_vector::binaryview::BinaryView;
 
 use super::DictConstraints;
 use super::DictEncoder;
@@ -24,11 +21,15 @@ use crate::Array;
 use crate::ArrayRef;
 use crate::IntoArray;
 use crate::accessor::ArrayAccessor;
+use crate::arrays::BinaryView;
 use crate::arrays::PrimitiveArray;
 use crate::arrays::VarBinVTable;
 use crate::arrays::VarBinViewArray;
 use crate::arrays::VarBinViewVTable;
 use crate::canonical::ToCanonical;
+use crate::dtype::DType;
+use crate::dtype::PType;
+use crate::dtype::UnsignedPType;
 use crate::validity::Validity;
 
 /// Dictionary encode varbin array. Specializes for primitive byte arrays to avoid double copying
@@ -194,6 +195,10 @@ impl<Code: UnsignedPType> DictEncoder for BytesDictBuilder<Code> {
             )
             .into_array()
         }
+    }
+
+    fn codes_ptype(&self) -> PType {
+        Code::PTYPE
     }
 }
 

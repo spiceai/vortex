@@ -2,14 +2,15 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 mod cast;
-mod compare;
 mod fill_null;
 mod filter;
-mod invert;
 mod is_constant;
 mod is_sorted;
+pub(crate) mod kernel;
 mod mask;
 mod min_max;
+pub(crate) mod rules;
+mod slice;
 mod sum;
 mod take;
 mod zip;
@@ -18,15 +19,15 @@ mod zip;
 mod tests {
     use rstest::rstest;
     use vortex_buffer::buffer;
-    use vortex_dtype::DType;
-    use vortex_dtype::Nullability;
-    use vortex_dtype::PType;
 
     use crate::IntoArray;
     use crate::arrays::ChunkedArray;
     use crate::arrays::PrimitiveArray;
     use crate::compute::conformance::binary_numeric::test_binary_numeric_array;
     use crate::compute::conformance::consistency::test_array_consistency;
+    use crate::dtype::DType;
+    use crate::dtype::Nullability;
+    use crate::dtype::PType;
 
     #[rstest]
     // Basic chunked arrays

@@ -1,39 +1,39 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use vortex_compute::take::Take;
-use vortex_dtype::DType;
-use vortex_dtype::Nullability;
-use vortex_dtype::PType;
+use kernel::PARENT_KERNELS;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
-use vortex_vector::Vector;
+use vortex_session::VortexSession;
 
 use super::DictArray;
 use super::DictMetadata;
+use super::take_canonical;
+use crate::Array;
 use crate::ArrayRef;
+use crate::Canonical;
 use crate::DeserializeMetadata;
+use crate::IntoArray;
 use crate::ProstMetadata;
 use crate::SerializeMetadata;
-use crate::VectorExecutor;
-use crate::arrays::vtable::rules::PARENT_RULES;
+use crate::arrays::ConstantArray;
+use crate::arrays::dict::compute::rules::PARENT_RULES;
 use crate::buffer::BufferHandle;
+use crate::dtype::DType;
+use crate::dtype::Nullability;
+use crate::dtype::PType;
 use crate::executor::ExecutionCtx;
+use crate::scalar::Scalar;
 use crate::serde::ArrayChildren;
 use crate::vtable;
 use crate::vtable::ArrayId;
-use crate::vtable::ArrayVTable;
-use crate::vtable::ArrayVTableExt;
-use crate::vtable::NotSupported;
 use crate::vtable::VTable;
 
 mod array;
-mod canonical;
-mod encode;
+mod kernel;
 mod operations;
-mod rules;
 mod validity;
 mod visitor;
 
@@ -42,25 +42,22 @@ vtable!(Dict);
 #[derive(Debug)]
 pub struct DictVTable;
 
+impl DictVTable {
+    pub const ID: ArrayId = ArrayId::new_ref("vortex.dict");
+}
+
 impl VTable for DictVTable {
     type Array = DictArray;
 
     type Metadata = ProstMetadata<DictMetadata>;
 
     type ArrayVTable = Self;
-    type CanonicalVTable = Self;
     type OperationsVTable = Self;
     type ValidityVTable = Self;
     type VisitorVTable = Self;
-    type ComputeVTable = NotSupported;
-    type EncodeVTable = Self;
 
-    fn id(&self) -> ArrayId {
-        ArrayId::new_ref("vortex.dict")
-    }
-
-    fn encoding(_array: &Self::Array) -> ArrayVTable {
-        DictVTable.as_vtable()
+    fn id(_array: &Self::Array) -> ArrayId {
+        Self::ID
     }
 
     fn metadata(array: &DictArray) -> VortexResult<Self::Metadata> {
@@ -81,13 +78,18 @@ impl VTable for DictVTable {
         Ok(Some(metadata.serialize()))
     }
 
-    fn deserialize(buffer: &[u8]) -> VortexResult<Self::Metadata> {
-        let metadata = <Self::Metadata as DeserializeMetadata>::deserialize(buffer)?;
+    fn deserialize(
+        bytes: &[u8],
+        _dtype: &DType,
+        _len: usize,
+        _buffers: &[BufferHandle],
+        _session: &VortexSession,
+    ) -> VortexResult<Self::Metadata> {
+        let metadata = <Self::Metadata as DeserializeMetadata>::deserialize(bytes)?;
         Ok(ProstMetadata(metadata))
     }
 
     fn build(
-        &self,
         dtype: &DType,
         len: usize,
         metadata: &Self::Metadata,
@@ -131,10 +133,25 @@ impl VTable for DictVTable {
         Ok(())
     }
 
-    fn execute(array: &Self::Array, ctx: &mut ExecutionCtx) -> VortexResult<Vector> {
-        let values = array.values().execute(ctx)?;
-        let codes = array.codes().execute(ctx)?.into_primitive();
-        Ok(values.take(&codes))
+    fn execute(array: &Self::Array, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
+        if let Some(canonical) = execute_fast_path(array, ctx)? {
+            return Ok(canonical);
+        }
+
+        // TODO(joe): if the values are constant return a constant
+        let values = array.values().clone().execute::<Canonical>(ctx)?;
+        let codes = array
+            .codes()
+            .clone()
+            .execute::<Canonical>(ctx)?
+            .into_primitive();
+
+        // TODO(ngates): if indices are sorted and unique (strict-sorted), then we should delegate to
+        //  the filter function since they're typically optimised for this case.
+        // TODO(ngates): if indices min is quite high, we could slice self and offset the indices
+        //  such that canonicalize does less work.
+
+        Ok(take_canonical(values, &codes, ctx)?.into_array())
     }
 
     fn reduce_parent(
@@ -144,4 +161,37 @@ impl VTable for DictVTable {
     ) -> VortexResult<Option<ArrayRef>> {
         PARENT_RULES.evaluate(array, parent, child_idx)
     }
+
+    fn execute_parent(
+        array: &Self::Array,
+        parent: &ArrayRef,
+        child_idx: usize,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<ArrayRef>> {
+        PARENT_KERNELS.execute(array, parent, child_idx, ctx)
+    }
+}
+
+/// Check for fast-path execution conditions.
+pub(super) fn execute_fast_path(
+    array: &DictArray,
+    _ctx: &mut ExecutionCtx,
+) -> VortexResult<Option<ArrayRef>> {
+    // Empty array - nothing to do
+    if array.is_empty() {
+        let result_dtype = array
+            .dtype()
+            .union_nullability(array.codes().dtype().nullability());
+        return Ok(Some(Canonical::empty(&result_dtype).into_array()));
+    }
+
+    // All codes are null - result is all nulls
+    if array.codes.all_invalid()? {
+        return Ok(Some(
+            ConstantArray::new(Scalar::null(array.dtype().as_nullable()), array.codes.len())
+                .into_array(),
+        ));
+    }
+
+    Ok(None)
 }

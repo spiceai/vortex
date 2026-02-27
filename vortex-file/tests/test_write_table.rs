@@ -8,17 +8,16 @@ use std::sync::LazyLock;
 
 use futures::StreamExt;
 use futures::pin_mut;
-use vortex_array::Array;
 use vortex_array::IntoArray;
 use vortex_array::ToCanonical;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::StructArray;
-use vortex_array::expr::session::ExprSession;
+use vortex_array::dtype::FieldNames;
+use vortex_array::field_path;
+use vortex_array::scalar_fn::session::ScalarFnSession;
 use vortex_array::session::ArraySession;
 use vortex_array::validity::Validity;
 use vortex_buffer::ByteBuffer;
-use vortex_dtype::FieldNames;
-use vortex_dtype::field_path;
 use vortex_file::OpenOptionsSessionExt;
 use vortex_file::WriteOptionsSessionExt;
 use vortex_io::session::RuntimeSession;
@@ -26,15 +25,13 @@ use vortex_layout::layouts::compressed::CompressingStrategy;
 use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
 use vortex_layout::layouts::table::TableStrategy;
 use vortex_layout::session::LayoutSession;
-use vortex_metrics::VortexMetrics;
 use vortex_session::VortexSession;
 
 static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     let mut session = VortexSession::empty()
-        .with::<VortexMetrics>()
         .with::<ArraySession>()
         .with::<LayoutSession>()
-        .with::<ExprSession>()
+        .with::<ScalarFnSession>()
         .with::<RuntimeSession>();
 
     vortex_file::register_default_encodings(&mut session);
@@ -87,7 +84,7 @@ async fn test_file_roundtrip() {
         .expect("write");
 
     let bytes = ByteBuffer::from(bytes);
-    let vxf = SESSION.open_options().open(bytes).await.expect("open");
+    let vxf = SESSION.open_options().open_buffer(bytes).expect("open");
 
     // Read the data back
     let stream = vxf
@@ -101,11 +98,11 @@ async fn test_file_roundtrip() {
     while let Some(next) = stream.next().await {
         let next = next.expect("next");
         let next = next.to_struct();
-        let a = next.field_by_name("a").unwrap().to_struct();
-        let b = next.field_by_name("b").unwrap();
+        let a = next.unmasked_field_by_name("a").unwrap().to_struct();
+        let b = next.unmasked_field_by_name("b").unwrap();
 
-        let raw = a.field_by_name("raw").unwrap();
-        let compressed = a.field_by_name("compressed").unwrap();
+        let raw = a.unmasked_field_by_name("raw").unwrap();
+        let compressed = a.unmasked_field_by_name("compressed").unwrap();
 
         assert!(raw.is_canonical());
         assert!(!compressed.is_canonical());

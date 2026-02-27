@@ -3,19 +3,21 @@
 
 mod validation;
 
+use std::ops::Deref;
 use std::path::PathBuf;
 
 use clap::Parser;
 use clap::value_parser;
 use duckdb_bench::DuckClient;
 use tokio::runtime::Runtime;
+use vortex::metrics::tracing::set_global_labels;
 use vortex_bench::BenchmarkArg;
 use vortex_bench::CompactionStrategy;
 use vortex_bench::Engine;
 use vortex_bench::Format;
 use vortex_bench::Opt;
 use vortex_bench::Opts;
-use vortex_bench::conversions::convert_parquet_to_vortex;
+use vortex_bench::conversions::convert_parquet_directory_to_vortex;
 use vortex_bench::create_benchmark;
 use vortex_bench::create_output_writer;
 use vortex_bench::display::DisplayFormat;
@@ -67,6 +69,18 @@ struct Args {
 
     #[arg(long = "opt", value_delimiter = ',', value_parser = value_parser!(Opt))]
     options: Vec<Opt>,
+
+    /// Print EXPLAIN output for each query instead of running benchmarks.
+    #[arg(long, default_value_t = false)]
+    explain: bool,
+
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Whether to reuse the DuckDB connection across iterations. Helpful when profiling \
+        to keep all work on the same threads"
+    )]
+    reuse: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -82,6 +96,10 @@ fn main() -> anyhow::Result<()> {
         args.queries.as_ref(),
         args.exclude_queries.as_ref(),
     );
+
+    if args.formats.is_empty() {
+        anyhow::bail!("provide a format with --formats");
+    }
 
     // Generate Vortex files from Parquet for any Vortex formats requested
     if benchmark.data_url().scheme() == "file" {
@@ -99,10 +117,18 @@ fn main() -> anyhow::Result<()> {
             for format in args.formats.iter().copied() {
                 match format {
                     Format::OnDiskVortex => {
-                        convert_parquet_to_vortex(&base_path, CompactionStrategy::Default).await?;
+                        convert_parquet_directory_to_vortex(
+                            &base_path,
+                            CompactionStrategy::Default,
+                        )
+                        .await?;
                     }
                     Format::VortexCompact => {
-                        convert_parquet_to_vortex(&base_path, CompactionStrategy::Compact).await?;
+                        convert_parquet_directory_to_vortex(
+                            &base_path,
+                            CompactionStrategy::Compact,
+                        )
+                        .await?;
                     }
                     // OnDiskDuckDB tables are created during register_tables by loading from Parquet
                     _ => {}
@@ -113,6 +139,33 @@ fn main() -> anyhow::Result<()> {
         })?;
     }
 
+    if args.explain {
+        for format in &args.formats {
+            let ctx = DuckClient::new(
+                &*benchmark,
+                *format,
+                args.delete_duckdb_database,
+                args.threads,
+            )?;
+            ctx.register_tables(&*benchmark, *format)?;
+
+            for (query_idx, query) in &filtered_queries {
+                println!("=== Q{query_idx} [{format}] ===");
+                println!("{query}");
+                println!();
+                let result = ctx.connection().query(&format!("EXPLAIN {query}"))?;
+                for chunk in result {
+                    let chunk_str =
+                        String::try_from(chunk.deref()).unwrap_or_else(|_| "<error>".to_string());
+                    println!("{chunk_str}");
+                }
+                println!();
+            }
+        }
+
+        return Ok(());
+    }
+
     let mut runner = SqlBenchmarkRunner::new(
         &*benchmark,
         Engine::DuckDB,
@@ -120,6 +173,8 @@ fn main() -> anyhow::Result<()> {
         args.track_memory,
         args.hide_progress_bar,
     )?;
+
+    let benchmark_name = benchmark.dataset().to_string();
 
     runner.run_all(
         &filtered_queries,
@@ -134,9 +189,17 @@ fn main() -> anyhow::Result<()> {
             ctx.register_tables(&*benchmark, format)?;
             Ok(ctx)
         },
-        |ctx, query| {
+        |ctx, query_idx, format, query| {
+            set_global_labels(vec![
+                ("format", format.to_string()),
+                ("benchmark_name", benchmark_name.clone()),
+                ("query_idx", query_idx.to_string()),
+            ]);
+
             // Make sure to reopen the duckdb connection between iterations
-            ctx.reopen()?;
+            if !args.reuse {
+                ctx.reopen()?;
+            }
             ctx.execute_query(query)
         },
     )?;

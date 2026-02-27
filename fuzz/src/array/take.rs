@@ -12,15 +12,15 @@ use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::StructArray;
 use vortex_array::arrays::VarBinViewArray;
 use vortex_array::builders::builder_with_capacity;
+use vortex_array::dtype::DType;
+use vortex_array::dtype::DecimalDType;
+use vortex_array::dtype::NativeDecimalType;
+use vortex_array::dtype::NativePType;
+use vortex_array::dtype::Nullability;
+use vortex_array::match_each_decimal_value_type;
+use vortex_array::match_each_native_ptype;
 use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
-use vortex_dtype::DType;
-use vortex_dtype::DecimalDType;
-use vortex_dtype::NativeDecimalType;
-use vortex_dtype::NativePType;
-use vortex_dtype::Nullability;
-use vortex_dtype::match_each_decimal_value_type;
-use vortex_dtype::match_each_native_ptype;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 
@@ -45,7 +45,7 @@ pub fn take_canonical_array(
     let nullable: Nullability = indices.contains(&None).into();
 
     let validity = if array.dtype().is_nullable() || nullable == Nullability::Nullable {
-        let validity_idx = array.validity_mask().to_bit_buffer();
+        let validity_idx = array.validity_mask()?.to_bit_buffer();
 
         Validity::from_iter(
             indices
@@ -62,8 +62,8 @@ pub fn take_canonical_array(
     match array.dtype() {
         DType::Bool(_) => {
             let bool_array = array.to_bool();
-            let vec_values = bool_array.bit_buffer().iter().collect::<Vec<_>>();
-            Ok(BoolArray::from_bit_buffer(
+            let vec_values = bool_array.to_bit_buffer().iter().collect::<Vec<_>>();
+            Ok(BoolArray::new(
                 indices_slice_non_opt
                     .iter()
                     .map(|i| vec_values[*i])
@@ -109,7 +109,7 @@ pub fn take_canonical_array(
         DType::Struct(..) => {
             let struct_array = array.to_struct();
             let taken_children = struct_array
-                .fields()
+                .unmasked_fields()
                 .iter()
                 .map(|c| take_canonical_array_non_nullable_indices(c, indices_slice_non_opt))
                 .collect::<VortexResult<Vec<_>>>()?;
@@ -131,7 +131,7 @@ pub fn take_canonical_array(
                 if let Some(idx) = idx {
                     builder.append_scalar(
                         &array
-                            .scalar_at(*idx)
+                            .scalar_at(*idx)?
                             .cast(&array.dtype().union_nullability(nullable))
                             .vortex_expect("cannot cast scalar nullability"),
                     )?;

@@ -7,21 +7,16 @@ use vortex_array::arrays::BoolArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::VarBinViewArray;
 use vortex_array::assert_arrays_eq;
+use vortex_array::assert_nth_scalar;
+use vortex_array::dtype::DType;
+use vortex_array::dtype::Nullability;
 use vortex_array::validity::Validity;
 use vortex_array::vtable::ValidityHelper;
 use vortex_buffer::Alignment;
 use vortex_buffer::Buffer;
-use vortex_dtype::DType;
-use vortex_dtype::Nullability;
 use vortex_mask::Mask;
 
 use crate::ZstdArray;
-
-macro_rules! assert_nth_scalar {
-    ($arr:expr, $n:expr, $expected:expr) => {
-        assert_eq!($arr.scalar_at($n), $expected.try_into().unwrap());
-    };
-}
 
 #[test]
 fn test_zstd_compress_decompress() {
@@ -34,23 +29,18 @@ fn test_zstd_compress_decompress() {
     assert!(compressed.dictionary.is_none());
 
     // check full decompression works
-    let decompressed = compressed.decompress().to_primitive();
+    let decompressed = compressed.decompress().unwrap();
     assert_arrays_eq!(decompressed, PrimitiveArray::from_iter(data));
 
     // check slicing works
-    let slice = compressed.slice(100..105);
+    let slice = compressed.slice(100..105).unwrap();
     for i in 0_i32..5 {
         assert_nth_scalar!(slice, i as usize, 100 + i);
     }
-    let primitive = slice.to_primitive();
-    assert_arrays_eq!(
-        primitive,
-        PrimitiveArray::from_iter([100, 101, 102, 103, 104])
-    );
+    assert_arrays_eq!(slice, PrimitiveArray::from_iter([100, 101, 102, 103, 104]));
 
-    let slice = compressed.slice(200..200);
-    let primitive = slice.to_primitive();
-    assert_arrays_eq!(primitive, PrimitiveArray::from_iter(Vec::<i32>::new()));
+    let slice = compressed.slice(200..200).unwrap();
+    assert_arrays_eq!(slice, PrimitiveArray::from_iter(Vec::<i32>::new()));
 }
 
 #[test]
@@ -63,8 +53,7 @@ fn test_zstd_empty() {
 
     let compressed = ZstdArray::from_primitive(&array, 3, 100).unwrap();
 
-    let primitive = compressed.to_primitive();
-    assert_arrays_eq!(primitive, PrimitiveArray::from_iter(data));
+    assert_arrays_eq!(compressed, PrimitiveArray::from_iter(data));
 }
 
 #[test]
@@ -74,7 +63,7 @@ fn test_zstd_with_validity_and_multi_frame() {
     validity[3] = true;
     validity[177] = true;
     let array = PrimitiveArray::new(
-        data.iter().cloned().collect::<Buffer<_>>(),
+        Buffer::from(data),
         Validity::Array(BoolArray::from_iter(validity).to_array()),
     );
 
@@ -85,19 +74,17 @@ fn test_zstd_with_validity_and_multi_frame() {
     assert_nth_scalar!(compressed, 10, None::<i32>);
     assert_nth_scalar!(compressed, 177, 177);
 
-    let decompressed = compressed.decompress().to_primitive();
+    let decompressed = compressed.decompress().unwrap().to_primitive();
     let decompressed_values = decompressed.as_slice::<i32>();
     assert_eq!(decompressed_values[3], 3);
     assert_eq!(decompressed_values[177], 177);
     assert_eq!(decompressed.validity(), array.validity());
 
     // check slicing works
-    let slice = compressed.slice(176..179);
+    let slice = compressed.slice(176..179).unwrap();
     let primitive = slice.to_primitive();
     assert_eq!(
-        TryInto::<i32>::try_into(primitive.scalar_at(1).as_ref())
-            .ok()
-            .unwrap(),
+        i32::try_from(&primitive.scalar_at(1).unwrap()).unwrap(),
         177
     );
     assert_eq!(
@@ -119,12 +106,11 @@ fn test_zstd_with_dict() {
     assert_nth_scalar!(compressed, 0, 0);
     assert_nth_scalar!(compressed, 199, 199);
 
-    let decompressed = compressed.decompress().to_primitive();
+    let decompressed = compressed.decompress().unwrap().to_primitive();
     assert_arrays_eq!(decompressed, PrimitiveArray::from_iter(data));
-    assert_eq!(decompressed.validity(), array.validity());
 
     // check slicing works
-    let slice = compressed.slice(176..179);
+    let slice = compressed.slice(176..179).unwrap();
     let primitive = slice.to_primitive();
     assert_arrays_eq!(primitive, PrimitiveArray::from_iter([176, 177, 178]));
 }
@@ -137,9 +123,12 @@ fn test_validity_vtable() {
         Validity::Array(BoolArray::from_iter(mask_bools.clone()).to_array()),
     );
     let compressed = ZstdArray::from_primitive(&array, 3, 0).unwrap();
-    assert_eq!(compressed.validity_mask(), Mask::from_iter(mask_bools));
     assert_eq!(
-        compressed.slice(1..4).validity_mask(),
+        compressed.validity_mask().unwrap(),
+        Mask::from_iter(mask_bools)
+    );
+    assert_eq!(
+        compressed.slice(1..4).unwrap().validity_mask().unwrap(),
         Mask::from_iter(vec![true, true, false])
     );
 }
@@ -163,7 +152,7 @@ fn test_zstd_var_bin_view() {
     assert_nth_scalar!(compressed, 3, "Lorem ipsum dolor sit amet");
     assert_nth_scalar!(compressed, 4, "baz");
 
-    let sliced = compressed.slice(1..4);
+    let sliced = compressed.slice(1..4).unwrap();
     assert_nth_scalar!(sliced, 0, "bar");
     assert_nth_scalar!(sliced, 1, None::<String>);
     assert_nth_scalar!(sliced, 2, "Lorem ipsum dolor sit amet");
@@ -187,7 +176,7 @@ fn test_zstd_decompress_var_bin_view() {
     assert_nth_scalar!(compressed, 2, None::<String>);
     assert_nth_scalar!(compressed, 3, "Lorem ipsum dolor sit amet");
     assert_nth_scalar!(compressed, 4, "baz");
-    let decompressed = compressed.decompress().to_varbinview();
+    let decompressed = compressed.decompress().unwrap().to_varbinview();
     assert_nth_scalar!(decompressed, 0, "foo");
     assert_nth_scalar!(decompressed, 1, "bar");
     assert_nth_scalar!(decompressed, 2, None::<String>);
@@ -200,7 +189,7 @@ fn test_sliced_array_children() {
     let data: Vec<Option<i32>> = (0..10).map(|v| (v != 5).then_some(v)).collect();
     let compressed =
         ZstdArray::from_primitive(&PrimitiveArray::from_option_iter(data), 0, 100).unwrap();
-    let sliced = compressed.slice(0..4);
+    let sliced = compressed.slice(0..4).unwrap();
     sliced.children();
 }
 

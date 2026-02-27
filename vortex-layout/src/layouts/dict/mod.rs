@@ -10,9 +10,9 @@ use reader::DictReader;
 use vortex_array::ArrayContext;
 use vortex_array::DeserializeMetadata;
 use vortex_array::ProstMetadata;
-use vortex_dtype::DType;
-use vortex_dtype::Nullability;
-use vortex_dtype::PType;
+use vortex_array::dtype::DType;
+use vortex_array::dtype::Nullability;
+use vortex_array::dtype::PType;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
@@ -101,16 +101,6 @@ impl VTable for DictVTable {
         )?))
     }
 
-    #[cfg(gpu_unstable)]
-    fn new_gpu_reader(
-        _layout: &Self::Layout,
-        _name: Arc<str>,
-        _segment_source: Arc<dyn SegmentSource>,
-        _ctx: Arc<cudarc::driver::CudaContext>,
-    ) -> VortexResult<crate::gpu::GpuLayoutReaderRef> {
-        todo!()
-    }
-
     fn build(
         _encoding: &Self::Encoding,
         dtype: &DType,
@@ -118,7 +108,7 @@ impl VTable for DictVTable {
         metadata: &<Self::Metadata as DeserializeMetadata>::Output,
         _segment_ids: Vec<SegmentId>,
         children: &dyn LayoutChildren,
-        _ctx: ArrayContext,
+        _ctx: &ArrayContext,
     ) -> VortexResult<Self::Layout> {
         let values = children.child(0, dtype)?;
         let codes_nullable = metadata

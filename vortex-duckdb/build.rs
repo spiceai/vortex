@@ -11,11 +11,17 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
 
 use bindgen::Abi;
 use once_cell::sync::Lazy;
 
 static DUCKDB_VERSION: Lazy<DuckDBVersion> = Lazy::new(|| {
+    // Override the DuckDB version via environment variable in case of an extension build.
+    // `DUCKDB_VERSION` is set by the extension build in the `duckdb-vortex` repo.
+    //
+    // This is to ensure that we don't implicitly build against a different DuckDB version during
+    // an extension build which might lead to subtle ABI breaks, e.g. reordering fields in C++ structs.
     if let Ok(version) = env::var("DUCKDB_VERSION") {
         // DUCKDB_VERSION env var can be set by:
         // - The extension build in `vortex-data/duckdb-vortex` repo
@@ -248,11 +254,7 @@ fn extract_duckdb_source(source_dir: &Path) -> Result<PathBuf, Box<dyn std::erro
 /// Build DuckDB from source. Used for commit hashes or when VX_DUCKDB_DEBUG is set.
 fn build_duckdb(duckdb_source_dir: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
     // Check for ninja
-    if std::process::Command::new("ninja")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
+    if Command::new("ninja").arg("--version").output().is_err() {
         return Err(
             "'ninja' is required to build DuckDB. Install it via your package manager.".into(),
         );
@@ -284,7 +286,7 @@ fn build_duckdb(duckdb_source_dir: &Path) -> Result<PathBuf, Box<dyn std::error:
                 ("1", "0")
             };
 
-        let output = std::process::Command::new("make")
+        let output = Command::new("make")
             .current_dir(&duckdb_repo_dir)
             .env("GEN", "ninja")
             .env("DISABLE_SANITIZER", asan_option)
@@ -465,8 +467,10 @@ fn main() {
         .file("cpp/data_chunk.cpp")
         .file("cpp/error.cpp")
         .file("cpp/expr.cpp")
+        .file("cpp/file_system.cpp")
         .file("cpp/logical_type.cpp")
         .file("cpp/object_cache.cpp")
+        .file("cpp/replacement_scan.cpp")
         .file("cpp/scalar_function.cpp")
         .file("cpp/table_filter.cpp")
         .file("cpp/table_function.cpp")
@@ -476,13 +480,28 @@ fn main() {
         .compile("vortex-duckdb-extras");
 
     // Generate the _exported_ bindings from our Rust code.
+    let generated_header = crate_dir.join("include/vortex.h");
     cbindgen::Builder::new()
         .with_config(cbindgen::Config::from_file(crate_dir.join("cbindgen.toml")).unwrap())
         .with_crate(&crate_dir)
         .with_no_includes()
         .generate()
         .expect("error: Unable to generate bindings for vortex.h")
-        .write_to_file(crate_dir.join("include/vortex.h"));
+        .write_to_file(&generated_header);
+
+    // Run clang-format on the generated header.
+    if let Ok(status) = Command::new("clang-format")
+        .arg("-i")
+        .arg("--style=file")
+        .arg(&generated_header)
+        .status()
+    {
+        if !status.success() {
+            println!("cargo:warning=clang-format exited with status {status}");
+        }
+    } else {
+        println!("cargo:warning=clang-format not found, skipping formatting of generated header");
+    }
 
     // Watch C/C++ source files for changes.
     for entry in walkdir::WalkDir::new("cpp/").into_iter().flatten() {

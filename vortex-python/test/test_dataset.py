@@ -108,14 +108,35 @@ def test_to_record_batch_reader_with_polars(ds: pd.Dataset):
     assert pldf.schema["float"] == polars.Float64
 
 
+def test_filter(ds: vx.dataset.VortexDataset):
+
+    tbl = ds.to_table(filter=(pc.field("string") >= "950000") & (pc.field("float") < 975.0))
+    assert len(tbl) == 6176
+
+    tbl = ds.to_table(filter=(pc.field("index") < 10))
+    assert len(tbl) == 10
+
+    tbl = ds.to_table(filter=((pc.field("index") + 1) < 10))
+    assert len(tbl) == 9
+
+    tbl = ds.to_table(filter=((pc.field("index") - 1) < 10))
+    assert len(tbl) == 11
+
+    tbl = ds.to_table(filter=((pc.field("index") * 2) < 10))
+    assert len(tbl) == 5
+
+    tbl = ds.to_table(filter=((pc.field("index") / 2) < 10))
+    assert len(tbl) == 20
+
+
 def test_duckdb(ds: vx.dataset.VortexDataset):
     assert ds  # pyright cannot determine that ds is used by duckdb.execute
-    # This would be a nice test but we do not support IsNotNull which duckdb uses
-    # tbl = duckdb.execute("select * from ds where string >= '950000' and float < 975.0").arrow().read_all()
-    # assert len(tbl) == 10_000
-    # assert tbl.schema == pa.schema(
-    #     [("bool", pa.bool_()), ("float", pa.float64()), ("index", pa.int64()), ("string", pa.utf8())]
-    # )
+
+    tbl = duckdb.execute("select * from ds where string >= '950000' and float < 975.0").arrow().read_all()
+    assert len(tbl) == 6176
+    assert tbl.schema == pa.schema(
+        [("bool", pa.bool_()), ("float", pa.float64()), ("index", pa.int64()), ("string", pa.utf8())]
+    )
 
     tbl = duckdb.execute("select * from ds").arrow().read_all()
     assert len(tbl) == 1_000_000
@@ -193,15 +214,7 @@ def test_fragment_to_batch_size(ds: vx.dataset.VortexDataset, batch_size: int):
 def test_fragment_to_table(ds: vx.dataset.VortexDataset):
     fragments = list(ds.get_fragments())
 
-    # The first fragment contains none of the matching records
-    tbl = fragments[0].to_table(columns=["bool", "float"], filter=pc.field("float") > 100)
-    assert len(tbl.slice(0, 10)) == 0
-
-    # From the second fragment onwards all records match
-    tbl = fragments[1].to_table(columns=["bool", "float"], filter=pc.field("float") > 100)
-    assert tbl.slice(0, 10) == pa.Table.from_struct_array(
-        pa.array([record(x, columns={"float", "bool"}) for x in range(10001, 10011)])
-    )
+    frag_row_count = 0
 
     for f in fragments:
         assert f.to_table(columns=["bool", "string"]).schema == pa.schema(
@@ -211,9 +224,13 @@ def test_fragment_to_table(ds: vx.dataset.VortexDataset):
             [("string", pa.string_view()), ("bool", pa.bool_())]
         )
 
+        frag_row_count += len(f.to_table(columns=["bool", "float"], filter=pc.field("float") > 100))
+
+    assert frag_row_count == 989_999
+
 
 def test_get_fragments(ds: vx.dataset.VortexDataset):
-    assert len(list(ds.get_fragments())) == 123
+    assert len(list(ds.get_fragments())) == 26
 
     assert ds.count_rows() == sum(f.count_rows() for f in ds.get_fragments())
 

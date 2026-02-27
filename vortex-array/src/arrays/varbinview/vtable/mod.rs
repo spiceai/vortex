@@ -1,37 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::mem::size_of;
 use std::sync::Arc;
 
+use kernel::PARENT_KERNELS;
 use vortex_buffer::Buffer;
-use vortex_buffer::ByteBuffer;
-use vortex_dtype::DType;
-use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
-use vortex_vector::Vector;
-use vortex_vector::binaryview::BinaryVector;
-use vortex_vector::binaryview::BinaryView;
-use vortex_vector::binaryview::StringVector;
+use vortex_session::VortexSession;
 
 use crate::ArrayRef;
 use crate::EmptyMetadata;
+use crate::ExecutionCtx;
+use crate::arrays::BinaryView;
 use crate::arrays::varbinview::VarBinViewArray;
+use crate::arrays::varbinview::compute::rules::PARENT_RULES;
 use crate::buffer::BufferHandle;
-use crate::executor::ExecutionCtx;
+use crate::dtype::DType;
 use crate::serde::ArrayChildren;
 use crate::validity::Validity;
 use crate::vtable;
 use crate::vtable::ArrayId;
-use crate::vtable::ArrayVTable;
-use crate::vtable::ArrayVTableExt;
-use crate::vtable::NotSupported;
 use crate::vtable::VTable;
 use crate::vtable::ValidityVTableFromValidityHelper;
 
 mod array;
-mod canonical;
+mod kernel;
 mod operations;
 mod validity;
 mod visitor;
@@ -41,25 +37,22 @@ vtable!(VarBinView);
 #[derive(Debug)]
 pub struct VarBinViewVTable;
 
+impl VarBinViewVTable {
+    pub const ID: ArrayId = ArrayId::new_ref("vortex.varbinview");
+}
+
 impl VTable for VarBinViewVTable {
     type Array = VarBinViewArray;
 
     type Metadata = EmptyMetadata;
 
     type ArrayVTable = Self;
-    type CanonicalVTable = Self;
     type OperationsVTable = Self;
     type ValidityVTable = ValidityVTableFromValidityHelper;
     type VisitorVTable = Self;
-    type ComputeVTable = NotSupported;
-    type EncodeVTable = NotSupported;
 
-    fn id(&self) -> ArrayId {
-        ArrayId::new_ref("vortex.varbinview")
-    }
-
-    fn encoding(_array: &Self::Array) -> ArrayVTable {
-        VarBinViewVTable.as_vtable()
+    fn id(_array: &Self::Array) -> ArrayId {
+        Self::ID
     }
 
     fn metadata(_array: &VarBinViewArray) -> VortexResult<Self::Metadata> {
@@ -70,32 +63,26 @@ impl VTable for VarBinViewVTable {
         Ok(Some(vec![]))
     }
 
-    fn deserialize(_buffer: &[u8]) -> VortexResult<Self::Metadata> {
+    fn deserialize(
+        _bytes: &[u8],
+        _dtype: &DType,
+        _len: usize,
+        _buffers: &[BufferHandle],
+        _session: &VortexSession,
+    ) -> VortexResult<Self::Metadata> {
         Ok(EmptyMetadata)
     }
 
     fn build(
-        &self,
         dtype: &DType,
         len: usize,
         _metadata: &Self::Metadata,
         buffers: &[BufferHandle],
         children: &dyn ArrayChildren,
     ) -> VortexResult<VarBinViewArray> {
-        if buffers.is_empty() {
-            vortex_bail!("Expected at least 1 buffer, got {}", buffers.len());
-        }
-        let mut buffers: Vec<ByteBuffer> = buffers
-            .iter()
-            .map(|b| b.clone().try_to_bytes())
-            .collect::<VortexResult<Vec<_>>>()?;
-        let views = buffers.pop().vortex_expect("buffers non-empty");
-
-        let views = Buffer::<BinaryView>::from_byte_buffer(views);
-
-        if views.len() != len {
-            vortex_bail!("Expected {} views, got {}", len, views.len());
-        }
+        let Some((views_handle, data_handles)) = buffers.split_last() else {
+            vortex_bail!("Expected at least 1 buffer, got 0");
+        };
 
         let validity = if children.is_empty() {
             Validity::from(dtype.nullability())
@@ -106,7 +93,35 @@ impl VTable for VarBinViewVTable {
             vortex_bail!("Expected 0 or 1 children, got {}", children.len());
         };
 
-        VarBinViewArray::try_new(views, Arc::from(buffers), dtype.clone(), validity)
+        let views_nbytes = views_handle.len();
+        let expected_views_nbytes = len
+            .checked_mul(size_of::<BinaryView>())
+            .ok_or_else(|| vortex_err!("views byte length overflow for len={len}"))?;
+        if views_nbytes != expected_views_nbytes {
+            vortex_bail!(
+                "Expected views buffer length {} bytes, got {} bytes",
+                expected_views_nbytes,
+                views_nbytes
+            );
+        }
+
+        // If any buffer is on device, skip host validation and use try_new_handle.
+        if buffers.iter().any(|b| b.is_on_device()) {
+            return VarBinViewArray::try_new_handle(
+                views_handle.clone(),
+                Arc::from(data_handles.to_vec()),
+                dtype.clone(),
+                validity,
+            );
+        }
+
+        let data_buffers = data_handles
+            .iter()
+            .map(|b| b.as_host().clone())
+            .collect::<Vec<_>>();
+        let views = Buffer::<BinaryView>::from_byte_buffer(views_handle.clone().as_host().clone());
+
+        VarBinViewArray::try_new(views, Arc::from(data_buffers), dtype.clone(), validity)
     }
 
     fn with_children(array: &mut Self::Array, children: Vec<ArrayRef>) -> VortexResult<()> {
@@ -126,25 +141,24 @@ impl VTable for VarBinViewVTable {
         Ok(())
     }
 
-    fn execute(array: &Self::Array, _ctx: &mut ExecutionCtx) -> VortexResult<Vector> {
-        Ok(match array.dtype() {
-            DType::Utf8(_) => unsafe {
-                StringVector::new_unchecked(
-                    array.views().clone(),
-                    Arc::new(array.buffers().to_vec().into_boxed_slice()),
-                    array.validity_mask(),
-                )
-                .into()
-            },
-            DType::Binary(_) => unsafe {
-                BinaryVector::new_unchecked(
-                    array.views().clone(),
-                    Arc::new(array.buffers().to_vec().into_boxed_slice()),
-                    array.validity_mask(),
-                )
-                .into()
-            },
-            _ => unreachable!("VarBinViewArray must have Binary or Utf8 dtype"),
-        })
+    fn reduce_parent(
+        array: &Self::Array,
+        parent: &ArrayRef,
+        child_idx: usize,
+    ) -> VortexResult<Option<ArrayRef>> {
+        PARENT_RULES.evaluate(array, parent, child_idx)
+    }
+
+    fn execute_parent(
+        array: &Self::Array,
+        parent: &ArrayRef,
+        child_idx: usize,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<ArrayRef>> {
+        PARENT_KERNELS.execute(array, parent, child_idx, ctx)
+    }
+
+    fn execute(array: &Self::Array, _ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
+        Ok(array.to_array())
     }
 }

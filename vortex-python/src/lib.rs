@@ -8,20 +8,24 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
 pub(crate) mod arrays;
-mod arrow;
+pub mod arrow;
+#[cfg(feature = "tui")]
+mod cli;
 mod compress;
 mod dataset;
 pub(crate) mod dtype;
+mod error;
 mod expr;
 mod file;
 mod io;
 mod iter;
-mod object_store_urls;
+mod object_store;
 mod python_repr;
 mod registry;
-pub(crate) mod scalar;
+pub mod scalar;
 mod scan;
 mod serde;
+mod store;
 
 use log::LevelFilter;
 use pyo3_log::Caching;
@@ -46,6 +50,7 @@ static SESSION: LazyLock<VortexSession> =
     LazyLock::new(|| VortexSession::default().with_handle(RUNTIME.handle()));
 
 /// Vortex is an Apache Arrow-compatible toolkit for working with compressed array data.
+#[cfg(feature = "extension-module")]
 #[pymodule]
 fn _lib(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     Python::attach(|py| -> PyResult<()> {
@@ -58,6 +63,8 @@ fn _lib(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
 
     // Initialize our submodules, living under vortex._lib
     arrays::init(py, m)?;
+    #[cfg(feature = "tui")]
+    cli::init(py, m)?;
     compress::init(py, m)?;
     dataset::init(py, m)?;
     dtype::init(py, m)?;
@@ -65,6 +72,7 @@ fn _lib(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     file::init(py, m)?;
     io::init(py, m)?;
     iter::init(py, m)?;
+    store::init(py, m)?;
     registry::init(py, m)?;
     scalar::init(py, m)?;
     serde::init(py, m)?;

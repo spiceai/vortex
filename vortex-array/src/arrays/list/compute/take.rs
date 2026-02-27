@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use vortex_dtype::IntegerPType;
-use vortex_dtype::Nullability;
-use vortex_dtype::match_each_integer_ptype;
-use vortex_dtype::match_smallest_offset_type;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 
@@ -14,25 +10,31 @@ use crate::ToCanonical;
 use crate::arrays::ListArray;
 use crate::arrays::ListVTable;
 use crate::arrays::PrimitiveArray;
+use crate::arrays::TakeExecute;
 use crate::builders::ArrayBuilder;
 use crate::builders::PrimitiveBuilder;
-use crate::compute::TakeKernel;
-use crate::compute::TakeKernelAdapter;
-use crate::compute::take;
-use crate::register_kernel;
+use crate::dtype::IntegerPType;
+use crate::dtype::Nullability;
+use crate::executor::ExecutionCtx;
+use crate::match_each_integer_ptype;
+use crate::match_smallest_offset_type;
 use crate::vtable::ValidityHelper;
 
 // TODO(connor)[ListView]: Re-revert to the version where we simply convert to a `ListView` and call
 // the `ListView::take` compute function once `ListView` is more stable.
 
-/// Take implementation for [`ListArray`].
-///
-/// Unlike `ListView`, `ListArray` must rebuild the elements array to maintain its invariant
-/// that lists are stored contiguously and in-order (`offset[i+1] >= offset[i]`). Taking
-/// non-contiguous indices would violate this requirement.
-impl TakeKernel for ListVTable {
+impl TakeExecute for ListVTable {
+    /// Take implementation for [`ListArray`].
+    ///
+    /// Unlike `ListView`, `ListArray` must rebuild the elements array to maintain its invariant
+    /// that lists are stored contiguously and in-order (`offset[i+1] >= offset[i]`). Taking
+    /// non-contiguous indices would violate this requirement.
     #[expect(clippy::cognitive_complexity)]
-    fn take(&self, array: &ListArray, indices: &dyn Array) -> VortexResult<ArrayRef> {
+    fn take(
+        array: &ListArray,
+        indices: &dyn Array,
+        _ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<ArrayRef>> {
         let indices = indices.to_primitive();
         // This is an over-approximation of the total number of elements in the resulting array.
         let total_approx = array.elements().len().saturating_mul(indices.len());
@@ -40,21 +42,19 @@ impl TakeKernel for ListVTable {
         match_each_integer_ptype!(array.offsets().dtype().as_ptype(), |O| {
             match_each_integer_ptype!(indices.ptype(), |I| {
                 match_smallest_offset_type!(total_approx, |OutputOffsetType| {
-                    _take::<I, O, OutputOffsetType>(array, &indices)
+                    _take::<I, O, OutputOffsetType>(array, &indices).map(Some)
                 })
             })
         })
     }
 }
 
-register_kernel!(TakeKernelAdapter(ListVTable).lift());
-
 fn _take<I: IntegerPType, O: IntegerPType, OutputOffsetType: IntegerPType>(
     array: &ListArray,
     indices_array: &PrimitiveArray,
 ) -> VortexResult<ArrayRef> {
-    let data_validity = array.validity_mask();
-    let indices_validity = indices_array.validity_mask();
+    let data_validity = array.validity_mask()?;
+    let indices_validity = indices_array.validity_mask()?;
 
     if !indices_validity.all_true() || !data_validity.all_true() {
         return _take_nullable::<I, O, OutputOffsetType>(array, indices_array);
@@ -100,7 +100,7 @@ fn _take<I: IntegerPType, O: IntegerPType, OutputOffsetType: IntegerPType>(
     let elements_to_take = elements_to_take.finish();
     let new_offsets = new_offsets.finish();
 
-    let new_elements = take(array.elements(), elements_to_take.as_ref())?;
+    let new_elements = array.elements().take(elements_to_take.to_array())?;
 
     Ok(ListArray::try_new(
         new_elements,
@@ -117,8 +117,8 @@ fn _take_nullable<I: IntegerPType, O: IntegerPType, OutputOffsetType: IntegerPTy
     let offsets_array = array.offsets().to_primitive();
     let offsets: &[O] = offsets_array.as_slice();
     let indices: &[I] = indices_array.as_slice();
-    let data_validity = array.validity_mask();
-    let indices_validity = indices_array.validity_mask();
+    let data_validity = array.validity_mask()?;
+    let indices_validity = indices_array.validity_mask()?;
 
     let mut new_offsets = PrimitiveBuilder::<OutputOffsetType>::with_capacity(
         Nullability::NonNullable,
@@ -168,7 +168,7 @@ fn _take_nullable<I: IntegerPType, O: IntegerPType, OutputOffsetType: IntegerPTy
 
     let elements_to_take = elements_to_take.finish();
     let new_offsets = new_offsets.finish();
-    let new_elements = take(array.elements(), elements_to_take.as_ref())?;
+    let new_elements = array.elements().take(elements_to_take.to_array())?;
 
     Ok(ListArray::try_new(
         new_elements,
@@ -184,10 +184,6 @@ mod test {
 
     use rstest::rstest;
     use vortex_buffer::buffer;
-    use vortex_dtype::DType;
-    use vortex_dtype::Nullability;
-    use vortex_dtype::PType::I32;
-    use vortex_scalar::Scalar;
 
     use crate::Array;
     use crate::IntoArray as _;
@@ -196,7 +192,10 @@ mod test {
     use crate::arrays::PrimitiveArray;
     use crate::arrays::list::ListArray;
     use crate::compute::conformance::take::test_take_conformance;
-    use crate::compute::take;
+    use crate::dtype::DType;
+    use crate::dtype::Nullability;
+    use crate::dtype::PType::I32;
+    use crate::scalar::Scalar;
     use crate::validity::Validity;
 
     #[test]
@@ -212,7 +211,7 @@ mod test {
         let idx =
             PrimitiveArray::from_option_iter(vec![Some(0), None, Some(1), Some(3)]).to_array();
 
-        let result = take(&list, &idx).unwrap();
+        let result = list.take(idx.to_array()).unwrap();
 
         assert_eq!(
             result.dtype(),
@@ -228,9 +227,9 @@ mod test {
 
         let element_dtype: Arc<DType> = Arc::new(I32.into());
 
-        assert!(result.is_valid(0));
+        assert!(result.is_valid(0).unwrap());
         assert_eq!(
-            result.scalar_at(0),
+            result.scalar_at(0).unwrap(),
             Scalar::list(
                 element_dtype.clone(),
                 vec![0i32.into(), 5.into()],
@@ -238,11 +237,11 @@ mod test {
             )
         );
 
-        assert!(result.is_invalid(1));
+        assert!(result.is_invalid(1).unwrap());
 
-        assert!(result.is_valid(2));
+        assert!(result.is_valid(2).unwrap());
         assert_eq!(
-            result.scalar_at(2),
+            result.scalar_at(2).unwrap(),
             Scalar::list(
                 element_dtype.clone(),
                 vec![3i32.into()],
@@ -250,9 +249,9 @@ mod test {
             )
         );
 
-        assert!(result.is_valid(3));
+        assert!(result.is_valid(3).unwrap());
         assert_eq!(
-            result.scalar_at(3),
+            result.scalar_at(3).unwrap(),
             Scalar::list(element_dtype, vec![], Nullability::Nullable)
         );
     }
@@ -270,7 +269,7 @@ mod test {
         let idx = PrimitiveArray::from_option_iter(vec![Some(0), Some(1), None]).to_array();
         // since idx is nullable, the final list will also be nullable
 
-        let result = take(&list, &idx).unwrap();
+        let result = list.take(idx.to_array()).unwrap();
         assert_eq!(
             result.dtype(),
             &DType::List(
@@ -292,7 +291,7 @@ mod test {
 
         let idx = buffer![1, 0, 2].into_array();
 
-        let result = take(&list, &idx).unwrap();
+        let result = list.take(idx.to_array()).unwrap();
 
         assert_eq!(
             result.dtype(),
@@ -308,9 +307,9 @@ mod test {
 
         let element_dtype: Arc<DType> = Arc::new(I32.into());
 
-        assert!(result.is_valid(0));
+        assert!(result.is_valid(0).unwrap());
         assert_eq!(
-            result.scalar_at(0),
+            result.scalar_at(0).unwrap(),
             Scalar::list(
                 element_dtype.clone(),
                 vec![3i32.into()],
@@ -318,9 +317,9 @@ mod test {
             )
         );
 
-        assert!(result.is_valid(1));
+        assert!(result.is_valid(1).unwrap());
         assert_eq!(
-            result.scalar_at(1),
+            result.scalar_at(1).unwrap(),
             Scalar::list(
                 element_dtype.clone(),
                 vec![0i32.into(), 5.into()],
@@ -328,9 +327,9 @@ mod test {
             )
         );
 
-        assert!(result.is_valid(2));
+        assert!(result.is_valid(2).unwrap());
         assert_eq!(
-            result.scalar_at(2),
+            result.scalar_at(2).unwrap(),
             Scalar::list(element_dtype, vec![], Nullability::NonNullable)
         );
     }
@@ -347,7 +346,7 @@ mod test {
 
         let idx = PrimitiveArray::empty::<i32>(Nullability::Nullable).to_array();
 
-        let result = take(&list, &idx).unwrap();
+        let result = list.take(idx.to_array()).unwrap();
         assert_eq!(
             result.dtype(),
             &DType::List(
@@ -410,14 +409,14 @@ mod test {
 
         // Take the same large list twice - would overflow u8 but works with u64.
         let idx = buffer![0u8, 0].into_array();
-        let result = take(&list, &idx).unwrap();
+        let result = list.take(idx.to_array()).unwrap();
 
         assert_eq!(result.len(), 2);
 
         let result_view = result.to_listview();
         assert_eq!(result_view.len(), 2);
-        assert!(result_view.is_valid(0));
-        assert!(result_view.is_valid(1));
+        assert!(result_view.is_valid(0).unwrap());
+        assert!(result_view.is_valid(1).unwrap());
     }
 
     #[test]
@@ -431,15 +430,15 @@ mod test {
 
         // Take the same large list twice - would overflow u8 but works with u64.
         let idx = PrimitiveArray::from_option_iter(vec![Some(0u8), None, Some(0u8)]).to_array();
-        let result = take(&list, &idx).unwrap();
+        let result = list.take(idx.to_array()).unwrap();
 
         assert_eq!(result.len(), 3);
 
         let result_view = result.to_listview();
         assert_eq!(result_view.len(), 3);
-        assert!(result_view.is_valid(0));
-        assert!(result_view.is_invalid(1));
-        assert!(result_view.is_valid(2));
+        assert!(result_view.is_valid(0).unwrap());
+        assert!(result_view.is_invalid(1).unwrap());
+        assert!(result_view.is_valid(2).unwrap());
     }
 
     /// Regression test for validity length mismatch bug.
@@ -461,7 +460,7 @@ mod test {
         let idx = buffer![0u32, 1, 0, 1].into_array();
 
         // This should not panic - result should have length 4.
-        let result = take(&list, &idx).unwrap();
+        let result = list.take(idx.to_array()).unwrap();
         assert_eq!(result.len(), 4);
     }
 }

@@ -3,20 +3,18 @@
 
 use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
-use vortex_array::compute::CastKernel;
-use vortex_array::compute::CastKernelAdapter;
-use vortex_array::compute::cast;
-use vortex_array::register_kernel;
-use vortex_dtype::DType;
-use vortex_dtype::Nullability::NonNullable;
+use vortex_array::builtins::ArrayBuiltins;
+use vortex_array::dtype::DType;
+use vortex_array::dtype::Nullability::NonNullable;
+use vortex_array::scalar_fn::fns::cast::CastReduce;
 use vortex_error::VortexResult;
 use vortex_error::vortex_panic;
 
 use crate::delta::DeltaArray;
 use crate::delta::DeltaVTable;
 
-impl CastKernel for DeltaVTable {
-    fn cast(&self, array: &DeltaArray, dtype: &DType) -> VortexResult<Option<ArrayRef>> {
+impl CastReduce for DeltaVTable {
+    fn cast(array: &DeltaArray, dtype: &DType) -> VortexResult<Option<ArrayRef>> {
         // Delta encoding stores differences between consecutive values, which requires
         // unsigned integers to avoid overflow issues. Signed integers could produce
         // negative deltas that wouldn't fit in the unsigned delta representation.
@@ -35,8 +33,8 @@ impl CastKernel for DeltaVTable {
         }
 
         // Cast both bases and deltas to the target type
-        let casted_bases = cast(array.bases(), &dtype.with_nullability(NonNullable))?;
-        let casted_deltas = cast(array.deltas(), dtype)?;
+        let casted_bases = array.bases().cast(dtype.with_nullability(NonNullable))?;
+        let casted_deltas = array.deltas().cast(dtype.clone())?;
 
         // Create a new DeltaArray with the casted components
         Ok(Some(
@@ -45,20 +43,17 @@ impl CastKernel for DeltaVTable {
     }
 }
 
-register_kernel!(CastKernelAdapter(DeltaVTable).lift());
-
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
-    use vortex_array::ToCanonical;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::assert_arrays_eq;
-    use vortex_array::compute::cast;
+    use vortex_array::builtins::ArrayBuiltins;
     use vortex_array::compute::conformance::cast::test_cast_conformance;
+    use vortex_array::dtype::DType;
+    use vortex_array::dtype::Nullability;
+    use vortex_array::dtype::PType;
     use vortex_buffer::Buffer;
-    use vortex_dtype::DType;
-    use vortex_dtype::Nullability;
-    use vortex_dtype::PType;
 
     use crate::delta::DeltaArray;
 
@@ -70,19 +65,17 @@ mod tests {
         );
         let array = DeltaArray::try_from_primitive_array(&primitive).unwrap();
 
-        let casted = cast(
-            array.as_ref(),
-            &DType::Primitive(PType::U32, Nullability::NonNullable),
-        )
-        .unwrap();
+        let casted = array
+            .to_array()
+            .cast(DType::Primitive(PType::U32, Nullability::NonNullable))
+            .unwrap();
         assert_eq!(
             casted.dtype(),
             &DType::Primitive(PType::U32, Nullability::NonNullable)
         );
 
         // Verify by decoding
-        let decoded = casted.to_primitive();
-        assert_arrays_eq!(decoded, PrimitiveArray::from_iter([10u32, 20, 30, 40, 50]));
+        assert_arrays_eq!(casted, PrimitiveArray::from_iter([10u32, 20, 30, 40, 50]));
     }
 
     #[test]
@@ -95,11 +88,10 @@ mod tests {
         );
         let array = DeltaArray::try_from_primitive_array(&values).unwrap();
 
-        let casted = cast(
-            array.as_ref(),
-            &DType::Primitive(PType::U32, Nullability::Nullable),
-        )
-        .unwrap();
+        let casted = array
+            .to_array()
+            .cast(DType::Primitive(PType::U32, Nullability::Nullable))
+            .unwrap();
         assert_eq!(
             casted.dtype(),
             &DType::Primitive(PType::U32, Nullability::Nullable)

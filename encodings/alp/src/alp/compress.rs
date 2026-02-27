@@ -5,12 +5,12 @@ use itertools::Itertools;
 use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
 use vortex_array::arrays::PrimitiveArray;
+use vortex_array::dtype::PType;
 use vortex_array::patches::Patches;
 use vortex_array::validity::Validity;
 use vortex_array::vtable::ValidityHelper;
 use vortex_buffer::Buffer;
 use vortex_buffer::BufferMut;
-use vortex_dtype::PType;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_mask::Mask;
@@ -22,7 +22,7 @@ use crate::alp::ALPFloat;
 #[macro_export]
 macro_rules! match_each_alp_float_ptype {
     ($self:expr, | $enc:ident | $body:block) => {{
-        use vortex_dtype::PType;
+        use vortex_array::dtype::PType;
         use vortex_error::vortex_panic;
         let ptype = $self;
         match ptype {
@@ -75,7 +75,7 @@ where
 
     let encoded_array = PrimitiveArray::new(encoded, values.validity().clone()).into_array();
 
-    let validity = values.validity_mask();
+    let validity = values.validity_mask()?;
     // exceptional_positions may contain exceptions at invalid positions (which contain garbage
     // data). We remove null exceptions in order to keep the Patches small.
     let (valid_exceptional_positions, valid_exceptional_values): (Buffer<u64>, Buffer<T>) =
@@ -120,7 +120,7 @@ where
             valid_exceptional_positions.into_array(),
             valid_exceptional_values,
             Some(chunk_offsets.into_array()),
-        ))
+        )?)
     };
     Ok((exponents, encoded_array, patches))
 }
@@ -133,10 +133,10 @@ mod tests {
     use f64::consts::PI;
     use vortex_array::ToCanonical;
     use vortex_array::assert_arrays_eq;
+    use vortex_array::dtype::NativePType;
     use vortex_array::validity::Validity;
     use vortex_buffer::Buffer;
     use vortex_buffer::buffer;
-    use vortex_dtype::NativePType;
 
     use super::*;
     use crate::decompress_into_array;
@@ -150,7 +150,7 @@ mod tests {
         assert_arrays_eq!(encoded.encoded(), expected_encoded);
         assert_eq!(encoded.exponents(), Exponents { e: 9, f: 6 });
 
-        let decoded = decompress_into_array(encoded);
+        let decoded = decompress_into_array(encoded).unwrap();
         assert_arrays_eq!(decoded, array);
     }
 
@@ -163,7 +163,7 @@ mod tests {
         assert_arrays_eq!(encoded.encoded(), expected_encoded);
         assert_eq!(encoded.exponents(), Exponents { e: 9, f: 6 });
 
-        let decoded = decompress_into_array(encoded);
+        let decoded = decompress_into_array(encoded).unwrap();
         let expected = PrimitiveArray::from_option_iter(vec![None, Some(1.234f32), None]);
         assert_arrays_eq!(decoded, expected);
     }
@@ -179,7 +179,7 @@ mod tests {
         assert_arrays_eq!(encoded.encoded(), expected_encoded);
         assert_eq!(encoded.exponents(), Exponents { e: 16, f: 13 });
 
-        let decoded = decompress_into_array(encoded);
+        let decoded = decompress_into_array(encoded).unwrap();
         let expected_decoded = PrimitiveArray::new(values, Validity::NonNullable);
         assert_arrays_eq!(decoded, expected_decoded);
     }
@@ -196,7 +196,7 @@ mod tests {
         assert_arrays_eq!(encoded.encoded(), expected_encoded);
         assert_eq!(encoded.exponents(), Exponents { e: 16, f: 13 });
 
-        let decoded = decompress_into_array(encoded);
+        let decoded = decompress_into_array(encoded).unwrap();
         assert_arrays_eq!(decoded, array);
     }
 
@@ -217,15 +217,14 @@ mod tests {
 
         assert_arrays_eq!(encoded, array);
 
-        let _decoded = decompress_into_array(encoded);
+        let _decoded = decompress_into_array(encoded).unwrap();
     }
 
     #[test]
     fn roundtrips_close_fractional() {
         let original = PrimitiveArray::from_iter([195.26274f32, 195.27837, -48.815685]);
         let alp_arr = alp_encode(&original, None).unwrap();
-        let decompressed = alp_arr.to_primitive();
-        assert_arrays_eq!(decompressed, original);
+        assert_arrays_eq!(alp_arr, original);
     }
 
     #[test]
@@ -362,11 +361,10 @@ mod tests {
         let original = PrimitiveArray::new(Buffer::from(values), Validity::NonNullable);
         let encoded = alp_encode(&original, None).unwrap();
 
-        let sliced_alp = encoded.slice(512..1024);
-        let decoded = sliced_alp.to_primitive();
+        let sliced_alp = encoded.slice(512..1024).unwrap();
 
-        let expected_slice = original.slice(512..1024).to_primitive();
-        assert_eq!(expected_slice.as_slice::<f32>(), decoded.as_slice::<f32>());
+        let expected_slice = original.slice(512..1024).unwrap();
+        assert_arrays_eq!(sliced_alp, expected_slice);
     }
 
     #[test]
@@ -375,11 +373,10 @@ mod tests {
         let original = PrimitiveArray::new(Buffer::from(values), Validity::NonNullable);
         let encoded = alp_encode(&original, None).unwrap();
 
-        let sliced_alp = encoded.slice(512..1024);
-        let decoded = sliced_alp.to_primitive();
+        let sliced_alp = encoded.slice(512..1024).unwrap();
 
-        let expected_slice = original.slice(512..1024).to_primitive();
-        assert_eq!(expected_slice.as_slice::<f64>(), decoded.as_slice::<f64>());
+        let expected_slice = original.slice(512..1024).unwrap();
+        assert_arrays_eq!(sliced_alp, expected_slice);
     }
 
     #[test]
@@ -392,11 +389,10 @@ mod tests {
         let original = PrimitiveArray::new(Buffer::from(values), Validity::NonNullable);
         let encoded = alp_encode(&original, None).unwrap();
 
-        let sliced_alp = encoded.slice(512..1024);
-        let decoded = sliced_alp.to_primitive();
+        let sliced_alp = encoded.slice(512..1024).unwrap();
 
-        let expected_slice = original.slice(512..1024).to_primitive();
-        assert_eq!(expected_slice.as_slice::<f64>(), decoded.as_slice::<f64>());
+        let expected_slice = original.slice(512..1024).unwrap();
+        assert_arrays_eq!(sliced_alp, expected_slice);
         assert!(encoded.patches().is_some());
     }
 
@@ -413,11 +409,10 @@ mod tests {
         let original = PrimitiveArray::new(Buffer::from(values), Validity::NonNullable);
         let encoded = alp_encode(&original, None).unwrap();
 
-        let sliced_alp = encoded.slice(1023..1025);
-        let decoded = sliced_alp.to_primitive();
+        let sliced_alp = encoded.slice(1023..1025).unwrap();
 
-        let expected_slice = original.slice(1023..1025).to_primitive();
-        assert_eq!(expected_slice.as_slice::<f64>(), decoded.as_slice::<f64>());
+        let expected_slice = original.slice(1023..1025).unwrap();
+        assert_arrays_eq!(sliced_alp, expected_slice);
         assert!(encoded.patches().is_some());
     }
 
@@ -430,10 +425,10 @@ mod tests {
         let original = PrimitiveArray::from_option_iter(values);
         let encoded = alp_encode(&original, None).unwrap();
 
-        let sliced_alp = encoded.slice(512..1024);
+        let sliced_alp = encoded.slice(512..1024).unwrap();
         let decoded = sliced_alp.to_primitive();
 
-        let expected_slice = original.slice(512..1024);
+        let expected_slice = original.slice(512..1024).unwrap();
         assert_arrays_eq!(decoded, expected_slice);
     }
 
@@ -444,8 +439,8 @@ mod tests {
         let encoded = alp_encode(&array, None).unwrap();
 
         assert!(encoded.patches().is_none());
-        let decoded = decompress_into_array(encoded);
-        assert_eq!(array.as_slice::<f32>(), decoded.as_slice::<f32>());
+        let decoded = decompress_into_array(encoded).unwrap();
+        assert_arrays_eq!(decoded, array);
     }
 
     #[test]
@@ -455,8 +450,8 @@ mod tests {
         let encoded = alp_encode(&array, None).unwrap();
 
         assert!(encoded.patches().is_none());
-        let decoded = decompress_into_array(encoded);
-        assert_eq!(array.as_slice::<f64>(), decoded.as_slice::<f64>());
+        let decoded = decompress_into_array(encoded).unwrap();
+        assert_arrays_eq!(decoded, array);
     }
 
     #[test]
@@ -468,12 +463,12 @@ mod tests {
         values[3000] = f32::NEG_INFINITY;
         values[4500] = f32::INFINITY;
 
-        let array = PrimitiveArray::new(Buffer::from(values.clone()), Validity::NonNullable);
+        let array = PrimitiveArray::new(Buffer::from(values), Validity::NonNullable);
         let encoded = alp_encode(&array, None).unwrap();
 
         assert!(encoded.patches().is_some());
-        let decoded = decompress_into_array(encoded);
-        assert_eq!(values.as_slice(), decoded.as_slice::<f32>());
+        let decoded = decompress_into_array(encoded).unwrap();
+        assert_arrays_eq!(decoded, array);
     }
 
     #[test]
@@ -493,7 +488,7 @@ mod tests {
         let encoded = alp_encode(&array, None).unwrap();
 
         assert!(encoded.patches().is_some());
-        let decoded = decompress_into_array(encoded);
+        let decoded = decompress_into_array(encoded).unwrap();
 
         for idx in 0..size {
             let decoded_val = decoded.as_slice::<f64>()[idx];
@@ -520,7 +515,7 @@ mod tests {
 
         let array = PrimitiveArray::from_option_iter(values);
         let encoded = alp_encode(&array, None).unwrap();
-        let decoded = decompress_into_array(encoded);
+        let decoded = decompress_into_array(encoded).unwrap();
 
         assert_arrays_eq!(decoded, array);
     }
@@ -540,7 +535,7 @@ mod tests {
 
         let array = PrimitiveArray::new(Buffer::from(values), validity);
         let encoded = alp_encode(&array, None).unwrap();
-        let decoded = decompress_into_array(encoded);
+        let decoded = decompress_into_array(encoded).unwrap();
 
         assert_arrays_eq!(decoded, array);
     }

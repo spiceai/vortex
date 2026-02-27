@@ -2,18 +2,19 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 mod cast;
-mod compare;
+pub(crate) mod compare;
 mod filter;
 mod is_sorted;
 mod list_contains;
 mod min_max;
+mod slice;
 mod take;
 
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
     use vortex_array::compute::conformance::consistency::test_array_consistency;
-    use vortex_dtype::Nullability;
+    use vortex_array::dtype::Nullability;
 
     use crate::SequenceArray;
 

@@ -1,44 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::ops::Range;
-
 use vortex_array::Array;
-use vortex_array::ArrayRef;
-use vortex_array::IntoArray;
+use vortex_array::scalar::Scalar;
 use vortex_array::vtable::OperationsVTable;
 use vortex_error::VortexExpect;
-use vortex_scalar::Scalar;
+use vortex_error::VortexResult;
 
 use crate::ALPRDArray;
 use crate::ALPRDVTable;
 
 impl OperationsVTable<ALPRDVTable> for ALPRDVTable {
-    fn slice(array: &ALPRDArray, range: Range<usize>) -> ArrayRef {
-        let left_parts_exceptions = array
-            .left_parts_patches()
-            .and_then(|patches| patches.slice(range.clone()));
-
-        // SAFETY: slicing components does not change the encoded values
-        unsafe {
-            ALPRDArray::new_unchecked(
-                array.dtype().clone(),
-                array.left_parts().slice(range.clone()),
-                array.left_parts_dictionary().clone(),
-                array.right_parts().slice(range),
-                array.right_bit_width(),
-                left_parts_exceptions,
-            )
-            .into_array()
-        }
-    }
-
-    fn scalar_at(array: &ALPRDArray, index: usize) -> Scalar {
+    fn scalar_at(array: &ALPRDArray, index: usize) -> VortexResult<Scalar> {
         // The left value can either be a direct value, or an exception.
         // The exceptions array represents exception positions with non-null values.
-        let maybe_patched_value = array
-            .left_parts_patches()
-            .and_then(|patches| patches.get_patched(index));
+        let maybe_patched_value = match array.left_parts_patches() {
+            Some(patches) => patches.get_patched(index)?,
+            None => None,
+        };
         let left = match maybe_patched_value {
             Some(patched_value) => patched_value
                 .as_primitive()
@@ -47,7 +26,7 @@ impl OperationsVTable<ALPRDVTable> for ALPRDVTable {
             _ => {
                 let left_code: u16 = array
                     .left_parts()
-                    .scalar_at(index)
+                    .scalar_at(index)?
                     .as_primitive()
                     .as_::<u16>()
                     .vortex_expect("left_code must be non-null");
@@ -56,10 +35,10 @@ impl OperationsVTable<ALPRDVTable> for ALPRDVTable {
         };
 
         // combine left and right values
-        if array.is_f32() {
+        Ok(if array.is_f32() {
             let right: u32 = array
                 .right_parts()
-                .scalar_at(index)
+                .scalar_at(index)?
                 .as_primitive()
                 .as_::<u32>()
                 .vortex_expect("non-null");
@@ -68,13 +47,13 @@ impl OperationsVTable<ALPRDVTable> for ALPRDVTable {
         } else {
             let right: u64 = array
                 .right_parts()
-                .scalar_at(index)
+                .scalar_at(index)?
                 .as_primitive()
                 .as_::<u64>()
                 .vortex_expect("non-null");
             let packed = f64::from_bits(((left as u64) << array.right_bit_width()) | right);
             Scalar::primitive(packed, array.dtype().nullability())
-        }
+        })
     }
 }
 
@@ -83,7 +62,7 @@ mod test {
     use rstest::rstest;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::assert_arrays_eq;
-    use vortex_scalar::Scalar;
+    use vortex_array::scalar::Scalar;
 
     use crate::ALPRDFloat;
     use crate::RDEncoder;

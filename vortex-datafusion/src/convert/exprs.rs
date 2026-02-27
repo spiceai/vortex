@@ -5,50 +5,62 @@ use std::sync::Arc;
 
 use arrow_schema::DataType;
 use arrow_schema::Schema;
+use datafusion_common::Result as DFResult;
+use datafusion_common::exec_datafusion_err;
+use datafusion_common::tree_node::TreeNode;
+use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_expr::Operator as DFOperator;
 use datafusion_functions::core::getfield::GetFieldFunc;
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::ScalarFunctionExpr;
-use datafusion_physical_expr_common::physical_expr::is_dynamic_physical_expr;
+use datafusion_physical_expr::projection::ProjectionExpr;
+use datafusion_physical_expr::projection::ProjectionExprs;
+use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_plan::expressions as df_expr;
 use itertools::Itertools;
-use vortex::compute::LikeOptions;
 use vortex::dtype::DType;
 use vortex::dtype::Nullability;
 use vortex::dtype::arrow::FromArrowType;
-use vortex::error::VortexResult;
-use vortex::error::vortex_bail;
-use vortex::error::vortex_err;
-use vortex::expr::Binary;
 use vortex::expr::Expression;
-use vortex::expr::Like;
-use vortex::expr::Operator;
-use vortex::expr::VTableExt;
-use vortex::expr::and;
-use vortex::expr::case_when;
-use vortex::expr::case_when_no_else;
+use vortex::expr::and_collect;
 use vortex::expr::cast;
 use vortex::expr::get_item;
 use vortex::expr::is_null;
 use vortex::expr::list_contains;
 use vortex::expr::lit;
 use vortex::expr::not;
+use vortex::expr::pack;
 use vortex::expr::root;
+use vortex::expr::zip_expr;
 use vortex::scalar::Scalar;
+use vortex::scalar_fn::ScalarFnVTableExt;
+use vortex::scalar_fn::fns::binary::Binary;
+use vortex::scalar_fn::fns::like::Like;
+use vortex::scalar_fn::fns::like::LikeOptions;
+use vortex::scalar_fn::fns::operators::Operator;
 
 use crate::convert::FromDataFusion;
+
+/// Result of splitting a projection into Vortex expressions and leftover DataFusion projections.
+pub struct ProcessedProjection {
+    pub scan_projection: Expression,
+    pub leftover_projection: ProjectionExprs,
+}
 
 /// Tries to convert the expressions into a vortex conjunction. Will return Ok(None) iff the input conjunction is empty.
 pub(crate) fn make_vortex_predicate(
     expr_convertor: &dyn ExpressionConvertor,
     predicate: &[Arc<dyn PhysicalExpr>],
-) -> VortexResult<Option<Expression>> {
-    let exprs = predicate
+) -> DFResult<Option<Expression>> {
+    let exprs: Vec<_> = predicate
         .iter()
-        .map(|e| expr_convertor.convert(e.as_ref()))
-        .collect::<VortexResult<Vec<_>>>()?;
+        .filter_map(|e| {
+            // If conversion fails, skip this expression (equivalent to lit(true) in AND conjunction)
+            expr_convertor.convert(e.as_ref()).ok()
+        })
+        .collect();
 
-    Ok(exprs.into_iter().reduce(and))
+    Ok(and_collect(exprs))
 }
 
 /// Trait for converting DataFusion expressions to Vortex ones.
@@ -57,7 +69,42 @@ pub trait ExpressionConvertor: Send + Sync {
     fn can_be_pushed_down(&self, expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool;
 
     /// Try and convert a DataFusion [`PhysicalExpr`] into a Vortex [`Expression`].
-    fn convert(&self, expr: &dyn PhysicalExpr) -> VortexResult<Expression>;
+    fn convert(&self, expr: &dyn PhysicalExpr) -> DFResult<Expression>;
+
+    /// Split a projection into Vortex expressions that can be pushed down and leftover
+    /// DataFusion projections that need to be evaluated after the scan.
+    fn split_projection(
+        &self,
+        source_projection: ProjectionExprs,
+        input_schema: &Schema,
+        output_schema: &Schema,
+    ) -> DFResult<ProcessedProjection>;
+
+    /// Create a projection that reads only the required columns without pushing down
+    /// any expressions. All projection logic is applied after the scan.
+    fn no_pushdown_projection(
+        &self,
+        source_projection: ProjectionExprs,
+        input_schema: &Schema,
+    ) -> DFResult<ProcessedProjection> {
+        // Get all unique column indices referenced by the projection
+        let column_indices = source_projection.column_indices();
+
+        // Create scan projection that reads the required columns
+        let scan_columns: Vec<(String, Expression)> = column_indices
+            .into_iter()
+            .map(|idx| {
+                let field = input_schema.field(idx);
+                let name = field.name().clone();
+                (name.clone(), get_item(name, root()))
+            })
+            .collect();
+
+        Ok(ProcessedProjection {
+            scan_projection: pack(scan_columns, Nullability::NonNullable),
+            leftover_projection: source_projection,
+        })
+    }
 }
 
 /// The default [`ExpressionConvertor`].
@@ -66,37 +113,70 @@ pub struct DefaultExpressionConvertor {}
 
 impl DefaultExpressionConvertor {
     /// Attempts to convert a DataFusion ScalarFunctionExpr to a Vortex expression.
-    fn try_convert_scalar_function(
-        &self,
-        scalar_fn: &ScalarFunctionExpr,
-    ) -> VortexResult<Expression> {
+    fn try_convert_scalar_function(&self, scalar_fn: &ScalarFunctionExpr) -> DFResult<Expression> {
         if let Some(get_field_fn) = ScalarFunctionExpr::try_downcast_func::<GetFieldFunc>(scalar_fn)
         {
-            let source_expr = get_field_fn
+            // DataFusion's GetFieldFunc flattens nested field access into a single call
+            // with multiple field name arguments. For example, `outer.inner.leaf` becomes
+            // get_field(Column("outer"), "inner", "leaf"). We build a chain of get_item
+            // calls for each field name in the path.
+            let (source_expr, field_names) = get_field_fn
                 .args()
-                .first()
-                .ok_or_else(|| vortex_err!("get_field missing source expression"))?
-                .as_ref();
-            let field_name_expr = get_field_fn
-                .args()
-                .get(1)
-                .ok_or_else(|| vortex_err!("get_field missing field name argument"))?;
-            let field_name = field_name_expr
-                .as_any()
-                .downcast_ref::<df_expr::Literal>()
-                .ok_or_else(|| vortex_err!("get_field field name must be a literal"))?
-                .value()
-                .try_as_str()
-                .flatten()
-                .ok_or_else(|| vortex_err!("get_field field name must be a UTF-8 string"))?;
-            return Ok(get_item(field_name.to_string(), self.convert(source_expr)?));
+                .split_first()
+                .ok_or_else(|| exec_datafusion_err!("get_field missing source expression"))?;
+
+            let mut result = self.convert(source_expr.as_ref())?;
+            for expr in field_names {
+                let field_name = expr
+                    .as_any()
+                    .downcast_ref::<df_expr::Literal>()
+                    .ok_or_else(|| exec_datafusion_err!("get_field field name must be a literal"))?
+                    .value()
+                    .try_as_str()
+                    .flatten()
+                    .ok_or_else(|| {
+                        exec_datafusion_err!("get_field field name must be a UTF-8 string")
+                    })?;
+                result = get_item(field_name.to_string(), result);
+            }
+            return Ok(result);
         }
 
-        tracing::debug!(
-            function_name = scalar_fn.name(),
-            "Unsupported ScalarFunctionExpr"
-        );
-        vortex_bail!("Unsupported ScalarFunctionExpr: {}", scalar_fn.name())
+        Err(exec_datafusion_err!(
+            "Unsupported ScalarFunctionExpr: {}",
+            scalar_fn.name()
+        ))
+    }
+
+    fn try_convert_case_expr(&self, case_expr: &df_expr::CaseExpr) -> DFResult<Expression> {
+        let mut else_expr = if let Some(else_expr) = case_expr.else_expr() {
+            self.convert(else_expr.as_ref())?
+        } else {
+            return Err(exec_datafusion_err!(
+                "CASE expression without ELSE is not supported for pushdown"
+            ));
+        };
+
+        if let Some(base_expr) = case_expr.expr() {
+            let base_expr = self.convert(base_expr.as_ref())?;
+            for (when_expr, then_expr) in case_expr.when_then_expr().iter().rev() {
+                let when_expr = self.convert(when_expr.as_ref())?;
+                let then_expr = self.convert(then_expr.as_ref())?;
+                else_expr = zip_expr(
+                    then_expr,
+                    else_expr,
+                    Binary.new_expr(Operator::Eq, [base_expr.clone(), when_expr]),
+                );
+            }
+        } else {
+            for (when_expr, then_expr) in case_expr.when_then_expr().iter().rev() {
+                let when_expr = self.convert(when_expr.as_ref())?;
+                let then_expr = self.convert(then_expr.as_ref())?;
+                else_expr = zip_expr(then_expr, else_expr, when_expr);
+            }
+        }
+
+        Ok(else_expr)
     }
 
     /// Attempts to convert a DataFusion CaseExpr to a Vortex expression.
@@ -137,10 +217,10 @@ impl DefaultExpressionConvertor {
 
 impl ExpressionConvertor for DefaultExpressionConvertor {
     fn can_be_pushed_down(&self, expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
-        can_be_pushed_down(expr, schema)
+        can_be_pushed_down_impl(expr, schema)
     }
 
-    fn convert(&self, df: &dyn PhysicalExpr) -> VortexResult<Expression> {
+    fn convert(&self, df: &dyn PhysicalExpr) -> DFResult<Expression> {
         // TODO(joe): Don't return an error when we have an unsupported node, bubble up "TRUE" as in keep
         //  for that node, up to any `and` or `or` node.
         if let Some(binary_expr) = df.as_any().downcast_ref::<df_expr::BinaryExpr>() {
@@ -205,7 +285,7 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
                     if let Some(lit) = e.as_any().downcast_ref::<df_expr::Literal>() {
                         Ok(Scalar::from_df(lit.value()))
                     } else {
-                        Err(vortex_err!("Failed to cast sub-expression"))
+                        Err(exec_datafusion_err!("Failed to cast sub-expression"))
                     }
                 })
                 .try_collect()?;
@@ -228,11 +308,80 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
             return self.try_convert_case_expr(case_expr);
         }
 
-        vortex_bail!("Couldn't convert DataFusion physical {df} expression to a vortex expression")
+        Err(exec_datafusion_err!(
+            "Couldn't convert DataFusion physical {df} expression to a vortex expression"
+        ))
+    }
+
+    fn split_projection(
+        &self,
+        source_projection: ProjectionExprs,
+        input_schema: &Schema,
+        output_schema: &Schema,
+    ) -> DFResult<ProcessedProjection> {
+        let mut scan_projection = vec![];
+        let mut leftover_projection: Vec<ProjectionExpr> = vec![];
+
+        for projection_expr in source_projection.iter() {
+            let r = projection_expr.expr.apply(|node| {
+                // We only pull column children of scalar functions that we can't push into the scan.
+                if let Some(scalar_fn_expr) = node.as_any().downcast_ref::<ScalarFunctionExpr>()
+                    && !can_scalar_fn_be_pushed_down(scalar_fn_expr)
+                {
+                    scan_projection.extend(
+                        collect_columns(node)
+                            .into_iter()
+                            .map(|c| (c.name().to_string(), get_item(c.name(), root()))),
+                    );
+
+                    leftover_projection.push(projection_expr.clone());
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+
+                // DataFusion assumes different decimal types can be coerced.
+                // Vortex expects a perfect match so we don't push it down.
+                if let Some(binary_expr) = node.as_any().downcast_ref::<df_expr::BinaryExpr>()
+                    && binary_expr.op().is_numerical_operators()
+                    && (is_decimal(&binary_expr.left().data_type(input_schema)?)
+                        && is_decimal(&binary_expr.right().data_type(input_schema)?))
+                {
+                    scan_projection.extend(
+                        collect_columns(node)
+                            .into_iter()
+                            .map(|c| (c.name().to_string(), get_item(c.name(), root()))),
+                    );
+
+                    leftover_projection.push(projection_expr.clone());
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+
+                Ok(TreeNodeRecursion::Continue)
+            })?;
+
+            // if we didn't stop early
+            if matches!(r, TreeNodeRecursion::Continue) {
+                scan_projection.push((
+                    projection_expr.alias.clone(),
+                    self.convert(projection_expr.expr.as_ref())?,
+                ));
+                leftover_projection.push(ProjectionExpr {
+                    expr: Arc::new(df_expr::Column::new_with_schema(
+                        projection_expr.alias.as_str(),
+                        output_schema,
+                    )?),
+                    alias: projection_expr.alias.clone(),
+                });
+            }
+        }
+
+        Ok(ProcessedProjection {
+            scan_projection: pack(scan_projection, Nullability::NonNullable),
+            leftover_projection: leftover_projection.into(),
+        })
     }
 }
 
-fn try_operator_from_df(value: &DFOperator) -> VortexResult<Operator> {
+fn try_operator_from_df(value: &DFOperator) -> DFResult<Operator> {
     match value {
         DFOperator::Eq => Ok(Operator::Eq),
         DFOperator::NotEq => Ok(Operator::NotEq),
@@ -277,18 +426,14 @@ fn try_operator_from_df(value: &DFOperator) -> VortexResult<Operator> {
         | DFOperator::QuestionAnd
         | DFOperator::QuestionPipe => {
             tracing::debug!(operator = %value, "Can't pushdown binary_operator operator");
-            Err(vortex_err!("Unsupported datafusion operator {value}"))
+            Err(exec_datafusion_err!(
+                "Unsupported datafusion operator {value}"
+            ))
         }
     }
 }
 
-pub(crate) fn can_be_pushed_down(df_expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
-    // We currently do not support pushdown of dynamic expressions in DF.
-    // See issue: https://github.com/vortex-data/vortex/issues/4034
-    if is_dynamic_physical_expr(df_expr) {
-        return false;
-    }
-
+fn can_be_pushed_down_impl(df_expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
     let expr = df_expr.as_any();
     if let Some(binary) = expr.downcast_ref::<df_expr::BinaryExpr>() {
         can_binary_be_pushed_down(binary, schema)
@@ -298,7 +443,8 @@ pub(crate) fn can_be_pushed_down(df_expr: &Arc<dyn PhysicalExpr>, schema: &Schem
             .ok()
             .is_some_and(|field| supported_data_types(field.data_type()))
     } else if let Some(like) = expr.downcast_ref::<df_expr::LikeExpr>() {
-        can_be_pushed_down(like.expr(), schema) && can_be_pushed_down(like.pattern(), schema)
+        can_be_pushed_down_impl(like.expr(), schema)
+            && can_be_pushed_down_impl(like.pattern(), schema)
     } else if let Some(lit) = expr.downcast_ref::<df_expr::Literal>() {
         supported_data_types(&lit.value().data_type())
     } else if let Some(cast_expr) = expr.downcast_ref::<df_expr::CastExpr>() {
@@ -308,16 +454,25 @@ pub(crate) fn can_be_pushed_down(df_expr: &Arc<dyn PhysicalExpr>, schema: &Schem
         // CastColumnExpr child must be an expression type that convert() can handle
         is_convertible_expr(cast_col_expr.expr())
     } else if let Some(is_null) = expr.downcast_ref::<df_expr::IsNullExpr>() {
-        can_be_pushed_down(is_null.arg(), schema)
+        can_be_pushed_down_impl(is_null.arg(), schema)
     } else if let Some(is_not_null) = expr.downcast_ref::<df_expr::IsNotNullExpr>() {
-        can_be_pushed_down(is_not_null.arg(), schema)
+        can_be_pushed_down_impl(is_not_null.arg(), schema)
     } else if let Some(in_list) = expr.downcast_ref::<df_expr::InListExpr>() {
-        can_be_pushed_down(in_list.expr(), schema)
-            && in_list.list().iter().all(|e| can_be_pushed_down(e, schema))
+        can_be_pushed_down_impl(in_list.expr(), schema)
+            && in_list
+                .list()
+                .iter()
+                .all(|e| can_be_pushed_down_impl(e, schema))
     } else if let Some(scalar_fn) = expr.downcast_ref::<ScalarFunctionExpr>() {
-        can_scalar_fn_be_pushed_down(scalar_fn, schema)
+        can_scalar_fn_be_pushed_down(scalar_fn)
     } else if let Some(case_expr) = expr.downcast_ref::<df_expr::CaseExpr>() {
         can_case_be_pushed_down(case_expr, schema)
+    } else if expr
+        .downcast_ref::<df_expr::DynamicFilterPhysicalExpr>()
+        .is_some()
+    {
+        // Assume dynamic filters can be pushed down - the child won't be specified until execution time
+        true
     } else {
         tracing::debug!(%df_expr, "DataFusion expression can't be pushed down");
         false
@@ -352,8 +507,24 @@ fn is_convertible_expr(df_expr: &Arc<dyn PhysicalExpr>) -> bool {
 fn can_binary_be_pushed_down(binary: &df_expr::BinaryExpr, schema: &Schema) -> bool {
     let is_op_supported = try_operator_from_df(binary.op()).is_ok();
     is_op_supported
-        && can_be_pushed_down(binary.left(), schema)
-        && can_be_pushed_down(binary.right(), schema)
+        && can_be_pushed_down_impl(binary.left(), schema)
+        && can_be_pushed_down_impl(binary.right(), schema)
+}
+
+fn can_case_be_pushed_down(case_expr: &df_expr::CaseExpr, schema: &Schema) -> bool {
+    case_expr
+        .expr()
+        .is_none_or(|base_expr| can_be_pushed_down_impl(base_expr, schema))
+        && case_expr
+            .when_then_expr()
+            .iter()
+            .all(|(when_expr, then_expr)| {
+                can_be_pushed_down_impl(when_expr, schema)
+                    && can_be_pushed_down_impl(then_expr, schema)
+            })
+        && case_expr
+            .else_expr()
+            .is_some_and(|else_expr| can_be_pushed_down_impl(else_expr, schema))
 }
 
 fn can_case_be_pushed_down(case_expr: &df_expr::CaseExpr, schema: &Schema) -> bool {
@@ -423,6 +594,17 @@ fn can_scalar_fn_be_pushed_down(scalar_fn: &ScalarFunctionExpr, schema: &Schema)
             .all(|arg| can_be_pushed_down(arg, schema))
 }
 
+// TODO(adam): Replace with `DataType::is_decimal` once its released.
+fn is_decimal(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Decimal32(_, _)
+            | DataType::Decimal64(_, _)
+            | DataType::Decimal128(_, _)
+            | DataType::Decimal256(_, _)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -439,6 +621,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::common_tests::TestSessionContext;
 
     #[rstest::fixture]
     fn test_schema() -> Schema {
@@ -589,6 +772,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_expr_from_df_case_when_with_else() {
+        let when_then_expr = vec![(
+            Arc::new(df_expr::Column::new("active", 0)) as Arc<dyn PhysicalExpr>,
+            Arc::new(df_expr::Literal::new(ScalarValue::Utf8(Some(
+                "yes".to_string(),
+            )))) as Arc<dyn PhysicalExpr>,
+        )];
+        let case_expr = df_expr::CaseExpr::try_new(
+            None,
+            when_then_expr,
+            Some(Arc::new(df_expr::Literal::new(ScalarValue::Utf8(Some(
+                "no".to_string(),
+            )))) as Arc<dyn PhysicalExpr>),
+        )
+        .unwrap();
+
+        let result = DefaultExpressionConvertor::default()
+            .convert(&case_expr)
+            .unwrap();
+
+        assert_snapshot!(result.display_tree().to_string(), @r#"
+        vortex.zip()
+        ├── if_true: vortex.literal("yes")
+        ├── if_false: vortex.literal("no")
+        └── mask: vortex.get_item(active)
+            └── input: vortex.root()
+        "#);
+    }
+
+    #[test]
+    fn test_expr_from_df_case_when_without_else_not_pushable() {
+        let when_then_expr = vec![(
+            Arc::new(df_expr::Column::new("active", 0)) as Arc<dyn PhysicalExpr>,
+            Arc::new(df_expr::Literal::new(ScalarValue::Utf8(Some(
+                "yes".to_string(),
+            )))) as Arc<dyn PhysicalExpr>,
+        )];
+        let case_expr = Arc::new(df_expr::CaseExpr::try_new(None, when_then_expr, None).unwrap())
+            as Arc<dyn PhysicalExpr>;
+
+        let schema = Schema::new(vec![Field::new("active", DataType::Boolean, false)]);
+        assert!(!can_be_pushed_down_impl(&case_expr, &schema));
+    }
+
     #[rstest]
     // Supported types
     #[case::null(DataType::Null, true)]
@@ -647,7 +875,7 @@ mod tests {
     fn test_can_be_pushed_down_column_supported(test_schema: Schema) {
         let col_expr = Arc::new(df_expr::Column::new("id", 0)) as Arc<dyn PhysicalExpr>;
 
-        assert!(can_be_pushed_down(&col_expr, &test_schema));
+        assert!(can_be_pushed_down_impl(&col_expr, &test_schema));
     }
 
     #[rstest]
@@ -655,14 +883,14 @@ mod tests {
         let col_expr =
             Arc::new(df_expr::Column::new("unsupported_list", 5)) as Arc<dyn PhysicalExpr>;
 
-        assert!(!can_be_pushed_down(&col_expr, &test_schema));
+        assert!(!can_be_pushed_down_impl(&col_expr, &test_schema));
     }
 
     #[rstest]
     fn test_can_be_pushed_down_column_not_found(test_schema: Schema) {
         let col_expr = Arc::new(df_expr::Column::new("nonexistent", 99)) as Arc<dyn PhysicalExpr>;
 
-        assert!(!can_be_pushed_down(&col_expr, &test_schema));
+        assert!(!can_be_pushed_down_impl(&col_expr, &test_schema));
     }
 
     #[rstest]
@@ -670,7 +898,7 @@ mod tests {
         let lit_expr =
             Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(42)))) as Arc<dyn PhysicalExpr>;
 
-        assert!(can_be_pushed_down(&lit_expr, &test_schema));
+        assert!(can_be_pushed_down_impl(&lit_expr, &test_schema));
     }
 
     #[rstest]
@@ -680,7 +908,7 @@ mod tests {
         let lit_expr =
             Arc::new(df_expr::Literal::new(unsupported_literal)) as Arc<dyn PhysicalExpr>;
 
-        assert!(!can_be_pushed_down(&lit_expr, &test_schema));
+        assert!(!can_be_pushed_down_impl(&lit_expr, &test_schema));
     }
 
     #[rstest]
@@ -691,7 +919,7 @@ mod tests {
         let binary_expr = Arc::new(df_expr::BinaryExpr::new(left, DFOperator::Eq, right))
             as Arc<dyn PhysicalExpr>;
 
-        assert!(can_be_pushed_down(&binary_expr, &test_schema));
+        assert!(can_be_pushed_down_impl(&binary_expr, &test_schema));
     }
 
     #[rstest]
@@ -705,7 +933,7 @@ mod tests {
             right,
         )) as Arc<dyn PhysicalExpr>;
 
-        assert!(!can_be_pushed_down(&binary_expr, &test_schema));
+        assert!(!can_be_pushed_down_impl(&binary_expr, &test_schema));
     }
 
     #[rstest]
@@ -716,7 +944,7 @@ mod tests {
         let binary_expr = Arc::new(df_expr::BinaryExpr::new(left, DFOperator::Eq, right))
             as Arc<dyn PhysicalExpr>;
 
-        assert!(!can_be_pushed_down(&binary_expr, &test_schema));
+        assert!(!can_be_pushed_down_impl(&binary_expr, &test_schema));
     }
 
     #[rstest]
@@ -728,7 +956,7 @@ mod tests {
         let like_expr =
             Arc::new(df_expr::LikeExpr::new(false, false, expr, pattern)) as Arc<dyn PhysicalExpr>;
 
-        assert!(can_be_pushed_down(&like_expr, &test_schema));
+        assert!(can_be_pushed_down_impl(&like_expr, &test_schema));
     }
 
     #[rstest]
@@ -740,6 +968,39 @@ mod tests {
         let like_expr =
             Arc::new(df_expr::LikeExpr::new(false, false, expr, pattern)) as Arc<dyn PhysicalExpr>;
 
-        assert!(!can_be_pushed_down(&like_expr, &test_schema));
+        assert!(!can_be_pushed_down_impl(&like_expr, &test_schema));
+    }
+
+    // https://github.com/vortex-data/vortex/issues/6211
+    #[tokio::test]
+    async fn test_cast_int_to_string() -> anyhow::Result<()> {
+        let ctx = TestSessionContext::default();
+
+        ctx.session
+            .sql(r#"copy (select 1 as id) to 'example.vortex'"#)
+            .await?
+            .show()
+            .await?;
+
+        ctx.session
+            .sql(r#"select cast(id as string) as sid from 'example.vortex' where id > 0"#)
+            .await?
+            .show()
+            .await?;
+
+        ctx.session
+            .sql(r#"select id from 'example.vortex' where cast (id as string) == '1'"#)
+            .await?
+            .show()
+            .await?;
+
+        // This fails as it pushes string cast to the scan
+        ctx.session
+            .sql(r#"select cast(id as string) from 'example.vortex'"#)
+            .await?
+            .collect()
+            .await?;
+
+        Ok(())
     }
 }

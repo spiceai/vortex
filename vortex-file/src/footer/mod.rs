@@ -20,21 +20,21 @@ mod serializer;
 pub use serializer::*;
 mod deserializer;
 pub use deserializer::*;
-pub(crate) use file_statistics::*;
+pub use file_statistics::FileStatistics;
 use flatbuffers::root;
 use itertools::Itertools;
 pub use segment::*;
 use vortex_array::ArrayContext;
-use vortex_array::session::ArraySessionExt;
-use vortex_array::stats::StatsSet;
+use vortex_array::dtype::DType;
+use vortex_array::vtable::ArrayId;
 use vortex_buffer::ByteBuffer;
-use vortex_dtype::DType;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
 use vortex_flatbuffers::FlatBuffer;
 use vortex_flatbuffers::footer as fb;
 use vortex_layout::LayoutContext;
+use vortex_layout::LayoutEncodingId;
 use vortex_layout::LayoutRef;
 use vortex_layout::layout_from_flatbuffer;
 use vortex_layout::session::LayoutSessionExt;
@@ -48,6 +48,8 @@ pub struct Footer {
     statistics: Option<FileStatistics>,
     // The specific arrays used within the file, in the order they were registered.
     array_ctx: ArrayContext,
+    // The approximate size of the footer in bytes, used for caching and memory management.
+    approx_byte_size: Option<usize>,
 }
 
 impl Footer {
@@ -62,7 +64,13 @@ impl Footer {
             segments,
             statistics,
             array_ctx,
+            approx_byte_size: None,
         }
+    }
+
+    pub(crate) fn with_approx_byte_size(mut self, approx_byte_size: usize) -> Self {
+        self.approx_byte_size = Some(approx_byte_size);
+        self
     }
 
     /// Read the [`Footer`] from a flatbuffer.
@@ -73,6 +81,7 @@ impl Footer {
         statistics: Option<FileStatistics>,
         session: &VortexSession,
     ) -> VortexResult<Self> {
+        let approx_byte_size = footer_bytes.len() + layout_bytes.len();
         let fb_footer = root::<fb::Footer>(&footer_bytes)?;
 
         // Create a LayoutContext from the registry.
@@ -80,19 +89,26 @@ impl Footer {
         let layout_ids = layout_specs
             .iter()
             .flat_map(|e| e.iter())
-            .map(|encoding| encoding.id());
-        let layout_ctx =
-            LayoutContext::try_from_registry(session.layouts().registry(), layout_ids)?;
+            .map(|encoding| LayoutEncodingId::new_arc(Arc::from(encoding.id())))
+            .collect();
+        let layout_ctx = LayoutContext::new(layout_ids);
 
         // Create an ArrayContext from the registry.
         let array_specs = fb_footer.array_specs();
         let array_ids = array_specs
             .iter()
             .flat_map(|e| e.iter())
-            .map(|encoding| encoding.id());
-        let array_ctx = ArrayContext::try_from_registry(session.arrays().registry(), array_ids)?;
+            .map(|encoding| ArrayId::new_arc(Arc::from(encoding.id())))
+            .collect();
+        let array_ctx = ArrayContext::new(array_ids);
 
-        let root_layout = layout_from_flatbuffer(layout_bytes, &dtype, &layout_ctx, &array_ctx)?;
+        let root_layout = layout_from_flatbuffer(
+            layout_bytes,
+            &dtype,
+            &layout_ctx,
+            &array_ctx,
+            session.layouts().registry(),
+        )?;
 
         let segments: Arc<[SegmentSpec]> = fb_footer
             .segment_specs()
@@ -111,6 +127,7 @@ impl Footer {
             segments,
             statistics,
             array_ctx,
+            approx_byte_size: Some(approx_byte_size),
         })
     }
 
@@ -125,13 +142,18 @@ impl Footer {
     }
 
     /// Returns the statistics of the file.
-    pub fn statistics(&self) -> Option<&Arc<[StatsSet]>> {
-        self.statistics.as_ref().map(|s| &s.0)
+    pub fn statistics(&self) -> Option<&FileStatistics> {
+        self.statistics.as_ref()
     }
 
     /// Returns the [`DType`] of the file.
     pub fn dtype(&self) -> &DType {
         self.root_layout.dtype()
+    }
+
+    /// Returns the approximate size of the footer in bytes, used for caching and memory management.
+    pub fn approx_byte_size(&self) -> Option<usize> {
+        self.approx_byte_size
     }
 
     /// Returns the number of rows in the file.

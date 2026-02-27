@@ -5,60 +5,72 @@ use std::ffi::c_char;
 use std::sync::Arc;
 
 use itertools::Itertools;
-use vortex::array::ArrayRef;
-use vortex::array::VectorExecutor;
+use vortex::array::ExecutionCtx;
+use vortex::array::arrays::BinaryView;
+use vortex::array::arrays::Inlined;
 use vortex::array::arrays::VarBinViewArray;
+use vortex::array::arrays::VarBinViewArrayParts;
 use vortex::buffer::Buffer;
 use vortex::buffer::ByteBuffer;
-use vortex::dtype::DType;
-use vortex::dtype::Nullability::NonNullable;
 use vortex::error::VortexResult;
-use vortex::error::vortex_panic;
 use vortex::mask::Mask;
-use vortex::session::VortexSession;
-use vortex::vector::Vector as VxVector;
-use vortex::vector::binaryview::BinaryView;
-use vortex::vector::binaryview::BinaryViewType;
-use vortex::vector::binaryview::BinaryViewVector;
-use vortex::vector::binaryview::Inlined;
 
-use crate::LogicalType;
-use crate::duckdb::Vector;
+use crate::duckdb::LogicalType;
 use crate::duckdb::VectorBuffer;
+use crate::duckdb::VectorRef;
 use crate::exporter::ColumnExporter;
 use crate::exporter::all_invalid;
+use crate::exporter::validity;
 
 struct VarBinViewExporter {
     views: Buffer<BinaryView>,
-    buffers: Vec<ByteBuffer>,
+    buffers: Arc<[ByteBuffer]>,
     vector_buffers: Vec<VectorBuffer>,
-    validity: Mask,
 }
 
-pub(crate) fn new_exporter(array: &VarBinViewArray) -> VortexResult<Box<dyn ColumnExporter>> {
-    let validity = array.validity_mask();
+pub(crate) fn new_exporter(
+    array: VarBinViewArray,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<Box<dyn ColumnExporter>> {
+    let len = array.len();
+    let VarBinViewArrayParts {
+        validity,
+        dtype,
+        views,
+        buffers,
+    } = array.into_parts();
+    let validity = validity.to_array(len).execute::<Mask>(ctx)?;
     if validity.all_false() {
-        return Ok(all_invalid::new_exporter(
-            array.len(),
-            &array.dtype().try_into()?,
-        ));
+        let ltype = LogicalType::try_from(dtype)?;
+        return Ok(all_invalid::new_exporter(len, &ltype));
     }
 
-    Ok(Box::new(VarBinViewExporter {
-        views: array.views().clone(),
-        buffers: array.buffers().to_vec(),
-        vector_buffers: array
-            .buffers()
-            .iter()
-            .cloned()
-            .map(VectorBuffer::new)
-            .collect_vec(),
-        validity: array.validity_mask(),
-    }))
+    let buffers = buffers
+        .iter()
+        .cloned()
+        .map(|b| b.unwrap_host())
+        .collect_vec();
+
+    let buffers: Arc<[ByteBuffer]> = Arc::from(buffers);
+
+    Ok(validity::new_exporter(
+        validity,
+        Box::new(VarBinViewExporter {
+            views: Buffer::<BinaryView>::from_byte_buffer(views.unwrap_host()),
+            vector_buffers: buffers.iter().cloned().map(VectorBuffer::new).collect_vec(),
+            buffers,
+        }),
+    ))
 }
 
 impl ColumnExporter for VarBinViewExporter {
-    fn export(&self, offset: usize, len: usize, vector: &mut Vector) -> VortexResult<()> {
+    fn export(
+        &self,
+        offset: usize,
+        len: usize,
+        vector: &mut VectorRef,
+        _ctx: &mut ExecutionCtx,
+    ) -> VortexResult<()> {
         // Copy the views into place.
         for (mut_view, view) in unsafe { vector.as_slice_mut::<PtrBinaryView>(len) }
             .iter_mut()
@@ -69,78 +81,6 @@ impl ColumnExporter for VarBinViewExporter {
         {
             *mut_view = view;
         }
-
-        // Update the validity mask.
-        unsafe { vector.set_validity(&self.validity, offset, len) };
-
-        // We register our buffers zero-copy with DuckDB and re-use them in each vector.
-        for buffer in &self.vector_buffers {
-            vector.add_string_vector_buffer(buffer);
-        }
-
-        Ok(())
-    }
-}
-
-struct VarBinViewVectorExporter {
-    views: Buffer<BinaryView>,
-    buffers: Arc<Box<[ByteBuffer]>>,
-    vector_buffers: Vec<VectorBuffer>,
-    mask: Mask,
-}
-
-pub(crate) fn new_vector_exporter(
-    array: ArrayRef,
-    session: &VortexSession,
-) -> VortexResult<Box<dyn ColumnExporter>> {
-    match array.execute_vector(session)? {
-        VxVector::String(vector) => new_vector_exporter_impl(vector),
-        VxVector::Binary(vector) => new_vector_exporter_impl(vector),
-        _ => vortex_panic!("cannot handle non-string/binary in exporter"),
-    }
-}
-
-pub(crate) fn new_vector_exporter_impl<T: BinaryViewType>(
-    vector: BinaryViewVector<T>,
-) -> VortexResult<Box<dyn ColumnExporter>> {
-    let (views, buffers, mask) = vector.into_parts();
-    let logical_type = if T::matches_dtype(&DType::Utf8(NonNullable)) {
-        LogicalType::varchar()
-    } else if T::matches_dtype(&DType::Binary(NonNullable)) {
-        LogicalType::blob()
-    } else {
-        vortex_panic!("unknown BinaryViewType")
-    };
-
-    if mask.all_false() {
-        return Ok(all_invalid::new_exporter(mask.len(), &logical_type));
-    }
-
-    let vector_buffers = buffers.iter().cloned().map(VectorBuffer::new).collect_vec();
-
-    Ok(Box::new(VarBinViewVectorExporter {
-        views,
-        buffers,
-        vector_buffers,
-        mask,
-    }))
-}
-
-impl ColumnExporter for VarBinViewVectorExporter {
-    fn export(&self, offset: usize, len: usize, vector: &mut Vector) -> VortexResult<()> {
-        // Copy the views into place.
-        for (mut_view, view) in unsafe { vector.as_slice_mut::<PtrBinaryView>(len) }
-            .iter_mut()
-            .zip(to_ptr_binary_view(
-                self.views[offset..offset + len].iter(),
-                &self.buffers,
-            ))
-        {
-            *mut_view = view;
-        }
-
-        // Update the validity mask.
-        unsafe { vector.set_validity(&self.mask, offset, len) };
 
         // We register our buffers zero-copy with DuckDB and re-use them in each vector.
         for buffer in &self.vector_buffers {
@@ -200,4 +140,80 @@ fn to_ptr_binary_view<'a>(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use Nullability::Nullable;
+    use vortex::dtype::DType;
+    use vortex::dtype::Nullability;
+    use vortex::error::VortexResult;
+    use vortex_array::VortexSessionExecute;
+    use vortex_array::arrays::VarBinViewArray;
+
+    use crate::SESSION;
+    use crate::duckdb::DataChunk;
+    use crate::duckdb::LogicalType;
+    use crate::exporter::varbinview::new_exporter;
+
+    #[test]
+    fn all_invalid_varbinview() -> VortexResult<()> {
+        let arr = VarBinViewArray::from_iter([Option::<&str>::None; 4], DType::Utf8(Nullable));
+
+        let mut chunk = DataChunk::new([LogicalType::varchar()]);
+        let mut ctx = SESSION.create_execution_ctx();
+
+        new_exporter(arr, &mut ctx)?.export(0, 3, chunk.get_vector_mut(0), &mut ctx)?;
+        chunk.set_len(3);
+
+        assert_eq!(
+            format!("{}", String::try_from(&*chunk).unwrap()),
+            r#"Chunk - [1 Columns]
+- CONSTANT VARCHAR: 3 = [ NULL]
+"#
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn all_invalid_varbinview_section() -> VortexResult<()> {
+        let arr =
+            VarBinViewArray::from_iter([None, None, None, Some("Hey")], DType::Utf8(Nullable));
+
+        let mut chunk = DataChunk::new([LogicalType::varchar()]);
+        let mut ctx = SESSION.create_execution_ctx();
+
+        new_exporter(arr, &mut ctx)?.export(0, 3, chunk.get_vector_mut(0), &mut ctx)?;
+        chunk.set_len(3);
+
+        assert_eq!(
+            format!("{}", String::try_from(&*chunk).unwrap()),
+            r#"Chunk - [1 Columns]
+- CONSTANT VARCHAR: 3 = [ NULL]
+"#
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn partial_invalid_varbinview_section() -> VortexResult<()> {
+        let arr = VarBinViewArray::from_iter(
+            [None, None, Some("Hi"), Some("Hey")],
+            DType::Utf8(Nullable),
+        );
+
+        let mut chunk = DataChunk::new([LogicalType::varchar()]);
+        let mut ctx = SESSION.create_execution_ctx();
+
+        new_exporter(arr, &mut ctx)?.export(0, 3, chunk.get_vector_mut(0), &mut ctx)?;
+        chunk.set_len(3);
+
+        assert_eq!(
+            format!("{}", String::try_from(&*chunk).unwrap()),
+            r#"Chunk - [1 Columns]
+- FLAT VARCHAR: 3 = [ NULL, NULL, Hi]
+"#
+        );
+        Ok(())
+    }
 }

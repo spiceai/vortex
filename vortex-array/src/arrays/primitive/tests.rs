@@ -2,7 +2,6 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use vortex_buffer::buffer;
-use vortex_scalar::PValue;
 
 use crate::ArrayRef;
 use crate::IntoArray;
@@ -13,6 +12,7 @@ use crate::compute::conformance::mask::test_mask_conformance;
 use crate::compute::conformance::search_sorted::rstest_reuse::apply;
 use crate::compute::conformance::search_sorted::search_sorted_conformance;
 use crate::compute::conformance::search_sorted::*;
+use crate::scalar::PValue;
 use crate::search_sorted::SearchResult;
 use crate::search_sorted::SearchSorted;
 use crate::search_sorted::SearchSortedSide;
@@ -24,11 +24,12 @@ fn test_search_sorted_primitive(
     #[case] value: i32,
     #[case] side: SearchSortedSide,
     #[case] expected: SearchResult,
-) {
+) -> vortex_error::VortexResult<()> {
     let res = array
         .as_primitive_typed()
-        .search_sorted(&Some(PValue::from(value)), side);
+        .search_sorted(&Some(PValue::from(value)), side)?;
     assert_eq!(res, expected);
+    Ok(())
 }
 
 #[test]
