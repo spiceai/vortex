@@ -1,43 +1,181 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::sync::Arc;
+
+use vortex_buffer::BufferMut;
 use vortex_dtype::DType;
+use vortex_dtype::ExtDType;
+use vortex_dtype::PType;
+use vortex_dtype::datetime::TemporalMetadata;
+use vortex_dtype::datetime::TimeUnit;
+use vortex_error::VortexResult;
+use vortex_error::vortex_bail;
+use vortex_error::vortex_err;
+use vortex_mask::AllOr;
 
 use crate::ArrayRef;
 use crate::IntoArray;
 use crate::arrays::ExtensionArray;
 use crate::arrays::ExtensionVTable;
+use crate::arrays::PrimitiveArray;
+use crate::canonical::ToCanonical;
 use crate::compute::CastKernel;
 use crate::compute::CastKernelAdapter;
 use crate::compute::{self};
 use crate::register_kernel;
+use crate::vtable::ValidityHelper;
 
 impl CastKernel for ExtensionVTable {
-    fn cast(
-        &self,
-        array: &ExtensionArray,
-        dtype: &DType,
-    ) -> vortex_error::VortexResult<Option<ArrayRef>> {
-        if !array.dtype().eq_ignore_nullability(dtype) {
+    fn cast(&self, array: &ExtensionArray, dtype: &DType) -> VortexResult<Option<ArrayRef>> {
+        let DType::Extension(ext_dtype) = dtype else {
             return Ok(None);
+        };
+
+        if array.ext_dtype().eq_ignore_nullability(ext_dtype) {
+            let new_storage = match compute::cast(array.storage(), ext_dtype.storage_dtype()) {
+                Ok(arr) => arr,
+                Err(e) => {
+                    tracing::warn!("Failed to cast storage array: {e}");
+                    return Ok(None);
+                }
+            };
+
+            return Ok(Some(
+                ExtensionArray::new(ext_dtype.clone(), new_storage).into_array(),
+            ));
         }
 
-        let DType::Extension(ext_dtype) = dtype else {
-            unreachable!("Already verified we have an extension dtype");
-        };
+        if let Some(new_storage) = cast_temporal_date_to_timestamp(array, ext_dtype)? {
+            return Ok(Some(
+                ExtensionArray::new(ext_dtype.clone(), new_storage).into_array(),
+            ));
+        }
 
-        let new_storage = match compute::cast(array.storage(), ext_dtype.storage_dtype()) {
-            Ok(arr) => arr,
-            Err(e) => {
-                tracing::warn!("Failed to cast storage array: {e}");
-                return Ok(None);
-            }
-        };
-
-        Ok(Some(
-            ExtensionArray::new(ext_dtype.clone(), new_storage).into_array(),
-        ))
+        Ok(None)
     }
+}
+
+fn cast_temporal_date_to_timestamp(
+    array: &ExtensionArray,
+    target_ext_dtype: &Arc<ExtDType>,
+) -> VortexResult<Option<ArrayRef>> {
+    let Ok(source_temporal) = TemporalMetadata::try_from(array.ext_dtype()) else {
+        return Ok(None);
+    };
+    let Ok(target_temporal) = TemporalMetadata::try_from(target_ext_dtype) else {
+        return Ok(None);
+    };
+
+    let (TemporalMetadata::Date(source_unit), TemporalMetadata::Timestamp(target_unit, _)) =
+        (source_temporal, target_temporal)
+    else {
+        return Ok(None);
+    };
+
+    let source_i64 = compute::cast(
+        array.storage(),
+        &DType::Primitive(PType::I64, array.dtype().nullability()),
+    )?;
+    let source_i64 = source_i64.to_primitive();
+
+    let converted = cast_date_values_to_timestamp(&source_i64, source_unit, target_unit)?;
+
+    compute::cast(converted.as_ref(), target_ext_dtype.storage_dtype()).map(Some)
+}
+
+fn cast_date_values_to_timestamp(
+    values: &PrimitiveArray,
+    source_unit: TimeUnit,
+    target_unit: TimeUnit,
+) -> VortexResult<PrimitiveArray> {
+    let (multiply, divide) = date_to_timestamp_scale(source_unit, target_unit)?;
+
+    let input = values.as_slice::<i64>();
+    let mut output = BufferMut::with_capacity(input.len());
+    match values.validity_mask().bit_buffer() {
+        AllOr::All => {
+            for &value in input {
+                // SAFETY: output has sufficient capacity for all pushed values.
+                unsafe { output.push_unchecked(convert_temporal_value(value, multiply, divide)?) };
+            }
+        }
+        AllOr::None => {
+            for _ in 0..input.len() {
+                // SAFETY: output has sufficient capacity for all pushed values.
+                unsafe { output.push_unchecked(0i64) };
+            }
+        }
+        AllOr::Some(bits) => {
+            for (&value, valid) in input.iter().zip(bits.iter()) {
+                if valid {
+                    // SAFETY: output has sufficient capacity for all pushed values.
+                    unsafe {
+                        output.push_unchecked(convert_temporal_value(value, multiply, divide)?)
+                    };
+                } else {
+                    // SAFETY: output has sufficient capacity for all pushed values.
+                    unsafe { output.push_unchecked(0i64) };
+                }
+            }
+        }
+    }
+
+    Ok(PrimitiveArray::new(
+        output.freeze(),
+        values.validity().clone(),
+    ))
+}
+
+fn date_to_timestamp_scale(
+    source_unit: TimeUnit,
+    target_unit: TimeUnit,
+) -> VortexResult<(i64, i64)> {
+    let source_ns = to_nanoseconds(source_unit)?;
+    let target_ns = to_nanoseconds(target_unit)?;
+
+    if source_ns >= target_ns {
+        let multiply = source_ns / target_ns;
+        return Ok((multiply, 1));
+    }
+
+    let divide = target_ns / source_ns;
+    Ok((1, divide))
+}
+
+fn to_nanoseconds(unit: TimeUnit) -> VortexResult<i64> {
+    match unit {
+        TimeUnit::Nanoseconds => Ok(1),
+        TimeUnit::Microseconds => Ok(1_000),
+        TimeUnit::Milliseconds => Ok(1_000_000),
+        TimeUnit::Seconds => Ok(1_000_000_000),
+        TimeUnit::Days => Ok(86_400_000_000_000),
+    }
+}
+
+fn convert_temporal_value(value: i64, multiply: i64, divide: i64) -> VortexResult<i64> {
+    let mut scaled = i128::from(value)
+        .checked_mul(i128::from(multiply))
+        .ok_or_else(
+            || vortex_err!(ComputeError: "Date value {value} overflows while scaling to timestamp"),
+        )?;
+
+    if divide != 1 {
+        let divisor = i128::from(divide);
+        if scaled % divisor != 0 {
+            vortex_bail!(
+                ComputeError:
+                "Date value {value} cannot be represented exactly in target timestamp unit"
+            );
+        }
+        scaled /= divisor;
+    }
+
+    if scaled < i128::from(i64::MIN) || scaled > i128::from(i64::MAX) {
+        vortex_bail!(ComputeError: "Date value {value} overflows target timestamp range");
+    }
+
+    Ok(scaled as i64)
 }
 
 register_kernel!(CastKernelAdapter(ExtensionVTable).lift());
@@ -52,6 +190,7 @@ mod tests {
     use vortex_dtype::ExtDType;
     use vortex_dtype::Nullability;
     use vortex_dtype::PType;
+    use vortex_dtype::datetime::DATE_ID;
     use vortex_dtype::datetime::TIMESTAMP_ID;
     use vortex_dtype::datetime::TemporalMetadata;
     use vortex_dtype::datetime::TimeUnit;
@@ -97,6 +236,62 @@ mod tests {
         assert_eq!(arr.len(), output.len());
         assert!(arr.dtype().eq_ignore_nullability(output.dtype()));
         assert_eq!(output.dtype(), &new_dtype);
+    }
+
+    #[test]
+    fn cast_date_days_to_timestamp_nanoseconds() {
+        let source_dtype = Arc::new(ExtDType::new(
+            DATE_ID.clone(),
+            Arc::new(DType::Primitive(PType::I32, Nullability::NonNullable)),
+            Some(TemporalMetadata::Date(TimeUnit::Days).into()),
+        ));
+        let target_dtype = Arc::new(ExtDType::new(
+            TIMESTAMP_ID.clone(),
+            Arc::new(DType::Primitive(PType::I64, Nullability::NonNullable)),
+            Some(TemporalMetadata::Timestamp(TimeUnit::Nanoseconds, None).into()),
+        ));
+
+        let arr = ExtensionArray::new(source_dtype, buffer![0i32, 1, -1].into_array());
+        let output = cast(arr.as_ref(), &DType::Extension(target_dtype.clone()))
+            .unwrap()
+            .to_extension();
+
+        assert_eq!(output.dtype(), &DType::Extension(target_dtype));
+
+        let storage = output.storage().to_primitive();
+        assert_eq!(
+            storage.as_slice::<i64>(),
+            &[0, 86_400_000_000_000, -86_400_000_000_000]
+        );
+    }
+
+    #[test]
+    fn cast_date_days_to_timestamp_seconds_nullable() {
+        let source_dtype = Arc::new(ExtDType::new(
+            DATE_ID.clone(),
+            Arc::new(DType::Primitive(PType::I32, Nullability::Nullable)),
+            Some(TemporalMetadata::Date(TimeUnit::Days).into()),
+        ));
+        let target_dtype = Arc::new(ExtDType::new(
+            TIMESTAMP_ID.clone(),
+            Arc::new(DType::Primitive(PType::I64, Nullability::Nullable)),
+            Some(TemporalMetadata::Timestamp(TimeUnit::Seconds, None).into()),
+        ));
+
+        let arr = ExtensionArray::new(
+            source_dtype,
+            PrimitiveArray::from_option_iter([Some(0i32), None, Some(2)]).into_array(),
+        );
+        let output = cast(arr.as_ref(), &DType::Extension(target_dtype.clone()))
+            .unwrap()
+            .to_extension();
+
+        assert_eq!(output.dtype(), &DType::Extension(target_dtype));
+
+        let storage = output.storage().to_primitive();
+        assert_eq!(storage.scalar_at(0).as_primitive().as_::<i64>(), Some(0));
+        assert!(storage.scalar_at(1).is_null());
+        assert_eq!(storage.scalar_at(2).as_primitive().as_::<i64>(), Some(172_800));
     }
 
     #[test]
