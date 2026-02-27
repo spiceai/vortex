@@ -67,6 +67,7 @@ use crate::PrecisionExt as _;
 use crate::convert::TryToDataFusion;
 
 const DEFAULT_FOOTER_INITIAL_READ_SIZE_BYTES: usize = MAX_POSTSCRIPT_SIZE as usize + EOF_SIZE;
+const DEFAULT_TARGET_FILE_SIZE_MB: usize = 128;
 
 /// Vortex implementation of a DataFusion [`FileFormat`].
 pub struct VortexFormat {
@@ -94,6 +95,11 @@ config_namespace! {
         /// Values smaller than `MAX_POSTSCRIPT_SIZE + EOF_SIZE` will be clamped to that minimum
         /// during footer parsing.
         pub footer_initial_read_size_bytes: usize, default = DEFAULT_FOOTER_INITIAL_READ_SIZE_BYTES
+        /// Target file size in megabytes for written Vortex files.
+        ///
+        /// When greater than 0, Vortex bypasses DataFusion's file demuxer and
+        /// splits output files based on approximate byte size rather than row count.
+        pub target_file_size_mb: usize, default = DEFAULT_TARGET_FILE_SIZE_MB
         /// Whether to enable projection pushdown into the underlying Vortex scan.
         ///
         /// When enabled, projection expressions may be partially evaluated during
@@ -506,8 +512,25 @@ impl FileFormat for VortexFormat {
             return not_impl_err!("Overwrites are not implemented yet for Vortex");
         }
 
+        let target_file_size = (self.opts.target_file_size_mb > 0)
+            .then(|| {
+                u64::try_from(self.opts.target_file_size_mb)
+                    .map_err(|e| {
+                        internal_datafusion_err!(
+                            "target_file_size_mb cannot be represented as u64: {e}"
+                        )
+                    })
+                    .map(|v| v.saturating_mul(1024 * 1024).max(1))
+            })
+            .transpose()?;
+
         let schema = conf.output_schema().clone();
-        let sink = Arc::new(VortexSink::new(conf, schema, self.session.clone()));
+        let sink = Arc::new(VortexSink::new(
+            conf,
+            schema,
+            self.session.clone(),
+            target_file_size,
+        ));
 
         Ok(Arc::new(DataSinkExec::new(input, sink, order_requirements)) as _)
     }
@@ -577,11 +600,17 @@ mod tests {
     }
 
     #[test]
-    fn format_plumbs_footer_initial_read_size() {
-        let mut opts = VortexOptions::default();
-        opts.set("footer_initial_read_size_bytes", "12345").unwrap();
+    fn format_plumbs_target_file_size_mb() {
+        let mut opts = VortexTableOptions::default();
+        opts.set("target_file_size_mb", "123").unwrap();
 
         let format = VortexFormat::new_with_options(VortexSession::default(), opts);
-        assert_eq!(format.file_cache.footer_initial_read_size_bytes(), 12345);
+        assert_eq!(format.options().target_file_size_mb, 123);
+    }
+
+    #[test]
+    fn format_target_file_size_default_is_128mb() {
+        let opts = VortexTableOptions::default();
+        assert_eq!(opts.target_file_size_mb, 128);
     }
 }

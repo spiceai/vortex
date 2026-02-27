@@ -175,8 +175,6 @@ impl FileSource for VortexSource {
             .clone()
             .unwrap_or_else(|| Arc::new(DefaultVortexReaderFactory::new(object_store)));
 
-        let table_schema = base_config.file_source.table_schema().clone();
-
         let opener = VortexOpener {
             partition,
             session: self.session.clone(),
