@@ -151,18 +151,6 @@ impl DefaultExpressionConvertor {
 
     /// Attempts to convert a DataFusion CaseExpr to a Vortex expression.
     fn try_convert_case_expr(&self, case_expr: &df_expr::CaseExpr) -> DFResult<Expression> {
-        // DataFusion CaseExpr has:
-        // - expr(): Optional base expression (for "CASE expr WHEN ..." form)
-        // - when_then_expr(): Vec of (when, then) pairs
-        // - else_expr(): Optional else expression
-
-        // We don't support the "CASE expr WHEN value1 THEN result1" form yet
-        if case_expr.expr().is_some() {
-            return Err(exec_datafusion_err!(
-                "CASE expr WHEN form is not yet supported, only searched CASE is supported"
-            ));
-        }
-
         let when_then_pairs = case_expr.when_then_expr();
         if when_then_pairs.is_empty() {
             return Err(exec_datafusion_err!(
@@ -170,14 +158,25 @@ impl DefaultExpressionConvertor {
             ));
         }
 
-        // Convert all when/then pairs
-        let mut children = Vec::with_capacity(when_then_pairs.len() * 2 + 1);
+        let base_expr = case_expr
+            .expr()
+            .map(|base_expr| self.convert(base_expr.as_ref()))
+            .transpose()?;
+
+        let mut children = Vec::with_capacity(
+            when_then_pairs.len() * 2 + usize::from(case_expr.else_expr().is_some()),
+        );
         for (when_expr, then_expr) in when_then_pairs {
-            children.push(self.convert(when_expr.as_ref())?);
+            let when_expr = self.convert(when_expr.as_ref())?;
+            let condition = if let Some(base_expr) = &base_expr {
+                Binary.new_expr(Operator::Eq, [base_expr.clone(), when_expr])
+            } else {
+                when_expr
+            };
+            children.push(condition);
             children.push(self.convert(then_expr.as_ref())?);
         }
 
-        // Handle the optional else clause
         if let Some(else_expr) = case_expr.else_expr() {
             children.push(self.convert(else_expr.as_ref())?);
             Ok(case_when(children))
@@ -489,13 +488,16 @@ fn can_binary_be_pushed_down(binary: &df_expr::BinaryExpr, schema: &Schema) -> b
 }
 
 fn can_case_be_pushed_down(case_expr: &df_expr::CaseExpr, schema: &Schema) -> bool {
-    // We only support the "searched CASE" form (CASE WHEN cond THEN result ...)
-    // not the "simple CASE" form (CASE expr WHEN value THEN result ...)
-    if case_expr.expr().is_some() {
+    if case_expr.when_then_expr().is_empty() {
         return false;
     }
 
-    // Check all when/then pairs
+    if let Some(base_expr) = case_expr.expr()
+        && !can_be_pushed_down_impl(base_expr, schema)
+    {
+        return false;
+    }
+
     for (when_expr, then_expr) in case_expr.when_then_expr() {
         if !can_be_pushed_down_impl(when_expr, schema)
             || !can_be_pushed_down_impl(then_expr, schema)
@@ -733,6 +735,51 @@ mod tests {
                 case_insensitive
             }
         );
+    }
+
+    #[test]
+    fn test_expr_from_df_case_when_with_else() {
+        let when_then_expr = vec![(
+            Arc::new(df_expr::Column::new("active", 0)) as Arc<dyn PhysicalExpr>,
+            Arc::new(df_expr::Literal::new(ScalarValue::Utf8(Some(
+                "yes".to_string(),
+            )))) as Arc<dyn PhysicalExpr>,
+        )];
+        let case_expr = df_expr::CaseExpr::try_new(
+            None,
+            when_then_expr,
+            Some(Arc::new(df_expr::Literal::new(ScalarValue::Utf8(Some(
+                "no".to_string(),
+            )))) as Arc<dyn PhysicalExpr>),
+        )
+        .unwrap();
+
+        let result = DefaultExpressionConvertor::default()
+            .convert(&case_expr)
+            .unwrap();
+
+        assert_snapshot!(result.display_tree().to_string(), @r#"
+        vortex.case_when(case_when(pairs=1, else=true))
+        ├── when_0: vortex.get_item(active)
+        │   └── input: vortex.root()
+        ├── then_0: vortex.literal("yes")
+        └── else: vortex.literal("no")
+        "#);
+    }
+
+    #[test]
+    fn test_expr_from_df_case_when_without_else_pushable() {
+        let when_then_expr = vec![(
+            Arc::new(df_expr::Column::new("active", 0)) as Arc<dyn PhysicalExpr>,
+            Arc::new(df_expr::Literal::new(ScalarValue::Utf8(Some(
+                "yes".to_string(),
+            )))) as Arc<dyn PhysicalExpr>,
+        )];
+        let case_expr = Arc::new(df_expr::CaseExpr::try_new(None, when_then_expr, None).unwrap())
+            as Arc<dyn PhysicalExpr>;
+
+        let schema = Schema::new(vec![Field::new("active", DataType::Boolean, false)]);
+        assert!(can_be_pushed_down_impl(&case_expr, &schema));
     }
 
     #[rstest]

@@ -704,6 +704,7 @@ mod tests {
     use crate::arrays::TemporalArray;
     use crate::arrays::VarBinVTable;
     use crate::arrays::VarBinViewVTable;
+    use crate::arrow::ArrowArrayExecutor;
     use crate::arrow::FromArrowArray as _;
     use crate::dtype::DType;
     use crate::dtype::Nullability;
@@ -1820,7 +1821,7 @@ mod tests {
         assert_eq!(arrow_map.len(), 3);
 
         // Convert Arrow MapArray → Vortex ListArray
-        let vortex_array = ArrayRef::from_arrow(&arrow_map, true);
+        let vortex_array = ArrayRef::from_arrow(&arrow_map, true).unwrap();
         assert_eq!(vortex_array.len(), 3);
 
         // Verify it's stored as List<Struct<key, value>>
@@ -1832,7 +1833,9 @@ mod tests {
         // Convert back to Arrow as a MapArray
         let map_dtype = arrow_map.data_type().clone();
         let mut ctx = crate::LEGACY_SESSION.create_execution_ctx();
-        let arrow_back = vortex_array.execute_arrow(&map_dtype, &mut ctx).unwrap();
+        let arrow_back = vortex_array
+            .execute_arrow(Some(&map_dtype), &mut ctx)
+            .unwrap();
         let map_back = arrow_back
             .as_any()
             .downcast_ref::<MapArray>()

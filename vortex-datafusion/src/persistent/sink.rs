@@ -603,7 +603,7 @@ mod tests {
 
     use crate::common_tests::TestSessionContext;
     use crate::persistent::VortexFormatFactory;
-    use crate::persistent::VortexOptions;
+    use crate::persistent::VortexTableOptions;
     use crate::persistent::sink::ActiveFileWriter;
     use crate::persistent::sink::finish_file_writer;
 
@@ -1052,7 +1052,7 @@ mod tests {
         let ctx = TestSessionContext::default();
 
         let target_mb = 16_usize;
-        let opts = VortexOptions {
+        let opts = VortexTableOptions {
             target_file_size_mb: target_mb,
             ..Default::default()
         };
@@ -1156,7 +1156,7 @@ mod tests {
         let ctx = TestSessionContext::default();
 
         let target_mb = 1_usize;
-        let opts = VortexOptions {
+        let opts = VortexTableOptions {
             target_file_size_mb: target_mb,
             ..Default::default()
         };
@@ -1250,7 +1250,7 @@ mod tests {
 
         let ctx = TestSessionContext::default();
 
-        let opts = VortexOptions {
+        let opts = VortexTableOptions {
             // Disable sink-side rolling/splitting.
             target_file_size_mb: 0,
             ..Default::default()
@@ -1351,7 +1351,7 @@ mod tests {
 
         let ctx = TestSessionContext::default();
 
-        let opts = VortexOptions {
+        let opts = VortexTableOptions {
             // Enable sink-side sizing, but make the threshold large enough
             // that all input data should fit in a single file.
             target_file_size_mb: 512,
