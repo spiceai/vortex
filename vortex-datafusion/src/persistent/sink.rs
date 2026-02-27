@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
+use datafusion::arrow::array::RecordBatch;
 use datafusion_common::DataFusionError;
 use datafusion_common::Result as DFResult;
 use datafusion_common::exec_datafusion_err;
@@ -22,6 +23,7 @@ use datafusion_physical_plan::DisplayAs;
 use datafusion_physical_plan::DisplayFormatType;
 use datafusion_physical_plan::metrics::MetricsSet;
 use futures::StreamExt;
+use futures::TryStreamExt;
 use object_store::ObjectStore;
 use object_store::path::Path;
 use tokio_stream::wrappers::ReceiverStream;
@@ -40,15 +42,116 @@ pub struct VortexSink {
     config: FileSinkConfig,
     schema: SchemaRef,
     session: VortexSession,
+    target_file_size: Option<u64>,
 }
 
 impl VortexSink {
-    pub fn new(config: FileSinkConfig, schema: SchemaRef, session: VortexSession) -> Self {
+    pub fn new(
+        config: FileSinkConfig,
+        schema: SchemaRef,
+        session: VortexSession,
+        target_file_size: Option<u64>,
+    ) -> Self {
         Self {
             config,
             schema,
             session,
+            target_file_size,
         }
+    }
+
+    async fn write_all_with_target_size(
+        &self,
+        mut data: SendableRecordBatchStream,
+        context: &Arc<TaskContext>,
+        target_file_size: u64,
+    ) -> DFResult<u64> {
+        if !self.config.table_partition_cols.is_empty() {
+            return FileSink::write_all(self, data, context).await;
+        }
+
+        let object_store = context
+            .runtime_env()
+            .object_store(&self.config.object_store_url)?;
+
+        let writer_schema = get_writer_schema(&self.config);
+        let dtype = DType::from_arrow(writer_schema);
+
+        let table_path = self
+            .config
+            .table_paths
+            .first()
+            .ok_or_else(|| exec_datafusion_err!("No output table path configured"))?;
+
+        let base_path = table_path.prefix();
+        let extension = self.config.file_extension.as_str();
+        let target_file_size = target_file_size.max(1);
+
+        let mut row_count = 0_u64;
+        let mut file_index = 0_usize;
+        let mut buffered_batches: Vec<RecordBatch> = Vec::new();
+        let mut buffered_bytes = 0_u64;
+
+        while let Some(batch) = data.try_next().await? {
+            buffered_bytes = buffered_bytes.saturating_add(batch.get_array_memory_size() as u64);
+            buffered_batches.push(batch);
+
+            if buffered_bytes >= target_file_size {
+                let path = split_path(base_path, file_index, extension);
+                let summary = self
+                    .write_batches(object_store.clone(), path, dtype.clone(), buffered_batches)
+                    .await?;
+                row_count = row_count.saturating_add(summary.row_count());
+                buffered_batches = Vec::new();
+                buffered_bytes = 0;
+                file_index += 1;
+            }
+        }
+
+        if !buffered_batches.is_empty() {
+            let path = split_path(base_path, file_index, extension);
+            let summary = self
+                .write_batches(object_store.clone(), path, dtype, buffered_batches)
+                .await?;
+            row_count = row_count.saturating_add(summary.row_count());
+        }
+
+        Ok(row_count)
+    }
+
+    async fn write_batches(
+        &self,
+        object_store: Arc<dyn ObjectStore>,
+        path: Path,
+        dtype: DType,
+        batches: Vec<RecordBatch>,
+    ) -> DFResult<WriteSummary> {
+        let stream = futures::stream::iter(
+            batches
+                .into_iter()
+                .map(|rb| ArrayRef::from_arrow(rb, false)),
+        );
+        let stream_adapter = ArrayStreamAdapter::new(dtype, stream);
+
+        let mut object_writer = ObjectStoreWrite::new(object_store, &path)
+            .await
+            .map_err(|e| exec_datafusion_err!("Failed to create ObjectStoreWrite: {e}"))?;
+
+        let summary = self
+            .session
+            .write_options()
+            .write(&mut object_writer, stream_adapter)
+            .await
+            .map_err(|e| exec_datafusion_err!("Failed to write Vortex file: {e}"))?;
+
+        object_writer
+            .shutdown()
+            .await
+            .map_err(|e| exec_datafusion_err!("Failed to shutdown Vortex writer: {e}"))?;
+
+        tracing::info!(path = %path, "Successfully written file");
+
+        Ok(summary)
     }
 }
 
@@ -90,6 +193,12 @@ impl DataSink for VortexSink {
         data: SendableRecordBatchStream,
         context: &Arc<TaskContext>,
     ) -> DFResult<u64> {
+        if let Some(target_file_size) = self.target_file_size {
+            return self
+                .write_all_with_target_size(data, context, target_file_size)
+                .await;
+        }
+
         FileSink::write_all(self, data, context).await
     }
 }
@@ -171,6 +280,15 @@ impl FileSink for VortexSink {
 
         Ok(row_count)
     }
+}
+
+fn split_path(base_path: &Path, file_index: usize, extension: &str) -> Path {
+    let mut base = base_path.to_string();
+    if !base.ends_with('/') {
+        base.push('/');
+    }
+    let filename = format!("part-{file_index:05}.{extension}");
+    Path::from(format!("{base}{filename}"))
 }
 
 #[cfg(test)]
