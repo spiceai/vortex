@@ -49,6 +49,8 @@ pub struct VortexSink {
     target_file_size: u64,
 }
 
+const DEFAULT_TARGET_FILE_SIZE_BYTES: u64 = 16 * 1024 * 1024;
+
 impl VortexSink {
     pub fn new(
         config: FileSinkConfig,
@@ -56,6 +58,15 @@ impl VortexSink {
         session: VortexSession,
         target_file_size: u64,
     ) -> Self {
+        let target_file_size = if target_file_size == 0 {
+            tracing::warn!(
+                "Received target_file_size=0 for VortexSink; defaulting to 16MB"
+            );
+            DEFAULT_TARGET_FILE_SIZE_BYTES
+        } else {
+            target_file_size
+        };
+
         Self {
             config,
             schema,
@@ -84,6 +95,8 @@ impl VortexSink {
         context: &Arc<TaskContext>,
         target_file_size: u64,
     ) -> DFResult<u64> {
+        let target_file_size = target_file_size.max(1);
+
         let object_store = context
             .runtime_env()
             .object_store(&self.config.object_store_url)?;
@@ -135,24 +148,32 @@ impl VortexSink {
             })?;
             let feed = feed_result?;
 
+            let file_row_count = summary.row_count();
+            let written_size = summary.size();
+
+            // If the stream never produced any rows, we're done (empty input).
+            if file_row_count == 0 {
+                if !feed.source_exhausted {
+                    return Err(DataFusionError::Execution(
+                        "Writer produced an empty file before the source was exhausted"
+                            .to_string(),
+                    ));
+                }
+                break;
+            }
+
             sink.shutdown().await.map_err(|e| {
                 DataFusionError::Execution(format!("Failed to shutdown Vortex writer: {e}"))
             })?;
 
-            let file_row_count = summary.row_count();
-            let written_size = summary.size();
-
             row_count += file_row_count;
-
-            // If the stream never produced any rows, we're done (empty input).
-            if file_row_count == 0 {
-                break;
-            }
 
             // Update compression ratio estimate for the next file.
             if written_size > 0 && !feed.source_exhausted {
                 let flushed_uncompressed = feed.uncompressed_bytes;
-                uncompressed_target = target_file_size * flushed_uncompressed / written_size;
+                uncompressed_target = target_file_size
+                    .saturating_mul(flushed_uncompressed)
+                    .saturating_div(written_size);
                 // Clamp to at least the target to avoid accumulating too little
                 uncompressed_target = uncompressed_target.max(target_file_size);
             }
@@ -322,6 +343,8 @@ async fn write_with_file_size_limit(
     rx: tokio::sync::mpsc::Receiver<datafusion_common::arrow::array::RecordBatch>,
     target_file_size: u64,
 ) -> DFResult<Vec<Path>> {
+    let target_file_size = target_file_size.max(1);
+
     let mut written_paths = Vec::new();
     let mut file_index: usize = 0;
 
@@ -353,17 +376,24 @@ async fn write_with_file_size_limit(
             .map_err(|e| DataFusionError::Execution(format!("Failed to write Vortex file: {e}")))?;
         let feed = feed_result?;
 
+        let file_row_count = summary.row_count();
+
+        // If the stream never produced any rows, the source was already exhausted.
+        if file_row_count == 0 {
+            if !feed.source_exhausted {
+                return Err(DataFusionError::Execution(
+                    "Writer produced an empty file before the source was exhausted"
+                        .to_string(),
+                ));
+            }
+            break;
+        }
+
         sink.shutdown().await.map_err(|e| {
             DataFusionError::Execution(format!("Failed to shutdown Vortex writer: {e}"))
         })?;
 
-        let file_row_count = summary.row_count();
         row_counter.fetch_add(file_row_count, Ordering::Relaxed);
-
-        // If the stream never produced any rows, the source was already exhausted.
-        if file_row_count == 0 {
-            break;
-        }
 
         tracing::debug!(path = %path, "Wrote split file at target size");
         written_paths.push(path);
@@ -427,6 +457,10 @@ async fn feed_record_batch_stream(
     while accumulated < target_bytes {
         match data.next().await.transpose()? {
             Some(rb) => {
+                if rb.num_rows() == 0 {
+                    continue;
+                }
+
                 let batch_size: u64 = rb
                     .columns()
                     .iter()
@@ -471,6 +505,10 @@ async fn feed_receiver_stream(
     while accumulated < target_bytes {
         match data.next().await {
             Some(rb) => {
+                if rb.num_rows() == 0 {
+                    continue;
+                }
+
                 let batch_size: u64 = rb
                     .columns()
                     .iter()
@@ -552,7 +590,9 @@ mod tests {
     use object_store::path::Path;
     use rstest::rstest;
     use tempfile::TempDir;
+    use tokio_stream::wrappers::ReceiverStream;
     use vortex::VortexSessionDefault;
+    use vortex::array::Array;
     use vortex::dtype::DType;
     use vortex::dtype::arrow::FromArrowType;
     use vortex::session::VortexSession;
@@ -1028,6 +1068,75 @@ mod tests {
         }
         // 127 distinct values
         assert_eq!(total, 127, "Expected 127 distinct groups");
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Unit tests for feed_receiver_stream
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_feed_receiver_stream_skips_empty_batches() -> anyhow::Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int8, false)]));
+
+        let empty = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int8Array::from(Vec::<i8>::new()))],
+        )?;
+        let non_empty =
+            RecordBatch::try_new(schema, vec![Arc::new(Int8Array::from(vec![1, 2, 3]))])?;
+
+        let (rb_tx, rb_rx) = tokio::sync::mpsc::channel(4);
+        rb_tx.send(empty).await?;
+        rb_tx.send(non_empty).await?;
+        drop(rb_tx);
+
+        let mut rb_stream = ReceiverStream::new(rb_rx);
+        let (array_tx, mut array_rx) = tokio::sync::mpsc::channel(4);
+
+        let feed = super::feed_receiver_stream(&mut rb_stream, array_tx, 1).await?;
+        assert!(!feed.source_exhausted);
+
+        let mut arrays = Vec::new();
+        while let Some(array) = array_rx.recv().await {
+            arrays.push(array?);
+        }
+
+        assert_eq!(arrays.len(), 1, "Empty batches should not be forwarded");
+        assert_eq!(
+            arrays[0].len(),
+            3,
+            "Non-empty batch should still be forwarded"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_feed_receiver_stream_all_empty_batches_exhausts_source() -> anyhow::Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int8, false)]));
+
+        let empty =
+            RecordBatch::try_new(schema, vec![Arc::new(Int8Array::from(Vec::<i8>::new()))])?;
+
+        let (rb_tx, rb_rx) = tokio::sync::mpsc::channel(2);
+        rb_tx.send(empty).await?;
+        drop(rb_tx);
+
+        let mut rb_stream = ReceiverStream::new(rb_rx);
+        let (array_tx, mut array_rx) = tokio::sync::mpsc::channel(2);
+
+        let feed = super::feed_receiver_stream(&mut rb_stream, array_tx, 1024).await?;
+        assert!(
+            feed.source_exhausted,
+            "All-empty input should exhaust source"
+        );
+
+        assert!(
+            array_rx.recv().await.is_none(),
+            "No arrays should be forwarded for empty input"
+        );
 
         Ok(())
     }

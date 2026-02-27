@@ -64,6 +64,7 @@ use crate::PrecisionExt as _;
 use crate::convert::TryToDataFusion;
 
 const DEFAULT_FOOTER_INITIAL_READ_SIZE_BYTES: usize = MAX_POSTSCRIPT_SIZE as usize + EOF_SIZE;
+const DEFAULT_TARGET_FILE_SIZE_MB: usize = 16;
 
 /// Vortex implementation of a DataFusion [`FileFormat`].
 pub struct VortexFormat {
@@ -425,9 +426,12 @@ impl FileFormat for VortexFormat {
         let target_file_size_mb = if self.opts.target_file_size_mb > 0 {
             self.opts.target_file_size_mb
         } else {
-            16 // Default to 16 MB when set to 0
+            DEFAULT_TARGET_FILE_SIZE_MB
         };
-        let target_file_size = target_file_size_mb as u64 * 1024 * 1024;
+        let target_file_size = match u64::try_from(target_file_size_mb) {
+            Ok(value_mb) => value_mb.saturating_mul(1024 * 1024),
+            Err(_) => u64::MAX,
+        };
 
         let schema = conf.output_schema().clone();
         let sink = Arc::new(VortexSink::new(
