@@ -28,6 +28,7 @@ use datafusion_datasource::file_compression_type::FileCompressionType;
 use datafusion_datasource::file_format::FileFormat;
 use datafusion_datasource::file_format::FileFormatFactory;
 use datafusion_datasource::file_scan_config::FileScanConfig;
+use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
 use datafusion_datasource::file_sink_config::FileSinkConfig;
 use datafusion_datasource::sink::DataSinkExec;
 use datafusion_datasource::source::DataSourceExec;
@@ -511,20 +512,17 @@ impl FileFormat for VortexFormat {
             return not_impl_err!("Overwrites are not implemented yet for Vortex");
         }
 
-        let target_file_size = if self.opts.target_file_size_mb > 0 {
-            Some(
+        let target_file_size = (self.opts.target_file_size_mb > 0)
+            .then(|| {
                 u64::try_from(self.opts.target_file_size_mb)
                     .map_err(|e| {
                         internal_datafusion_err!(
                             "target_file_size_mb cannot be represented as u64: {e}"
                         )
-                    })?
-                    .saturating_mul(1024 * 1024)
-                    .max(1),
-            )
-        } else {
-            None
-        };
+                    })
+                    .map(|v| v.saturating_mul(1024 * 1024).max(1))
+            })
+            .transpose()?;
 
         let schema = conf.output_schema().clone();
         let sink = Arc::new(VortexSink::new(
@@ -608,5 +606,11 @@ mod tests {
 
         let format = VortexFormat::new_with_options(VortexSession::default(), opts);
         assert_eq!(format.options().target_file_size_mb, 123);
+    }
+
+    #[test]
+    fn format_target_file_size_default_is_128mb() {
+        let opts = VortexTableOptions::default();
+        assert_eq!(opts.target_file_size_mb, 128);
     }
 }

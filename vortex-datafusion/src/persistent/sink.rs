@@ -6,9 +6,9 @@ use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use datafusion::arrow::array::RecordBatch;
 use datafusion_common::DataFusionError;
 use datafusion_common::Result as DFResult;
+use datafusion_common::arrow::array::RecordBatch;
 use datafusion_common::exec_datafusion_err;
 use datafusion_common_runtime::JoinSet;
 use datafusion_common_runtime::SpawnedTask;
@@ -312,8 +312,10 @@ mod tests {
     use futures::TryStreamExt;
     use rstest::rstest;
 
+    use super::split_path;
     use crate::common_tests::TestSessionContext;
     use crate::persistent::VortexFormatFactory;
+    use crate::persistent::VortexTableOptions;
 
     #[tokio::test]
     async fn test_insert_into_sql() -> anyhow::Result<()> {
@@ -413,10 +415,11 @@ mod tests {
     }
 
     /// Reproduction by <https://github.com/vortex-data/vortex/issues/4315>.
+    /// Uses a 1MB target file size to exercise file splitting behavior.
     #[rstest]
-    #[case(1000, 1)]
-    #[case(40_961, 4)]
-    #[case(1_000_000, 4)]
+    #[case(1_000, 1)]
+    #[case(5_000_000, 6)]
+    #[case(10_000_000, 10)]
     #[tokio::test]
     async fn test_write_large_batch(
         #[case] entries: usize,
@@ -424,15 +427,26 @@ mod tests {
     ) -> anyhow::Result<()> {
         let ctx = TestSessionContext::default();
 
+        let opts = VortexTableOptions {
+            target_file_size_mb: 1,
+            ..Default::default()
+        };
+
+        let factory = VortexFormatFactory::new().with_options(opts);
+
+        let values: Vec<i8> = (0..entries)
+            .map(|i| i8::try_from(i % 127))
+            .collect::<Result<_, _>>()?;
+
         let data = ctx.session.read_batch(RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("a", DataType::Int8, false)])),
-            vec![Arc::new(Int8Array::from(vec![0i8; entries]))],
+            vec![Arc::new(Int8Array::from(values))],
         )?)?;
 
         let logical_plan = LogicalPlanBuilder::copy_to(
             data.logical_plan().clone(),
             "/table/".to_string(),
-            format_as_file_type(Arc::new(VortexFormatFactory::new())),
+            format_as_file_type(Arc::new(factory)),
             Default::default(),
             vec![],
         )?
@@ -484,13 +498,7 @@ mod tests {
                 .unwrap();
 
             for i in 0..batch.num_rows() {
-                assert_eq!(
-                    col.value(i),
-                    0i8,
-                    "Expected value 0 at row {}, but found {}",
-                    total_rows + i,
-                    col.value(i)
-                );
+                assert_eq!(col.value(i), i8::try_from((total_rows + i) % 127)?);
             }
             total_rows += batch.num_rows();
         }
@@ -512,6 +520,46 @@ mod tests {
             expected_files,
             "Expected {expected_files} files for {entries} values"
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_write_large_batch_default_target_is_128mb() -> anyhow::Result<()> {
+        let ctx = TestSessionContext::default();
+
+        let entries = 1_000_000;
+        let values: Vec<i8> = (0..entries)
+            .map(|i| i8::try_from(i % 127))
+            .collect::<Result<_, _>>()?;
+
+        let data = ctx.session.read_batch(RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int8, false)])),
+            vec![Arc::new(Int8Array::from(values))],
+        )?)?;
+
+        let logical_plan = LogicalPlanBuilder::copy_to(
+            data.logical_plan().clone(),
+            "/table/".to_string(),
+            format_as_file_type(Arc::new(VortexFormatFactory::new())),
+            Default::default(),
+            vec![],
+        )?
+        .build()?;
+
+        ctx.session
+            .execute_logical_plan(logical_plan)
+            .await?
+            .collect()
+            .await?;
+
+        let file_metas = ctx
+            .store
+            .list(Some(&"/table".into()))
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        assert_eq!(file_metas.len(), 1);
 
         Ok(())
     }
@@ -556,5 +604,27 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn test_split_path_basic() {
+        let path = object_store::path::Path::from("data/output");
+        assert_eq!(
+            split_path(&path, 0, "vortex").to_string(),
+            "data/output/part-00000.vortex"
+        );
+        assert_eq!(
+            split_path(&path, 12, "vortex").to_string(),
+            "data/output/part-00012.vortex"
+        );
+    }
+
+    #[test]
+    fn test_split_path_preserves_trailing_slash() {
+        let path = object_store::path::Path::from("nested/path/");
+        assert_eq!(
+            split_path(&path, 3, "vx").to_string(),
+            "nested/path/part-00003.vx"
+        );
     }
 }

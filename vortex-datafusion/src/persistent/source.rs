@@ -175,8 +175,6 @@ impl FileSource for VortexSource {
             .clone()
             .unwrap_or_else(|| Arc::new(DefaultVortexReaderFactory::new(object_store)));
 
-        let table_schema = base_config.file_source.table_schema().clone();
-
         let opener = VortexOpener {
             partition,
             session: self.session.clone(),
@@ -220,22 +218,6 @@ impl FileSource for VortexSource {
 
     fn file_type(&self) -> &str {
         VORTEX_FILE_EXTENSION
-    }
-
-    fn projection(&self) -> Option<&ProjectionExprs> {
-        self.projection.as_ref()
-    }
-
-    fn try_pushdown_projection(
-        &self,
-        projection: &ProjectionExprs,
-    ) -> DFResult<Option<Arc<dyn FileSource>>> {
-        let mut source = self.clone();
-        source.projection = match &self.projection {
-            Some(existing) => Some(existing.try_merge(projection)?),
-            None => Some(projection.clone()),
-        };
-        Ok(Some(Arc::new(source)))
     }
 
     fn fmt_extra(&self, t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {

@@ -178,41 +178,6 @@ impl DefaultExpressionConvertor {
 
         Ok(else_expr)
     }
-
-    /// Attempts to convert a DataFusion CaseExpr to a Vortex expression.
-    fn try_convert_case_expr(&self, case_expr: &df_expr::CaseExpr) -> VortexResult<Expression> {
-        // DataFusion CaseExpr has:
-        // - expr(): Optional base expression (for "CASE expr WHEN ..." form)
-        // - when_then_expr(): Vec of (when, then) pairs
-        // - else_expr(): Optional else expression
-
-        // We don't support the "CASE expr WHEN value1 THEN result1" form yet
-        if case_expr.expr().is_some() {
-            vortex_bail!(
-                "CASE expr WHEN form is not yet supported, only searched CASE is supported"
-            );
-        }
-
-        let when_then_pairs = case_expr.when_then_expr();
-        if when_then_pairs.is_empty() {
-            vortex_bail!("CASE expression must have at least one WHEN clause");
-        }
-
-        // Convert all when/then pairs
-        let mut children = Vec::with_capacity(when_then_pairs.len() * 2 + 1);
-        for (when_expr, then_expr) in when_then_pairs {
-            children.push(self.convert(when_expr.as_ref())?);
-            children.push(self.convert(then_expr.as_ref())?);
-        }
-
-        // Handle the optional else clause
-        if let Some(else_expr) = case_expr.else_expr() {
-            children.push(self.convert(else_expr.as_ref())?);
-            Ok(case_when(children))
-        } else {
-            Ok(case_when_no_else(children))
-        }
-    }
 }
 
 impl ExpressionConvertor for DefaultExpressionConvertor {
@@ -326,7 +291,7 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
             let r = projection_expr.expr.apply(|node| {
                 // We only pull column children of scalar functions that we can't push into the scan.
                 if let Some(scalar_fn_expr) = node.as_any().downcast_ref::<ScalarFunctionExpr>()
-                    && !can_scalar_fn_be_pushed_down(scalar_fn_expr)
+                    && !can_scalar_fn_be_pushed_down(scalar_fn_expr, input_schema)
                 {
                     scan_projection.extend(
                         collect_columns(node)
@@ -464,7 +429,7 @@ fn can_be_pushed_down_impl(df_expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> 
                 .iter()
                 .all(|e| can_be_pushed_down_impl(e, schema))
     } else if let Some(scalar_fn) = expr.downcast_ref::<ScalarFunctionExpr>() {
-        can_scalar_fn_be_pushed_down(scalar_fn)
+        can_scalar_fn_be_pushed_down(scalar_fn, schema)
     } else if let Some(case_expr) = expr.downcast_ref::<df_expr::CaseExpr>() {
         can_case_be_pushed_down(case_expr, schema)
     } else if expr
@@ -527,30 +492,6 @@ fn can_case_be_pushed_down(case_expr: &df_expr::CaseExpr, schema: &Schema) -> bo
             .is_some_and(|else_expr| can_be_pushed_down_impl(else_expr, schema))
 }
 
-fn can_case_be_pushed_down(case_expr: &df_expr::CaseExpr, schema: &Schema) -> bool {
-    // We only support the "searched CASE" form (CASE WHEN cond THEN result ...)
-    // not the "simple CASE" form (CASE expr WHEN value THEN result ...)
-    if case_expr.expr().is_some() {
-        return false;
-    }
-
-    // Check all when/then pairs
-    for (when_expr, then_expr) in case_expr.when_then_expr() {
-        if !can_be_pushed_down(when_expr, schema) || !can_be_pushed_down(then_expr, schema) {
-            return false;
-        }
-    }
-
-    // Check the optional else clause
-    if let Some(else_expr) = case_expr.else_expr()
-        && !can_be_pushed_down(else_expr, schema)
-    {
-        return false;
-    }
-
-    true
-}
-
 fn supported_data_types(dt: &DataType) -> bool {
     use DataType::*;
 
@@ -591,7 +532,7 @@ fn can_scalar_fn_be_pushed_down(scalar_fn: &ScalarFunctionExpr, schema: &Schema)
         && scalar_fn
             .args()
             .iter()
-            .all(|arg| can_be_pushed_down(arg, schema))
+            .all(|arg| can_be_pushed_down_impl(arg, schema))
 }
 
 // TODO(adam): Replace with `DataType::is_decimal` once its released.
