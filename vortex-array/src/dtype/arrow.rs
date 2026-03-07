@@ -191,6 +191,14 @@ impl FromArrowType<(&DataType, Nullability)> for DType {
             | DataType::LargeListView(e) => {
                 DType::List(Arc::new(Self::from_arrow(e.as_ref())), nullability)
             }
+            DataType::Map(entries_field, _ordered) => {
+                // Map is logically List<Struct<key, value>>.
+                // The entries_field contains a Struct type with the key and value fields.
+                DType::List(
+                    Arc::new(Self::from_arrow(entries_field.as_ref())),
+                    nullability,
+                )
+            }
             DataType::FixedSizeList(e, size) => DType::FixedSizeList(
                 Arc::new(Self::from_arrow(e.as_ref())),
                 *size as u32,

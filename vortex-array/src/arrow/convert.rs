@@ -13,6 +13,7 @@ use arrow_array::GenericByteArray;
 use arrow_array::GenericByteViewArray;
 use arrow_array::GenericListArray;
 use arrow_array::GenericListViewArray;
+use arrow_array::MapArray as ArrowMapArray;
 use arrow_array::NullArray as ArrowNullArray;
 use arrow_array::OffsetSizeTrait;
 use arrow_array::PrimitiveArray as ArrowPrimitiveArray;
@@ -456,6 +457,18 @@ impl FromArrowArray<&ArrowFixedSizeListArray> for ArrayRef {
     }
 }
 
+impl FromArrowArray<&ArrowMapArray> for ArrayRef {
+    fn from_arrow(value: &ArrowMapArray, nullable: bool) -> VortexResult<Self> {
+        // Arrow Map is logically List<Struct<key, value>> with i32 offsets.
+        // We convert it to a ListArray of structs.
+        let entries = Self::from_arrow(value.entries() as &dyn ArrowArray, false)?;
+        let offsets = value.offsets().clone().into_array();
+        let nulls = nulls(value.nulls(), nullable);
+
+        Ok(ListArray::try_new(entries, offsets, nulls)?.into_array())
+    }
+}
+
 impl FromArrowArray<&ArrowNullArray> for ArrayRef {
     fn from_arrow(value: &ArrowNullArray, nullable: bool) -> VortexResult<Self> {
         assert!(nullable);
@@ -517,6 +530,7 @@ impl FromArrowArray<&dyn ArrowArray> for ArrayRef {
             DataType::ListView(_) => Self::from_arrow(array.as_list_view::<i32>(), nullable),
             DataType::LargeListView(_) => Self::from_arrow(array.as_list_view::<i64>(), nullable),
             DataType::FixedSizeList(..) => Self::from_arrow(array.as_fixed_size_list(), nullable),
+            DataType::Map(..) => Self::from_arrow(array.as_map(), nullable),
             DataType::Null => Self::from_arrow(as_null_array(array), nullable),
             DataType::Timestamp(u, _) => match u {
                 ArrowTimeUnit::Second => {
@@ -680,6 +694,7 @@ mod tests {
 
     use crate::ArrayRef;
     use crate::IntoArray;
+    use crate::VortexSessionExecute;
     use crate::arrays::DecimalVTable;
     use crate::arrays::FixedSizeListVTable;
     use crate::arrays::ListVTable;
@@ -690,6 +705,7 @@ mod tests {
     use crate::arrays::VarBinVTable;
     use crate::arrays::VarBinViewVTable;
     use crate::arrow::FromArrowArray as _;
+    use crate::arrow::executor::ArrowArrayExecutor as _;
     use crate::dtype::DType;
     use crate::dtype::Nullability;
     use crate::dtype::PType;
@@ -1776,5 +1792,58 @@ mod tests {
         );
 
         ArrayRef::from_arrow(null_struct_array_with_non_nullable_field.as_ref(), true).unwrap();
+    }
+
+    #[test]
+    fn test_map_array_conversion() {
+        use arrow_array::MapArray;
+        use arrow_array::builder::MapBuilder;
+        use arrow_array::builder::StringBuilder;
+
+        // Build a MapArray: map<string, int32>
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
+        // First map entry: {"a": 1, "b": 2}
+        builder.keys().append_value("a");
+        builder.values().append_value(1);
+        builder.keys().append_value("b");
+        builder.values().append_value(2);
+        builder.append(true).unwrap();
+
+        // Second map entry: null
+        builder.append(false).unwrap();
+
+        // Third map entry: {"c": 3}
+        builder.keys().append_value("c");
+        builder.values().append_value(3);
+        builder.append(true).unwrap();
+
+        let arrow_map = builder.finish();
+        assert_eq!(arrow_map.len(), 3);
+
+        // Convert Arrow MapArray → Vortex ListArray
+        let vortex_array = ArrayRef::from_arrow(&arrow_map, true).unwrap();
+        assert_eq!(vortex_array.len(), 3);
+
+        // Verify it's stored as List<Struct<key, value>>
+        let list_array = vortex_array.as_::<ListVTable>();
+        assert_eq!(list_array.elements().len(), 3); // 3 total key-value pairs
+        let struct_elements = list_array.elements().as_::<StructVTable>();
+        assert_eq!(struct_elements.names().len(), 2); // key and value fields
+
+        // Convert back to Arrow as a MapArray
+        let map_dtype = arrow_map.data_type().clone();
+        let arrow_back = vortex_array
+            .execute_arrow(
+                Some(&map_dtype),
+                &mut crate::LEGACY_SESSION.create_execution_ctx(),
+            )
+            .unwrap();
+        let map_back = arrow_back
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .expect("Should be a MapArray");
+        assert_eq!(map_back.len(), 3);
+        assert_eq!(map_back.entries().len(), 3);
+        assert!(map_back.is_null(1)); // Second entry was null
     }
 }

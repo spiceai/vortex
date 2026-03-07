@@ -181,7 +181,8 @@ fn convert_temporal_value(value: i64, multiply: i64, divide: i64) -> VortexResul
         vortex_bail!(Compute: "Date value {value} overflows target timestamp range");
     }
 
-    Ok(scaled as i64)
+    i64::try_from(scaled)
+        .map_err(|_| vortex_error::vortex_err!(Compute: "Date value {value} overflows target timestamp range"))
 }
 
 #[cfg(test)]

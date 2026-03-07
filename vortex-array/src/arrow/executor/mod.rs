@@ -9,6 +9,7 @@ mod dictionary;
 mod fixed_size_list;
 mod list;
 mod list_view;
+mod map;
 pub mod null;
 pub mod primitive;
 mod run_end;
@@ -29,7 +30,6 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
 
-use crate::Array;
 use crate::ArrayRef;
 use crate::arrays::ListVTable;
 use crate::arrays::VarBinVTable;
@@ -41,6 +41,7 @@ use crate::arrow::executor::dictionary::to_arrow_dictionary;
 use crate::arrow::executor::fixed_size_list::to_arrow_fixed_list;
 use crate::arrow::executor::list::to_arrow_list;
 use crate::arrow::executor::list_view::to_arrow_list_view;
+use crate::arrow::executor::map::to_arrow_map;
 use crate::arrow::executor::null::to_arrow_null;
 use crate::arrow::executor::primitive::to_arrow_primitive;
 use crate::arrow::executor::run_end::to_arrow_run_end;
@@ -156,8 +157,10 @@ impl ArrowArrayExecutor for ArrayRef {
             DataType::RunEndEncoded(ends_type, values_type) => {
                 to_arrow_run_end(self, ends_type.data_type(), values_type, ctx)
             }
+            DataType::Map(entries_field, ordered) => {
+                to_arrow_map(self, entries_field, *ordered, ctx)
+            }
             DataType::FixedSizeBinary(_)
-            | DataType::Map(..)
             | DataType::Duration(_)
             | DataType::Interval(_)
             | DataType::Union(..) => {
