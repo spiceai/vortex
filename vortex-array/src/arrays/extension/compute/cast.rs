@@ -175,7 +175,8 @@ fn convert_temporal_value(value: i64, multiply: i64, divide: i64) -> VortexResul
         vortex_bail!(ComputeError: "Date value {value} overflows target timestamp range");
     }
 
-    Ok(scaled as i64)
+    i64::try_from(scaled)
+        .map_err(|_| vortex_error::vortex_err!(ComputeError: "Date value {value} overflows target timestamp range"))
 }
 
 register_kernel!(CastKernelAdapter(ExtensionVTable).lift());
@@ -291,7 +292,10 @@ mod tests {
         let storage = output.storage().to_primitive();
         assert_eq!(storage.scalar_at(0).as_primitive().as_::<i64>(), Some(0));
         assert!(storage.scalar_at(1).is_null());
-        assert_eq!(storage.scalar_at(2).as_primitive().as_::<i64>(), Some(172_800));
+        assert_eq!(
+            storage.scalar_at(2).as_primitive().as_::<i64>(),
+            Some(172_800)
+        );
     }
 
     #[test]
