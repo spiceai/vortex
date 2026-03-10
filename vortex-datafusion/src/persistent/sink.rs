@@ -1539,6 +1539,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_target_file_size_uses_single_sink_input_partition() -> anyhow::Result<()> {
+        use datafusion::datasource::MemTable;
+        use datafusion_datasource::file_format::format_as_file_type;
+
+        let ctx = TestSessionContext::default();
+
+        let opts = VortexTableOptions {
+            // Enable sink-side sizing, but make the threshold large enough
+            // that all input data should fit in a single file.
+            target_file_size_mb: 512,
+            ..Default::default()
+        };
+        let factory = VortexFormatFactory::new().with_options(opts);
+
+        let rows_per_partition = 300_000_usize;
+        let num_partitions = 8_usize;
+        let expected_total_rows = (rows_per_partition * num_partitions) as i64;
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+
+        // Build a MemTable with multiple physical input partitions to mimic
+        // DataFusion's parallel writer inputs.
+        let mut partitions: Vec<Vec<RecordBatch>> = Vec::new();
+        for p in 0..num_partitions {
+            let values = pseudo_random_i64s(rows_per_partition, (p * rows_per_partition) as i64);
+            partitions.push(vec![RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(values))],
+            )?]);
+        }
+
+        let table = MemTable::try_new(schema, partitions)?;
+        ctx.session.register_table("source", Arc::new(table))?;
+
+        let source = ctx.session.table("source").await?;
+        let logical_plan = LogicalPlanBuilder::copy_to(
+            source.logical_plan().clone(),
+            "/table/".to_string(),
+            format_as_file_type(Arc::new(factory)),
+            Default::default(),
+            vec![],
+        )?
+        .build()?;
+
+        ctx.session
+            .execute_logical_plan(logical_plan)
+            .await?
+            .collect()
+            .await?;
+
+        let file_metas = ctx
+            .store
+            .list(Some(&"/table".into()))
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let unique_write_ids: vortex_utils::aliases::hash_set::HashSet<_> = file_metas
+            .iter()
+            .filter_map(|m| {
+                m.location
+                    .filename()
+                    .and_then(|name| name.split_once('_'))
+                    .map(|(prefix, _)| prefix.to_string())
+            })
+            .collect();
+
+        assert_eq!(
+            unique_write_ids.len(),
+            1,
+            "Expected one write_id (single sink stream), got {:?} from files: {:?}",
+            unique_write_ids,
+            file_metas
+                .iter()
+                .map(|m| format!("{}: {}B", m.location, m.size))
+                .collect::<Vec<_>>()
+        );
+
+        assert!(
+            file_metas.len() < num_partitions,
+            "Expected fewer output files than input partitions after coalescing; got {} files for {num_partitions} input partitions",
+            file_metas.len()
+        );
+
+        let result = ctx
+            .session
+            .sql("SELECT COUNT(*) AS cnt FROM '/table/'")
+            .await?
+            .collect()
+            .await?;
+
+        let count = result[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(count, expected_total_rows, "Total row count mismatch");
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_write_partitioned_with_null_partition_values_errors() -> anyhow::Result<()> {
         let ctx = TestSessionContext::default();
 

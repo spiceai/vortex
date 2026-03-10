@@ -35,6 +35,8 @@ use datafusion_datasource::source::DataSourceExec;
 use datafusion_expr::dml::InsertOp;
 use datafusion_physical_expr::LexRequirement;
 use datafusion_physical_plan::ExecutionPlan;
+use datafusion_physical_plan::Partitioning;
+use datafusion_physical_plan::repartition::RepartitionExec;
 use futures::FutureExt;
 use futures::StreamExt as _;
 use futures::TryStreamExt as _;
@@ -523,6 +525,15 @@ impl FileFormat for VortexFormat {
                     .map(|v| v.saturating_mul(1024 * 1024).max(1))
             })
             .transpose()?;
+
+        let input = if target_file_size.is_some() {
+            Arc::new(RepartitionExec::try_new(
+                input,
+                Partitioning::RoundRobinBatch(1),
+            )?) as Arc<dyn ExecutionPlan>
+        } else {
+            input
+        };
 
         let schema = conf.output_schema().clone();
         let sink = Arc::new(VortexSink::new(
