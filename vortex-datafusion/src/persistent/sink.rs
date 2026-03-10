@@ -722,7 +722,7 @@ mod tests {
 
         let file_metas = ctx
             .store
-            .list(Some(&"/table".into()))
+            .list(Some(&"table".into()))
             .try_collect::<Vec<_>>()
             .await?;
 
@@ -1471,23 +1471,22 @@ mod tests {
         };
         let factory = VortexFormatFactory::new().with_options(opts);
 
-        let batch_rows = 8192_usize;
-        let total_elements = 16 * 1024 * 1024 / 8; // ~16MB Arrow memory
-        let num_batches = total_elements / batch_rows;
-        let expected_total_rows = (num_batches * batch_rows) as i64;
+        let rows_per_partition = 300_000_usize;
+        let num_partitions = 8_usize;
+        let expected_total_rows = (rows_per_partition * num_partitions) as i64;
 
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
 
-        let mut batches = Vec::new();
-        for i in 0..num_batches {
-            let values = pseudo_random_i64s(batch_rows, (i * batch_rows) as i64);
-            batches.push(RecordBatch::try_new(
+        let mut partitions: Vec<Vec<RecordBatch>> = Vec::new();
+        for p in 0..num_partitions {
+            let values = pseudo_random_i64s(rows_per_partition, (p * rows_per_partition) as i64);
+            partitions.push(vec![RecordBatch::try_new(
                 schema.clone(),
                 vec![Arc::new(Int64Array::from(values))],
-            )?);
+            )?]);
         }
 
-        let table = MemTable::try_new(schema, vec![batches])?;
+        let table = MemTable::try_new(schema, partitions)?;
         ctx.session.register_table("source", Arc::new(table))?;
 
         let source = ctx.session.table("source").await?;
@@ -1511,6 +1510,27 @@ mod tests {
             .list(Some(&"/table".into()))
             .try_collect::<Vec<_>>()
             .await?;
+
+        let unique_write_ids: vortex_utils::aliases::hash_set::HashSet<_> = file_metas
+            .iter()
+            .filter_map(|m| {
+                m.location
+                    .filename()
+                    .and_then(|name| name.split_once('_'))
+                    .map(|(prefix, _)| prefix.to_string())
+            })
+            .collect();
+
+        assert_eq!(
+            unique_write_ids.len(),
+            1,
+            "Expected one write_id with target size disabled; got {:?} from files: {:?}",
+            unique_write_ids,
+            file_metas
+                .iter()
+                .map(|m| format!("{}: {}B", m.location, m.size))
+                .collect::<Vec<_>>()
+        );
 
         assert_eq!(
             file_metas.len(),

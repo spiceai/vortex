@@ -526,14 +526,14 @@ impl FileFormat for VortexFormat {
             })
             .transpose()?;
 
-        let input = if target_file_size.is_some() {
-            Arc::new(RepartitionExec::try_new(
-                input,
-                Partitioning::RoundRobinBatch(1),
-            )?) as Arc<dyn ExecutionPlan>
-        } else {
-            input
-        };
+        // DataSinkExec requires a single input partition at execution time.
+        // Force a single input stream so VortexSink performs one coordinated
+        // write per statement instead of one independent write per CPU/input
+        // partition, which would create many small `*_00000` files.
+        let input = Arc::new(RepartitionExec::try_new(
+            input,
+            Partitioning::RoundRobinBatch(1),
+        )?) as Arc<dyn ExecutionPlan>;
 
         let schema = conf.output_schema().clone();
         let sink = Arc::new(VortexSink::new(
