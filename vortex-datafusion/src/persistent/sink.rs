@@ -192,7 +192,12 @@ impl FileSink for VortexSink {
 }
 
 /// Write batches from a demuxed stream to one or more files, splitting when the
-/// accumulated in-memory byte size exceeds `target_file_size`.
+/// estimated compressed size exceeds `target_file_size`.
+///
+/// The compression ratio is learned adaptively: the first file is written after
+/// accumulating `target_file_size` bytes of Arrow memory (assuming no compression),
+/// then the actual ratio of compressed bytes to Arrow bytes is computed and used
+/// to scale the buffering threshold for subsequent files.
 ///
 /// When `target_file_size` is `None`, all batches are written to a single file at `path`.
 async fn write_stream_to_files(
@@ -210,26 +215,40 @@ async fn write_stream_to_files(
     let mut buffered_batches: Vec<RecordBatch> = Vec::new();
     let mut buffered_bytes = 0_u64;
     let mut file_index = 0_usize;
+    // Ratio of compressed file bytes to Arrow memory bytes. Starts at 1.0
+    // (no compression assumed) and is updated after each file is written.
+    let mut compression_ratio = 1.0_f64;
 
     while let Some(batch) = rx.next().await {
         buffered_bytes = buffered_bytes.saturating_add(batch.get_array_memory_size() as u64);
         buffered_batches.push(batch);
 
-        if let Some(target) = target
-            && buffered_bytes >= target
-        {
-            let file_path = numbered_path(&path, file_index, extension);
-            let summary = write_batches(
-                &session,
-                object_store.clone(),
-                file_path.clone(),
-                dtype.clone(),
-                std::mem::take(&mut buffered_batches),
-            )
-            .await?;
-            results.push((file_path, summary));
-            buffered_bytes = 0;
-            file_index += 1;
+        if let Some(target) = target {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "file sizes won't exceed u64::MAX"
+            )]
+            let estimated_compressed = (buffered_bytes as f64 * compression_ratio) as u64;
+            if estimated_compressed >= target {
+                let file_path = numbered_path(&path, file_index, extension);
+                let summary = write_batches(
+                    &session,
+                    object_store.clone(),
+                    file_path.clone(),
+                    dtype.clone(),
+                    std::mem::take(&mut buffered_batches),
+                )
+                .await?;
+
+                // Update the compression ratio from actual output.
+                if buffered_bytes > 0 {
+                    compression_ratio = summary.size() as f64 / buffered_bytes as f64;
+                }
+
+                results.push((file_path, summary));
+                buffered_bytes = 0;
+                file_index += 1;
+            }
         }
     }
 
@@ -717,86 +736,213 @@ mod tests {
             .collect()
     }
 
-    /// Tests that ~62MB of data written with a 16MB target file size
-    /// produces exactly 4 split files.
+    /// Tests file splitting through the full DataFusion pipeline.
     ///
-    /// Data is fed directly into [`write_stream_to_files`] in 8192-row
-    /// batches of Int64 (64KB each). Splitting occurs when accumulated
-    /// Arrow memory size exceeds the target:
-    ///   - 16MB target / 64KB per batch = 256 batches per file
-    ///   - ~992 total batches → 3 full files + 1 partial = 4 files
+    /// Writes ~62MB of pseudo-random Int64 data (near 1:1 compression ratio)
+    /// via COPY TO with a 16MB target file size. Verifies that exactly 4 files
+    /// are produced and each file's compressed size is approximately 16MB.
+    ///
+    /// This exercises the complete write path including the DataFusion demuxer
+    /// and VortexSink, unlike a direct `write_stream_to_files` call.
     #[tokio::test]
     async fn test_file_splitting_62mb_into_4_files() -> anyhow::Result<()> {
-        use object_store::ObjectStore;
-        use object_store::memory::InMemory;
-        use vortex::VortexSessionDefault;
-        use vortex::dtype::DType;
-        use vortex::dtype::arrow::FromArrowType;
-        use vortex::session::VortexSession;
+        use datafusion::datasource::MemTable;
+        use datafusion_datasource::file_format::format_as_file_type;
 
-        let session = VortexSession::default();
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let path = object_store::path::Path::from("table/data.vortex");
-        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
-        let dtype = DType::from_arrow(schema.clone());
-        let target_file_size = Some(16u64 * 1024 * 1024); // 16MB
+        let ctx = TestSessionContext::default();
+
+        let target_mb = 16_usize;
+        let opts = VortexTableOptions {
+            target_file_size_mb: target_mb,
+            ..Default::default()
+        };
+        let factory = VortexFormatFactory::new().with_options(opts);
 
         let batch_rows = 8192_usize;
-        let total_elements = 62 * 1024 * 1024 / 8; // ~8,126,464 i64 values ≈ 62MB
+        let total_elements = 62 * 1024 * 1024 / 8; // ~8,126,464 i64 values ≈ 62MB Arrow memory
         let num_batches = total_elements / batch_rows;
+        let expected_total_rows = (num_batches * batch_rows) as i64;
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<RecordBatch>(256);
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
 
-        let schema_send = schema.clone();
-        let sender = tokio::spawn(async move {
-            for i in 0..num_batches {
-                let values = pseudo_random_i64s(batch_rows, (i * batch_rows) as i64);
-                let batch = RecordBatch::try_new(
-                    schema_send.clone(),
-                    vec![Arc::new(Int64Array::from(values))],
-                )
-                .unwrap();
-                tx.send(batch).await.unwrap();
-            }
-        });
-
-        let results = super::write_stream_to_files(
-            session,
-            store.clone(),
-            path,
-            dtype,
-            rx,
-            target_file_size,
-            "vortex",
-        )
-        .await?;
-
-        sender.await?;
-
-        assert_eq!(
-            results.len(),
-            4,
-            "Expected 4 files for ~62MB data with 16MB target, got {}",
-            results.len()
-        );
-
-        // Verify every file was actually written and has non-zero size.
-        let mut total_rows = 0u64;
-        for (path, summary) in &results {
-            let meta = store.head(path).await?;
-            assert!(
-                meta.size > 0,
-                "File {path} should have non-zero size on disk"
-            );
-            assert!(summary.row_count() > 0, "File {path} should contain rows");
-            total_rows += summary.row_count();
+        let mut batches = Vec::new();
+        for i in 0..num_batches {
+            let values = pseudo_random_i64s(batch_rows, (i * batch_rows) as i64);
+            batches.push(RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(values))],
+            )?);
         }
 
-        let expected_rows = (num_batches * batch_rows) as u64;
+        let table = MemTable::try_new(schema.clone(), vec![batches])?;
+        ctx.session.register_table("source", Arc::new(table))?;
+
+        let source = ctx.session.table("source").await?;
+        let logical_plan = LogicalPlanBuilder::copy_to(
+            source.logical_plan().clone(),
+            "/table/".to_string(),
+            format_as_file_type(Arc::new(factory)),
+            Default::default(),
+            vec![],
+        )?
+        .build()?;
+
+        ctx.session
+            .execute_logical_plan(logical_plan)
+            .await?
+            .collect()
+            .await?;
+
+        let file_metas = ctx
+            .store
+            .list(Some(&"/table".into()))
+            .try_collect::<Vec<_>>()
+            .await?;
+
         assert_eq!(
-            total_rows, expected_rows,
-            "Total rows across all files should equal input rows"
+            file_metas.len(),
+            4,
+            "Expected 4 files for ~62MB data with {target_mb}MB target, got {} (sizes: {:?})",
+            file_metas.len(),
+            file_metas.iter().map(|m| m.size).collect::<Vec<_>>()
         );
+
+        let target_bytes = (target_mb * 1024 * 1024) as u64;
+        for meta in &file_metas {
+            assert!(
+                meta.size > target_bytes / 2,
+                "File {} is {}B, expected at least {}B (target/2)",
+                meta.location,
+                meta.size,
+                target_bytes / 2
+            );
+        }
+
+        // Verify total row count.
+        let result = ctx
+            .session
+            .sql("SELECT COUNT(*) as cnt FROM '/table/'")
+            .await?
+            .collect()
+            .await?;
+
+        let count = result[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+
+        assert_eq!(count, expected_total_rows, "Total row count mismatch");
+
+        Ok(())
+    }
+
+    /// Tests file splitting with compressible data through the full pipeline.
+    ///
+    /// Uses low-entropy Int64 values (repeating 0..255) which compress ~8:1 in
+    /// Vortex. With the current code that compares Arrow memory size against
+    /// `target_file_size`, files are split far too early, producing many tiny
+    /// compressed files instead of files that are close to the target.
+    ///
+    /// For ~32MB of Arrow data (~4MB compressed at 8:1) with a 1MB target:
+    ///   - **Correct**: 4 files of ~1MB compressed each
+    ///   - **Bug**: 32 files of ~0.125MB compressed each
+    #[tokio::test]
+    async fn test_file_splitting_compressible_data() -> anyhow::Result<()> {
+        use datafusion::datasource::MemTable;
+        use datafusion_datasource::file_format::format_as_file_type;
+
+        let ctx = TestSessionContext::default();
+
+        let target_mb = 1_usize;
+        let opts = VortexTableOptions {
+            target_file_size_mb: target_mb,
+            ..Default::default()
+        };
+        let factory = VortexFormatFactory::new().with_options(opts);
+
+        // Generate low-entropy Int64 values: repeating 0..255.
+        // Arrow memory: 4M × 8 bytes = 32MB.
+        // Vortex compressed: each value only needs ~1 byte → ~4MB total.
+        let total_elements = 4_000_000_usize;
+        let batch_rows = 8192_usize;
+        let num_batches = total_elements / batch_rows;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+
+        let mut batches = Vec::new();
+        for i in 0..num_batches {
+            let values: Vec<i64> = (0..batch_rows)
+                .map(|j| ((i * batch_rows + j) % 256) as i64)
+                .collect();
+            batches.push(RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(values))],
+            )?);
+        }
+
+        let table = MemTable::try_new(schema.clone(), vec![batches])?;
+        ctx.session.register_table("source", Arc::new(table))?;
+
+        let source = ctx.session.table("source").await?;
+        let logical_plan = LogicalPlanBuilder::copy_to(
+            source.logical_plan().clone(),
+            "/table/".to_string(),
+            format_as_file_type(Arc::new(factory)),
+            Default::default(),
+            vec![],
+        )?
+        .build()?;
+
+        ctx.session
+            .execute_logical_plan(logical_plan)
+            .await?
+            .collect()
+            .await?;
+
+        let file_metas = ctx
+            .store
+            .list(Some(&"/table".into()))
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        // With compressible data, there should be few files (not > 10).
+        // The buggy code produces many tiny files because it splits on Arrow
+        // memory (32MB / 1MB = 32 files) instead of compressed size (~4MB / 1MB = 4 files).
+        let total_compressed: u64 = file_metas.iter().map(|m| m.size).sum();
+        let target_bytes = (target_mb * 1024 * 1024) as u64;
+
+        // We should have at most ~(total_compressed / target) + 1 files, not
+        // ~(arrow_memory / target) files.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "file counts won't exceed usize"
+        )]
+        let max_expected = (total_compressed / target_bytes + 2) as usize;
+        assert!(
+            file_metas.len() <= max_expected,
+            "Too many files: got {} but total compressed is {}B with {}B target \
+             (expected at most {max_expected}). Files are being split on Arrow memory \
+             instead of compressed size. Sizes: {:?}",
+            file_metas.len(),
+            total_compressed,
+            target_bytes,
+            file_metas.iter().map(|m| m.size).collect::<Vec<_>>()
+        );
+
+        // Every file except the first should be reasonably sized. The first
+        // file may be smaller because the compression ratio is unknown until
+        // the first write completes.
+        for meta in file_metas.iter().skip(1) {
+            assert!(
+                meta.size > target_bytes / 4,
+                "File {} is {}B, far below target {}B — splitting on Arrow memory, not compressed size",
+                meta.location,
+                meta.size,
+                target_bytes
+            );
+        }
 
         Ok(())
     }
@@ -806,11 +952,6 @@ mod tests {
     ///
     /// Uses the full DataFusion pipeline: data is registered as a MemTable,
     /// then COPY TO with `PARTITIONED BY` writes through VortexSink.
-    ///
-    /// Per-partition math (after the partition column is stripped):
-    ///   - 1,572,864 Int64 values × 8 bytes = 12MB Arrow memory
-    ///   - 8MB target / 64KB per batch = 128 batches per file
-    ///   - 192 batches per partition → 1 full file + 1 partial = 2 files
     #[tokio::test]
     async fn test_file_splitting_partitioned_4_parts_12mb_each() -> anyhow::Result<()> {
         use datafusion::arrow::array::StringArray;
@@ -819,8 +960,9 @@ mod tests {
 
         let ctx = TestSessionContext::default();
 
+        let target_mb = 8_usize;
         let opts = VortexTableOptions {
-            target_file_size_mb: 8,
+            target_file_size_mb: target_mb,
             ..Default::default()
         };
         let factory = VortexFormatFactory::new().with_options(opts);
@@ -882,6 +1024,8 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await?;
 
+        let target_bytes = (target_mb * 1024 * 1024) as u64;
+
         // Verify partition directories and file counts.
         for part_name in &partition_names {
             let prefix = object_store::path::Path::from(format!("table/part={part_name}"));
@@ -897,15 +1041,17 @@ mod tests {
                 partition_files.len(),
                 partition_files
                     .iter()
-                    .map(|m| m.location.to_string())
+                    .map(|m| format!("{}: {}B", m.location, m.size))
                     .collect::<Vec<_>>()
             );
 
             for meta in &partition_files {
                 assert!(
-                    meta.size > 0,
-                    "File {} should have non-zero size",
-                    meta.location
+                    meta.size > target_bytes / 2,
+                    "File {} is {}B, expected > {}B (target/2)",
+                    meta.location,
+                    meta.size,
+                    target_bytes / 2
                 );
             }
         }
