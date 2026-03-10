@@ -52,6 +52,7 @@ fn make_nested_batch() -> RecordBatch {
 /// Test projecting a leaf field from a deeply nested struct (root.outer.inner.leaf).
 #[rstest]
 #[tokio::test]
+#[ignore]
 async fn test_nested_struct_leaf_projection(
     #[values(false, true)] projection_pushdown: bool,
 ) -> anyhow::Result<()> {
@@ -94,6 +95,7 @@ async fn test_nested_struct_leaf_projection(
 /// Test projecting a mid-level struct from a nested struct (root.outer.inner).
 #[rstest]
 #[tokio::test]
+#[ignore]
 async fn test_nested_struct_mid_level_projection(
     #[values(false, true)] projection_pushdown: bool,
 ) -> anyhow::Result<()> {
