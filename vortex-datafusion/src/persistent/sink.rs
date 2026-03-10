@@ -1660,6 +1660,549 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_insert_sql_target_size_multi_partition_source_single_write_id()
+    -> anyhow::Result<()> {
+        use datafusion::datasource::MemTable;
+
+        let ctx = TestSessionContext::default();
+
+        ctx.session
+            .sql(
+                "CREATE EXTERNAL TABLE my_tbl \
+                (a BIGINT NOT NULL) \
+                STORED AS vortex \
+                LOCATION 'table/' \
+                OPTIONS(target_file_size_mb '64');",
+            )
+            .await?;
+
+        let rows_per_partition = 300_000_usize;
+        let num_partitions = 8_usize;
+        let expected_total_rows = (rows_per_partition * num_partitions) as i64;
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+
+        let mut partitions: Vec<Vec<RecordBatch>> = Vec::new();
+        for p in 0..num_partitions {
+            let values = pseudo_random_i64s(rows_per_partition, (p * rows_per_partition) as i64);
+            partitions.push(vec![RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(values))],
+            )?]);
+        }
+
+        let source = MemTable::try_new(schema, partitions)?;
+        ctx.session.register_table("source", Arc::new(source))?;
+
+        ctx.session
+            .sql("INSERT INTO my_tbl SELECT a FROM source")
+            .await?
+            .collect()
+            .await?;
+
+        let all_files = ctx.store.list(None).try_collect::<Vec<_>>().await?;
+
+        let unique_write_ids: vortex_utils::aliases::hash_set::HashSet<_> = all_files
+            .iter()
+            .filter_map(|m| {
+                m.location
+                    .filename()
+                    .and_then(|name| name.split_once('_'))
+                    .map(|(prefix, _)| prefix.to_string())
+            })
+            .collect();
+
+        assert_eq!(
+            unique_write_ids.len(),
+            1,
+            "Expected one write_id, got {:?} from files: {:?}",
+            unique_write_ids,
+            all_files
+                .iter()
+                .map(|m| format!("{}: {}B", m.location, m.size))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            all_files.len() < num_partitions,
+            "Expected fewer files than input partitions; got {} files for {num_partitions} input partitions",
+            all_files.len()
+        );
+
+        let result = ctx
+            .session
+            .sql("SELECT COUNT(*) AS cnt FROM my_tbl")
+            .await?
+            .collect()
+            .await?;
+        let count = result[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(count, expected_total_rows, "Total row count mismatch");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_insert_sql_partitioned_target_size_multi_partition_source_single_write_id()
+    -> anyhow::Result<()> {
+        use datafusion::arrow::array::StringArray;
+        use datafusion::datasource::MemTable;
+
+        let ctx = TestSessionContext::default();
+
+        ctx.session
+            .sql(
+                "CREATE EXTERNAL TABLE my_tbl \
+                (part VARCHAR NOT NULL, val BIGINT NOT NULL) \
+                STORED AS vortex \
+                LOCATION 'table/' \
+                PARTITIONED BY (part) \
+                OPTIONS(target_file_size_mb '64');",
+            )
+            .await?;
+
+        let rows_per_partition = 150_000_usize;
+        let num_partitions = 8_usize;
+        let expected_total_rows = (rows_per_partition * num_partitions) as i64;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("part", DataType::Utf8, false),
+            Field::new("val", DataType::Int64, false),
+        ]));
+
+        let mut partitions: Vec<Vec<RecordBatch>> = Vec::new();
+        for p in 0..num_partitions {
+            let values = pseudo_random_i64s(rows_per_partition, (p * rows_per_partition) as i64);
+            let part_name = if p % 2 == 0 { "alpha" } else { "beta" };
+            let part_values: Vec<&str> = vec![part_name; rows_per_partition];
+
+            partitions.push(vec![RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(part_values)),
+                    Arc::new(Int64Array::from(values)),
+                ],
+            )?]);
+        }
+
+        let source = MemTable::try_new(schema, partitions)?;
+        ctx.session.register_table("source", Arc::new(source))?;
+
+        ctx.session
+            .sql("INSERT INTO my_tbl (part, val) SELECT part, val FROM source")
+            .await?
+            .collect()
+            .await?;
+
+        let all_files = ctx.store.list(None).try_collect::<Vec<_>>().await?;
+
+        let unique_write_ids: vortex_utils::aliases::hash_set::HashSet<_> = all_files
+            .iter()
+            .filter_map(|m| {
+                m.location
+                    .filename()
+                    .and_then(|name| name.split_once('_'))
+                    .map(|(prefix, _)| prefix.to_string())
+            })
+            .collect();
+
+        assert_eq!(
+            unique_write_ids.len(),
+            1,
+            "Expected one write_id for partitioned INSERT, got {:?} from files: {:?}",
+            unique_write_ids,
+            all_files
+                .iter()
+                .map(|m| format!("{}: {}B", m.location, m.size))
+                .collect::<Vec<_>>()
+        );
+
+        assert!(
+            all_files
+                .iter()
+                .any(|m| m.location.to_string().contains("part=alpha")),
+            "Expected partition directory part=alpha"
+        );
+        assert!(
+            all_files
+                .iter()
+                .any(|m| m.location.to_string().contains("part=beta")),
+            "Expected partition directory part=beta"
+        );
+
+        let result = ctx
+            .session
+            .sql("SELECT COUNT(*) AS cnt FROM my_tbl")
+            .await?
+            .collect()
+            .await?;
+        let count = result[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(count, expected_total_rows, "Total row count mismatch");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_insert_sql_streaming_source_single_write_id() -> anyhow::Result<()> {
+        use arrow_schema::SchemaRef;
+        use datafusion::catalog::streaming::StreamingTable;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use datafusion::physical_plan::streaming::PartitionStream;
+        use futures::stream;
+
+        #[derive(Debug)]
+        struct StaticPartitionStream {
+            schema: SchemaRef,
+            batch: RecordBatch,
+        }
+
+        impl PartitionStream for StaticPartitionStream {
+            fn schema(&self) -> &SchemaRef {
+                &self.schema
+            }
+
+            fn execute(
+                &self,
+                _ctx: Arc<datafusion::execution::TaskContext>,
+            ) -> datafusion::physical_plan::SendableRecordBatchStream {
+                let schema = Arc::clone(&self.schema);
+                let batch = self.batch.clone();
+                Box::pin(RecordBatchStreamAdapter::new(
+                    schema,
+                    stream::iter(vec![Ok(batch)]),
+                ))
+            }
+        }
+
+        let ctx = TestSessionContext::default();
+
+        ctx.session
+            .sql(
+                "CREATE EXTERNAL TABLE my_tbl \
+                (a BIGINT NOT NULL) \
+                STORED AS vortex \
+                LOCATION 'table/' \
+                OPTIONS(target_file_size_mb '64');",
+            )
+            .await?;
+
+        let rows_per_partition = 300_000_usize;
+        let num_partitions = 8_usize;
+        let expected_total_rows = (rows_per_partition * num_partitions) as i64;
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+
+        let mut partitions: Vec<Arc<dyn PartitionStream>> = Vec::new();
+        for p in 0..num_partitions {
+            let values = pseudo_random_i64s(rows_per_partition, (p * rows_per_partition) as i64);
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(values))])?;
+
+            partitions.push(Arc::new(StaticPartitionStream {
+                schema: schema.clone(),
+                batch,
+            }));
+        }
+
+        let source = StreamingTable::try_new(schema, partitions)?;
+        ctx.session
+            .register_table("source_stream", Arc::new(source))?;
+
+        ctx.session
+            .sql("INSERT INTO my_tbl SELECT a FROM source_stream")
+            .await?
+            .collect()
+            .await?;
+
+        let all_files = ctx.store.list(None).try_collect::<Vec<_>>().await?;
+
+        let unique_write_ids: vortex_utils::aliases::hash_set::HashSet<_> = all_files
+            .iter()
+            .filter_map(|m| {
+                m.location
+                    .filename()
+                    .and_then(|name| name.split_once('_'))
+                    .map(|(prefix, _)| prefix.to_string())
+            })
+            .collect();
+
+        assert_eq!(
+            unique_write_ids.len(),
+            1,
+            "Expected one write_id for streaming source insert, got {:?} from files: {:?}",
+            unique_write_ids,
+            all_files
+                .iter()
+                .map(|m| format!("{}: {}B", m.location, m.size))
+                .collect::<Vec<_>>()
+        );
+
+        let result = ctx
+            .session
+            .sql("SELECT COUNT(*) AS cnt FROM my_tbl")
+            .await?
+            .collect()
+            .await?;
+        let count = result[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(count, expected_total_rows, "Total row count mismatch");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_listing_table_direct_insert_into_streaming_exec_single_write_id()
+    -> anyhow::Result<()> {
+        use arrow_schema::SchemaRef;
+        use datafusion::physical_plan::ExecutionPlan;
+        use datafusion::physical_plan::collect;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use datafusion::physical_plan::streaming::PartitionStream;
+        use datafusion::physical_plan::streaming::StreamingTableExec;
+        use datafusion_expr::dml::InsertOp;
+        use futures::stream;
+
+        #[derive(Debug)]
+        struct StaticPartitionStream {
+            schema: SchemaRef,
+            batch: RecordBatch,
+        }
+
+        impl PartitionStream for StaticPartitionStream {
+            fn schema(&self) -> &SchemaRef {
+                &self.schema
+            }
+
+            fn execute(
+                &self,
+                _ctx: Arc<datafusion::execution::TaskContext>,
+            ) -> datafusion::physical_plan::SendableRecordBatchStream {
+                let schema = Arc::clone(&self.schema);
+                let batch = self.batch.clone();
+                Box::pin(RecordBatchStreamAdapter::new(
+                    schema,
+                    stream::iter(vec![Ok(batch)]),
+                ))
+            }
+        }
+
+        let ctx = TestSessionContext::default();
+
+        ctx.session
+            .sql(
+                "CREATE EXTERNAL TABLE my_tbl \
+                (a BIGINT NOT NULL) \
+                STORED AS vortex \
+                LOCATION 'table/' \
+                OPTIONS(target_file_size_mb '64');",
+            )
+            .await?;
+
+        let table_provider = ctx.session.table_provider("my_tbl").await?;
+
+        let rows_per_partition = 300_000_usize;
+        let num_partitions = 8_usize;
+        let expected_total_rows = (rows_per_partition * num_partitions) as i64;
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+
+        let mut partitions: Vec<Arc<dyn PartitionStream>> = Vec::new();
+        for p in 0..num_partitions {
+            let values = pseudo_random_i64s(rows_per_partition, (p * rows_per_partition) as i64);
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(values))])?;
+
+            partitions.push(Arc::new(StaticPartitionStream {
+                schema: schema.clone(),
+                batch,
+            }));
+        }
+
+        let input = Arc::new(StreamingTableExec::try_new(
+            schema,
+            partitions,
+            None,
+            Vec::new(),
+            false,
+            None,
+        )?) as Arc<dyn ExecutionPlan>;
+
+        let plan = table_provider
+            .insert_into(&ctx.session.state(), input, InsertOp::Append)
+            .await?;
+        let _count_batches = collect(plan, ctx.session.task_ctx()).await?;
+
+        let all_files = ctx.store.list(None).try_collect::<Vec<_>>().await?;
+
+        let unique_write_ids: vortex_utils::aliases::hash_set::HashSet<_> = all_files
+            .iter()
+            .filter_map(|m| {
+                m.location
+                    .filename()
+                    .and_then(|name| name.split_once('_'))
+                    .map(|(prefix, _)| prefix.to_string())
+            })
+            .collect();
+
+        assert_eq!(
+            unique_write_ids.len(),
+            1,
+            "Expected one write_id for direct insert_into streaming exec, got {:?} from files: {:?}",
+            unique_write_ids,
+            all_files
+                .iter()
+                .map(|m| format!("{}: {}B", m.location, m.size))
+                .collect::<Vec<_>>()
+        );
+
+        let result = ctx
+            .session
+            .sql("SELECT COUNT(*) AS cnt FROM my_tbl")
+            .await?
+            .collect()
+            .await?;
+        let count = result[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(count, expected_total_rows, "Total row count mismatch");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_listing_table_direct_insert_into_unbounded_streaming_exec_single_write_id()
+    -> anyhow::Result<()> {
+        use arrow_schema::SchemaRef;
+        use datafusion::physical_plan::ExecutionPlan;
+        use datafusion::physical_plan::collect;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use datafusion::physical_plan::streaming::PartitionStream;
+        use datafusion::physical_plan::streaming::StreamingTableExec;
+        use datafusion_expr::dml::InsertOp;
+        use futures::stream;
+
+        #[derive(Debug)]
+        struct StaticPartitionStream {
+            schema: SchemaRef,
+            batch: RecordBatch,
+        }
+
+        impl PartitionStream for StaticPartitionStream {
+            fn schema(&self) -> &SchemaRef {
+                &self.schema
+            }
+
+            fn execute(
+                &self,
+                _ctx: Arc<datafusion::execution::TaskContext>,
+            ) -> datafusion::physical_plan::SendableRecordBatchStream {
+                let schema = Arc::clone(&self.schema);
+                let batch = self.batch.clone();
+                Box::pin(RecordBatchStreamAdapter::new(
+                    schema,
+                    stream::iter(vec![Ok(batch)]),
+                ))
+            }
+        }
+
+        let ctx = TestSessionContext::default();
+
+        ctx.session
+            .sql(
+                "CREATE EXTERNAL TABLE my_tbl \
+                (a BIGINT NOT NULL) \
+                STORED AS vortex \
+                LOCATION 'table/' \
+                OPTIONS(target_file_size_mb '64');",
+            )
+            .await?;
+
+        let table_provider = ctx.session.table_provider("my_tbl").await?;
+
+        let rows_per_partition = 100_000_usize;
+        let num_partitions = 8_usize;
+        let expected_total_rows = (rows_per_partition * num_partitions) as i64;
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+
+        let mut partitions: Vec<Arc<dyn PartitionStream>> = Vec::new();
+        for p in 0..num_partitions {
+            let values = pseudo_random_i64s(rows_per_partition, (p * rows_per_partition) as i64);
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(values))])?;
+
+            partitions.push(Arc::new(StaticPartitionStream {
+                schema: schema.clone(),
+                batch,
+            }));
+        }
+
+        let input = Arc::new(StreamingTableExec::try_new(
+            schema,
+            partitions,
+            None,
+            Vec::new(),
+            true,
+            None,
+        )?) as Arc<dyn ExecutionPlan>;
+
+        let plan = table_provider
+            .insert_into(&ctx.session.state(), input, InsertOp::Append)
+            .await?;
+        let _count_batches = collect(plan, ctx.session.task_ctx()).await?;
+
+        let all_files = ctx.store.list(None).try_collect::<Vec<_>>().await?;
+
+        let unique_write_ids: vortex_utils::aliases::hash_set::HashSet<_> = all_files
+            .iter()
+            .filter_map(|m| {
+                m.location
+                    .filename()
+                    .and_then(|name| name.split_once('_'))
+                    .map(|(prefix, _)| prefix.to_string())
+            })
+            .collect();
+
+        assert_eq!(
+            unique_write_ids.len(),
+            1,
+            "Expected one write_id for unbounded streaming insert, got {:?} from files: {:?}",
+            unique_write_ids,
+            all_files
+                .iter()
+                .map(|m| format!("{}: {}B", m.location, m.size))
+                .collect::<Vec<_>>()
+        );
+
+        let result = ctx
+            .session
+            .sql("SELECT COUNT(*) AS cnt FROM my_tbl")
+            .await?
+            .collect()
+            .await?;
+        let count = result[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(count, expected_total_rows, "Total row count mismatch");
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_write_partitioned_with_null_partition_values_errors() -> anyhow::Result<()> {
         let ctx = TestSessionContext::default();
 
