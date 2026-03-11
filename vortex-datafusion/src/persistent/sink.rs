@@ -365,12 +365,12 @@ async fn write_partitioned_record_batch_stream_to_files(
 
     while let Some(batch) = data.next().await.transpose()? {
         let take_map = compute_take_arrays(&batch, partition_options.partition_by)?;
+        let batch_struct: StructArray = batch.clone().into();
 
         for (part_key, mut builder) in take_map {
             let take_indices = builder.finish();
-            let part_batch_struct: StructArray = batch.clone().into();
             let part_batch =
-                RecordBatch::from(take(&part_batch_struct, &take_indices, None)?.as_struct());
+                RecordBatch::from(take(&batch_struct, &take_indices, None)?.as_struct());
 
             let final_batch = if partition_options.keep_partition_by_columns {
                 part_batch
