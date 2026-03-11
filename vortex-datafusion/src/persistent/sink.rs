@@ -538,15 +538,25 @@ fn compute_take_arrays(
     batch: &RecordBatch,
     partition_by: &[(String, DataType)],
 ) -> DFResult<HashMap<Vec<String>, UInt64Builder>> {
-    let mut take_map: HashMap<Vec<String>, UInt64Builder> = HashMap::new();
-    let partition_columns: Vec<_> = partition_by
-        .iter()
-        .map(|(name, _)| {
-            batch.column_by_name(name).ok_or_else(|| {
-                exec_datafusion_err!("Partition column '{name}' does not exist in source data")
-            })
+            batch
+                .column_by_name(name)
+                .map(|array| (name.clone(), array.clone()))
+                .ok_or_else(|| {
+                    exec_datafusion_err!("Partition column '{name}' does not exist in source data")
+                })
         })
         .collect::<DFResult<_>>()?;
+
+    for row in 0..batch.num_rows() {
+        let mut part_key = Vec::with_capacity(partition_columns.len());
+        for (name, array) in &partition_columns {
+            if array.is_null(row) {
+                return Err(exec_datafusion_err!(
+                    "Partition column '{}' contains NULL value at row {}",
+                    name,
+                    row
+                ));
+            }
 
     for ((name, _), array) in partition_by.iter().zip(partition_columns.iter()) {
         let null_count = array.null_count();
