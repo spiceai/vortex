@@ -46,6 +46,7 @@ use vortex::io::VortexWrite;
 use vortex::io::object_store::ObjectStoreWrite;
 use vortex::session::VortexSession;
 use vortex_utils::aliases::hash_map::HashMap;
+use vortex_utils::aliases::hash_set::HashSet;
 
 struct WriteOutputOptions<'a> {
     base_output_path: &'a ListingTableUrl,
@@ -286,67 +287,82 @@ async fn write_record_batch_stream_to_files(
     let mut file_index = 0_usize;
     let mut compression_estimate = CompressionEstimate::identity();
 
-    while let Some(batch) = data.next().await.transpose()? {
-        if active_writer.is_none() {
-            let file_path = output_file_path(
-                output_options.base_output_path,
-                file_index,
-                output_options.extension,
-                single_file_output,
-                output_options.write_id,
-            );
-            active_writer = Some(start_file_writer(
-                &session,
-                object_store.clone(),
-                file_path,
-                dtype.clone(),
-                None,
-            ));
-        }
+    let write_result: DFResult<()> = async {
+        while let Some(batch) = data.next().await.transpose()? {
+            if active_writer.is_none() {
+                let file_path = output_file_path(
+                    output_options.base_output_path,
+                    file_index,
+                    output_options.extension,
+                    single_file_output,
+                    output_options.write_id,
+                );
+                active_writer = Some(start_file_writer(
+                    &session,
+                    object_store.clone(),
+                    file_path,
+                    dtype.clone(),
+                    None,
+                ));
+            }
 
-        let batch_bytes = batch_uncompressed_bytes(&batch)?;
-        let writer = active_writer
-            .as_mut()
-            .ok_or_else(|| exec_datafusion_err!("Missing active file writer for sink output"))?;
-        send_batch_to_active_writer(writer, batch).await?;
-        uncompressed_bytes_in_file = uncompressed_bytes_in_file
-            .checked_add(batch_bytes)
-            .ok_or_else(|| {
-                exec_datafusion_err!(
-                    "Uncompressed byte counter overflow for output file {}",
-                    writer.path
-                )
+            let batch_bytes = batch_uncompressed_bytes(&batch)?;
+            let writer = active_writer.as_mut().ok_or_else(|| {
+                exec_datafusion_err!("Missing active file writer for sink output")
             })?;
-
-        if let Some(target) = target {
-            let estimated_compressed =
-                compression_estimate.estimate_compressed_size(uncompressed_bytes_in_file)?;
-            if estimated_compressed >= target {
-                let writer = active_writer.take().ok_or_else(|| {
+            send_batch_to_active_writer(writer, batch).await?;
+            uncompressed_bytes_in_file = uncompressed_bytes_in_file
+                .checked_add(batch_bytes)
+                .ok_or_else(|| {
                     exec_datafusion_err!(
-                        "Missing active file writer while finalizing rotated output file"
+                        "Uncompressed byte counter overflow for output file {}",
+                        writer.path
                     )
                 })?;
-                let file_path = writer.path.clone();
-                let summary = finish_file_writer(writer).await?;
-                if uncompressed_bytes_in_file > 0 {
-                    compression_estimate = CompressionEstimate::from_file_sizes(
-                        summary.size(),
-                        uncompressed_bytes_in_file,
-                    )?;
-                }
 
-                results.push((file_path, summary));
-                uncompressed_bytes_in_file = 0;
-                file_index += 1;
+            if let Some(target) = target {
+                let estimated_compressed =
+                    compression_estimate.estimate_compressed_size(uncompressed_bytes_in_file)?;
+                if estimated_compressed >= target {
+                    let writer = active_writer.take().ok_or_else(|| {
+                        exec_datafusion_err!(
+                            "Missing active file writer while finalizing rotated output file"
+                        )
+                    })?;
+                    let file_path = writer.path.clone();
+                    let summary = finish_file_writer(writer).await?;
+                    if uncompressed_bytes_in_file > 0 {
+                        compression_estimate = CompressionEstimate::from_file_sizes(
+                            summary.size(),
+                            uncompressed_bytes_in_file,
+                        )?;
+                    }
+
+                    results.push((file_path, summary));
+                    uncompressed_bytes_in_file = 0;
+                    file_index += 1;
+                }
             }
         }
-    }
 
-    if let Some(writer) = active_writer {
-        let file_path = writer.path.clone();
-        let summary = finish_file_writer(writer).await?;
-        results.push((file_path, summary));
+        if let Some(writer) = active_writer.take() {
+            let file_path = writer.path.clone();
+            let summary = finish_file_writer(writer).await?;
+            results.push((file_path, summary));
+        }
+
+        Ok(())
+    }
+    .await;
+
+    if let Err(err) = write_result {
+        cleanup_failed_write(
+            object_store,
+            active_writer.into_iter().collect(),
+            results.iter().map(|(path, _)| path.clone()).collect(),
+        )
+        .await;
+        return Err(err);
     }
 
     Ok(results)
@@ -367,124 +383,144 @@ async fn write_partitioned_record_batch_stream_to_files(
     let mut states: HashMap<Vec<String>, PartitionState> = HashMap::new();
     let writer_slots = Arc::new(Semaphore::new(MAX_OPEN_PARTITION_WRITERS));
 
-    while let Some(batch) = data.next().await.transpose()? {
-        let take_map = compute_take_arrays(&batch, partition_options.partition_by)?;
-        let batch_struct: StructArray = batch.clone().into();
+    let write_result: DFResult<()> = async {
+        while let Some(batch) = data.next().await.transpose()? {
+            let take_map = compute_take_arrays(&batch, partition_options.partition_by)?;
+            // Convert the batch once per input batch and reuse for each partition's take.
+            let batch_struct: StructArray = batch.clone().into();
 
-        for (part_key, mut builder) in take_map {
-            let take_indices = builder.finish();
-            let part_batch =
-                RecordBatch::from(take(&batch_struct, &take_indices, None)?.as_struct());
+            for (part_key, mut builder) in take_map {
+                let take_indices = builder.finish();
+                let part_batch =
+                    RecordBatch::from(take(&batch_struct, &take_indices, None)?.as_struct());
 
-            let final_batch = if partition_options.keep_partition_by_columns {
-                part_batch
-            } else {
-                remove_partition_by_columns(&part_batch, partition_options.partition_by)?
-            };
-
-            states
-                .entry(part_key.clone())
-                .or_insert_with(PartitionState::new);
-
-            let needs_open_writer = states
-                .get(&part_key)
-                .ok_or_else(|| {
-                    exec_datafusion_err!("Missing partition state for key {:?}", part_key)
-                })?
-                .active_writer
-                .is_none();
-
-            if needs_open_writer {
-                let permit = loop {
-                    match writer_slots.clone().try_acquire_owned() {
-                        Ok(permit) => break permit,
-                        Err(TryAcquireError::NoPermits) => {
-                            evict_one_active_partition_writer(&mut states, &mut results).await?;
-                        }
-                        Err(TryAcquireError::Closed) => {
-                            return Err(exec_datafusion_err!(
-                                "Partition writer semaphore closed unexpectedly"
-                            ));
-                        }
-                    }
+                let final_batch = if partition_options.keep_partition_by_columns {
+                    part_batch
+                } else {
+                    remove_partition_by_columns(&part_batch, partition_options.partition_by)?
                 };
 
+                states
+                    .entry(part_key.clone())
+                    .or_insert_with(PartitionState::new);
+
+                let needs_open_writer = states
+                    .get(&part_key)
+                    .ok_or_else(|| {
+                        exec_datafusion_err!("Missing partition state for key {:?}", part_key)
+                    })?
+                    .active_writer
+                    .is_none();
+
+                if needs_open_writer {
+                    let permit = loop {
+                        match writer_slots.clone().try_acquire_owned() {
+                            Ok(permit) => break permit,
+                            Err(TryAcquireError::NoPermits) => {
+                                evict_one_active_partition_writer(&mut states, &mut results)
+                                    .await?;
+                            }
+                            Err(TryAcquireError::Closed) => {
+                                return Err(exec_datafusion_err!(
+                                    "Partition writer semaphore closed unexpectedly"
+                                ));
+                            }
+                        }
+                    };
+
+                    let state = states.get_mut(&part_key).ok_or_else(|| {
+                        exec_datafusion_err!("Missing partition state for key {:?}", part_key)
+                    })?;
+                    let file_path = partition_output_file_path(
+                        output_options.base_output_path,
+                        partition_options.partition_by,
+                        &part_key,
+                        state.file_index,
+                        output_options.extension,
+                        output_options.write_id,
+                    );
+                    state.active_writer = Some(start_file_writer(
+                        &session,
+                        object_store.clone(),
+                        file_path,
+                        dtype.clone(),
+                        Some(permit),
+                    ));
+                }
+
+                let batch_bytes = batch_uncompressed_bytes(&final_batch)?;
                 let state = states.get_mut(&part_key).ok_or_else(|| {
                     exec_datafusion_err!("Missing partition state for key {:?}", part_key)
                 })?;
-                let file_path = partition_output_file_path(
-                    output_options.base_output_path,
-                    partition_options.partition_by,
-                    &part_key,
-                    state.file_index,
-                    output_options.extension,
-                    output_options.write_id,
-                );
-                state.active_writer = Some(start_file_writer(
-                    &session,
-                    object_store.clone(),
-                    file_path,
-                    dtype.clone(),
-                    Some(permit),
-                ));
-            }
-
-            let batch_bytes = batch_uncompressed_bytes(&final_batch)?;
-            let state = states.get_mut(&part_key).ok_or_else(|| {
-                exec_datafusion_err!("Missing partition state for key {:?}", part_key)
-            })?;
-            let writer = state.active_writer.as_mut().ok_or_else(|| {
-                exec_datafusion_err!(
-                    "Missing active partition writer for partition key {:?}",
-                    part_key
-                )
-            })?;
-            send_batch_to_active_writer(writer, final_batch).await?;
-            state.uncompressed_bytes_in_file = state
-                .uncompressed_bytes_in_file
-                .checked_add(batch_bytes)
-                .ok_or_else(|| {
+                let writer = state.active_writer.as_mut().ok_or_else(|| {
                     exec_datafusion_err!(
-                        "Uncompressed byte counter overflow for partition key {:?}",
+                        "Missing active partition writer for partition key {:?}",
                         part_key
                     )
                 })?;
-
-            if let Some(target) = target {
-                let estimated_compressed = state
-                    .compression_estimate
-                    .estimate_compressed_size(state.uncompressed_bytes_in_file)?;
-
-                if estimated_compressed >= target {
-                    let writer = state.active_writer.take().ok_or_else(|| {
+                send_batch_to_active_writer(writer, final_batch).await?;
+                state.uncompressed_bytes_in_file = state
+                    .uncompressed_bytes_in_file
+                    .checked_add(batch_bytes)
+                    .ok_or_else(|| {
                         exec_datafusion_err!(
-                            "Missing active partition writer while rotating partition file"
+                            "Uncompressed byte counter overflow for partition key {:?}",
+                            part_key
                         )
                     })?;
-                    let file_path = writer.path.clone();
-                    let summary = finish_file_writer(writer).await?;
 
-                    if state.uncompressed_bytes_in_file > 0 {
-                        state.compression_estimate = CompressionEstimate::from_file_sizes(
-                            summary.size(),
-                            state.uncompressed_bytes_in_file,
-                        )?;
+                if let Some(target) = target {
+                    let estimated_compressed = state
+                        .compression_estimate
+                        .estimate_compressed_size(state.uncompressed_bytes_in_file)?;
+
+                    if estimated_compressed >= target {
+                        let writer = state.active_writer.take().ok_or_else(|| {
+                            exec_datafusion_err!(
+                                "Missing active partition writer while rotating partition file"
+                            )
+                        })?;
+                        let file_path = writer.path.clone();
+                        let summary = finish_file_writer(writer).await?;
+
+                        if state.uncompressed_bytes_in_file > 0 {
+                            state.compression_estimate = CompressionEstimate::from_file_sizes(
+                                summary.size(),
+                                state.uncompressed_bytes_in_file,
+                            )?;
+                        }
+
+                        results.push((file_path, summary));
+                        state.uncompressed_bytes_in_file = 0;
+                        state.file_index += 1;
                     }
-
-                    results.push((file_path, summary));
-                    state.uncompressed_bytes_in_file = 0;
-                    state.file_index += 1;
                 }
             }
         }
-    }
 
-    for (_part_key, mut state) in states {
-        if let Some(writer) = state.active_writer.take() {
-            let file_path = writer.path.clone();
-            let summary = finish_file_writer(writer).await?;
-            results.push((file_path, summary));
+        for (_part_key, mut state) in std::mem::take(&mut states) {
+            if let Some(writer) = state.active_writer.take() {
+                let file_path = writer.path.clone();
+                let summary = finish_file_writer(writer).await?;
+                results.push((file_path, summary));
+            }
         }
+
+        Ok(())
+    }
+    .await;
+
+    if let Err(err) = write_result {
+        cleanup_failed_write(
+            object_store,
+            states
+                .into_values()
+                .filter_map(|mut state| state.active_writer.take())
+                .collect(),
+            results.iter().map(|(path, _)| path.clone()).collect(),
+        )
+        .await;
+        return Err(err);
     }
 
     Ok(results)
@@ -688,6 +724,30 @@ fn start_file_writer(
         sender,
         task,
         _permit: permit,
+    }
+}
+
+async fn cleanup_failed_write(
+    object_store: Arc<dyn ObjectStore>,
+    active_writers: Vec<ActiveFileWriter>,
+    finished_paths: Vec<Path>,
+) {
+    let mut cleanup_paths = HashSet::new();
+
+    for writer in active_writers {
+        cleanup_paths.insert(writer.path.clone());
+        writer.task.abort();
+        drop(writer.task.await);
+    }
+
+    for path in finished_paths {
+        cleanup_paths.insert(path);
+    }
+
+    for path in cleanup_paths {
+        if let Err(e) = object_store.delete(&path).await {
+            tracing::warn!(path = %path, error = %e, "Failed to delete sink output during error cleanup");
+        }
     }
 }
 
