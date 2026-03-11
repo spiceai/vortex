@@ -35,6 +35,7 @@ use datafusion_datasource::source::DataSourceExec;
 use datafusion_expr::dml::InsertOp;
 use datafusion_physical_expr::LexRequirement;
 use datafusion_physical_plan::ExecutionPlan;
+use datafusion_physical_plan::ExecutionPlanProperties;
 use datafusion_physical_plan::Partitioning;
 use datafusion_physical_plan::repartition::RepartitionExec;
 use futures::FutureExt;
@@ -530,15 +531,14 @@ impl FileFormat for VortexFormat {
         // Force a single input stream so VortexSink performs one coordinated
         // write per statement instead of one independent write per CPU/input
         // partition, which would create many small `*_00000` files.
-        let input: Arc<dyn ExecutionPlan> =
-            if input.output_partitioning().partition_count() > 1 {
-                Arc::new(RepartitionExec::try_new(
-                    input,
-                    Partitioning::RoundRobinBatch(1),
-                )?)
-            } else {
-                input
-            };
+        let input: Arc<dyn ExecutionPlan> = if input.output_partitioning().partition_count() > 1 {
+            Arc::new(RepartitionExec::try_new(
+                input,
+                Partitioning::RoundRobinBatch(1),
+            )?)
+        } else {
+            input
+        };
 
         let schema = conf.output_schema().clone();
         let sink = Arc::new(VortexSink::new(

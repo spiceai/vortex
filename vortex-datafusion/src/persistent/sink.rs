@@ -159,8 +159,11 @@ impl VortexSink {
         }
     }
 
-    fn base_output_path(&self) -> &ListingTableUrl {
-        &self.config.table_paths[0]
+    fn base_output_path(&self) -> DFResult<&ListingTableUrl> {
+        self.config
+            .table_paths
+            .first()
+            .ok_or_else(|| exec_datafusion_err!("Vortex sink requires at least one table path"))
     }
 }
 
@@ -208,6 +211,7 @@ impl DataSink for VortexSink {
         let writer_schema = get_writer_schema(&self.config);
         let dtype = DType::from_arrow(writer_schema);
         let write_id = Uuid::new_v4().simple().to_string();
+        let base_output_path = self.base_output_path()?;
 
         let summaries = if self.config.table_partition_cols.is_empty() {
             write_record_batch_stream_to_files(
@@ -216,7 +220,7 @@ impl DataSink for VortexSink {
                 dtype,
                 data,
                 &WriteOutputOptions {
-                    base_output_path: self.base_output_path(),
+                    base_output_path,
                     target_file_size: self.target_file_size,
                     extension: &self.config.file_extension,
                     write_id: &write_id,
@@ -230,7 +234,7 @@ impl DataSink for VortexSink {
                 dtype,
                 data,
                 &WriteOutputOptions {
-                    base_output_path: self.base_output_path(),
+                    base_output_path,
                     target_file_size: self.target_file_size,
                     extension: &self.config.file_extension,
                     write_id: &write_id,
@@ -543,6 +547,15 @@ fn compute_take_arrays(
             })
         })
         .collect::<DFResult<_>>()?;
+
+    for ((name, _), array) in partition_by.iter().zip(partition_columns.iter()) {
+        let null_count = array.null_count();
+        if null_count > 0 {
+            return Err(exec_datafusion_err!(
+                "Partition column '{name}' contains null values ({null_count} nulls), which is not allowed for partitioned writes"
+            ));
+        }
+    }
 
     for row in 0..batch.num_rows() {
         let mut part_key = Vec::with_capacity(partition_columns.len());
@@ -1204,7 +1217,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_take_arrays_with_null_partition_values() -> anyhow::Result<()> {
+    fn test_compute_take_arrays_with_null_partition_values_errors() -> anyhow::Result<()> {
         use datafusion::arrow::array::Int32Array;
         use datafusion::arrow::array::StringArray;
 
@@ -1226,13 +1239,8 @@ mod tests {
             ("bucket".to_string(), DataType::Int32),
         ];
 
-        let groups = compute_take_arrays(&batch, &partition_by)?;
-        let total_indices: usize = groups
-            .into_values()
-            .map(|mut builder| builder.finish().len())
-            .sum();
-
-        assert_eq!(total_indices, batch.num_rows());
+        let err = compute_take_arrays(&batch, &partition_by).unwrap_err();
+        assert!(err.to_string().contains("contains null values"));
 
         Ok(())
     }
