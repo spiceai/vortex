@@ -261,9 +261,10 @@ impl DataSink for VortexSink {
 
 /// Write batches from a single input stream to one or more output files.
 ///
-/// For collection paths, files are emitted as `part-00000.{extension}` and so on.
+/// For collection paths, files are emitted using the `{write_id}_{file_index:05}.{extension}`
+/// naming scheme as produced by the underlying writer implementation.
 /// For a single-file path, the original target path is used unless rolling is needed,
-/// in which case numbered variants are produced.
+/// in which case additional files follow the same naming scheme.
 async fn write_record_batch_stream_to_files(
     session: VortexSession,
     object_store: Arc<dyn ObjectStore>,
