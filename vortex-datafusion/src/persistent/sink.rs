@@ -1319,8 +1319,8 @@ mod tests {
     /// via COPY TO with a 16MB target file size. Verifies that exactly 4 files
     /// are produced and each file's compressed size is approximately 16MB.
     ///
-    /// This exercises the complete write path including the DataFusion demuxer
-    /// and VortexSink, unlike a direct `write_stream_to_files` call.
+    /// This exercises the complete COPY TO write path through DataFusion and
+    /// VortexSink, unlike a direct `write_stream_to_files` call.
     #[tokio::test]
     async fn test_file_splitting_62mb_into_4_files() -> anyhow::Result<()> {
         use datafusion::datasource::MemTable;
