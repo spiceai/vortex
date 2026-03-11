@@ -30,6 +30,9 @@ use futures::SinkExt;
 use futures::StreamExt;
 use object_store::ObjectStore;
 use object_store::path::Path;
+use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::Semaphore;
+use tokio::sync::TryAcquireError;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 use vortex::array::ArrayRef;
@@ -111,6 +114,27 @@ struct ActiveFileWriter {
     path: Path,
     sender: futures::channel::mpsc::Sender<RecordBatch>,
     task: JoinHandle<DFResult<WriteSummary>>,
+    _permit: Option<OwnedSemaphorePermit>,
+}
+
+const MAX_OPEN_PARTITION_WRITERS: usize = 32;
+
+struct PartitionState {
+    active_writer: Option<ActiveFileWriter>,
+    uncompressed_bytes_in_file: u64,
+    file_index: usize,
+    compression_estimate: CompressionEstimate,
+}
+
+impl PartitionState {
+    fn new() -> Self {
+        Self {
+            active_writer: None,
+            uncompressed_bytes_in_file: 0,
+            file_index: 0,
+            compression_estimate: CompressionEstimate::identity(),
+        }
+    }
 }
 
 pub struct VortexSink {
@@ -271,6 +295,7 @@ async fn write_record_batch_stream_to_files(
                 object_store.clone(),
                 file_path,
                 dtype.clone(),
+                None,
             ));
         }
 
@@ -333,26 +358,9 @@ async fn write_partitioned_record_batch_stream_to_files(
 ) -> DFResult<Vec<(Path, WriteSummary)>> {
     let target = output_options.target_file_size.map(|t| t.max(1));
 
-    struct PartitionState {
-        active_writer: Option<ActiveFileWriter>,
-        uncompressed_bytes_in_file: u64,
-        file_index: usize,
-        compression_estimate: CompressionEstimate,
-    }
-
-    impl PartitionState {
-        fn new() -> Self {
-            Self {
-                active_writer: None,
-                uncompressed_bytes_in_file: 0,
-                file_index: 0,
-                compression_estimate: CompressionEstimate::identity(),
-            }
-        }
-    }
-
     let mut results: Vec<(Path, WriteSummary)> = Vec::new();
     let mut states: HashMap<Vec<String>, PartitionState> = HashMap::new();
+    let writer_slots = Arc::new(Semaphore::new(MAX_OPEN_PARTITION_WRITERS));
 
     while let Some(batch) = data.next().await.transpose()? {
         let take_map = compute_take_arrays(&batch, partition_options.partition_by)?;
@@ -369,10 +377,36 @@ async fn write_partitioned_record_batch_stream_to_files(
                 remove_partition_by_columns(&part_batch, partition_options.partition_by)?
             };
 
-            let state = states
+            states
                 .entry(part_key.clone())
                 .or_insert_with(PartitionState::new);
-            if state.active_writer.is_none() {
+
+            let needs_open_writer = states
+                .get(&part_key)
+                .ok_or_else(|| {
+                    exec_datafusion_err!("Missing partition state for key {:?}", part_key)
+                })?
+                .active_writer
+                .is_none();
+
+            if needs_open_writer {
+                let permit = loop {
+                    match writer_slots.clone().try_acquire_owned() {
+                        Ok(permit) => break permit,
+                        Err(TryAcquireError::NoPermits) => {
+                            evict_one_active_partition_writer(&mut states, &mut results).await?;
+                        }
+                        Err(TryAcquireError::Closed) => {
+                            return Err(exec_datafusion_err!(
+                                "Partition writer semaphore closed unexpectedly"
+                            ));
+                        }
+                    }
+                };
+
+                let state = states.get_mut(&part_key).ok_or_else(|| {
+                    exec_datafusion_err!("Missing partition state for key {:?}", part_key)
+                })?;
                 let file_path = partition_output_file_path(
                     output_options.base_output_path,
                     partition_options.partition_by,
@@ -386,10 +420,14 @@ async fn write_partitioned_record_batch_stream_to_files(
                     object_store.clone(),
                     file_path,
                     dtype.clone(),
+                    Some(permit),
                 ));
             }
 
             let batch_bytes = batch_uncompressed_bytes(&final_batch)?;
+            let state = states.get_mut(&part_key).ok_or_else(|| {
+                exec_datafusion_err!("Missing partition state for key {:?}", part_key)
+            })?;
             let writer = state.active_writer.as_mut().ok_or_else(|| {
                 exec_datafusion_err!(
                     "Missing active partition writer for partition key {:?}",
@@ -445,6 +483,50 @@ async fn write_partitioned_record_batch_stream_to_files(
     }
 
     Ok(results)
+}
+
+async fn evict_one_active_partition_writer(
+    states: &mut HashMap<Vec<String>, PartitionState>,
+    results: &mut Vec<(Path, WriteSummary)>,
+) -> DFResult<()> {
+    let evict_key = states
+        .iter()
+        .find_map(|(key, state)| state.active_writer.as_ref().map(|_| key.clone()))
+        .ok_or_else(|| {
+            exec_datafusion_err!(
+                "Writer capacity exhausted but no active partition writer was available for eviction"
+            )
+        })?;
+
+    let state = states
+        .get_mut(&evict_key)
+        .ok_or_else(|| exec_datafusion_err!("Missing partition state for key {:?}", evict_key))?;
+
+    let writer = state.active_writer.take().ok_or_else(|| {
+        exec_datafusion_err!(
+            "Expected active partition writer for key {:?} during eviction",
+            evict_key
+        )
+    })?;
+
+    let file_path = writer.path.clone();
+    let summary = finish_file_writer(writer).await?;
+
+    if state.uncompressed_bytes_in_file > 0 {
+        state.compression_estimate =
+            CompressionEstimate::from_file_sizes(summary.size(), state.uncompressed_bytes_in_file)?;
+    }
+
+    state.uncompressed_bytes_in_file = 0;
+    state.file_index = state.file_index.checked_add(1).ok_or_else(|| {
+        exec_datafusion_err!(
+            "File index overflow while evicting partition writer for key {:?}",
+            evict_key
+        )
+    })?;
+
+    results.push((file_path, summary));
+    Ok(())
 }
 
 fn compute_take_arrays(
@@ -542,6 +624,7 @@ fn start_file_writer(
     object_store: Arc<dyn ObjectStore>,
     path: Path,
     dtype: DType,
+    permit: Option<OwnedSemaphorePermit>,
 ) -> ActiveFileWriter {
     // Use a small bounded channel to enforce backpressure and avoid unbounded buffering.
     let (sender, receiver) = futures::channel::mpsc::channel::<RecordBatch>(1);
@@ -576,7 +659,12 @@ fn start_file_writer(
         Ok(summary)
     });
 
-    ActiveFileWriter { path, sender, task }
+    ActiveFileWriter {
+        path,
+        sender,
+        task,
+        _permit: permit,
+    }
 }
 
 async fn send_batch_to_active_writer(
@@ -2340,6 +2428,91 @@ mod tests {
         assert!(
             err.to_string().contains("contains null values"),
             "Expected NULL partition insert to fail loudly; got: {err}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_partition_writer_cap_preserves_all_rows() -> anyhow::Result<()> {
+        use datafusion::arrow::array::StringArray;
+        use datafusion::datasource::MemTable;
+        use datafusion_datasource::file_format::format_as_file_type;
+
+        let ctx = TestSessionContext::default();
+
+        let opts = VortexTableOptions {
+            // Disable size-based splitting so writer eviction is the only reason files roll.
+            target_file_size_mb: 0,
+            ..Default::default()
+        };
+        let factory = VortexFormatFactory::new().with_options(opts);
+
+        let num_partitions = super::MAX_OPEN_PARTITION_WRITERS + 84;
+        let rounds = 3_usize;
+        let expected_total_rows = i64::try_from(num_partitions * rounds)?;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("part", DataType::Utf8, false),
+            Field::new("val", DataType::Int64, false),
+        ]));
+
+        // Build interleaved batches so many partitions are active over time,
+        // forcing repeated writer eviction/re-open under the cap.
+        let mut batches = Vec::new();
+        for round in 0..rounds {
+            let mut parts = Vec::with_capacity(num_partitions);
+            let mut vals = Vec::with_capacity(num_partitions);
+            for p in 0..num_partitions {
+                parts.push(format!("p{p:03}"));
+                vals.push(i64::try_from(round * num_partitions + p)?);
+            }
+
+            batches.push(RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(parts)),
+                    Arc::new(Int64Array::from(vals)),
+                ],
+            )?);
+        }
+
+        let table = MemTable::try_new(schema, vec![batches])?;
+        ctx.session.register_table("source", Arc::new(table))?;
+
+        let source = ctx.session.table("source").await?;
+        let logical_plan = LogicalPlanBuilder::copy_to(
+            source.logical_plan().clone(),
+            "/table/".to_string(),
+            format_as_file_type(Arc::new(factory)),
+            Default::default(),
+            vec!["part".to_string()],
+        )?
+        .build()?;
+
+        ctx.session
+            .execute_logical_plan(logical_plan)
+            .await?
+            .collect()
+            .await?;
+
+        let result = ctx
+            .session
+            .sql("SELECT COUNT(*) AS cnt FROM '/table/'")
+            .await?
+            .collect()
+            .await?;
+
+        let count = result[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+
+        assert_eq!(
+            count, expected_total_rows,
+            "Total row count mismatch with partition writer cap"
         );
 
         Ok(())
