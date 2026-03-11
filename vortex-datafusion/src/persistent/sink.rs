@@ -26,9 +26,11 @@ use datafusion_execution::TaskContext;
 use datafusion_physical_plan::DisplayAs;
 use datafusion_physical_plan::DisplayFormatType;
 use datafusion_physical_plan::metrics::MetricsSet;
+use futures::SinkExt;
 use futures::StreamExt;
 use object_store::ObjectStore;
 use object_store::path::Path;
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 use vortex::array::ArrayRef;
 use vortex::array::arrow::FromArrowArray;
@@ -52,6 +54,63 @@ struct WriteOutputOptions<'a> {
 struct PartitionWriteOptions<'a> {
     partition_by: &'a [(String, DataType)],
     keep_partition_by_columns: bool,
+}
+
+#[derive(Clone, Copy)]
+struct CompressionEstimate {
+    compressed_bytes: u64,
+    uncompressed_bytes: u64,
+}
+
+impl CompressionEstimate {
+    fn identity() -> Self {
+        Self {
+            compressed_bytes: 1,
+            uncompressed_bytes: 1,
+        }
+    }
+
+    fn from_file_sizes(compressed_bytes: u64, uncompressed_bytes: u64) -> DFResult<Self> {
+        if uncompressed_bytes == 0 {
+            return Err(exec_datafusion_err!(
+                "Cannot derive compression estimate from zero uncompressed bytes"
+            ));
+        }
+
+        Ok(Self {
+            compressed_bytes,
+            uncompressed_bytes,
+        })
+    }
+
+    fn estimate_compressed_size(self, uncompressed_bytes: u64) -> DFResult<u64> {
+        if self.uncompressed_bytes == 0 {
+            return Err(exec_datafusion_err!(
+                "Compression estimate denominator must be non-zero"
+            ));
+        }
+
+        let estimated = u128::from(uncompressed_bytes)
+            .checked_mul(u128::from(self.compressed_bytes))
+            .ok_or_else(|| {
+                exec_datafusion_err!(
+                    "Compressed size estimate overflow for {} * {}",
+                    uncompressed_bytes,
+                    self.compressed_bytes
+                )
+            })?
+            / u128::from(self.uncompressed_bytes);
+
+        u64::try_from(estimated).map_err(|_| {
+            exec_datafusion_err!("Compressed size estimate does not fit in u64: {estimated}")
+        })
+    }
+}
+
+struct ActiveFileWriter {
+    path: Path,
+    sender: futures::channel::mpsc::Sender<RecordBatch>,
+    task: JoinHandle<DFResult<WriteSummary>>,
 }
 
 pub struct VortexSink {
@@ -162,7 +221,13 @@ impl DataSink for VortexSink {
 
         let mut row_count = 0_u64;
         for (path, summary) in summaries {
-            row_count += summary.row_count();
+            row_count = row_count.checked_add(summary.row_count()).ok_or_else(|| {
+                exec_datafusion_err!(
+                    "Row count overflow while aggregating sink summaries (current={}, file={})",
+                    row_count,
+                    summary.row_count()
+                )
+            })?;
             tracing::info!(path = %path, "Successfully written file");
         }
 
@@ -187,65 +252,70 @@ async fn write_record_batch_stream_to_files(
         && output_options.base_output_path.file_extension().is_some();
 
     let mut results: Vec<(Path, WriteSummary)> = Vec::new();
-    let mut buffered_batches: Vec<RecordBatch> = Vec::new();
-    let mut buffered_bytes = 0_u64;
+    let mut active_writer: Option<ActiveFileWriter> = None;
+    let mut uncompressed_bytes_in_file = 0_u64;
     let mut file_index = 0_usize;
-    let mut compression_ratio = 1.0_f64;
+    let mut compression_estimate = CompressionEstimate::identity();
 
     while let Some(batch) = data.next().await.transpose()? {
-        buffered_bytes = buffered_bytes.saturating_add(batch.get_array_memory_size() as u64);
-        buffered_batches.push(batch);
+        if active_writer.is_none() {
+            let file_path = output_file_path(
+                output_options.base_output_path,
+                file_index,
+                output_options.extension,
+                single_file_output,
+                output_options.write_id,
+            );
+            active_writer = Some(start_file_writer(
+                &session,
+                object_store.clone(),
+                file_path,
+                dtype.clone(),
+            ));
+        }
+
+        let batch_bytes = batch_uncompressed_bytes(&batch)?;
+        let writer = active_writer
+            .as_mut()
+            .ok_or_else(|| exec_datafusion_err!("Missing active file writer for sink output"))?;
+        send_batch_to_active_writer(writer, batch).await?;
+        uncompressed_bytes_in_file = uncompressed_bytes_in_file
+            .checked_add(batch_bytes)
+            .ok_or_else(|| {
+                exec_datafusion_err!(
+                    "Uncompressed byte counter overflow for output file {}",
+                    writer.path
+                )
+            })?;
 
         if let Some(target) = target {
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "file sizes won't exceed u64::MAX"
-            )]
-            let estimated_compressed = (buffered_bytes as f64 * compression_ratio) as u64;
+            let estimated_compressed =
+                compression_estimate.estimate_compressed_size(uncompressed_bytes_in_file)?;
             if estimated_compressed >= target {
-                let file_path = output_file_path(
-                    output_options.base_output_path,
-                    file_index,
-                    output_options.extension,
-                    single_file_output,
-                    output_options.write_id,
-                );
-                let summary = write_batches(
-                    &session,
-                    object_store.clone(),
-                    file_path.clone(),
-                    dtype.clone(),
-                    std::mem::take(&mut buffered_batches),
-                )
-                .await?;
-
-                if buffered_bytes > 0 {
-                    compression_ratio = summary.size() as f64 / buffered_bytes as f64;
+                let writer = active_writer.take().ok_or_else(|| {
+                    exec_datafusion_err!(
+                        "Missing active file writer while finalizing rotated output file"
+                    )
+                })?;
+                let file_path = writer.path.clone();
+                let summary = finish_file_writer(writer).await?;
+                if uncompressed_bytes_in_file > 0 {
+                    compression_estimate = CompressionEstimate::from_file_sizes(
+                        summary.size(),
+                        uncompressed_bytes_in_file,
+                    )?;
                 }
 
                 results.push((file_path, summary));
-                buffered_bytes = 0;
+                uncompressed_bytes_in_file = 0;
                 file_index += 1;
             }
         }
     }
 
-    if !buffered_batches.is_empty() {
-        let file_path = output_file_path(
-            output_options.base_output_path,
-            file_index,
-            output_options.extension,
-            single_file_output,
-            output_options.write_id,
-        );
-        let summary = write_batches(
-            &session,
-            object_store,
-            file_path.clone(),
-            dtype,
-            buffered_batches,
-        )
-        .await?;
+    if let Some(writer) = active_writer {
+        let file_path = writer.path.clone();
+        let summary = finish_file_writer(writer).await?;
         results.push((file_path, summary));
     }
 
@@ -264,19 +334,19 @@ async fn write_partitioned_record_batch_stream_to_files(
     let target = output_options.target_file_size.map(|t| t.max(1));
 
     struct PartitionState {
-        buffered_batches: Vec<RecordBatch>,
-        buffered_bytes: u64,
+        active_writer: Option<ActiveFileWriter>,
+        uncompressed_bytes_in_file: u64,
         file_index: usize,
-        compression_ratio: f64,
+        compression_estimate: CompressionEstimate,
     }
 
     impl PartitionState {
         fn new() -> Self {
             Self {
-                buffered_batches: Vec::new(),
-                buffered_bytes: 0,
+                active_writer: None,
+                uncompressed_bytes_in_file: 0,
                 file_index: 0,
-                compression_ratio: 1.0,
+                compression_estimate: CompressionEstimate::identity(),
             }
         }
     }
@@ -302,72 +372,76 @@ async fn write_partitioned_record_batch_stream_to_files(
             let state = states
                 .entry(part_key.clone())
                 .or_insert_with(PartitionState::new);
-            state.buffered_bytes = state
-                .buffered_bytes
-                .saturating_add(final_batch.get_array_memory_size() as u64);
-            state.buffered_batches.push(final_batch);
+            if state.active_writer.is_none() {
+                let file_path = partition_output_file_path(
+                    output_options.base_output_path,
+                    partition_options.partition_by,
+                    &part_key,
+                    state.file_index,
+                    output_options.extension,
+                    output_options.write_id,
+                );
+                state.active_writer = Some(start_file_writer(
+                    &session,
+                    object_store.clone(),
+                    file_path,
+                    dtype.clone(),
+                ));
+            }
+
+            let batch_bytes = batch_uncompressed_bytes(&final_batch)?;
+            let writer = state.active_writer.as_mut().ok_or_else(|| {
+                exec_datafusion_err!(
+                    "Missing active partition writer for partition key {:?}",
+                    part_key
+                )
+            })?;
+            send_batch_to_active_writer(writer, final_batch).await?;
+            state.uncompressed_bytes_in_file = state
+                .uncompressed_bytes_in_file
+                .checked_add(batch_bytes)
+                .ok_or_else(|| {
+                    exec_datafusion_err!(
+                        "Uncompressed byte counter overflow for partition key {:?}",
+                        part_key
+                    )
+                })?;
 
             if let Some(target) = target {
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "file sizes won't exceed u64::MAX"
-                )]
-                let estimated_compressed =
-                    (state.buffered_bytes as f64 * state.compression_ratio) as u64;
+                let estimated_compressed = state
+                    .compression_estimate
+                    .estimate_compressed_size(state.uncompressed_bytes_in_file)?;
 
                 if estimated_compressed >= target {
-                    let file_path = partition_output_file_path(
-                        output_options.base_output_path,
-                        partition_options.partition_by,
-                        &part_key,
-                        state.file_index,
-                        output_options.extension,
-                        output_options.write_id,
-                    );
-                    let summary = write_batches(
-                        &session,
-                        object_store.clone(),
-                        file_path.clone(),
-                        dtype.clone(),
-                        std::mem::take(&mut state.buffered_batches),
-                    )
-                    .await?;
+                    let writer = state.active_writer.take().ok_or_else(|| {
+                        exec_datafusion_err!(
+                            "Missing active partition writer while rotating partition file"
+                        )
+                    })?;
+                    let file_path = writer.path.clone();
+                    let summary = finish_file_writer(writer).await?;
 
-                    if state.buffered_bytes > 0 {
-                        state.compression_ratio =
-                            summary.size() as f64 / state.buffered_bytes as f64;
+                    if state.uncompressed_bytes_in_file > 0 {
+                        state.compression_estimate = CompressionEstimate::from_file_sizes(
+                            summary.size(),
+                            state.uncompressed_bytes_in_file,
+                        )?;
                     }
 
                     results.push((file_path, summary));
-                    state.buffered_bytes = 0;
+                    state.uncompressed_bytes_in_file = 0;
                     state.file_index += 1;
                 }
             }
         }
     }
 
-    for (part_key, mut state) in states {
-        if state.buffered_batches.is_empty() {
-            continue;
+    for (_part_key, mut state) in states {
+        if let Some(writer) = state.active_writer.take() {
+            let file_path = writer.path.clone();
+            let summary = finish_file_writer(writer).await?;
+            results.push((file_path, summary));
         }
-
-        let file_path = partition_output_file_path(
-            output_options.base_output_path,
-            partition_options.partition_by,
-            &part_key,
-            state.file_index,
-            output_options.extension,
-            output_options.write_id,
-        );
-        let summary = write_batches(
-            &session,
-            object_store.clone(),
-            file_path.clone(),
-            dtype.clone(),
-            std::mem::take(&mut state.buffered_batches),
-        )
-        .await?;
-        results.push((file_path, summary));
     }
 
     Ok(results)
@@ -396,7 +470,9 @@ fn compute_take_arrays(
             part_key.push(value);
         }
         let builder = take_map.entry(part_key).or_default();
-        builder.append_value(row as u64);
+        let row_index = u64::try_from(row)
+            .map_err(|_| exec_datafusion_err!("Row index does not fit in u64: {row}"))?;
+        builder.append_value(row_index);
     }
 
     Ok(take_map)
@@ -461,37 +537,78 @@ fn numbered_path(original: &Path, index: usize, extension: &str) -> Path {
         Path::from(format!("{s}_{index:05}.{extension}"))
     }
 }
-/// Write a set of [`RecordBatch`]es to a single Vortex file at `path`.
-async fn write_batches(
+fn start_file_writer(
     session: &VortexSession,
     object_store: Arc<dyn ObjectStore>,
     path: Path,
     dtype: DType,
-    batches: Vec<RecordBatch>,
-) -> DFResult<WriteSummary> {
-    let stream = futures::stream::iter(
-        batches
-            .into_iter()
-            .map(|rb| ArrayRef::from_arrow(rb, false)),
-    );
-    let stream_adapter = ArrayStreamAdapter::new(dtype, stream);
+) -> ActiveFileWriter {
+    // Use a small bounded channel to enforce backpressure and avoid unbounded buffering.
+    let (sender, receiver) = futures::channel::mpsc::channel::<RecordBatch>(1);
+    let session = session.clone();
+    let path_for_task = path.clone();
 
-    let mut object_writer = ObjectStoreWrite::new(object_store, &path)
-        .await
-        .map_err(|e| exec_datafusion_err!("Failed to create ObjectStoreWrite: {e}"))?;
+    let task = tokio::spawn(async move {
+        let mut object_writer = ObjectStoreWrite::new(object_store, &path_for_task)
+            .await
+            .map_err(|e| {
+                exec_datafusion_err!(
+                    "Failed to create ObjectStoreWrite for '{}': {e}",
+                    path_for_task
+                )
+            })?;
 
-    let summary = session
-        .write_options()
-        .write(&mut object_writer, stream_adapter)
-        .await
-        .map_err(|e| exec_datafusion_err!("Failed to write Vortex file: {e}"))?;
+        let stream = receiver.map(|rb| ArrayRef::from_arrow(rb, false));
+        let stream_adapter = ArrayStreamAdapter::new(dtype, stream);
 
-    object_writer
-        .shutdown()
-        .await
-        .map_err(|e| exec_datafusion_err!("Failed to shutdown Vortex writer: {e}"))?;
+        let summary = session
+            .write_options()
+            .write(&mut object_writer, stream_adapter)
+            .await
+            .map_err(|e| {
+                exec_datafusion_err!("Failed to write Vortex file '{}': {e}", path_for_task)
+            })?;
 
-    Ok(summary)
+        object_writer.shutdown().await.map_err(|e| {
+            exec_datafusion_err!("Failed to shutdown Vortex writer '{}': {e}", path_for_task)
+        })?;
+
+        Ok(summary)
+    });
+
+    ActiveFileWriter { path, sender, task }
+}
+
+async fn send_batch_to_active_writer(
+    writer: &mut ActiveFileWriter,
+    batch: RecordBatch,
+) -> DFResult<()> {
+    writer.sender.send(batch).await.map_err(|e| {
+        exec_datafusion_err!(
+            "Failed to send batch to active writer for '{}': {e}",
+            writer.path
+        )
+    })
+}
+
+async fn finish_file_writer(mut writer: ActiveFileWriter) -> DFResult<WriteSummary> {
+    writer.sender.close_channel();
+    match writer.task.await {
+        Ok(result) => result,
+        Err(e) => Err(exec_datafusion_err!(
+            "Vortex writer task for '{}' failed to join: {e}",
+            writer.path
+        )),
+    }
+}
+
+fn batch_uncompressed_bytes(batch: &RecordBatch) -> DFResult<u64> {
+    u64::try_from(batch.get_array_memory_size()).map_err(|_| {
+        exec_datafusion_err!(
+            "RecordBatch memory size does not fit in u64: {}",
+            batch.get_array_memory_size()
+        )
+    })
 }
 
 /// Build the output path for a rolling write.
@@ -1178,7 +1295,7 @@ mod tests {
             file_metas.iter().map(|m| m.size).collect::<Vec<_>>()
         );
 
-        let target_bytes = (target_mb * 1024 * 1024) as u64;
+        let target_bytes = u64::try_from(target_mb * 1024 * 1024)?;
         for meta in &file_metas {
             assert!(
                 meta.size > target_bytes / 2,
@@ -1282,15 +1399,11 @@ mod tests {
         // The buggy code produces many tiny files because it splits on Arrow
         // memory (32MB / 1MB = 32 files) instead of compressed size (~4MB / 1MB = 4 files).
         let total_compressed: u64 = file_metas.iter().map(|m| m.size).sum();
-        let target_bytes = (target_mb * 1024 * 1024) as u64;
+        let target_bytes = u64::try_from(target_mb * 1024 * 1024)?;
 
         // We should have at most ~(total_compressed / target) + 1 files, not
         // ~(arrow_memory / target) files.
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "file counts won't exceed usize"
-        )]
-        let max_expected = (total_compressed / target_bytes + 2) as usize;
+        let max_expected = usize::try_from(total_compressed / target_bytes + 2)?;
         assert!(
             file_metas.len() <= max_expected,
             "Too many files: got {} but total compressed is {}B with {}B target \
@@ -1395,7 +1508,7 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await?;
 
-        let target_bytes = (target_mb * 1024 * 1024) as u64;
+        let target_bytes = u64::try_from(target_mb * 1024 * 1024)?;
 
         // Verify partition directories and file counts.
         for part_name in &partition_names {
