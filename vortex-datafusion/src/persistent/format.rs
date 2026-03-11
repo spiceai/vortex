@@ -36,8 +36,7 @@ use datafusion_expr::dml::InsertOp;
 use datafusion_physical_expr::LexRequirement;
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::ExecutionPlanProperties;
-use datafusion_physical_plan::Partitioning;
-use datafusion_physical_plan::repartition::RepartitionExec;
+use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use futures::FutureExt;
 use futures::StreamExt as _;
 use futures::TryStreamExt as _;
@@ -100,8 +99,9 @@ config_namespace! {
         pub footer_initial_read_size_bytes: usize, default = DEFAULT_FOOTER_INITIAL_READ_SIZE_BYTES
         /// Target file size in megabytes for written Vortex files.
         ///
-        /// When greater than 0, Vortex bypasses DataFusion's file demuxer and
-        /// splits output files based on approximate byte size rather than row count.
+        /// When greater than 0 for non-partitioned writes, Vortex bypasses
+        /// DataFusion's file demuxer and splits output files based on
+        /// approximate byte size rather than row count.
         pub target_file_size_mb: usize, default = DEFAULT_TARGET_FILE_SIZE_MB
         /// Whether to enable projection pushdown into the underlying Vortex scan.
         ///
@@ -527,15 +527,19 @@ impl FileFormat for VortexFormat {
             })
             .transpose()?;
 
-        // DataSinkExec requires a single input partition at execution time.
-        // Force a single input stream so VortexSink performs one coordinated
-        // write per statement instead of one independent write per CPU/input
-        // partition, which would create many small `*_00000` files.
-        let input: Arc<dyn ExecutionPlan> = if input.output_partitioning().partition_count() > 1 {
-            Arc::new(RepartitionExec::try_new(
-                input,
-                Partitioning::RoundRobinBatch(1),
-            )?)
+        // For non-partitioned writes, force a single input stream so VortexSink
+        // performs one coordinated write per statement instead of one
+        // independent write per CPU/input partition.
+        //
+        // Use coalescing rather than repartitioning to avoid introducing a
+        // shuffle/dispatcher step that can interleave batches from different
+        // input partitions.
+        //
+        // For partitioned writes, keep DataFusion's demuxer behavior.
+        let input: Arc<dyn ExecutionPlan> = if conf.table_partition_cols.is_empty()
+            && input.output_partitioning().partition_count() > 1
+        {
+            Arc::new(CoalescePartitionsExec::new(input))
         } else {
             input
         };
