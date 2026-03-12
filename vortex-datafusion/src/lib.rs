@@ -48,3 +48,85 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod common_tests {
+    use std::sync::Arc;
+    use std::sync::LazyLock;
+
+    use datafusion::arrow::array::RecordBatch;
+    use datafusion::datasource::provider::DefaultTableFactory;
+    use datafusion::execution::SessionStateBuilder;
+    use datafusion::prelude::SessionContext;
+    use datafusion_common::GetExt;
+    use object_store::ObjectStore;
+    use object_store::memory::InMemory;
+    use url::Url;
+    use vortex::VortexSessionDefault;
+    use vortex::array::ArrayRef;
+    use vortex::array::arrow::FromArrowArray;
+    use vortex::file::WriteOptionsSessionExt;
+    use vortex::io::ObjectStoreWriter;
+    use vortex::io::VortexWrite;
+    use vortex::session::VortexSession;
+
+    use crate::VortexFormatFactory;
+    use crate::VortexOptions;
+
+    static VX_SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::default);
+
+    pub struct TestSessionContext {
+        pub store: Arc<dyn ObjectStore>,
+        pub session: SessionContext,
+    }
+
+    impl Default for TestSessionContext {
+        fn default() -> Self {
+            Self::new(false)
+        }
+    }
+
+    impl TestSessionContext {
+        /// Create a new test session context with the given projection pushdown setting.
+        pub fn new(projection_pushdown: bool) -> Self {
+            let store = Arc::new(InMemory::new());
+            let opts = VortexOptions {
+                projection_pushdown,
+                ..Default::default()
+            };
+            let factory = Arc::new(VortexFormatFactory::new().with_options(opts));
+            let mut session_state_builder = SessionStateBuilder::new()
+                .with_default_features()
+                .with_table_factory(
+                    factory.get_ext().to_uppercase(),
+                    Arc::new(DefaultTableFactory::new()),
+                )
+                .with_object_store(&Url::try_from("file://").unwrap(), store.clone());
+
+            if let Some(file_formats) = session_state_builder.file_formats() {
+                file_formats.push(factory as _);
+            }
+
+            let session: SessionContext =
+                SessionContext::new_with_state(session_state_builder.build()).enable_url_table();
+
+            Self { store, session }
+        }
+
+        /// Write arrow data into a vortex file.
+        pub async fn write_arrow_batch<P>(&self, path: P, batch: &RecordBatch) -> anyhow::Result<()>
+        where
+            P: Into<object_store::path::Path>,
+        {
+            let array = ArrayRef::from_arrow(batch, false);
+            let mut write = ObjectStoreWriter::new(self.store.clone(), &path.into()).await?;
+            VX_SESSION
+                .write_options()
+                .write(&mut write, array.to_array_stream())
+                .await?;
+            write.shutdown().await?;
+
+            Ok(())
+        }
+    }
+}
