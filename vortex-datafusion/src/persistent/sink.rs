@@ -505,14 +505,19 @@ mod tests {
     use datafusion::logical_expr::LogicalPlanBuilder;
     use datafusion::logical_expr::Values;
     use datafusion_common::ScalarValue;
+    use datafusion_common::exec_datafusion_err;
     use datafusion_datasource::ListingTableUrl;
     use datafusion_datasource::file_format::format_as_file_type;
     use futures::TryStreamExt;
     use rstest::rstest;
+    use tokio::sync::oneshot;
+    use tokio::time::Duration;
 
     use crate::common_tests::TestSessionContext;
     use crate::persistent::VortexFormatFactory;
     use crate::persistent::VortexTableOptions;
+    use crate::persistent::sink::ActiveFileWriter;
+    use crate::persistent::sink::finish_file_writer;
 
     fn split_path(
         base_path: &object_store::path::Path,
@@ -856,6 +861,52 @@ mod tests {
             output_file_path(&collection, 3, "vortex", false, "wid").to_string(),
             "tmp/table/wid_00003.vortex"
         );
+    }
+
+    #[tokio::test]
+    async fn test_finish_file_writer_waits_for_task_completion() -> anyhow::Result<()> {
+        let (sender, receiver) = futures::channel::mpsc::channel::<RecordBatch>(1);
+        drop(receiver);
+
+        let (gate_tx, gate_rx) = oneshot::channel::<()>();
+
+        let writer = ActiveFileWriter {
+            path: object_store::path::Path::from("table/pending.vortex"),
+            sender,
+            task: tokio::spawn(async move {
+                let _ = gate_rx.await;
+                Err(exec_datafusion_err!(
+                    "synthetic writer failure after completion gate"
+                ))
+            }),
+        };
+
+        let mut finish_fut = Box::pin(finish_file_writer(writer));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut finish_fut)
+                .await
+                .is_err(),
+            "finish_file_writer returned before writer task completed"
+        );
+
+        gate_tx
+            .send(())
+            .map_err(|_| anyhow::anyhow!("failed to release writer completion gate in test"))?;
+
+        let err = match finish_fut.await {
+            Ok(_) => {
+                return Err(anyhow::anyhow!(
+                    "finish_file_writer unexpectedly succeeded after gate release"
+                ));
+            }
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("synthetic writer failure"),
+            "unexpected error: {err}"
+        );
+
+        Ok(())
     }
 
     #[test]
