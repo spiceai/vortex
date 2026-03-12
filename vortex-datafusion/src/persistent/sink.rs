@@ -49,15 +49,15 @@ struct WriteOutputOptions<'a> {
 
 #[derive(Clone, Copy)]
 struct CompressionEstimate {
-    compressed_bytes: u64,
-    uncompressed_bytes: u64,
+    prev_compressed_bytes: u64,
+    prev_uncompressed_bytes: u64,
 }
 
 impl CompressionEstimate {
     fn identity() -> Self {
         Self {
-            compressed_bytes: 1,
-            uncompressed_bytes: 1,
+            prev_compressed_bytes: 1,
+            prev_uncompressed_bytes: 1,
         }
     }
 
@@ -69,28 +69,28 @@ impl CompressionEstimate {
         }
 
         Ok(Self {
-            compressed_bytes,
-            uncompressed_bytes,
+            prev_compressed_bytes: compressed_bytes,
+            prev_uncompressed_bytes: uncompressed_bytes,
         })
     }
 
     fn estimate_compressed_size(self, uncompressed_bytes: u64) -> DFResult<u64> {
-        if self.uncompressed_bytes == 0 {
+        if self.prev_uncompressed_bytes == 0 {
             return Err(exec_datafusion_err!(
                 "Compression estimate denominator must be non-zero"
             ));
         }
 
         let estimated = u128::from(uncompressed_bytes)
-            .checked_mul(u128::from(self.compressed_bytes))
+            .checked_mul(u128::from(self.prev_compressed_bytes))
             .ok_or_else(|| {
                 exec_datafusion_err!(
                     "Compressed size estimate overflow for {} * {}",
                     uncompressed_bytes,
-                    self.compressed_bytes
+                    self.prev_compressed_bytes
                 )
             })?
-            / u128::from(self.uncompressed_bytes);
+            / u128::from(self.prev_uncompressed_bytes);
 
         u64::try_from(estimated).map_err(|_| {
             exec_datafusion_err!("Compressed size estimate does not fit in u64: {estimated}")
@@ -177,7 +177,7 @@ impl DataSink for VortexSink {
             .object_store(&self.config.object_store_url)?;
         let writer_schema = get_writer_schema(&self.config);
         let dtype = DType::from_arrow(writer_schema);
-        let write_id = Uuid::new_v4().simple().to_string();
+        let write_id = Uuid::now_v7().simple().to_string();
         let base_output_path = self.base_output_path()?;
         let partition_column_names = self
             .config
@@ -211,7 +211,7 @@ impl DataSink for VortexSink {
                     summary.row_count()
                 )
             })?;
-            tracing::info!(path = %path, "Successfully written file");
+            tracing::debug!(path = %path, "Successfully written file");
         }
 
         Ok(row_count)
