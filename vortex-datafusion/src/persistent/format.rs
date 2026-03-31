@@ -17,6 +17,7 @@ use datafusion_common::Result as DFResult;
 use datafusion_common::Statistics;
 use datafusion_common::config::ConfigField;
 use datafusion_common::config_namespace;
+use datafusion_common::internal_datafusion_err;
 use datafusion_common::not_impl_err;
 use datafusion_common::parsers::CompressionTypeVariant;
 use datafusion_common::stats::Precision;
@@ -33,6 +34,8 @@ use datafusion_datasource::source::DataSourceExec;
 use datafusion_expr::dml::InsertOp;
 use datafusion_physical_expr::LexRequirement;
 use datafusion_physical_plan::ExecutionPlan;
+use datafusion_physical_plan::ExecutionPlanProperties;
+use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use futures::FutureExt;
 use futures::StreamExt as _;
 use futures::TryStreamExt as _;
@@ -64,6 +67,7 @@ use crate::PrecisionExt as _;
 use crate::convert::TryToDataFusion;
 
 const DEFAULT_FOOTER_INITIAL_READ_SIZE_BYTES: usize = MAX_POSTSCRIPT_SIZE as usize + EOF_SIZE;
+const DEFAULT_TARGET_FILE_SIZE_MB: usize = 128;
 
 /// Vortex implementation of a DataFusion [`FileFormat`].
 pub struct VortexFormat {
@@ -96,6 +100,24 @@ config_namespace! {
         /// Values smaller than `MAX_POSTSCRIPT_SIZE + EOF_SIZE` will be clamped to that minimum
         /// during footer parsing.
         pub footer_initial_read_size_bytes: usize, default = DEFAULT_FOOTER_INITIAL_READ_SIZE_BYTES
+        /// Target file size in megabytes for written Vortex files.
+        ///
+        /// When greater than 0 for non-partitioned writes, Vortex bypasses
+        /// DataFusion's file demuxer and splits output files based on
+        /// approximate byte size rather than row count.
+        pub target_file_size_mb: usize, default = DEFAULT_TARGET_FILE_SIZE_MB
+        /// Whether to enable projection pushdown into the underlying Vortex scan.
+        ///
+        /// When enabled, projection expressions may be partially evaluated during
+        /// the scan. When disabled, Vortex reads only the referenced columns and
+        /// all expressions are evaluated after the scan.
+        pub projection_pushdown: bool, default = false
+        /// The intra-partition scan concurrency, controlling the number of row splits to process
+        /// concurrently per-thread within each file.
+        ///
+        /// This does not affect the overall parallelism
+        /// across partitions, which is controlled by DataFusion's execution configuration.
+        pub scan_concurrency: Option<usize>, default = None
     }
 }
 
@@ -417,8 +439,42 @@ impl FileFormat for VortexFormat {
             return not_impl_err!("Overwrites are not implemented yet for Vortex");
         }
 
+        let target_file_size = (self.opts.target_file_size_mb > 0)
+            .then(|| {
+                u64::try_from(self.opts.target_file_size_mb)
+                    .map_err(|e| {
+                        internal_datafusion_err!(
+                            "target_file_size_mb cannot be represented as u64: {e}"
+                        )
+                    })
+                    .map(|v| v.saturating_mul(1024 * 1024).max(1))
+            })
+            .transpose()?;
+
+        // For non-partitioned writes, force a single input stream so VortexSink
+        // performs one coordinated write per statement instead of one
+        // independent write per CPU/input partition.
+        //
+        // Use coalescing rather than repartitioning to avoid introducing a
+        // shuffle/dispatcher step that can interleave batches from different
+        // input partitions.
+        //
+        // For partitioned writes, keep DataFusion's demuxer behavior.
+        let input: Arc<dyn ExecutionPlan> = if conf.table_partition_cols.is_empty()
+            && input.output_partitioning().partition_count() > 1
+        {
+            Arc::new(CoalescePartitionsExec::new(input))
+        } else {
+            input
+        };
+
         let schema = conf.output_schema().clone();
-        let sink = Arc::new(VortexSink::new(conf, schema, self.session.clone()));
+        let sink = Arc::new(VortexSink::new(
+            conf,
+            schema,
+            self.session.clone(),
+            target_file_size,
+        ));
 
         Ok(Arc::new(DataSinkExec::new(input, sink, order_requirements)) as _)
     }
