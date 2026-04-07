@@ -239,8 +239,9 @@ fn constant_list_scalar_contains(
     let elements = list_scalar.elements().vortex_expect("non null");
 
     let len = values.len();
-    let mut result: Option<ArrayRef> = None;
     let false_scalar = Scalar::bool(false, nullability);
+    let values = values.to_array();
+    let mut partials = Vec::with_capacity(elements.len());
 
     for element in elements {
         let res = Binary
@@ -249,17 +250,39 @@ fn constant_list_scalar_contains(
                 Operator::Eq,
                 [
                     ConstantArray::new(element, len).into_array(),
-                    values.to_array(),
+                    values.clone(),
                 ],
             )?
             .fill_null(false_scalar.clone())?;
-        if let Some(acc) = result {
-            result = Some(acc.binary(res, Operator::Or)?)
-        } else {
-            result = Some(res);
-        }
+        partials.push(res);
     }
-    Ok(result.unwrap_or_else(|| ConstantArray::new(false_scalar, len).to_array()))
+
+    if partials.is_empty() {
+        return Ok(ConstantArray::new(false_scalar, len).to_array());
+    }
+
+    or_arrays_balanced(partials)
+}
+
+fn or_arrays_balanced(mut arrays: Vec<ArrayRef>) -> VortexResult<ArrayRef> {
+    debug_assert!(!arrays.is_empty());
+
+    while arrays.len() > 1 {
+        let mut next = Vec::with_capacity(arrays.len().div_ceil(2));
+        let mut i = 0;
+        while i + 1 < arrays.len() {
+            next.push(arrays[i].binary(arrays[i + 1].clone(), Operator::Or)?);
+            i += 2;
+        }
+        if i < arrays.len() {
+            next.push(arrays[i].clone());
+        }
+        arrays = next;
+    }
+
+    Ok(arrays
+        .pop()
+        .expect("or_arrays_balanced must be called with at least one array"))
 }
 
 /// Returns a [`BoolArray`] where each bit represents if a list contains the scalar.
@@ -428,6 +451,8 @@ fn list_is_not_empty(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+
+    use super::or_arrays_balanced;
 
     use itertools::Itertools;
     use rstest::rstest;
@@ -786,6 +811,44 @@ mod tests {
         let contains = list_array.apply(&expr).unwrap();
         assert!(contains.is::<ConstantVTable>(), "Expected constant result");
         let expected = BoolArray::from_iter([true, true]);
+        assert_arrays_eq!(contains, expected);
+    }
+
+    fn array_depth(array: &dyn Array) -> usize {
+        1 + (0..array.nchildren())
+            .filter_map(|idx| array.nth_child(idx))
+            .map(|child| array_depth(child.as_ref()))
+            .max()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn test_or_arrays_balanced_depth() {
+        let arrays = vec![
+            BoolArray::from_iter([true, false]).into_array(),
+            BoolArray::from_iter([false, true]).into_array(),
+            BoolArray::from_iter([false, false]).into_array(),
+            BoolArray::from_iter([true, true]).into_array(),
+            BoolArray::from_iter([true, false]).into_array(),
+        ];
+
+        let result = or_arrays_balanced(arrays).unwrap();
+        assert_eq!(array_depth(result.as_ref()), 4);
+    }
+
+    #[test]
+    fn test_constant_list_large_regression() {
+        let list_scalar = Scalar::list(
+            Arc::new(DType::Primitive(I32, Nullability::NonNullable)),
+            (0i32..2048).map(Into::into).collect(),
+            Nullability::NonNullable,
+        );
+
+        let values = PrimitiveArray::from_iter(0i32..2048).into_array();
+        let expr = list_contains(lit(list_scalar), root());
+        let contains = values.apply(&expr).unwrap();
+
+        let expected = BoolArray::from_iter(std::iter::repeat_n(true, 2048));
         assert_arrays_eq!(contains, expected);
     }
 
