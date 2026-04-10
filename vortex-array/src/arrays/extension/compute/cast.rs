@@ -127,10 +127,7 @@ fn cast_date_values_to_timestamp(
         }
     }
 
-    Ok(PrimitiveArray::new(
-        output.freeze(),
-        values.validity()?,
-    ))
+    Ok(PrimitiveArray::new(output.freeze(), values.validity()?))
 }
 
 fn date_to_timestamp_scale(

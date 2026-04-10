@@ -1514,8 +1514,10 @@ mod tests {
         let mut partitions: Vec<Arc<dyn PartitionStream>> = Vec::new();
         for p in 0..num_partitions {
             let values = pseudo_random_i64s(rows_per_partition, (p * rows_per_partition) as i64);
-            let batch =
-                RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int64Array::from(values))])?;
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(values))],
+            )?;
 
             partitions.push(Arc::new(StaticPartitionStream {
                 schema: Arc::clone(&schema),
@@ -1631,8 +1633,10 @@ mod tests {
         let mut partitions: Vec<Arc<dyn PartitionStream>> = Vec::new();
         for p in 0..num_partitions {
             let values = pseudo_random_i64s(rows_per_partition, (p * rows_per_partition) as i64);
-            let batch =
-                RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int64Array::from(values))])?;
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(values))],
+            )?;
 
             partitions.push(Arc::new(StaticPartitionStream {
                 schema: Arc::clone(&schema),
@@ -1752,8 +1756,10 @@ mod tests {
         let mut partitions: Vec<Arc<dyn PartitionStream>> = Vec::new();
         for p in 0..num_partitions {
             let values = pseudo_random_i64s(rows_per_partition, (p * rows_per_partition) as i64);
-            let batch =
-                RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int64Array::from(values))])?;
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(values))],
+            )?;
 
             partitions.push(Arc::new(StaticPartitionStream {
                 schema: Arc::clone(&schema),

@@ -60,11 +60,17 @@ jobs:
           sccache: s3
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-prebuild
-      # Use uvx for ruff to avoid building the Rust extension (saves ~4.5 min)
+      - name: Install uv
+        if: github.repository != 'vortex-data/vortex'
+        uses: spiraldb/actions/.github/actions/setup-uv@0.18.5
+        with:
+          sync: false
+          prune-cache: false
+      # Use uv tool run for ruff to avoid building the Rust extension (saves ~4.5 min)
       - name: Python Lint - Format
-        run: uvx ruff format --check .
+        run: uv tool run ruff format --check .
       - name: Python Lint - Ruff
-        run: uvx ruff check .
+        run: uv tool run ruff check .
       # PyRight needs the project for type information, so use uv run
       - name: Python Lint - PyRight
         env:
@@ -293,10 +299,14 @@ jobs:
           sccache: s3
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-prebuild
+      - name: Install cargo-hack
+        if: github.repository != 'vortex-data/vortex'
+        shell: bash
+        run: command -v cargo-hack >/dev/null || cargo install --locked cargo-hack
       - name: Rust Lint - Clippy No Default Features
         shell: bash
         run: |
-          cargo hack --no-dev-deps --ignore-private clippy --profile ci --no-default-features -- -D warnings
+          cargo hack --ignore-private clippy --profile ci --no-default-features -- -D warnings
 
   public-api:
     name: "Public API lock files"
