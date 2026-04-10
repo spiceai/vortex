@@ -5,29 +5,25 @@ use vortex_error::VortexResult;
 
 use crate::ArrayRef;
 use crate::IntoArray;
+use crate::array::ArrayView;
+use crate::arrays::ListView;
 use crate::arrays::ListViewArray;
-use crate::arrays::ListViewVTable;
+use crate::arrays::listview::ListViewArrayExt;
 use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
 use crate::scalar_fn::fns::cast::CastReduce;
-use crate::vtable::ValidityHelper;
 
-impl CastReduce for ListViewVTable {
-    fn cast(array: &ListViewArray, dtype: &DType) -> VortexResult<Option<ArrayRef>> {
+impl CastReduce for ListView {
+    fn cast(array: ArrayView<'_, ListView>, dtype: &DType) -> VortexResult<Option<ArrayRef>> {
         // Check if we're casting to a `List` type.
         let Some(target_element_type) = dtype.as_list_element_opt() else {
             return Ok(None);
         };
 
         // Cast the elements to the target element type.
-        let new_elements = array
-            .elements()
-            .cast((**target_element_type).clone())?
-            .to_canonical()?
-            .into_array();
+        let new_elements = array.elements().cast((**target_element_type).clone())?;
         let validity = array
-            .validity()
-            .clone()
+            .validity()?
             .cast_nullability(dtype.nullability(), array.len())?;
 
         // SAFETY: Since `cast` is length-preserving, all of the invariants remain the same.

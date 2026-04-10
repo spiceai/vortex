@@ -4,18 +4,16 @@
 #![allow(clippy::unwrap_used)]
 
 use divan::Bencher;
-use rand::Rng;
+use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use vortex_array::Array;
 use vortex_array::IntoArray;
 use vortex_array::arrays::PrimitiveArray;
-use vortex_array::compute::warm_up_vtables;
 use vortex_buffer::Buffer;
+use vortex_runend::RunEnd;
 use vortex_runend::RunEndArray;
 
 fn main() {
-    warm_up_vtables();
     divan::main();
 }
 
@@ -70,5 +68,5 @@ fn fixture(n: usize, run_step: usize, valid_density: f64) -> RunEndArray {
     )
     .into_array();
 
-    RunEndArray::new(ends, values)
+    RunEnd::new(ends, values)
 }

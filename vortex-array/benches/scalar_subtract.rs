@@ -4,7 +4,7 @@
 #![allow(clippy::unwrap_used)]
 
 use divan::Bencher;
-use rand::Rng;
+use rand::RngExt;
 use rand::SeedableRng;
 use rand::distr::Uniform;
 use rand::rngs::StdRng;
@@ -44,7 +44,7 @@ fn scalar_subtract(bencher: Bencher) {
         .with_inputs(|| (&chunked, LEGACY_SESSION.create_execution_ctx()))
         .bench_refs(|(chunked, ctx)| {
             chunked
-                .to_array()
+                .clone()
                 .binary(
                     ConstantArray::new(
                         vortex_array::scalar::Scalar::from(to_subtract),

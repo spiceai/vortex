@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use vortex_array::Array;
 use vortex_array::ArrayRef;
+use vortex_array::ArrayView;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::ToCanonical;
-use vortex_array::arrays::TakeExecute;
+use vortex_array::arrays::dict::TakeExecute;
 use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::Nullability;
 use vortex_array::expr::stats::Stat;
@@ -15,16 +15,18 @@ use vortex_array::scalar::Scalar;
 use vortex_error::VortexResult;
 use vortex_error::vortex_panic;
 
-use crate::DateTimePartsArray;
-use crate::DateTimePartsVTable;
-
-fn take_datetime_parts(array: &DateTimePartsArray, indices: &dyn Array) -> VortexResult<ArrayRef> {
+use crate::DateTimeParts;
+use crate::array::DateTimePartsArrayExt;
+fn take_datetime_parts(
+    array: ArrayView<DateTimeParts>,
+    indices: &ArrayRef,
+) -> VortexResult<ArrayRef> {
     // we go ahead and canonicalize here to avoid worst-case canonicalizing 3 separate times
     let indices = indices.to_primitive();
 
-    let taken_days = array.days().take(indices.to_array())?;
-    let taken_seconds = array.seconds().take(indices.to_array())?;
-    let taken_subseconds = array.subseconds().take(indices.to_array())?;
+    let taken_days = array.days().take(indices.clone().into_array())?;
+    let taken_seconds = array.seconds().take(indices.clone().into_array())?;
+    let taken_subseconds = array.subseconds().take(indices.clone().into_array())?;
 
     // Update the dtype if the nullability changed due to nullable indices
     let dtype = if taken_days.dtype().is_nullable() != array.dtype().is_nullable() {
@@ -36,13 +38,10 @@ fn take_datetime_parts(array: &DateTimePartsArray, indices: &dyn Array) -> Vorte
     };
 
     if !taken_seconds.dtype().is_nullable() && !taken_subseconds.dtype().is_nullable() {
-        return Ok(DateTimePartsArray::try_new(
-            dtype,
-            taken_days,
-            taken_seconds,
-            taken_subseconds,
-        )?
-        .into_array());
+        return Ok(
+            DateTimeParts::try_new(dtype, taken_days, taken_seconds, taken_subseconds)?
+                .into_array(),
+        );
     }
 
     // DateTimePartsArray requires seconds and subseconds to be non-nullable.
@@ -79,16 +78,13 @@ fn take_datetime_parts(array: &DateTimePartsArray, indices: &dyn Array) -> Vorte
         .cast(array.subseconds().dtype())?;
     let taken_subseconds = taken_subseconds.fill_null(subseconds_fill)?;
 
-    Ok(
-        DateTimePartsArray::try_new(dtype, taken_days, taken_seconds, taken_subseconds)?
-            .into_array(),
-    )
+    Ok(DateTimeParts::try_new(dtype, taken_days, taken_seconds, taken_subseconds)?.into_array())
 }
 
-impl TakeExecute for DateTimePartsVTable {
+impl TakeExecute for DateTimeParts {
     fn take(
-        array: &DateTimePartsArray,
-        indices: &dyn Array,
+        array: ArrayView<'_, Self>,
+        indices: &ArrayRef,
         _ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
         take_datetime_parts(array, indices).map(Some)
@@ -105,10 +101,11 @@ mod tests {
     use vortex_array::extension::datetime::TimeUnit;
     use vortex_buffer::buffer;
 
+    use crate::DateTimeParts;
     use crate::DateTimePartsArray;
 
     #[rstest]
-    #[case(DateTimePartsArray::try_from(TemporalArray::new_timestamp(
+    #[case(DateTimeParts::try_from_temporal(TemporalArray::new_timestamp(
         buffer![
             0i64,
             86_400_000,  // 1 day in ms
@@ -119,7 +116,7 @@ mod tests {
         TimeUnit::Milliseconds,
         Some("UTC".into())
     )).unwrap())]
-    #[case(DateTimePartsArray::try_from(TemporalArray::new_timestamp(
+    #[case(DateTimeParts::try_from_temporal(TemporalArray::new_timestamp(
         PrimitiveArray::from_option_iter([
             Some(0i64),
             None,
@@ -130,12 +127,12 @@ mod tests {
         TimeUnit::Milliseconds,
         Some("UTC".into())
     )).unwrap())]
-    #[case(DateTimePartsArray::try_from(TemporalArray::new_timestamp(
+    #[case(DateTimeParts::try_from_temporal(TemporalArray::new_timestamp(
         buffer![86_400_000i64].into_array(),
         TimeUnit::Milliseconds,
         Some("UTC".into())
     )).unwrap())]
     fn test_take_datetime_parts_conformance(#[case] array: DateTimePartsArray) {
-        test_take_conformance(array.as_ref());
+        test_take_conformance(&array.into_array());
     }
 }

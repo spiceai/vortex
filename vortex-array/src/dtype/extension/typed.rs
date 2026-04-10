@@ -4,13 +4,10 @@
 //! Typed and inner representations of extension dtypes.
 //!
 //! - [`ExtDType<V>`]: The public typed wrapper, parameterized by a concrete [`ExtVTable`].
-//! - [`ExtDTypeInner<V>`]: The private inner struct that holds the vtable + data.
 //! - [`DynExtDType`]: The private sealed trait for type-erased dispatch.
 
 use std::any::Any;
-use std::fmt::Debug;
-use std::fmt::Display;
-use std::fmt::Formatter;
+use std::fmt;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::sync::Arc;
@@ -23,6 +20,7 @@ use crate::dtype::Nullability;
 use crate::dtype::extension::ExtDTypeRef;
 use crate::dtype::extension::ExtId;
 use crate::dtype::extension::ExtVTable;
+use crate::scalar::ScalarValue;
 
 /// A typed extension data type, parameterized by a concrete [`ExtVTable`].
 ///
@@ -33,7 +31,14 @@ use crate::dtype::extension::ExtVTable;
 /// [`try_with_vtable()`]: ExtDType::try_with_vtable
 /// [`erased()`]: ExtDType::erased
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ExtDType<V: ExtVTable>(pub(super) Arc<ExtDTypeInner<V>>);
+pub struct ExtDType<V: ExtVTable> {
+    /// The extension dtype vtable.
+    vtable: V,
+    /// The extension dtype metadata.
+    metadata: V::Metadata,
+    /// The underlying storage dtype.
+    storage_dtype: DType,
+}
 
 /// Convenience implementation for zero-sized VTables (or VTables that implement `Default`).
 impl<V: ExtVTable + Default> ExtDType<V> {
@@ -43,6 +48,7 @@ impl<V: ExtVTable + Default> ExtDType<V> {
     }
 }
 
+#[allow(clippy::same_name_method)]
 impl<V: ExtVTable> ExtDType<V> {
     /// Creates a new extension dtype with the given metadata and storage dtype.
     pub fn try_with_vtable(
@@ -50,110 +56,130 @@ impl<V: ExtVTable> ExtDType<V> {
         metadata: V::Metadata,
         storage_dtype: DType,
     ) -> VortexResult<Self> {
-        vtable.validate_dtype(&metadata, &storage_dtype)?;
-
-        Ok(Self(Arc::new(ExtDTypeInner::<V> {
+        let this = Self {
             vtable,
             metadata,
             storage_dtype,
-        })))
+        };
+
+        V::validate_dtype(&this)?;
+
+        Ok(this)
     }
 
     /// Returns the identifier of the extension type.
     pub fn id(&self) -> ExtId {
-        self.0.vtable.id()
+        self.vtable.id()
     }
 
     /// Returns the vtable of the extension type.
     pub fn vtable(&self) -> &V {
-        &self.0.vtable
+        &self.vtable
     }
 
     /// Returns the metadata of the extension type.
     pub fn metadata(&self) -> &V::Metadata {
-        &self.0.metadata
+        &self.metadata
     }
 
     /// Returns the storage dtype of the extension type.
     pub fn storage_dtype(&self) -> &DType {
-        &self.0.storage_dtype
+        &self.storage_dtype
+    }
+
+    /// Returns a new [`ExtDTypeRef`] with the given nullability.
+    pub fn with_nullability(&self, nullability: Nullability) -> ExtDTypeRef {
+        let storage_dtype = self.storage_dtype.with_nullability(nullability);
+        ExtDType::<V>::try_with_vtable(self.vtable.clone(), self.metadata.clone(), storage_dtype)
+            .vortex_expect(
+                "Extension DType should not fail validation with the same storage type \
+                 but different nullability",
+            )
+            .erased()
+    }
+
+    /// Serializes the metadata into a byte vector.
+    pub fn serialize_metadata(&self) -> VortexResult<Vec<u8>> {
+        V::serialize_metadata(&self.vtable, &self.metadata)
+    }
+
+    /// Validates that the given storage scalar value is valid for this dtype.
+    pub fn validate_scalar_value(&self, storage_value: &ScalarValue) -> VortexResult<()> {
+        V::validate_scalar_value(self, storage_value)
+    }
+
+    /// Can a value of `other` be implicitly coerced into this extension type?
+    pub fn can_coerce_from(&self, other: &DType) -> bool {
+        V::can_coerce_from(self, other)
+    }
+
+    /// Can this extension type be implicitly coerced into `other`?
+    pub fn can_coerce_to(&self, other: &DType) -> bool {
+        V::can_coerce_to(self, other)
+    }
+
+    /// Compute the least supertype of this extension type and another type.
+    pub fn least_supertype(&self, other: &DType) -> Option<DType> {
+        V::least_supertype(self, other)
     }
 
     /// Erase the concrete type information, returning a type-erased extension dtype.
     pub fn erased(self) -> ExtDTypeRef {
-        ExtDTypeRef(self.0)
+        ExtDTypeRef(Arc::new(self))
     }
 }
 
-// ---------------------------------------------------------------------------
-// Private inner struct + sealed trait
-// ---------------------------------------------------------------------------
-
-/// The private inner representation of an extension dtype, pairing a vtable with its metadata
-/// and storage dtype.
+/// An object-safe, sealed trait for type-erased extension dtype dispatch.
 ///
-/// This is the sole implementor of [`DynExtDType`], enabling [`ExtDTypeRef`] to safely downcast
-/// back to the concrete vtable type via [`Any`].
-#[derive(Debug, PartialEq, Eq, Hash)]
-pub(super) struct ExtDTypeInner<V: ExtVTable> {
-    /// The extension dtype vtable.
-    pub(super) vtable: V,
-    /// The extension dtype metadata.
-    pub(super) metadata: V::Metadata,
-    /// The underlying storage dtype.
-    pub(super) storage_dtype: DType,
-}
-
-/// An object-safe, sealed trait encapsulating the behavior for extension dtypes.
-///
-/// This provides type-erased access to the extension dtype's identity, storage dtype, and
-/// metadata. The only implementor is [`ExtDTypeInner`].
+/// Methods that have a corresponding inherent method on [`ExtDType<V>`] are thin forwarders
+/// (e.g. `id`, `storage_dtype`). Methods that exist only for erased dispatch have no
+/// inherent counterpart (e.g. `as_any`, `metadata_any`, `metadata_eq`).
 pub(super) trait DynExtDType: 'static + Send + Sync + super::sealed::Sealed {
-    /// Returns `self` as a trait object for downcasting.
     fn as_any(&self) -> &dyn Any;
-    /// Returns the [`ExtId`] identifying this extension type.
     fn id(&self) -> ExtId;
-    /// Returns a reference to the storage [`DType`].
     fn storage_dtype(&self) -> &DType;
-    /// Returns the metadata as a trait object for downcasting.
     fn metadata_any(&self) -> &dyn Any;
-    /// Formats the metadata using [`Debug`].
-    fn metadata_debug(&self, f: &mut Formatter<'_>) -> std::fmt::Result;
-    /// Formats the metadata using [`Display`].
-    fn metadata_display(&self, f: &mut Formatter<'_>) -> std::fmt::Result;
-    /// Checks equality of the metadata against a type-erased value.
+    fn metadata_debug(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result;
+    fn metadata_display(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result;
     fn metadata_eq(&self, other: &dyn Any) -> bool;
-    /// Hashes the metadata into the given [`Hasher`].
     fn metadata_hash(&self, state: &mut dyn Hasher);
-    /// Serializes the metadata into a byte vector.
-    fn metadata_serialize(&self) -> VortexResult<Vec<u8>>;
-    /// Returns a new [`ExtDTypeRef`] with the given nullability.
+    fn serialize_metadata(&self) -> VortexResult<Vec<u8>>;
     fn with_nullability(&self, nullability: Nullability) -> ExtDTypeRef;
+    fn validate_scalar_value(&self, storage_value: &ScalarValue) -> VortexResult<()>;
+    fn value_display(&self, f: &mut fmt::Formatter<'_>, storage_value: &ScalarValue)
+    -> fmt::Result;
+    fn can_coerce_from(&self, other: &DType) -> bool;
+    fn can_coerce_to(&self, other: &DType) -> bool;
+    fn least_supertype(&self, other: &DType) -> Option<DType>;
 }
 
-impl<V: ExtVTable> DynExtDType for ExtDTypeInner<V> {
+/// Blanket impl: thin forwarder to `ExtDType<V>` inherent methods.
+///
+/// Rust's method resolution picks inherent methods over trait methods, so `self.id()` etc.
+/// call the inherent impl, not this trait impl (no infinite recursion).
+impl<V: ExtVTable> DynExtDType for ExtDType<V> {
     fn as_any(&self) -> &dyn Any {
         self
     }
 
     fn id(&self) -> ExtId {
-        self.vtable.id()
+        self.id()
     }
 
     fn storage_dtype(&self) -> &DType {
-        &self.storage_dtype
+        self.storage_dtype()
     }
 
     fn metadata_any(&self) -> &dyn Any {
         &self.metadata
     }
 
-    fn metadata_debug(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        <V::Metadata as Debug>::fmt(&self.metadata, f)
+    fn metadata_debug(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        <V::Metadata as fmt::Debug>::fmt(&self.metadata, f)
     }
 
-    fn metadata_display(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        <V::Metadata as Display>::fmt(&self.metadata, f)
+    fn metadata_display(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        <V::Metadata as fmt::Display>::fmt(&self.metadata, f)
     }
 
     fn metadata_eq(&self, other: &dyn Any) -> bool {
@@ -167,17 +193,43 @@ impl<V: ExtVTable> DynExtDType for ExtDTypeInner<V> {
         <V::Metadata as Hash>::hash(&self.metadata, &mut state);
     }
 
-    fn metadata_serialize(&self) -> VortexResult<Vec<u8>> {
-        V::serialize_metadata(&self.vtable, &self.metadata)
+    fn serialize_metadata(&self) -> VortexResult<Vec<u8>> {
+        self.serialize_metadata()
     }
 
     fn with_nullability(&self, nullability: Nullability) -> ExtDTypeRef {
-        let storage_dtype = self.storage_dtype.with_nullability(nullability);
-        ExtDType::<V>::try_with_vtable(self.vtable.clone(), self.metadata.clone(), storage_dtype)
-            .vortex_expect(
-                "Extension DType should not fail validation with the same storage type \
-                 but different nullability",
-            )
-            .erased()
+        self.with_nullability(nullability)
+    }
+
+    fn validate_scalar_value(&self, storage_value: &ScalarValue) -> VortexResult<()> {
+        self.validate_scalar_value(storage_value)
+    }
+
+    fn value_display(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+        storage_value: &ScalarValue,
+    ) -> fmt::Result {
+        match V::unpack_native(self, storage_value) {
+            Ok(native) => fmt::Display::fmt(&native, f),
+            Err(_) => write!(
+                f,
+                "<error unpacking native storage value {} for extension type {}>",
+                storage_value,
+                self.id()
+            ),
+        }
+    }
+
+    fn can_coerce_from(&self, other: &DType) -> bool {
+        self.can_coerce_from(other)
+    }
+
+    fn can_coerce_to(&self, other: &DType) -> bool {
+        self.can_coerce_to(other)
+    }
+
+    fn least_supertype(&self, other: &DType) -> Option<DType> {
+        self.least_supertype(other)
     }
 }

@@ -15,14 +15,14 @@ use num_traits::ToPrimitive;
 
 mod array;
 mod compress;
-mod compute;
+pub(crate) mod compute;
 mod decompress;
 mod ops;
 mod rules;
 
 #[cfg(test)]
 mod tests {
-    use vortex_array::ProstMetadata;
+    use prost::Message;
     use vortex_array::dtype::PType;
     use vortex_array::patches::PatchesMetadata;
     use vortex_array::test_harness::check_metadata;
@@ -34,7 +34,7 @@ mod tests {
     fn test_alp_metadata() {
         check_metadata(
             "alp.metadata",
-            ProstMetadata(ALPMetadata {
+            &ALPMetadata {
                 patches: Some(PatchesMetadata::new(
                     usize::MAX,
                     usize::MAX,
@@ -45,7 +45,8 @@ mod tests {
                 )),
                 exp_e: u32::MAX,
                 exp_f: u32::MAX,
-            }),
+            }
+            .encode_to_vec(),
         );
     }
 }

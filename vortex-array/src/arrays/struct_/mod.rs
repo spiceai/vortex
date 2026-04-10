@@ -2,12 +2,13 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 mod array;
-pub use array::StructArray;
-pub use array::StructArrayParts;
+pub use array::StructArrayExt;
+pub use array::StructDataParts;
+pub use vtable::StructArray;
 pub(crate) mod compute;
 
 mod vtable;
-pub use vtable::StructVTable;
+pub use vtable::Struct;
 
 #[cfg(test)]
 mod tests;

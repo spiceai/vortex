@@ -1,40 +1,45 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::hash::Hasher;
+use std::sync::Arc;
+
+use prost::Message;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
+use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
 
-use crate::Array;
+use crate::ArrayEq;
+use crate::ArrayHash;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
+use crate::ExecutionResult;
 use crate::IntoArray;
-use crate::ProstMetadata;
-use crate::arrays::ListArray;
+use crate::Precision;
+use crate::array::Array;
+use crate::array::ArrayId;
+use crate::array::ArrayView;
+use crate::array::VTable;
+use crate::arrays::list::ListArrayExt;
+use crate::arrays::list::ListData;
+use crate::arrays::list::array::NUM_SLOTS;
+use crate::arrays::list::array::SLOT_NAMES;
 use crate::arrays::list::compute::PARENT_KERNELS;
 use crate::arrays::list::compute::rules::PARENT_RULES;
-use crate::arrays::list_view_from_list;
+use crate::arrays::listview::list_view_from_list;
 use crate::buffer::BufferHandle;
 use crate::dtype::DType;
 use crate::dtype::Nullability;
 use crate::dtype::PType;
-use crate::metadata::DeserializeMetadata;
-use crate::metadata::SerializeMetadata;
 use crate::serde::ArrayChildren;
 use crate::validity::Validity;
-use crate::vtable;
-use crate::vtable::ArrayId;
-use crate::vtable::VTable;
-use crate::vtable::ValidityVTableFromValidityHelper;
-
-mod array;
 mod operations;
 mod validity;
-mod visitor;
-
-vtable!(List);
+/// A [`List`]-encoded Vortex array.
+pub type ListArray = Array<List>;
 
 #[derive(Clone, prost::Message)]
 pub struct ListMetadata {
@@ -44,58 +49,106 @@ pub struct ListMetadata {
     offset_ptype: i32,
 }
 
-impl VTable for ListVTable {
-    type Array = ListArray;
+impl ArrayHash for ListData {
+    fn array_hash<H: Hasher>(&self, _state: &mut H, _precision: Precision) {}
+}
 
-    type Metadata = ProstMetadata<ListMetadata>;
+impl ArrayEq for ListData {
+    fn array_eq(&self, _other: &Self, _precision: Precision) -> bool {
+        true
+    }
+}
 
-    type ArrayVTable = Self;
+impl VTable for List {
+    type ArrayData = ListData;
+
     type OperationsVTable = Self;
-    type ValidityVTable = ValidityVTableFromValidityHelper;
-    type VisitorVTable = Self;
+    type ValidityVTable = Self;
 
-    fn id(_array: &Self::Array) -> ArrayId {
+    fn id(&self) -> ArrayId {
         Self::ID
     }
 
+    fn nbuffers(_array: ArrayView<'_, Self>) -> usize {
+        0
+    }
+
+    fn buffer(_array: ArrayView<'_, Self>, idx: usize) -> BufferHandle {
+        vortex_panic!("ListArray buffer index {idx} out of bounds")
+    }
+
+    fn buffer_name(_array: ArrayView<'_, Self>, idx: usize) -> Option<String> {
+        vortex_panic!("ListArray buffer_name index {idx} out of bounds")
+    }
+
     fn reduce_parent(
-        array: &Self::Array,
+        array: ArrayView<'_, Self>,
         parent: &ArrayRef,
         child_idx: usize,
     ) -> VortexResult<Option<ArrayRef>> {
         PARENT_RULES.evaluate(array, parent, child_idx)
     }
 
-    fn metadata(array: &ListArray) -> VortexResult<Self::Metadata> {
-        Ok(ProstMetadata(ListMetadata {
-            elements_len: array.elements().len() as u64,
-            offset_ptype: PType::try_from(array.offsets().dtype())? as i32,
-        }))
-    }
-
-    fn serialize(metadata: Self::Metadata) -> VortexResult<Option<Vec<u8>>> {
-        Ok(Some(SerializeMetadata::serialize(metadata)))
-    }
-
-    fn deserialize(
-        bytes: &[u8],
-        _dtype: &DType,
-        _len: usize,
-        _buffers: &[BufferHandle],
+    fn serialize(
+        array: ArrayView<'_, Self>,
         _session: &VortexSession,
-    ) -> VortexResult<Self::Metadata> {
-        Ok(ProstMetadata(
-            <ProstMetadata<ListMetadata> as DeserializeMetadata>::deserialize(bytes)?,
+    ) -> VortexResult<Option<Vec<u8>>> {
+        Ok(Some(
+            ListMetadata {
+                elements_len: array.elements().len() as u64,
+                offset_ptype: PType::try_from(array.offsets().dtype())? as i32,
+            }
+            .encode_to_vec(),
         ))
     }
 
-    fn build(
+    fn validate(
+        &self,
+        _data: &ListData,
         dtype: &DType,
         len: usize,
-        metadata: &Self::Metadata,
+        slots: &[Option<ArrayRef>],
+    ) -> VortexResult<()> {
+        vortex_ensure!(
+            slots.len() == NUM_SLOTS,
+            "ListArray expected {NUM_SLOTS} slots, found {}",
+            slots.len()
+        );
+        let elements = slots[crate::arrays::list::array::ELEMENTS_SLOT]
+            .as_ref()
+            .vortex_expect("ListArray elements slot");
+        let offsets = slots[crate::arrays::list::array::OFFSETS_SLOT]
+            .as_ref()
+            .vortex_expect("ListArray offsets slot");
+        vortex_ensure!(
+            offsets.len().saturating_sub(1) == len,
+            "ListArray length {} does not match outer length {}",
+            offsets.len().saturating_sub(1),
+            len
+        );
+
+        let actual_dtype = DType::List(Arc::new(elements.dtype().clone()), dtype.nullability());
+        vortex_ensure!(
+            &actual_dtype == dtype,
+            "ListArray dtype {} does not match outer dtype {}",
+            actual_dtype,
+            dtype
+        );
+
+        Ok(())
+    }
+
+    fn deserialize(
+        &self,
+        dtype: &DType,
+        len: usize,
+        metadata: &[u8],
+
         _buffers: &[BufferHandle],
         children: &dyn ArrayChildren,
-    ) -> VortexResult<ListArray> {
+        _session: &VortexSession,
+    ) -> VortexResult<crate::array::ArrayParts<Self>> {
+        let metadata = ListMetadata::decode(metadata)?;
         let validity = if children.len() == 2 {
             Validity::from(dtype.nullability())
         } else if children.len() == 3 {
@@ -111,49 +164,32 @@ impl VTable for ListVTable {
         let elements = children.get(
             0,
             element_dtype.as_ref(),
-            usize::try_from(metadata.0.elements_len)?,
+            usize::try_from(metadata.elements_len)?,
         )?;
 
         let offsets = children.get(
             1,
-            &DType::Primitive(metadata.0.offset_ptype(), Nullability::NonNullable),
+            &DType::Primitive(metadata.offset_ptype(), Nullability::NonNullable),
             len + 1,
         )?;
 
-        ListArray::try_new(elements, offsets, validity)
+        let data = ListData::try_build(elements.clone(), offsets.clone(), validity.clone())?;
+        let slots = ListData::make_slots(&elements, &offsets, &validity, len);
+        Ok(crate::array::ArrayParts::new(self.clone(), dtype.clone(), len, data).with_slots(slots))
     }
 
-    fn with_children(array: &mut Self::Array, children: Vec<ArrayRef>) -> VortexResult<()> {
-        vortex_ensure!(
-            children.len() == 2 || children.len() == 3,
-            "ListArray expects 2 or 3 children, got {}",
-            children.len()
-        );
-
-        let mut iter = children.into_iter();
-        let elements = iter
-            .next()
-            .vortex_expect("children length already validated");
-        let offsets = iter
-            .next()
-            .vortex_expect("children length already validated");
-        let validity = if let Some(validity_array) = iter.next() {
-            Validity::Array(validity_array)
-        } else {
-            Validity::from(array.dtype.nullability())
-        };
-
-        let new_array = ListArray::try_new(elements, offsets, validity)?;
-        *array = new_array;
-        Ok(())
+    fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {
+        SLOT_NAMES[idx].to_string()
     }
 
-    fn execute(array: &Self::Array, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
-        Ok(list_view_from_list(array.clone(), ctx)?.into_array())
+    fn execute(array: Array<Self>, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
+        Ok(ExecutionResult::done(
+            list_view_from_list(array, ctx)?.into_array(),
+        ))
     }
 
     fn execute_parent(
-        array: &Self::Array,
+        array: ArrayView<'_, Self>,
         parent: &ArrayRef,
         child_idx: usize,
         ctx: &mut ExecutionCtx,
@@ -162,9 +198,9 @@ impl VTable for ListVTable {
     }
 }
 
-#[derive(Debug)]
-pub struct ListVTable;
+#[derive(Clone, Debug)]
+pub struct List;
 
-impl ListVTable {
+impl List {
     pub const ID: ArrayId = ArrayId::new_ref("vortex.list");
 }

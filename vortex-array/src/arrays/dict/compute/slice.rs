@@ -7,18 +7,20 @@ use vortex_error::VortexResult;
 
 use crate::ArrayRef;
 use crate::IntoArray;
+use crate::array::ArrayView;
+use crate::arrays::Constant;
 use crate::arrays::ConstantArray;
-use crate::arrays::ConstantVTable;
+use crate::arrays::Dict;
 use crate::arrays::DictArray;
-use crate::arrays::DictVTable;
-use crate::arrays::SliceReduce;
+use crate::arrays::dict::DictArraySlotsExt;
+use crate::arrays::slice::SliceReduce;
 use crate::scalar::Scalar;
 
-impl SliceReduce for DictVTable {
-    fn slice(array: &Self::Array, range: Range<usize>) -> VortexResult<Option<ArrayRef>> {
+impl SliceReduce for Dict {
+    fn slice(array: ArrayView<'_, Self>, range: Range<usize>) -> VortexResult<Option<ArrayRef>> {
         let sliced_code = array.codes().slice(range)?;
         // TODO(joe): if the range is size 1 replace with a constant array
-        if let Some(code) = sliced_code.as_opt::<ConstantVTable>() {
+        if let Some(code) = sliced_code.as_opt::<Constant>() {
             let code = code.scalar().as_primitive().as_::<usize>();
             return if let Some(code) = code {
                 let values = array.values().slice(code..code + 1)?;
@@ -32,7 +34,7 @@ impl SliceReduce for DictVTable {
             } else {
                 Ok(Some(
                     ConstantArray::new(Scalar::null(array.dtype().clone()), sliced_code.len())
-                        .to_array(),
+                        .into_array(),
                 ))
             };
         }
@@ -48,11 +50,10 @@ mod tests {
     use vortex_buffer::buffer;
     use vortex_error::VortexResult;
 
-    use crate::Array;
     use crate::IntoArray;
-    use crate::arrays::ConstantArray;
     use crate::arrays::DictArray;
     use crate::arrays::PrimitiveArray;
+    use crate::arrays::dict::compute::slice::ConstantArray;
     use crate::assert_arrays_eq;
     use crate::dtype::DType;
     use crate::dtype::Nullability::Nullable;

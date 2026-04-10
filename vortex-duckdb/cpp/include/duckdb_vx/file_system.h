@@ -3,7 +3,12 @@
 
 #pragma once
 
+#include "duckdb_vx/duckdb_diagnostics.h"
+
+DUCKDB_INCLUDES_BEGIN
 #include "duckdb.h"
+DUCKDB_INCLUDES_END
+
 #include "duckdb_vx/client_context.h"
 #include "duckdb_vx/error.h"
 
@@ -39,7 +44,7 @@ duckdb_state duckdb_vx_fs_read(duckdb_vx_file_handle handle,
 
 /// Callback invoked for each entry returned by `duckdb_vx_fs_list_files`.
 ///
-/// @param name  The entry name (not a full path).
+/// @param name  The entry's path, full for remote files, relative for local files
 /// @param is_dir  Whether the entry is a directory.
 /// @param user_data  Opaque pointer forwarded from the caller.
 typedef void (*duckdb_vx_list_files_callback)(const char *name, bool is_dir, void *user_data);

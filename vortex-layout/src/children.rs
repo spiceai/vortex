@@ -7,15 +7,14 @@ use std::sync::Arc;
 
 use flatbuffers::Follow;
 use itertools::Itertools;
-use vortex_array::ArrayContext;
 use vortex_array::dtype::DType;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
 use vortex_flatbuffers::FlatBuffer;
 use vortex_flatbuffers::layout as fbl;
+use vortex_session::registry::ReadContext;
 
-use crate::LayoutContext;
 use crate::LayoutRef;
 use crate::segments::SegmentId;
 use crate::session::LayoutRegistry;
@@ -44,7 +43,7 @@ impl Debug for dyn LayoutChildren {
 
 impl LayoutChildren for Arc<dyn LayoutChildren> {
     fn to_arc(&self) -> Arc<dyn LayoutChildren> {
-        self.clone()
+        Arc::clone(self)
     }
 
     fn child(&self, idx: usize, dtype: &DType) -> VortexResult<LayoutRef> {
@@ -85,7 +84,7 @@ impl LayoutChildren for OwnedLayoutChildren {
         if child.dtype() != dtype {
             vortex_bail!("Child dtype mismatch: {} != {}", child.dtype(), dtype);
         }
-        Ok(child.clone())
+        Ok(Arc::clone(child))
     }
 
     fn child_row_count(&self, idx: usize) -> u64 {
@@ -101,9 +100,10 @@ impl LayoutChildren for OwnedLayoutChildren {
 pub(crate) struct ViewedLayoutChildren {
     flatbuffer: FlatBuffer,
     flatbuffer_loc: usize,
-    array_ctx: ArrayContext,
-    layout_ctx: LayoutContext,
+    array_read_ctx: ReadContext,
+    layout_read_ctx: ReadContext,
     layouts: LayoutRegistry,
+    allow_unknown: bool,
 }
 
 impl ViewedLayoutChildren {
@@ -115,16 +115,18 @@ impl ViewedLayoutChildren {
     pub(super) unsafe fn new_unchecked(
         flatbuffer: FlatBuffer,
         flatbuffer_loc: usize,
-        array_ctx: ArrayContext,
-        layout_ctx: LayoutContext,
+        array_read_ctx: ReadContext,
+        layout_read_ctx: ReadContext,
         layouts: LayoutRegistry,
+        allow_unknown: bool,
     ) -> Self {
         Self {
             flatbuffer,
             flatbuffer_loc,
-            array_ctx,
-            layout_ctx,
+            array_read_ctx,
+            layout_read_ctx,
             layouts,
+            allow_unknown,
         }
     }
 
@@ -134,6 +136,41 @@ impl ViewedLayoutChildren {
         // as it was constructed from a validated flatbuffer in ViewedLayoutChildren::try_new.
         // The lifetime of the returned Layout is tied to self, ensuring the buffer remains valid.
         unsafe { fbl::Layout::follow(self.flatbuffer.as_ref(), self.flatbuffer_loc) }
+    }
+
+    fn foreign_layout_from_fb(
+        &self,
+        fb_layout: fbl::Layout<'_>,
+        dtype: &DType,
+    ) -> VortexResult<LayoutRef> {
+        let encoding_id = self
+            .layout_read_ctx
+            .resolve(fb_layout.encoding())
+            .ok_or_else(|| vortex_err!("Encoding not found: {}", fb_layout.encoding()))?;
+
+        let children = fb_layout
+            .children()
+            .unwrap_or_default()
+            .iter()
+            .map(|child| self.foreign_layout_from_fb(child, dtype))
+            .collect::<VortexResult<Vec<_>>>()?;
+
+        Ok(crate::layouts::foreign::new_foreign_layout(
+            encoding_id,
+            dtype.clone(),
+            fb_layout.row_count(),
+            fb_layout
+                .metadata()
+                .map(|m| m.bytes().to_vec())
+                .unwrap_or_default(),
+            fb_layout
+                .segments()
+                .unwrap_or_default()
+                .iter()
+                .map(SegmentId::from)
+                .collect_vec(),
+            children,
+        ))
     }
 }
 
@@ -151,18 +188,25 @@ impl LayoutChildren for ViewedLayoutChildren {
         let viewed_children = ViewedLayoutChildren {
             flatbuffer: self.flatbuffer.clone(),
             flatbuffer_loc: fb_child._tab.loc(),
-            array_ctx: self.array_ctx.clone(),
-            layout_ctx: self.layout_ctx.clone(),
+            array_read_ctx: self.array_read_ctx.clone(),
+            layout_read_ctx: self.layout_read_ctx.clone(),
             layouts: self.layouts.clone(),
+            allow_unknown: self.allow_unknown,
         };
 
         let encoding_id = self
-            .layout_ctx
+            .layout_read_ctx
             .resolve(fb_child.encoding())
             .ok_or_else(|| vortex_err!("Encoding not found: {}", fb_child.encoding()))?;
-        let encoding = self.layouts.find(&encoding_id).ok_or_else(|| {
-            vortex_err!("Encoding not found in registry: {}", fb_child.encoding())
-        })?;
+        let Some(encoding) = self.layouts.find(&encoding_id) else {
+            if self.allow_unknown {
+                return viewed_children.foreign_layout_from_fb(fb_child, dtype);
+            }
+            return Err(vortex_err!(
+                "Encoding not found in registry: {}",
+                fb_child.encoding()
+            ));
+        };
 
         encoding.build(
             dtype,
@@ -178,7 +222,7 @@ impl LayoutChildren for ViewedLayoutChildren {
                 .map(SegmentId::from)
                 .collect_vec(),
             &viewed_children,
-            &self.array_ctx,
+            &self.array_read_ctx,
         )
     }
 

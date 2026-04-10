@@ -25,7 +25,8 @@ use vortex::array::validity::Validity;
 use vortex::buffer::Buffer;
 use vortex::dtype::NativePType;
 use vortex::dtype::PType;
-use vortex::encodings::fastlanes::BitPackedArray;
+use vortex::encodings::fastlanes::BitPackedData;
+use vortex::encodings::fastlanes::FoR;
 use vortex::encodings::fastlanes::FoRArray;
 use vortex::error::VortexExpect;
 use vortex::scalar::Scalar;
@@ -55,13 +56,11 @@ where
         PrimitiveArray::new(Buffer::from(data), Validity::NonNullable).into_array();
 
     if bp && T::PTYPE != PType::U8 {
-        let child =
-            BitPackedArray::encode(primitive_array.as_ref(), 8).vortex_expect("failed to bitpack");
-        FoRArray::try_new(child.into_array(), reference.into())
+        let child = BitPackedData::encode(&primitive_array, 8).vortex_expect("failed to bitpack");
+        FoR::try_new(child.into_array(), reference.into())
             .vortex_expect("failed to create FoR array")
     } else {
-        FoRArray::try_new(primitive_array, reference.into())
-            .vortex_expect("failed to create FoR array")
+        FoR::try_new(primitive_array, reference.into()).vortex_expect("failed to create FoR array")
     }
 }
 
@@ -92,7 +91,8 @@ where
                         .with_launch_strategy(Arc::new(timed));
 
                     for _ in 0..iters {
-                        block_on(for_array.to_array().execute_cuda(&mut cuda_ctx)).unwrap();
+                        block_on(for_array.clone().into_array().execute_cuda(&mut cuda_ctx))
+                            .unwrap();
                     }
 
                     Duration::from_nanos(timer.load(Ordering::Relaxed))
@@ -130,7 +130,8 @@ where
                         .with_launch_strategy(Arc::new(timed));
 
                     for _ in 0..iters {
-                        block_on(for_array.to_array().execute_cuda(&mut cuda_ctx)).unwrap();
+                        block_on(for_array.clone().into_array().execute_cuda(&mut cuda_ctx))
+                            .unwrap();
                     }
 
                     Duration::from_nanos(timer.load(Ordering::Relaxed))

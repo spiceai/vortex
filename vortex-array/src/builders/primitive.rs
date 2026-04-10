@@ -10,7 +10,6 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 use vortex_mask::Mask;
 
-use crate::Array;
 use crate::ArrayRef;
 use crate::IntoArray;
 use crate::arrays::PrimitiveArray;
@@ -52,9 +51,20 @@ impl<T: NativePType> PrimitiveBuilder<T> {
         self.nulls.append_non_null();
     }
 
+    /// Appends `n` copies of `value` as non-null entries, directly writing into the buffer.
+    pub fn append_n_values(&mut self, value: T, n: usize) {
+        self.values.push_n(value, n);
+        self.nulls.append_n_non_nulls(n);
+    }
+
     /// Returns the raw primitive values in this builder as a slice.
     pub fn values(&self) -> &[T] {
         self.values.as_ref()
+    }
+
+    /// Returns the raw primitive values in this builder as a mutable slice.
+    pub fn values_mut(&mut self) -> &mut [T] {
+        self.values.as_mut()
     }
 
     /// Create a new handle to the next `len` uninitialized values in the builder.
@@ -164,7 +174,7 @@ impl<T: NativePType> ArrayBuilder for PrimitiveBuilder<T> {
         Ok(())
     }
 
-    unsafe fn extend_from_array_unchecked(&mut self, array: &dyn Array) {
+    unsafe fn extend_from_array_unchecked(&mut self, array: &ArrayRef) {
         let array = array.to_primitive();
 
         // This should be checked in `extend_from_array` but we can check it again.
@@ -175,11 +185,8 @@ impl<T: NativePType> ArrayBuilder for PrimitiveBuilder<T> {
         );
 
         self.values.extend_from_slice(array.as_slice::<T>());
-        self.nulls.append_validity_mask(
-            array
-                .validity_mask()
-                .vortex_expect("validity_mask in extend_from_array_unchecked"),
-        );
+        self.nulls
+            .append_validity_mask(array.validity_mask().vortex_expect("validity_mask"));
     }
 
     fn reserve_exact(&mut self, additional: usize) {
@@ -348,6 +355,8 @@ impl<T> UninitRange<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    use vortex_error::VortexExpect;
+
     use super::*;
     use crate::assert_arrays_eq;
 
@@ -609,10 +618,27 @@ mod tests {
         // values[2] might be any value since it's null.
 
         // Check validity - first two should be valid, third should be null.
-        use crate::vtable::ValidityHelper;
-        assert!(array.validity().is_valid(0).unwrap());
-        assert!(array.validity().is_valid(1).unwrap());
-        assert!(!array.validity().is_valid(2).unwrap());
+        assert!(
+            array
+                .validity()
+                .vortex_expect("primitive validity should be derivable")
+                .is_valid(0)
+                .unwrap()
+        );
+        assert!(
+            array
+                .validity()
+                .vortex_expect("primitive validity should be derivable")
+                .is_valid(1)
+                .unwrap()
+        );
+        assert!(
+            !array
+                .validity()
+                .vortex_expect("primitive validity should be derivable")
+                .is_valid(2)
+                .unwrap()
+        );
 
         // Test wrong dtype error.
         let mut builder = PrimitiveBuilder::<i32>::with_capacity(Nullability::NonNullable, 10);

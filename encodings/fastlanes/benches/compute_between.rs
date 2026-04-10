@@ -3,21 +3,21 @@
 #![expect(clippy::unwrap_used)]
 
 use num_traits::NumCast;
-use rand::Rng;
+use rand::RngExt;
 use rand::rngs::StdRng;
-use vortex_alp::ALPArray;
+use vortex_alp::ALP;
+use vortex_alp::ALPArrayExt;
+use vortex_alp::ALPArraySlotsExt;
 use vortex_alp::alp_encode;
 use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
 use vortex_array::ToCanonical;
 use vortex_array::arrays::PrimitiveArray;
-use vortex_array::compute::warm_up_vtables;
 use vortex_array::dtype::NativePType;
 use vortex_error::VortexExpect;
 use vortex_fastlanes::bitpack_compress::bitpack_to_best_bit_width;
 
 fn main() {
-    warm_up_vtables();
     divan::main();
 }
 
@@ -56,7 +56,7 @@ fn generate_alp_bit_pack_primitive_array<T: NativePType + NumCast>(
     let bp = bitpack_to_best_bit_width(&encoded)
         .vortex_expect("")
         .into_array();
-    ALPArray::new(bp, alp.exponents(), None).into_array()
+    ALP::new(bp, alp.exponents(), None).into_array()
 }
 
 const BENCH_ARGS: &[usize] = &[2 << 10, 2 << 13, 2 << 14];
@@ -99,14 +99,16 @@ mod primitive {
             .with_inputs(|| (&arr, LEGACY_SESSION.create_execution_ctx()))
             .bench_refs(|(arr, ctx)| {
                 let gte = arr
-                    .to_array()
+                    .clone()
+                    .into_array()
                     .binary(
                         ConstantArray::new(min, arr.len()).into_array(),
                         Operator::Gte,
                     )
                     .vortex_expect("");
                 let lt = arr
-                    .to_array()
+                    .clone()
+                    .into_array()
                     .binary(
                         ConstantArray::new(max, arr.len()).into_array(),
                         Operator::Lt,
@@ -135,7 +137,8 @@ mod primitive {
         bencher
             .with_inputs(|| (&arr, LEGACY_SESSION.create_execution_ctx()))
             .bench_refs(|(arr, ctx)| {
-                arr.to_array()
+                arr.clone()
+                    .into_array()
                     .between(
                         ConstantArray::new(min, arr.len()).into_array(),
                         ConstantArray::new(max, arr.len()).into_array(),
@@ -189,14 +192,14 @@ mod bitpack {
             .with_inputs(|| (&arr, LEGACY_SESSION.create_execution_ctx()))
             .bench_refs(|(arr, ctx)| {
                 let gte = arr
-                    .to_array()
+                    .clone()
                     .binary(
                         ConstantArray::new(min, arr.len()).into_array(),
                         Operator::Gte,
                     )
                     .vortex_expect("");
                 let lt = arr
-                    .to_array()
+                    .clone()
                     .binary(
                         ConstantArray::new(max, arr.len()).into_array(),
                         Operator::Lt,
@@ -280,14 +283,14 @@ mod alp {
             .with_inputs(|| (&arr, LEGACY_SESSION.create_execution_ctx()))
             .bench_refs(|(arr, ctx)| {
                 let gte = arr
-                    .to_array()
+                    .clone()
                     .binary(
                         ConstantArray::new(min, arr.len()).into_array(),
                         Operator::Gte,
                     )
                     .vortex_expect("");
                 let lt = arr
-                    .to_array()
+                    .clone()
                     .binary(
                         ConstantArray::new(max, arr.len()).into_array(),
                         Operator::Lt,

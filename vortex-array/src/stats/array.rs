@@ -14,15 +14,17 @@ use super::MutTypedStatsSetRef;
 use super::StatsSet;
 use super::StatsSetIntoIter;
 use super::TypedStatsSetRef;
-use crate::Array;
+use crate::ArrayRef;
+use crate::LEGACY_SESSION;
+use crate::VortexSessionExecute;
+use crate::aggregate_fn::fns::is_constant::is_constant;
+use crate::aggregate_fn::fns::is_sorted::is_sorted;
+use crate::aggregate_fn::fns::is_sorted::is_strict_sorted;
+use crate::aggregate_fn::fns::min_max::MinMaxResult;
+use crate::aggregate_fn::fns::min_max::min_max;
+use crate::aggregate_fn::fns::nan_count::nan_count;
+use crate::aggregate_fn::fns::sum::sum;
 use crate::builders::builder_with_capacity;
-use crate::compute::MinMaxResult;
-use crate::compute::is_constant;
-use crate::compute::is_sorted;
-use crate::compute::is_strict_sorted;
-use crate::compute::min_max;
-use crate::compute::nan_count;
-use crate::compute::sum;
 use crate::expr::stats::Precision;
 use crate::expr::stats::Stat;
 use crate::expr::stats::StatsProvider;
@@ -41,12 +43,12 @@ pub struct ArrayStats {
 /// Constructed by calling [`ArrayStats::to_ref`].
 pub struct StatsSetRef<'a> {
     // We need to reference back to the array
-    dyn_array_ref: &'a dyn Array,
+    dyn_array_ref: &'a ArrayRef,
     array_stats: &'a ArrayStats,
 }
 
 impl ArrayStats {
-    pub fn to_ref<'a>(&'a self, array: &'a dyn Array) -> StatsSetRef<'a> {
+    pub fn to_ref<'a>(&'a self, array: &'a ArrayRef) -> StatsSetRef<'a> {
         StatsSetRef {
             dyn_array_ref: array,
             array_stats: self,
@@ -81,6 +83,10 @@ impl From<ArrayStats> for StatsSet {
 }
 
 impl StatsSetRef<'_> {
+    pub(crate) fn replace(&self, stats: StatsSet) {
+        *self.array_stats.inner.write() = stats;
+    }
+
     pub fn set_iter(&self, iter: StatsSetIntoIter) {
         let mut guard = self.array_stats.inner.write();
         for (stat, value) in iter {
@@ -130,6 +136,13 @@ impl StatsSetRef<'_> {
         self.array_stats.inner.read().clone()
     }
 
+    /// Returns a clone of the underlying [`ArrayStats`].
+    ///
+    /// Since [`ArrayStats`] uses `Arc` internally, this is a cheap reference-count increment.
+    pub fn to_array_stats(&self) -> ArrayStats {
+        self.array_stats.clone()
+    }
+
     pub fn with_iter<
         F: for<'a> FnOnce(&mut dyn Iterator<Item = &'a (Stat, Precision<ScalarValue>)>) -> R,
         R,
@@ -142,21 +155,27 @@ impl StatsSetRef<'_> {
     }
 
     pub fn compute_stat(&self, stat: Stat) -> VortexResult<Option<Scalar>> {
+        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+
         // If it's already computed and exact, we can return it.
         if let Some(Precision::Exact(s)) = self.get(stat) {
             return Ok(Some(s));
         }
 
         Ok(match stat {
-            Stat::Min => min_max(self.dyn_array_ref)?.map(|MinMaxResult { min, max: _ }| min),
-            Stat::Max => min_max(self.dyn_array_ref)?.map(|MinMaxResult { min: _, max }| max),
+            Stat::Min => {
+                min_max(self.dyn_array_ref, &mut ctx)?.map(|MinMaxResult { min, max: _ }| min)
+            }
+            Stat::Max => {
+                min_max(self.dyn_array_ref, &mut ctx)?.map(|MinMaxResult { min: _, max }| max)
+            }
             Stat::Sum => {
                 Stat::Sum
                     .dtype(self.dyn_array_ref.dtype())
                     .is_some()
                     .then(|| {
                         // Sum is supported for this dtype.
-                        sum(self.dyn_array_ref)
+                        sum(self.dyn_array_ref, &mut ctx)
                     })
                     .transpose()?
             }
@@ -165,11 +184,11 @@ impl StatsSetRef<'_> {
                 if self.dyn_array_ref.is_empty() {
                     None
                 } else {
-                    is_constant(self.dyn_array_ref)?.map(|v| v.into())
+                    Some(is_constant(self.dyn_array_ref, &mut ctx)?.into())
                 }
             }
-            Stat::IsSorted => is_sorted(self.dyn_array_ref)?.map(|v| v.into()),
-            Stat::IsStrictSorted => is_strict_sorted(self.dyn_array_ref)?.map(|v| v.into()),
+            Stat::IsSorted => Some(is_sorted(self.dyn_array_ref, &mut ctx)?.into()),
+            Stat::IsStrictSorted => Some(is_strict_sorted(self.dyn_array_ref, &mut ctx)?.into()),
             Stat::UncompressedSizeInBytes => {
                 let mut builder =
                     builder_with_capacity(self.dyn_array_ref.dtype(), self.dyn_array_ref.len());
@@ -186,7 +205,7 @@ impl StatsSetRef<'_> {
                     .is_some()
                     .then(|| {
                         // NaNCount is supported for this dtype.
-                        nan_count(self.dyn_array_ref)
+                        nan_count(self.dyn_array_ref, &mut ctx)
                     })
                     .transpose()?
                     .map(|s| s.into())

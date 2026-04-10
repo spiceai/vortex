@@ -4,28 +4,28 @@
 use std::ops::Range;
 
 use vortex_array::ArrayRef;
+use vortex_array::ArrayView;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::arrays::ConstantArray;
-use vortex_array::arrays::FilterExecuteAdaptor;
-use vortex_array::arrays::SliceArray;
-use vortex_array::arrays::SliceVTable;
-use vortex_array::arrays::TakeExecuteAdaptor;
+use vortex_array::arrays::Slice;
+use vortex_array::arrays::dict::TakeExecuteAdaptor;
+use vortex_array::arrays::filter::FilterExecuteAdaptor;
 use vortex_array::kernel::ExecuteParentKernel;
 use vortex_array::kernel::ParentKernelSet;
 use vortex_array::scalar_fn::fns::binary::CompareExecuteAdaptor;
 use vortex_error::VortexResult;
 
-use crate::RunEndArray;
-use crate::RunEndVTable;
-use crate::compute::take_from::RunEndVTableTakeFrom;
+use crate::RunEnd;
+use crate::array::RunEndArrayExt;
+use crate::compute::take_from::RunEndTakeFrom;
 
-pub(super) const PARENT_KERNELS: ParentKernelSet<RunEndVTable> = ParentKernelSet::new(&[
-    ParentKernelSet::lift(&CompareExecuteAdaptor(RunEndVTable)),
+pub(super) const PARENT_KERNELS: ParentKernelSet<RunEnd> = ParentKernelSet::new(&[
+    ParentKernelSet::lift(&CompareExecuteAdaptor(RunEnd)),
     ParentKernelSet::lift(&RunEndSliceKernel),
-    ParentKernelSet::lift(&FilterExecuteAdaptor(RunEndVTable)),
-    ParentKernelSet::lift(&TakeExecuteAdaptor(RunEndVTable)),
-    ParentKernelSet::lift(&RunEndVTableTakeFrom),
+    ParentKernelSet::lift(&FilterExecuteAdaptor(RunEnd)),
+    ParentKernelSet::lift(&TakeExecuteAdaptor(RunEnd)),
+    ParentKernelSet::lift(&RunEndTakeFrom),
 ]);
 
 /// Kernel to execute slicing on a RunEnd array.
@@ -35,13 +35,13 @@ pub(super) const PARENT_KERNELS: ParentKernelSet<RunEndVTable> = ParentKernelSet
 #[derive(Debug)]
 struct RunEndSliceKernel;
 
-impl ExecuteParentKernel<RunEndVTable> for RunEndSliceKernel {
-    type Parent = SliceVTable;
+impl ExecuteParentKernel<RunEnd> for RunEndSliceKernel {
+    type Parent = Slice;
 
     fn execute_parent(
         &self,
-        array: &RunEndArray,
-        parent: &SliceArray,
+        array: ArrayView<'_, RunEnd>,
+        parent: ArrayView<'_, Slice>,
         _child_idx: usize,
         _ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
@@ -49,7 +49,7 @@ impl ExecuteParentKernel<RunEndVTable> for RunEndSliceKernel {
     }
 }
 
-fn slice(array: &RunEndArray, range: Range<usize>) -> VortexResult<ArrayRef> {
+fn slice(array: ArrayView<'_, RunEnd>, range: Range<usize>) -> VortexResult<ArrayRef> {
     let new_length = range.len();
 
     let slice_begin = array.find_physical_index(range.start)?;
@@ -63,7 +63,7 @@ fn slice(array: &RunEndArray, range: Range<usize>) -> VortexResult<ArrayRef> {
 
     // SAFETY: we maintain the ends invariant in our slice implementation
     Ok(unsafe {
-        RunEndArray::new_unchecked(
+        RunEnd::new_unchecked(
             array.ends().slice(slice_begin..slice_end)?,
             array.values().slice(slice_begin..slice_end)?,
             range.start + array.offset(),

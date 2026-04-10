@@ -5,16 +5,16 @@ use vortex_buffer::BufferMut;
 use vortex_error::VortexResult;
 use vortex_mask::Mask;
 
-use crate::Array;
 use crate::ArrayRef;
 use crate::Canonical;
 use crate::IntoArray;
-use crate::arrays::ChunkedVTable;
+use crate::array::ArrayView;
+use crate::arrays::Chunked;
+use crate::arrays::ChunkedArray;
 use crate::arrays::PrimitiveArray;
-use crate::arrays::TakeExecute;
-use crate::arrays::chunked::ChunkedArray;
+use crate::arrays::chunked::ChunkedArrayExt;
+use crate::arrays::dict::TakeExecute;
 use crate::builtins::ArrayBuiltins;
-use crate::canonical::ToCanonical;
 use crate::dtype::DType;
 use crate::dtype::PType;
 use crate::executor::ExecutionCtx;
@@ -23,14 +23,13 @@ use crate::validity::Validity;
 // TODO(joe): this is pretty unoptimized but better than before. We want canonical using a builder
 // we also want to return a chunked array ideally.
 fn take_chunked(
-    array: &ChunkedArray,
-    indices: &dyn Array,
+    array: ArrayView<'_, Chunked>,
+    indices: &ArrayRef,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
     let indices = indices
-        .to_array()
         .cast(DType::Primitive(PType::U64, indices.dtype().nullability()))?
-        .to_primitive();
+        .execute::<PrimitiveArray>(ctx)?;
 
     let indices_mask = indices.validity_mask()?;
     let indices_values = indices.as_slice::<u64>();
@@ -61,9 +60,10 @@ fn take_chunked(
     for chunk_idx in 0..nchunks {
         let chunk_start = chunk_offsets[chunk_idx];
         let chunk_end = chunk_offsets[chunk_idx + 1];
-        let chunk_len = usize::try_from(chunk_end - chunk_start)?;
+        let chunk_len = chunk_end - chunk_start;
+        let chunk_end_u64 = u64::try_from(chunk_end)?;
 
-        let range_end = cursor + pairs[cursor..].partition_point(|&(v, _)| v < chunk_end);
+        let range_end = cursor + pairs[cursor..].partition_point(|&(v, _)| v < chunk_end_u64);
         let chunk_pairs = &pairs[cursor..range_end];
 
         if !chunk_pairs.is_empty() {
@@ -72,7 +72,7 @@ fn take_chunked(
                 if cursor + i > 0 && val != pairs[cursor + i - 1].0 {
                     dedup_idx += 1;
                 }
-                let local = usize::try_from(val - chunk_start)?;
+                let local = usize::try_from(val)? - chunk_start;
                 if local_indices.last() != Some(&local) {
                     local_indices.push(local);
                 }
@@ -96,14 +96,15 @@ fn take_chunked(
 
     // 4. Single take to restore original order and expand duplicates.
     //    Carry the original index validity so null indices produce null outputs.
-    let take_validity = Validity::from_mask(indices_mask, indices.dtype().nullability());
+    let take_validity =
+        Validity::from_mask(indices.validity_mask()?, indices.dtype().nullability());
     flat.take(PrimitiveArray::new(final_take.freeze(), take_validity).into_array())
 }
 
-impl TakeExecute for ChunkedVTable {
+impl TakeExecute for Chunked {
     fn take(
-        array: &ChunkedArray,
-        indices: &dyn Array,
+        array: ArrayView<'_, Chunked>,
+        indices: &ArrayRef,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
         take_chunked(array, indices, ctx).map(Some)
@@ -118,11 +119,11 @@ mod test {
 
     use crate::IntoArray;
     use crate::ToCanonical;
-    use crate::array::Array;
     use crate::arrays::BoolArray;
+    use crate::arrays::ChunkedArray;
     use crate::arrays::PrimitiveArray;
     use crate::arrays::StructArray;
-    use crate::arrays::chunked::ChunkedArray;
+    use crate::arrays::chunked::ChunkedArrayExt;
     use crate::assert_arrays_eq;
     use crate::compute::conformance::take::test_take_conformance;
     use crate::dtype::FieldNames;
@@ -138,7 +139,7 @@ mod test {
         assert_eq!(arr.len(), 9);
         let indices = buffer![0u64, 0, 6, 4].into_array();
 
-        let result = arr.take(indices.to_array()).unwrap();
+        let result = arr.take(indices).unwrap();
         assert_arrays_eq!(result, PrimitiveArray::from_iter([1i32, 1, 1, 2]));
     }
 
@@ -151,7 +152,7 @@ mod test {
         assert_eq!(arr.len(), 9);
         let indices = PrimitiveArray::new(buffer![0u64, 0, 6, 4], Validity::NonNullable);
 
-        let result = arr.take(indices.to_array()).unwrap();
+        let result = arr.take(indices.into_array()).unwrap();
         assert_arrays_eq!(
             result,
             PrimitiveArray::from_option_iter([1i32, 1, 1, 2].map(Some))
@@ -170,7 +171,7 @@ mod test {
             Validity::Array(bitbuffer![1 0 0 1].into_array()),
         );
 
-        let result = arr.take(indices.to_array()).unwrap();
+        let result = arr.take(indices.into_array()).unwrap();
         assert_arrays_eq!(
             result,
             PrimitiveArray::from_option_iter([Some(1i32), None, None, Some(2)])
@@ -183,17 +184,20 @@ mod test {
             StructArray::try_new(FieldNames::default(), vec![], 100, Validity::NonNullable)
                 .unwrap();
 
-        let arr = ChunkedArray::from_iter(vec![struct_array.to_array(), struct_array.to_array()]);
+        let arr = ChunkedArray::from_iter(vec![
+            struct_array.clone().into_array(),
+            struct_array.into_array(),
+        ]);
 
         let result = arr
-            .take(PrimitiveArray::from_option_iter(vec![Some(0), None, Some(101)]).to_array())
+            .take(PrimitiveArray::from_option_iter(vec![Some(0), None, Some(101)]).into_array())
             .unwrap();
 
         let expect = StructArray::try_new(
             FieldNames::default(),
             vec![],
             3,
-            Validity::Array(BoolArray::from_iter(vec![true, false, true]).to_array()),
+            Validity::Array(BoolArray::from_iter(vec![true, false, true]).into_array()),
         )
         .unwrap();
         assert_arrays_eq!(result, expect);
@@ -208,7 +212,7 @@ mod test {
         assert_eq!(arr.len(), 9);
 
         let indices = PrimitiveArray::empty::<u64>(Nullability::NonNullable);
-        let result = arr.take(indices.to_array()).unwrap();
+        let result = arr.take(indices.into_array()).unwrap();
 
         assert!(result.is_empty());
         assert_eq!(result.dtype(), arr.dtype());
@@ -232,7 +236,7 @@ mod test {
 
         // Fully shuffled indices that cross every chunk boundary.
         let indices = buffer![8u64, 0, 5, 3, 2, 7, 1, 6, 4].into_array();
-        let result = arr.take(indices.to_array())?;
+        let result = arr.take(indices)?;
 
         assert_arrays_eq!(
             result,
@@ -269,7 +273,7 @@ mod test {
             vortex_buffer::Buffer::from(indices.clone()),
             Validity::NonNullable,
         );
-        let result = arr.take(indices_arr.to_array())?;
+        let result = arr.take(indices_arr.into_array())?;
 
         // Verify every element.
         let result = result.to_primitive();
@@ -298,7 +302,7 @@ mod test {
         // Indices with nulls scattered across chunk boundaries.
         let indices =
             PrimitiveArray::from_option_iter([Some(5u64), None, Some(0), Some(3), None, Some(2)]);
-        let result = arr.take(indices.to_array())?;
+        let result = arr.take(indices.into_array())?;
 
         assert_arrays_eq!(
             result,
@@ -325,14 +329,14 @@ mod test {
                 .clone(),
         )
         .unwrap();
-        test_take_conformance(arr.as_ref());
+        test_take_conformance(&arr.into_array());
 
         // Test with nullable chunked array
         let a = PrimitiveArray::from_option_iter([Some(1i32), None, Some(3)]);
         let b = PrimitiveArray::from_option_iter([Some(4i32), Some(5)]);
         let dtype = a.dtype().clone();
         let arr = ChunkedArray::try_new(vec![a.into_array(), b.into_array()], dtype).unwrap();
-        test_take_conformance(arr.as_ref());
+        test_take_conformance(&arr.into_array());
 
         // Test with multiple identical chunks
         let chunk = buffer![10i32, 20, 30, 40, 50].into_array();
@@ -341,6 +345,6 @@ mod test {
             chunk.dtype().clone(),
         )
         .unwrap();
-        test_take_conformance(arr.as_ref());
+        test_take_conformance(&arr.into_array());
     }
 }

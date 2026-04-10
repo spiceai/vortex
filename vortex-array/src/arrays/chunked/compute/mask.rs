@@ -6,27 +6,28 @@ use vortex_error::VortexResult;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::IntoArray;
+use crate::array::ArrayView;
+use crate::arrays::Chunked;
 use crate::arrays::ChunkedArray;
-use crate::arrays::ChunkedVTable;
-use crate::arrays::ScalarFnArrayExt;
+use crate::arrays::chunked::ChunkedArrayExt;
+use crate::arrays::scalar_fn::ScalarFnFactoryExt;
 use crate::scalar_fn::EmptyOptions;
 use crate::scalar_fn::fns::mask::Mask as MaskExpr;
 use crate::scalar_fn::fns::mask::MaskKernel;
 
-impl MaskKernel for ChunkedVTable {
+impl MaskKernel for Chunked {
     fn mask(
-        array: &ChunkedArray,
+        array: ArrayView<'_, Chunked>,
         mask: &ArrayRef,
         _ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
         let chunk_offsets = array.chunk_offsets();
         let new_chunks: Vec<ArrayRef> = array
-            .chunks()
-            .iter()
+            .iter_chunks()
             .enumerate()
             .map(|(i, chunk)| {
-                let start: usize = chunk_offsets[i].try_into()?;
-                let end: usize = chunk_offsets[i + 1].try_into()?;
+                let start = chunk_offsets[i];
+                let end = chunk_offsets[i + 1];
                 let chunk_mask = mask.slice(start..end)?;
                 MaskExpr.try_new_array(chunk.len(), EmptyOptions, [chunk.clone(), chunk_mask])
             })
@@ -56,15 +57,15 @@ mod test {
         vec![
             buffer![0u64, 1].into_array(),
             buffer![2_u64].into_array(),
-            PrimitiveArray::empty::<u64>(Nullability::NonNullable).to_array(),
+            PrimitiveArray::empty::<u64>(Nullability::NonNullable).into_array(),
             buffer![3_u64, 4].into_array(),
         ],
         DType::Primitive(PType::U64, Nullability::NonNullable),
     ).unwrap())]
     #[case(ChunkedArray::try_new(
         vec![
-            PrimitiveArray::from_option_iter([Some(1i32), None, Some(3)]).to_array(),
-            PrimitiveArray::from_option_iter([Some(4i32), Some(5)]).to_array(),
+            PrimitiveArray::from_option_iter([Some(1i32), None, Some(3)]).into_array(),
+            PrimitiveArray::from_option_iter([Some(4i32), Some(5)]).into_array(),
         ],
         DType::Primitive(PType::I32, Nullability::Nullable),
     ).unwrap())]
@@ -79,6 +80,6 @@ mod test {
         DType::Primitive(PType::F32, Nullability::NonNullable),
     ).unwrap())]
     fn test_mask_chunked_conformance(#[case] chunked: ChunkedArray) {
-        test_mask_conformance(chunked.as_ref());
+        test_mask_conformance(&chunked.into_array());
     }
 }

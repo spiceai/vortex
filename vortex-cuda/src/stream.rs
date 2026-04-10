@@ -4,13 +4,12 @@
 //! CUDA stream utility functions.
 
 use std::fmt::Debug;
+use std::ops::Deref;
 use std::sync::Arc;
 
 use cudarc::driver::CudaSlice;
 use cudarc::driver::CudaStream;
-use cudarc::driver::DevicePtrMut;
 use cudarc::driver::DeviceRepr;
-use cudarc::driver::result::memcpy_htod_async;
 use cudarc::driver::result::stream;
 use futures::future::BoxFuture;
 use kanal::Sender;
@@ -23,6 +22,14 @@ use crate::CudaDeviceBuffer;
 
 #[derive(Clone)]
 pub struct VortexCudaStream(pub(crate) Arc<CudaStream>);
+
+impl Deref for VortexCudaStream {
+    type Target = Arc<CudaStream>;
+
+    fn deref(&self) -> &Arc<CudaStream> {
+        &self.0
+    }
+}
 
 impl VortexCudaStream {
     /// Allocates a typed buffer on the GPU.
@@ -40,8 +47,7 @@ impl VortexCudaStream {
     ) -> VortexResult<CudaSlice<T>> {
         // SAFETY: No safety guarantees for allocations on the GPU.
         unsafe {
-            self.0
-                .alloc::<T>(len)
+            self.alloc::<T>(len)
                 .map_err(|e| vortex_err!("Failed to allocate device memory: {}", e))
         }
     }
@@ -65,24 +71,11 @@ impl VortexCudaStream {
         D: AsRef<[T]> + Send + 'static,
     {
         let host_slice: &[T] = data.as_ref();
+        // `device_alloc` binds the CUDA context to the current thread.
         let mut cuda_slice: CudaSlice<T> = self.device_alloc(host_slice.len())?;
-        let (device_ptr, record_write) = cuda_slice.device_ptr_mut(&self.0);
 
-        // calling the unsafe memcpy_htod_async expects the cuda context thread local
-        // to be set. To avoid invalid context error from the cuda call we set it
-        // explicitly here.
-        // TODO(os): wrap calling unsafe cudarc functions with something that binds always
-        //           so we don't forget
-        self.0
-            .context()
-            .bind_to_thread()
-            .map_err(|e| vortex_err!("Failed to bind CUDA context: {}", e))?;
-
-        unsafe {
-            memcpy_htod_async(device_ptr, host_slice, self.0.cu_stream())
-                .map_err(|e| vortex_err!("Failed to schedule async copy to device: {}", e))?;
-        }
-        drop(record_write);
+        self.memcpy_htod(host_slice, &mut cuda_slice)
+            .map_err(|e| vortex_err!("Failed to schedule H2D copy: {}", e))?;
 
         let cuda_buf = CudaDeviceBuffer::new(cuda_slice);
         let stream = Arc::clone(&self.0);
@@ -95,6 +88,28 @@ impl VortexCudaStream {
 
             Ok(BufferHandle::new_device(Arc::new(cuda_buf)))
         }))
+    }
+
+    /// Synchronous variant of [`copy_to_device`](Self::copy_to_device).
+    ///
+    /// Allocates device memory, enqueues the H2D copy on the stream, and
+    /// returns immediately. The device pointer is valid as soon as this call
+    /// returns; the copy completes before any later work on the same stream.
+    ///
+    /// For **pageable** host memory (the common case), `memcpy_htod` stages
+    /// the source into a driver-managed pinned buffer before returning, so
+    /// the source data is safe to drop after this call.
+    pub(crate) fn copy_to_device_sync<T>(&self, data: &[T]) -> VortexResult<BufferHandle>
+    where
+        T: DeviceRepr + Debug + Send + Sync + 'static,
+    {
+        let mut cuda_slice: CudaSlice<T> = self.device_alloc(data.len())?;
+
+        self.memcpy_htod(data, &mut cuda_slice)
+            .map_err(|e| vortex_err!("Failed to schedule H2D copy: {}", e))?;
+
+        let cuda_buf = CudaDeviceBuffer::new(cuda_slice);
+        Ok(BufferHandle::new_device(Arc::new(cuda_buf)))
     }
 }
 

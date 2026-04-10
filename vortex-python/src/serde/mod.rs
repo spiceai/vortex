@@ -20,7 +20,8 @@ use crate::arrays::PyArrayRef;
 use crate::error::PyVortexResult;
 use crate::install_module;
 use crate::serde::context::PyArrayContext;
-use crate::serde::parts::PyArrayParts;
+use crate::serde::context::PyReadContext;
+use crate::serde::parts::PySerializedArray;
 
 /// Register serde functions and classes.
 pub(crate) fn init(py: Python, parent: &Bound<PyModule>) -> PyResult<()> {
@@ -28,8 +29,9 @@ pub(crate) fn init(py: Python, parent: &Bound<PyModule>) -> PyResult<()> {
     parent.add_submodule(&m)?;
     install_module("vortex._lib.serde", &m)?;
 
-    m.add_class::<PyArrayParts>()?;
+    m.add_class::<PySerializedArray>()?;
     m.add_class::<PyArrayContext>()?;
+    m.add_class::<PyReadContext>()?;
     m.add_function(wrap_pyfunction!(decode_ipc_array, &m)?)?;
     m.add_function(wrap_pyfunction!(decode_ipc_array_buffers, &m)?)?;
 

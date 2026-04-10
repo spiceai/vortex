@@ -7,13 +7,16 @@ use vortex_error::vortex_err;
 
 use crate::ArrayRef;
 use crate::IntoArray;
+use crate::array::ArrayView;
 use crate::arrays::ConstantArray;
-use crate::arrays::ExactScalarFn;
-use crate::arrays::ScalarFnArrayExt;
-use crate::arrays::ScalarFnArrayView;
-use crate::arrays::SliceReduceAdaptor;
+use crate::arrays::Struct;
 use crate::arrays::StructArray;
-use crate::arrays::StructVTable;
+use crate::arrays::dict::TakeReduceAdaptor;
+use crate::arrays::scalar_fn::ExactScalarFn;
+use crate::arrays::scalar_fn::ScalarFnArrayView;
+use crate::arrays::scalar_fn::ScalarFnFactoryExt;
+use crate::arrays::slice::SliceReduceAdaptor;
+use crate::arrays::struct_::StructArrayExt;
 use crate::builtins::ArrayBuiltins;
 use crate::optimizer::rules::ArrayParentReduceRule;
 use crate::optimizer::rules::ParentRuleSet;
@@ -23,13 +26,13 @@ use crate::scalar_fn::fns::get_item::GetItem;
 use crate::scalar_fn::fns::mask::Mask;
 use crate::scalar_fn::fns::mask::MaskReduceAdaptor;
 use crate::validity::Validity;
-use crate::vtable::ValidityHelper;
 
-pub(crate) const PARENT_RULES: ParentRuleSet<StructVTable> = ParentRuleSet::new(&[
+pub(crate) const PARENT_RULES: ParentRuleSet<Struct> = ParentRuleSet::new(&[
     ParentRuleSet::lift(&StructCastPushDownRule),
     ParentRuleSet::lift(&StructGetItemRule),
-    ParentRuleSet::lift(&MaskReduceAdaptor(StructVTable)),
-    ParentRuleSet::lift(&SliceReduceAdaptor(StructVTable)),
+    ParentRuleSet::lift(&MaskReduceAdaptor(Struct)),
+    ParentRuleSet::lift(&SliceReduceAdaptor(Struct)),
+    ParentRuleSet::lift(&TakeReduceAdaptor(Struct)),
 ]);
 
 /// Rule to push down cast into struct fields.
@@ -40,16 +43,18 @@ pub(crate) const PARENT_RULES: ParentRuleSet<StructVTable> = ParentRuleSet::new(
 /// at the end of the struct, filled with null values.
 #[derive(Debug)]
 struct StructCastPushDownRule;
-impl ArrayParentReduceRule<StructVTable> for StructCastPushDownRule {
+impl ArrayParentReduceRule<Struct> for StructCastPushDownRule {
     type Parent = ExactScalarFn<Cast>;
 
     fn reduce_parent(
         &self,
-        array: &StructArray,
+        array: ArrayView<'_, Struct>,
         parent: ScalarFnArrayView<Cast>,
         _child_idx: usize,
     ) -> VortexResult<Option<ArrayRef>> {
-        let target_fields = parent.options.as_struct_fields();
+        let Some(target_fields) = parent.options.as_struct_fields_opt() else {
+            return Ok(None);
+        };
         let mut new_fields = Vec::with_capacity(target_fields.nfields());
 
         for (target_name, target_dtype) in target_fields.names().iter().zip(target_fields.fields())
@@ -74,12 +79,11 @@ impl ArrayParentReduceRule<StructVTable> for StructCastPushDownRule {
         }
 
         let validity = if parent.options.is_nullable() {
-            array.validity().clone().into_nullable()
+            array.validity()?.into_nullable()
         } else {
             array
-                .validity()
-                .clone()
-                .into_non_nullable(array.len)
+                .validity()?
+                .into_non_nullable(array.len())
                 .ok_or_else(|| vortex_err!("Failed to cast nullable struct to non-nullable"))?
         };
 
@@ -94,21 +98,27 @@ impl ArrayParentReduceRule<StructVTable> for StructCastPushDownRule {
 /// Rule to flatten get_item from struct by field name
 #[derive(Debug)]
 pub(crate) struct StructGetItemRule;
-impl ArrayParentReduceRule<StructVTable> for StructGetItemRule {
+impl ArrayParentReduceRule<Struct> for StructGetItemRule {
     type Parent = ExactScalarFn<GetItem>;
 
     fn reduce_parent(
         &self,
-        child: &StructArray,
+        child: ArrayView<'_, Struct>,
         parent: ScalarFnArrayView<'_, GetItem>,
         _child_idx: usize,
     ) -> VortexResult<Option<ArrayRef>> {
         let field_name = parent.options;
-        let Some(field) = child.unmasked_field_by_name_opt(field_name) else {
-            return Ok(None);
-        };
+        let field = child
+            .unmasked_field_by_name_opt(field_name)
+            .ok_or_else(|| {
+                vortex_err!(
+                    "Field '{}' missing from struct array {}",
+                    field_name,
+                    child.struct_fields().names()
+                )
+            })?;
 
-        match child.validity() {
+        match child.validity()? {
             Validity::NonNullable | Validity::AllValid => {
                 // If the struct is non-nullable or all valid, the field's validity is unchanged
                 Ok(Some(field.clone()))
@@ -125,7 +135,7 @@ impl ArrayParentReduceRule<StructVTable> for StructGetItemRule {
             }
             Validity::Array(mask) => {
                 // If the validity is an array, we need to combine it with the field's validity
-                Mask.try_new_array(field.len(), EmptyOptions, [field.clone(), mask.clone()])
+                Mask.try_new_array(field.len(), EmptyOptions, [field.clone(), mask])
                     .map(Some)
             }
         }
@@ -134,16 +144,20 @@ impl ArrayParentReduceRule<StructVTable> for StructGetItemRule {
 
 #[cfg(test)]
 mod tests {
+    use vortex_buffer::buffer;
+
     use crate::IntoArray;
-    use crate::arrays::ConstantArray;
     use crate::arrays::StructArray;
     use crate::arrays::VarBinViewArray;
+    use crate::arrays::struct_::StructArrayExt;
+    use crate::arrays::struct_::compute::rules::ConstantArray;
     use crate::assert_arrays_eq;
     use crate::builtins::ArrayBuiltins;
     use crate::canonical::ToCanonical;
     use crate::dtype::DType;
     use crate::dtype::FieldNames;
     use crate::dtype::Nullability;
+    use crate::dtype::PType;
     use crate::dtype::StructFields;
     use crate::scalar::Scalar;
     use crate::validity::Validity;
@@ -171,7 +185,8 @@ mod tests {
             Nullability::NonNullable,
         );
 
-        // Use ArrayBuiltins::cast which goes through the optimizer and applies StructCastPushDownRule
+        // Use `ArrayBuiltins::cast` which goes through the optimizer and applies
+        // `StructCastPushDownRule`.
         let result = source.into_array().cast(target).unwrap().to_struct();
         assert_arrays_eq!(
             result.unmasked_field_by_name("a").unwrap(),
@@ -185,5 +200,125 @@ mod tests {
             result.unmasked_field_by_name("c").unwrap(),
             ConstantArray::new(Scalar::null(utf8_null), 1)
         );
+    }
+
+    /// Regression test: casting a struct to a non-struct DType must not panic. Previously,
+    /// `StructCastPushDownRule` called `as_struct_fields()` which panics on non-struct types.
+    #[test]
+    fn cast_struct_to_non_struct_does_not_panic() {
+        let source = StructArray::try_new(
+            FieldNames::from(["x"]),
+            vec![buffer![1i32, 2, 3].into_array()],
+            3,
+            Validity::NonNullable,
+        )
+        .unwrap();
+
+        // Casting a struct to a primitive type should not panic. Before the fix,
+        // `StructCastPushDownRule` would panic via `as_struct_fields()` on the non-struct target.
+        let result = source
+            .into_array()
+            .cast(DType::Primitive(PType::I32, Nullability::NonNullable));
+        // Whether this errors or succeeds depends on execution, but the key invariant is that the
+        // optimizer rule does not panic.
+        if let Ok(arr) = &result {
+            assert_eq!(
+                arr.dtype(),
+                &DType::Primitive(PType::I32, Nullability::NonNullable)
+            );
+        }
+    }
+
+    #[test]
+    fn cast_struct_drop_field() {
+        // Casting to a struct with a subset of fields should succeed.
+        let source = StructArray::try_new(
+            FieldNames::from(["a", "b", "c"]),
+            vec![
+                buffer![1i32, 2, 3].into_array(),
+                buffer![10i64, 20, 30].into_array(),
+                buffer![100u8, 200, 255].into_array(),
+            ],
+            3,
+            Validity::NonNullable,
+        )
+        .unwrap();
+
+        let target = DType::Struct(
+            StructFields::new(
+                FieldNames::from(["a", "c"]),
+                vec![
+                    DType::Primitive(PType::I32, Nullability::NonNullable),
+                    DType::Primitive(PType::U8, Nullability::NonNullable),
+                ],
+            ),
+            Nullability::NonNullable,
+        );
+
+        let result = source.into_array().cast(target).unwrap().to_struct();
+        assert_eq!(result.unmasked_fields().len(), 2);
+        assert_arrays_eq!(
+            result.unmasked_field_by_name("a").unwrap(),
+            buffer![1i32, 2, 3].into_array()
+        );
+        assert_arrays_eq!(
+            result.unmasked_field_by_name("c").unwrap(),
+            buffer![100u8, 200, 255].into_array()
+        );
+    }
+
+    #[test]
+    fn cast_struct_field_type_widening() {
+        // Casting struct fields to wider types (i32 -> i64).
+        let source = StructArray::try_new(
+            FieldNames::from(["val"]),
+            vec![buffer![1i32, 2, 3].into_array()],
+            3,
+            Validity::NonNullable,
+        )
+        .unwrap();
+
+        let target = DType::Struct(
+            StructFields::new(
+                FieldNames::from(["val"]),
+                vec![DType::Primitive(PType::I64, Nullability::NonNullable)],
+            ),
+            Nullability::NonNullable,
+        );
+
+        let result = source.into_array().cast(target).unwrap().to_struct();
+        assert_eq!(
+            result.unmasked_field_by_name("val").unwrap().dtype(),
+            &DType::Primitive(PType::I64, Nullability::NonNullable)
+        );
+        assert_arrays_eq!(
+            result.unmasked_field_by_name("val").unwrap(),
+            buffer![1i64, 2, 3].into_array()
+        );
+    }
+
+    #[test]
+    fn cast_struct_add_non_nullable_field_fails() {
+        // Adding a non-nullable field via cast should fail.
+        let source = StructArray::try_new(
+            FieldNames::from(["a"]),
+            vec![buffer![1i32].into_array()],
+            1,
+            Validity::NonNullable,
+        )
+        .unwrap();
+
+        let target = DType::Struct(
+            StructFields::new(
+                FieldNames::from(["a", "b"]),
+                vec![
+                    DType::Primitive(PType::I32, Nullability::NonNullable),
+                    DType::Primitive(PType::I32, Nullability::NonNullable),
+                ],
+            ),
+            Nullability::NonNullable,
+        );
+
+        assert!(source.into_array().cast(target).is_err());
     }
 }

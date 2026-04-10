@@ -8,12 +8,12 @@ use tracing::instrument;
 use vortex::array::ArrayRef;
 use vortex::array::Canonical;
 use vortex::array::arrays::DecimalArray;
-use vortex::array::arrays::PrimitiveArrayParts;
-use vortex::encodings::decimal_byte_parts::DecimalBytePartsArrayParts;
-use vortex::encodings::decimal_byte_parts::DecimalBytePartsVTable;
+use vortex::array::arrays::primitive::PrimitiveDataParts;
+use vortex::encodings::decimal_byte_parts::DecimalByteParts;
+use vortex::encodings::decimal_byte_parts::DecimalBytePartsArrayExt;
+use vortex::error::VortexExpect;
 use vortex::error::VortexResult;
 use vortex::error::vortex_bail;
-use vortex_cuda_macros::cuda_tests;
 
 use crate::CudaExecutionCtx;
 use crate::executor::CudaArrayExt;
@@ -31,18 +31,25 @@ impl CudaExecute for DecimalBytePartsExecutor {
         array: ArrayRef,
         ctx: &mut CudaExecutionCtx,
     ) -> VortexResult<Canonical> {
-        let Ok(array) = array.try_into::<DecimalBytePartsVTable>() else {
+        let Ok(array) = array.try_downcast::<DecimalByteParts>() else {
             vortex_bail!("cannot downcast to DecimalBytePartsArray")
         };
 
-        let decimal_dtype = *array.decimal_dtype();
-        let DecimalBytePartsArrayParts { msp, .. } = array.into_parts();
-        let PrimitiveArrayParts {
+        let decimal_dtype = *array
+            .dtype()
+            .as_decimal_opt()
+            .vortex_expect("DecimalBytePartsArray dtype must be decimal");
+        let msp = array.msp().clone();
+        let PrimitiveDataParts {
             buffer,
             ptype,
             validity,
             ..
-        } = msp.execute_cuda(ctx).await?.into_primitive().into_parts();
+        } = msp
+            .execute_cuda(ctx)
+            .await?
+            .into_primitive()
+            .into_data_parts();
 
         // SAFETY: The primitive array's buffer is already validated with correct type.
         // The decimal dtype matches the array's dtype, and validity is preserved.
@@ -52,7 +59,7 @@ impl CudaExecute for DecimalBytePartsExecutor {
     }
 }
 
-#[cuda_tests]
+#[cfg(test)]
 mod tests {
     use rstest::rstest;
     use vortex::array::IntoArray;
@@ -61,7 +68,7 @@ mod tests {
     use vortex::array::validity::Validity;
     use vortex::buffer::Buffer;
     use vortex::dtype::DecimalDType;
-    use vortex::encodings::decimal_byte_parts::DecimalBytePartsArray;
+    use vortex::encodings::decimal_byte_parts::DecimalByteParts;
     use vortex::error::VortexExpect;
     use vortex::session::VortexSession;
 
@@ -73,7 +80,7 @@ mod tests {
     #[case::i16_p10_s2(Buffer::from(vec![100i16, 200, 300, 400, 500]), 10, 2)]
     #[case::i32_p18_s4(Buffer::from(vec![100i32, 200, 300, 400, 500]), 18, 4)]
     #[case::i64_p38_s6(Buffer::from(vec![100i64, 200, 300, 400, 500]), 38, 6)]
-    #[tokio::test]
+    #[crate::test]
     async fn test_decimal_byte_parts_gpu_decode<T: vortex::dtype::NativePType>(
         #[case] encoded: Buffer<T>,
         #[case] precision: u8,
@@ -83,7 +90,7 @@ mod tests {
             .vortex_expect("create execution context");
 
         let decimal_dtype = DecimalDType::new(precision, scale);
-        let dbp_array = DecimalBytePartsArray::try_new(
+        let dbp_array = DecimalByteParts::try_new(
             PrimitiveArray::new(encoded, Validity::NonNullable).into_array(),
             decimal_dtype,
         )
@@ -92,7 +99,7 @@ mod tests {
         let cpu_result = dbp_array.to_canonical().vortex_expect("CPU canonicalize");
 
         let gpu_result = DecimalBytePartsExecutor
-            .execute(dbp_array.to_array(), &mut cuda_ctx)
+            .execute(dbp_array.into_array(), &mut cuda_ctx)
             .await
             .vortex_expect("GPU decode");
 

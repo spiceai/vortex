@@ -169,24 +169,48 @@ impl ExtVTable for Timestamp {
         })
     }
 
-    fn validate_dtype(
-        &self,
-        _metadata: &Self::Metadata,
-        storage_dtype: &DType,
-    ) -> VortexResult<()> {
+    fn can_coerce_from(ext_dtype: &ExtDType<Self>, other: &DType) -> bool {
+        let DType::Extension(other_ext) = other else {
+            return false;
+        };
+        let Some(other_opts) = other_ext.metadata_opt::<Timestamp>() else {
+            return false;
+        };
+        let our_opts = ext_dtype.metadata();
+        our_opts.tz == other_opts.tz
+            && our_opts.unit <= other_opts.unit
+            && (ext_dtype.storage_dtype().is_nullable() || !other.is_nullable())
+    }
+
+    fn least_supertype(ext_dtype: &ExtDType<Self>, other: &DType) -> Option<DType> {
+        let DType::Extension(other_ext) = other else {
+            return None;
+        };
+        let other_opts = other_ext.metadata_opt::<Timestamp>()?;
+        let our_opts = ext_dtype.metadata();
+        if our_opts.tz != other_opts.tz {
+            return None;
+        }
+        let finest = our_opts.unit.min(other_opts.unit);
+        let union_null = ext_dtype.storage_dtype().nullability() | other.nullability();
+        Some(DType::Extension(
+            Timestamp::new_with_tz(finest, our_opts.tz.clone(), union_null).erased(),
+        ))
+    }
+
+    fn validate_dtype(ext_dtype: &ExtDType<Self>) -> VortexResult<()> {
         vortex_ensure!(
-            matches!(storage_dtype, DType::Primitive(PType::I64, _)),
+            matches!(ext_dtype.storage_dtype(), DType::Primitive(PType::I64, _)),
             "Timestamp storage dtype must be i64"
         );
         Ok(())
     }
 
     fn unpack_native<'a>(
-        &self,
-        metadata: &'a Self::Metadata,
-        _storage_dtype: &'a DType,
+        ext_dtype: &'a ExtDType<Self>,
         storage_value: &'a ScalarValue,
     ) -> VortexResult<Self::NativeValue<'a>> {
+        let metadata = ext_dtype.metadata();
         let ts_value = storage_value.as_primitive().cast::<i64>()?;
         let tz = metadata.tz.as_ref();
 
@@ -221,5 +245,124 @@ impl ExtVTable for Timestamp {
         }
 
         Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use vortex_error::VortexResult;
+
+    use crate::dtype::DType;
+    use crate::dtype::Nullability::Nullable;
+    use crate::extension::datetime::TimeUnit;
+    use crate::extension::datetime::Timestamp;
+    use crate::scalar::PValue;
+    use crate::scalar::Scalar;
+    use crate::scalar::ScalarValue;
+
+    #[test]
+    fn validate_timestamp_scalar() -> VortexResult<()> {
+        let dtype = DType::Extension(Timestamp::new(TimeUnit::Seconds, Nullable).erased());
+        Scalar::try_new(dtype, Some(ScalarValue::Primitive(PValue::I64(0))))?;
+
+        Ok(())
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn reject_timestamp_with_invalid_timezone() {
+        let dtype = DType::Extension(
+            Timestamp::new_with_tz(
+                TimeUnit::Seconds,
+                Some(Arc::from("Not/A/Timezone")),
+                Nullable,
+            )
+            .erased(),
+        );
+        let result = Scalar::try_new(dtype, Some(ScalarValue::Primitive(PValue::I64(0))));
+        assert!(result.is_err());
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn display_timestamp_scalar() {
+        // Local (no timezone) timestamp.
+        let local_dtype = DType::Extension(Timestamp::new(TimeUnit::Seconds, Nullable).erased());
+        let scalar = Scalar::new(local_dtype, Some(ScalarValue::Primitive(PValue::I64(0))));
+        assert_eq!(format!("{}", scalar.as_extension()), "1970-01-01T00:00:00Z");
+
+        // Zoned timestamp.
+        let zoned_dtype = DType::Extension(
+            Timestamp::new_with_tz(
+                TimeUnit::Seconds,
+                Some(Arc::from("America/New_York")),
+                Nullable,
+            )
+            .erased(),
+        );
+        let scalar = Scalar::new(zoned_dtype, Some(ScalarValue::Primitive(PValue::I64(0))));
+        assert_eq!(
+            format!("{}", scalar.as_extension()),
+            "1969-12-31T19:00:00-05:00[America/New_York]"
+        );
+    }
+
+    #[test]
+    fn least_supertype_timestamp_units() {
+        use crate::dtype::Nullability::NonNullable;
+
+        let secs = DType::Extension(Timestamp::new(TimeUnit::Seconds, NonNullable).erased());
+        let ns = DType::Extension(Timestamp::new(TimeUnit::Nanoseconds, NonNullable).erased());
+        let expected =
+            DType::Extension(Timestamp::new(TimeUnit::Nanoseconds, NonNullable).erased());
+        assert_eq!(secs.least_supertype(&ns).unwrap(), expected);
+        assert_eq!(ns.least_supertype(&secs).unwrap(), expected);
+    }
+
+    #[test]
+    fn least_supertype_timestamp_tz_mismatch() {
+        use crate::dtype::Nullability::NonNullable;
+
+        let utc = DType::Extension(
+            Timestamp::new_with_tz(TimeUnit::Seconds, Some(Arc::from("UTC")), NonNullable).erased(),
+        );
+        let none = DType::Extension(Timestamp::new(TimeUnit::Seconds, NonNullable).erased());
+        assert!(utc.least_supertype(&none).is_none());
+    }
+
+    #[test]
+    fn least_supertype_timestamp_same_tz() {
+        use crate::dtype::Nullability::NonNullable;
+
+        let utc_s = DType::Extension(
+            Timestamp::new_with_tz(TimeUnit::Seconds, Some(Arc::from("UTC")), NonNullable).erased(),
+        );
+        let utc_ns = DType::Extension(
+            Timestamp::new_with_tz(TimeUnit::Nanoseconds, Some(Arc::from("UTC")), NonNullable)
+                .erased(),
+        );
+        let expected = DType::Extension(
+            Timestamp::new_with_tz(TimeUnit::Nanoseconds, Some(Arc::from("UTC")), NonNullable)
+                .erased(),
+        );
+        assert_eq!(utc_s.least_supertype(&utc_ns).unwrap(), expected);
+    }
+
+    #[test]
+    fn can_coerce_from_timestamp_tz() {
+        use crate::dtype::Nullability::NonNullable;
+
+        let utc = DType::Extension(
+            Timestamp::new_with_tz(TimeUnit::Nanoseconds, Some(Arc::from("UTC")), NonNullable)
+                .erased(),
+        );
+        let utc_s = DType::Extension(
+            Timestamp::new_with_tz(TimeUnit::Seconds, Some(Arc::from("UTC")), NonNullable).erased(),
+        );
+        let none = DType::Extension(Timestamp::new(TimeUnit::Nanoseconds, NonNullable).erased());
+        assert!(utc.can_coerce_from(&utc_s));
+        assert!(!utc.can_coerce_from(&none));
     }
 }

@@ -7,18 +7,20 @@ use vortex_error::VortexResult;
 
 use crate::ArrayRef;
 use crate::IntoArray;
-use crate::arrays::SliceReduce;
+use crate::array::ArrayView;
+use crate::arrays::VarBin;
 use crate::arrays::VarBinArray;
-use crate::arrays::VarBinVTable;
+use crate::arrays::slice::SliceReduce;
+use crate::arrays::varbin::VarBinArrayExt;
 
-impl SliceReduce for VarBinVTable {
-    fn slice(array: &Self::Array, range: Range<usize>) -> VortexResult<Option<ArrayRef>> {
-        VarBinVTable::_slice(array, range).map(Some)
+impl SliceReduce for VarBin {
+    fn slice(array: ArrayView<'_, Self>, range: Range<usize>) -> VortexResult<Option<ArrayRef>> {
+        VarBin::_slice(array, range).map(Some)
     }
 }
 
-impl VarBinVTable {
-    pub fn _slice(array: &VarBinArray, range: Range<usize>) -> VortexResult<ArrayRef> {
+impl VarBin {
+    pub fn _slice(array: ArrayView<'_, VarBin>, range: Range<usize>) -> VortexResult<ArrayRef> {
         Ok(unsafe {
             VarBinArray::new_unchecked_from_handle(
                 array.offsets().slice(range.start..range.end + 1)?,

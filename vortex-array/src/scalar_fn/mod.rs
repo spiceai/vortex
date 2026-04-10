@@ -11,14 +11,22 @@ use arcref::ArcRef;
 
 mod vtable;
 pub use vtable::*;
+
 mod plugin;
 pub use plugin::*;
+
+mod foreign;
+pub use foreign::*;
+
 mod typed;
 pub use typed::*;
+
 mod erased;
 pub use erased::*;
+
 mod options;
 pub use options::*;
+
 mod signature;
 pub use signature::*;
 
@@ -31,11 +39,11 @@ pub type ScalarFnId = ArcRef<str>;
 /// Private module to seal [`typed::DynScalarFn`].
 mod sealed {
     use crate::scalar_fn::ScalarFnVTable;
-    use crate::scalar_fn::typed::ScalarFnInner;
+    use crate::scalar_fn::typed::ScalarFn;
 
     /// Marker trait to prevent external implementations of [`super::typed::DynScalarFn`].
     pub(crate) trait Sealed {}
 
     /// This can be the **only** implementor for [`super::typed::DynScalarFn`].
-    impl<V: ScalarFnVTable> Sealed for ScalarFnInner<V> {}
+    impl<V: ScalarFnVTable> Sealed for ScalarFn<V> {}
 }

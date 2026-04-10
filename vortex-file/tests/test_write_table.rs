@@ -10,13 +10,18 @@ use futures::StreamExt;
 use futures::pin_mut;
 use vortex_array::IntoArray;
 use vortex_array::ToCanonical;
+use vortex_array::arrays::BoolArray;
+use vortex_array::arrays::DictArray;
+use vortex_array::arrays::ListViewArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::StructArray;
+use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::dtype::FieldNames;
 use vortex_array::field_path;
 use vortex_array::scalar_fn::session::ScalarFnSession;
 use vortex_array::session::ArraySession;
 use vortex_array::validity::Validity;
+use vortex_btrblocks::BtrBlocksCompressor;
 use vortex_buffer::ByteBuffer;
 use vortex_file::OpenOptionsSessionExt;
 use vortex_file::WriteOptionsSessionExt;
@@ -28,13 +33,13 @@ use vortex_layout::session::LayoutSession;
 use vortex_session::VortexSession;
 
 static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
-    let mut session = VortexSession::empty()
+    let session = VortexSession::empty()
         .with::<ArraySession>()
         .with::<LayoutSession>()
         .with::<ScalarFnSession>()
         .with::<RuntimeSession>();
 
-    vortex_file::register_default_encodings(&mut session);
+    vortex_file::register_default_encodings(&session);
 
     session
 });
@@ -64,9 +69,9 @@ async fn test_file_roundtrip() {
 
     // Create a writer which by default uses the BtrBlocks compressor for a.compressed, but leaves
     // the b and the a.raw columns uncompressed.
-    let default_strategy = Arc::new(CompressingStrategy::new_btrblocks(
+    let default_strategy = Arc::new(CompressingStrategy::new(
         FlatLayoutStrategy::default(),
-        false,
+        BtrBlocksCompressor::default(),
     ));
 
     let writer = Arc::new(
@@ -110,4 +115,53 @@ async fn test_file_roundtrip() {
         assert!(b.is_canonical());
         assert!(raw.nbytes() > compressed.nbytes());
     }
+}
+
+/// Regression test: writing a Dict<ListView> where the list has
+/// Validity::Array(BoolArray) and the dict codes are nullable used to fail
+/// with "Array vortex.fill_null does not support serialization".
+#[tokio::test]
+async fn test_dict_listview_validity_roundtrip() {
+    let elements = PrimitiveArray::from_iter(vec![1i32, 2, 3, 4, 5]).into_array();
+    let offsets = PrimitiveArray::from_iter(vec![0u32, 2, 4]).into_array();
+    let sizes = PrimitiveArray::from_iter(vec![2u32, 2, 1]).into_array();
+    let list_validity = Validity::Array(BoolArray::from_iter([true, false, true]).into_array());
+    let listview = ListViewArray::new(elements, offsets, sizes, list_validity).into_array();
+
+    let codes = PrimitiveArray::new(
+        vortex_buffer::buffer![0u32, 0, 1, 0, 2],
+        Validity::from_iter(vec![true, false, true, true, true]),
+    )
+    .into_array();
+
+    let dict = DictArray::new(codes, listview).into_array();
+
+    let data = StructArray::from_fields(&[("col", dict)])
+        .expect("from_fields")
+        .into_array();
+
+    let mut bytes = Vec::new();
+    SESSION
+        .write_options()
+        .write(&mut bytes, data.to_array_stream())
+        .await
+        .expect("write should not fail with fill_null serialization error");
+
+    let bytes = ByteBuffer::from(bytes);
+    let vxf = SESSION.open_options().open_buffer(bytes).expect("open");
+
+    let stream = vxf
+        .scan()
+        .expect("scan")
+        .into_stream()
+        .expect("into_stream");
+    pin_mut!(stream);
+
+    let chunk = stream
+        .next()
+        .await
+        .unwrap()
+        .expect("read back should succeed");
+    vortex_array::assert_arrays_eq!(data, chunk);
+    assert!(stream.next().await.is_none(), "expected a single chunk");
 }

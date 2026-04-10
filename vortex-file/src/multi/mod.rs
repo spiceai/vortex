@@ -17,9 +17,9 @@ use vortex_error::vortex_err;
 use vortex_io::filesystem::FileListing;
 use vortex_io::filesystem::FileSystemRef;
 use vortex_layout::LayoutReaderRef;
-use vortex_scan::api::DataSource;
-use vortex_scan::multi::LayoutReaderFactory;
-use vortex_scan::multi::MultiLayoutDataSource;
+use vortex_layout::scan::multi::LayoutReaderFactory;
+use vortex_layout::scan::multi::MultiLayoutDataSource;
+use vortex_scan::DataSource;
 use vortex_session::VortexSession;
 
 use crate::OpenOptionsSessionExt;
@@ -127,10 +127,10 @@ impl MultiFileDataSource {
             .iter()
             .map(|f| {
                 Arc::new(VortexFileReaderFactory {
-                    fs: fs.clone(),
+                    fs: Arc::clone(&fs),
                     file: f.clone(),
                     session: self.session.clone(),
-                    open_options_fn: self.open_options_fn.clone(),
+                    open_options_fn: Arc::clone(&self.open_options_fn),
                 }) as Arc<dyn LayoutReaderFactory>
             })
             .collect();

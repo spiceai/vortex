@@ -4,20 +4,20 @@
 use vortex_error::VortexResult;
 use vortex_mask::AllOr;
 
-use crate::Array;
 use crate::ArrayRef;
 use crate::IntoArray;
+use crate::array::ArrayView;
+use crate::arrays::Constant;
 use crate::arrays::ConstantArray;
-use crate::arrays::ConstantVTable;
 use crate::arrays::MaskedArray;
-use crate::arrays::TakeReduce;
-use crate::arrays::TakeReduceAdaptor;
+use crate::arrays::dict::TakeReduce;
+use crate::arrays::dict::TakeReduceAdaptor;
 use crate::optimizer::rules::ParentRuleSet;
 use crate::scalar::Scalar;
 use crate::validity::Validity;
 
-impl TakeReduce for ConstantVTable {
-    fn take(array: &ConstantArray, indices: &dyn Array) -> VortexResult<Option<ArrayRef>> {
+impl TakeReduce for Constant {
+    fn take(array: ArrayView<'_, Constant>, indices: &ArrayRef) -> VortexResult<Option<ArrayRef>> {
         let result = match indices.validity_mask()?.bit_buffer() {
             AllOr::All => {
                 let scalar = Scalar::try_new(
@@ -52,7 +52,7 @@ impl TakeReduce for ConstantVTable {
     }
 }
 
-impl ConstantVTable {
+impl Constant {
     pub const TAKE_RULES: ParentRuleSet<Self> =
         ParentRuleSet::new(&[ParentRuleSet::lift(&TakeReduceAdaptor::<Self>(Self))]);
 }
@@ -63,7 +63,6 @@ mod tests {
     use vortex_buffer::buffer;
     use vortex_mask::AllOr;
 
-    use crate::Array;
     use crate::IntoArray;
     use crate::ToCanonical;
     use crate::arrays::ConstantArray;
@@ -76,7 +75,7 @@ mod tests {
 
     #[test]
     fn take_nullable_indices() {
-        let array = ConstantArray::new(42, 10).to_array();
+        let array = ConstantArray::new(42, 10).into_array();
         let taken = array
             .take(
                 PrimitiveArray::new(
@@ -106,7 +105,7 @@ mod tests {
 
     #[test]
     fn take_all_valid_indices() {
-        let array = ConstantArray::new(42, 10).to_array();
+        let array = ConstantArray::new(42, 10).into_array();
         let taken = array
             .take(PrimitiveArray::new(buffer![0, 5, 7], Validity::AllValid).into_array())
             .unwrap();
@@ -128,6 +127,6 @@ mod tests {
     #[case(ConstantArray::new(Scalar::null_native::<i64>(), 5))]
     #[case(ConstantArray::new(true, 1))]
     fn test_take_constant_conformance(#[case] array: ConstantArray) {
-        test_take_conformance(array.as_ref());
+        test_take_conformance(&array.into_array());
     }
 }

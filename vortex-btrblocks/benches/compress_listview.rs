@@ -10,7 +10,7 @@ mod benchmarks {
     use divan::Bencher;
     use divan::counter::BytesCount;
     use divan::counter::ItemsCount;
-    use rand::Rng;
+    use rand::RngExt;
     use rand::SeedableRng;
     use rand::prelude::StdRng;
     use vortex_array::ArrayRef;
@@ -181,7 +181,7 @@ mod benchmarks {
             .with_inputs(|| &array)
             .input_counter(|_| ItemsCount::new(NUM_ROWS))
             .input_counter(move |_| BytesCount::new(nbytes as usize))
-            .bench_refs(|array| compressor.compress(array.as_ref()).unwrap());
+            .bench_refs(|array| compressor.compress(array).unwrap());
     }
 }
 

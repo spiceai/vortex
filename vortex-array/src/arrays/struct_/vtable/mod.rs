@@ -1,78 +1,144 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::sync::Arc;
-
 use itertools::Itertools;
 use kernel::PARENT_KERNELS;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
-use vortex_error::vortex_ensure;
+use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
 
 use crate::ArrayRef;
-use crate::EmptyMetadata;
 use crate::ExecutionCtx;
-use crate::arrays::struct_::StructArray;
+use crate::ExecutionResult;
+use crate::array::Array;
+use crate::array::ArrayView;
+use crate::array::EmptyArrayData;
+use crate::array::VTable;
+use crate::array::child_to_validity;
+use crate::arrays::struct_::array::FIELDS_OFFSET;
+use crate::arrays::struct_::array::VALIDITY_SLOT;
+use crate::arrays::struct_::array::make_struct_slots;
 use crate::arrays::struct_::compute::rules::PARENT_RULES;
 use crate::buffer::BufferHandle;
 use crate::dtype::DType;
 use crate::serde::ArrayChildren;
 use crate::validity::Validity;
-use crate::vtable;
-use crate::vtable::VTable;
-use crate::vtable::ValidityVTableFromValidityHelper;
-
-mod array;
 mod kernel;
 mod operations;
 mod validity;
-mod visitor;
 
-use crate::vtable::ArrayId;
+use crate::array::ArrayId;
 
-vtable!(Struct);
+/// A [`Struct`]-encoded Vortex array.
+pub type StructArray = Array<Struct>;
 
-impl VTable for StructVTable {
-    type Array = StructArray;
+impl VTable for Struct {
+    type ArrayData = EmptyArrayData;
 
-    type Metadata = EmptyMetadata;
-
-    type ArrayVTable = Self;
     type OperationsVTable = Self;
-    type ValidityVTable = ValidityVTableFromValidityHelper;
-    type VisitorVTable = Self;
+    type ValidityVTable = Self;
 
-    fn id(_array: &Self::Array) -> ArrayId {
+    fn id(&self) -> ArrayId {
         Self::ID
     }
 
-    fn metadata(_array: &StructArray) -> VortexResult<Self::Metadata> {
-        Ok(EmptyMetadata)
+    fn nbuffers(_array: ArrayView<'_, Self>) -> usize {
+        0
     }
 
-    fn serialize(_metadata: Self::Metadata) -> VortexResult<Option<Vec<u8>>> {
+    fn validate(
+        &self,
+        _data: &EmptyArrayData,
+        dtype: &DType,
+        len: usize,
+        slots: &[Option<ArrayRef>],
+    ) -> VortexResult<()> {
+        let DType::Struct(struct_dtype, nullability) = dtype else {
+            vortex_bail!("Expected struct dtype, found {:?}", dtype)
+        };
+
+        let expected_slots = struct_dtype.nfields() + 1;
+        if slots.len() != expected_slots {
+            vortex_bail!(
+                InvalidArgument: "StructArray has {} slots but expected {}",
+                slots.len(),
+                expected_slots
+            );
+        }
+
+        let validity = child_to_validity(&slots[VALIDITY_SLOT], *nullability);
+        if let Some(validity_len) = validity.maybe_len()
+            && validity_len != len
+        {
+            vortex_bail!(
+                InvalidArgument: "StructArray validity length {} does not match outer length {}",
+                validity_len,
+                len
+            );
+        }
+
+        let field_slots = &slots[FIELDS_OFFSET..];
+        if field_slots.is_empty() {
+            return Ok(());
+        }
+
+        for (idx, (slot, field_dtype)) in field_slots.iter().zip(struct_dtype.fields()).enumerate()
+        {
+            let field = slot
+                .as_ref()
+                .ok_or_else(|| vortex_error::vortex_err!("StructArray missing field slot {idx}"))?;
+            if field.len() != len {
+                vortex_bail!(
+                    InvalidArgument: "StructArray field {idx} has length {} but expected {}",
+                    field.len(),
+                    len
+                );
+            }
+            if field.dtype() != &field_dtype {
+                vortex_bail!(
+                    InvalidArgument: "StructArray field {idx} has dtype {} but expected {}",
+                    field.dtype(),
+                    field_dtype
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    fn buffer(_array: ArrayView<'_, Self>, idx: usize) -> BufferHandle {
+        vortex_panic!("StructArray buffer index {idx} out of bounds")
+    }
+
+    fn buffer_name(_array: ArrayView<'_, Self>, idx: usize) -> Option<String> {
+        vortex_panic!("StructArray buffer_name index {idx} out of bounds")
+    }
+
+    fn serialize(
+        _array: ArrayView<'_, Self>,
+        _session: &VortexSession,
+    ) -> VortexResult<Option<Vec<u8>>> {
         Ok(Some(vec![]))
     }
 
     fn deserialize(
-        _bytes: &[u8],
-        _dtype: &DType,
-        _len: usize,
-        _buffers: &[BufferHandle],
-        _session: &VortexSession,
-    ) -> VortexResult<Self::Metadata> {
-        Ok(EmptyMetadata)
-    }
-
-    fn build(
+        &self,
         dtype: &DType,
         len: usize,
-        _metadata: &Self::Metadata,
+        metadata: &[u8],
+
         _buffers: &[BufferHandle],
         children: &dyn ArrayChildren,
-    ) -> VortexResult<StructArray> {
+        _session: &VortexSession,
+    ) -> VortexResult<crate::array::ArrayParts<Self>> {
+        if !metadata.is_empty() {
+            vortex_bail!(
+                "StructArray expects empty metadata, got {} bytes",
+                metadata.len()
+            );
+        }
         let DType::Struct(struct_dtype, nullability) = dtype else {
             vortex_bail!("Expected struct dtype, found {:?}", dtype)
         };
@@ -80,7 +146,6 @@ impl VTable for StructVTable {
         let (validity, non_data_children) = if children.len() == struct_dtype.nfields() {
             (Validity::from(*nullability), 0_usize)
         } else if children.len() == struct_dtype.nfields() + 1 {
-            // Validity is the first child if it exists.
             let validity = children.get(0, &Validity::DTYPE, len)?;
             (Validity::Array(validity), 1_usize)
         } else {
@@ -92,7 +157,7 @@ impl VTable for StructVTable {
             );
         };
 
-        let children: Vec<_> = (0..struct_dtype.nfields())
+        let field_children: Vec<_> = (0..struct_dtype.nfields())
             .map(|i| {
                 let child_dtype = struct_dtype
                     .field_by_index(i)
@@ -101,47 +166,27 @@ impl VTable for StructVTable {
             })
             .try_collect()?;
 
-        StructArray::try_new_with_dtype(children, struct_dtype.clone(), len, validity)
+        let slots = make_struct_slots(&field_children, &validity, len);
+        Ok(
+            crate::array::ArrayParts::new(self.clone(), dtype.clone(), len, EmptyArrayData)
+                .with_slots(slots),
+        )
     }
 
-    fn with_children(array: &mut Self::Array, children: Vec<ArrayRef>) -> VortexResult<()> {
-        let DType::Struct(struct_dtype, _nullability) = &array.dtype else {
-            vortex_bail!("Expected struct dtype, found {:?}", array.dtype)
-        };
-
-        // First child is validity (if present), followed by fields
-        let (validity, non_data_children) = if children.len() == struct_dtype.nfields() {
-            (array.validity.clone(), 0_usize)
-        } else if children.len() == struct_dtype.nfields() + 1 {
-            (Validity::Array(children[0].clone()), 1_usize)
+    fn slot_name(array: ArrayView<'_, Self>, idx: usize) -> String {
+        if idx == VALIDITY_SLOT {
+            "validity".to_string()
         } else {
-            vortex_bail!(
-                "Expected {} or {} children, found {}",
-                struct_dtype.nfields(),
-                struct_dtype.nfields() + 1,
-                children.len()
-            );
-        };
-
-        let fields: Arc<[ArrayRef]> = children.into_iter().skip(non_data_children).collect();
-        vortex_ensure!(
-            fields.len() == struct_dtype.nfields(),
-            "Expected {} field children, found {}",
-            struct_dtype.nfields(),
-            fields.len()
-        );
-
-        array.fields = fields;
-        array.validity = validity;
-        Ok(())
+            array.dtype().as_struct_fields().names()[idx - FIELDS_OFFSET].to_string()
+        }
     }
 
-    fn execute(array: &Self::Array, _ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
-        Ok(array.to_array())
+    fn execute(array: Array<Self>, _ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
+        Ok(ExecutionResult::done(array))
     }
 
     fn reduce_parent(
-        array: &Self::Array,
+        array: ArrayView<'_, Self>,
         parent: &ArrayRef,
         child_idx: usize,
     ) -> VortexResult<Option<ArrayRef>> {
@@ -149,7 +194,7 @@ impl VTable for StructVTable {
     }
 
     fn execute_parent(
-        array: &Self::Array,
+        array: ArrayView<'_, Self>,
         parent: &ArrayRef,
         child_idx: usize,
         ctx: &mut ExecutionCtx,
@@ -158,9 +203,9 @@ impl VTable for StructVTable {
     }
 }
 
-#[derive(Debug)]
-pub struct StructVTable;
+#[derive(Clone, Debug)]
+pub struct Struct;
 
-impl StructVTable {
+impl Struct {
     pub const ID: ArrayId = ArrayId::new_ref("vortex.struct");
 }

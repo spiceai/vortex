@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::collections::BTreeSet;
+use std::future;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -11,6 +12,8 @@ use futures::future::BoxFuture;
 use futures::stream::FuturesOrdered;
 use itertools::Itertools;
 use vortex_array::ArrayRef;
+use vortex_array::Canonical;
+use vortex_array::IntoArray;
 use vortex_array::MaskFuture;
 use vortex_array::arrays::ChunkedArray;
 use vortex_array::dtype::DType;
@@ -57,7 +60,7 @@ impl ChunkedReader {
             .map(|idx| Arc::from(format!("{name}.[{idx}]")))
             .collect();
         let lazy_children = LazyReaderChildren::new(
-            layout.children.clone(),
+            Arc::clone(&layout.children),
             dtypes,
             names,
             segment_source,
@@ -224,7 +227,7 @@ impl LayoutReader for ChunkedReader {
             chunk_evals.push(chunk_eval);
         }
 
-        let name = self.name.clone();
+        let name = Arc::clone(&self.name);
         Ok(MaskFuture::new(mask.len(), async move {
             tracing::debug!(
                 "Chunked pruning evaluation {} (mask = {})",
@@ -267,7 +270,7 @@ impl LayoutReader for ChunkedReader {
             chunk_evals.push(chunk_eval);
         }
 
-        let name = self.name.clone();
+        let name = Arc::clone(&self.name);
         Ok(MaskFuture::new(mask.len(), async move {
             tracing::debug!("Chunked mask evaluation {}", name);
 
@@ -292,7 +295,7 @@ impl LayoutReader for ChunkedReader {
     ) -> VortexResult<BoxFuture<'static, VortexResult<ArrayRef>>> {
         let dtype = expr.return_dtype(self.dtype())?;
         if row_range.is_empty() {
-            return Ok(async move { Ok(ChunkedArray::try_new(vec![], dtype)?.to_array()) }.boxed());
+            return Ok(future::ready(Ok(Canonical::empty(&dtype).into_array())).boxed());
         }
 
         let mut chunk_evals = vec![];
@@ -317,7 +320,7 @@ impl LayoutReader for ChunkedReader {
             }
 
             // Combine the arrays.
-            Ok(ChunkedArray::try_new(chunks, dtype)?.to_array())
+            Ok(ChunkedArray::try_new(chunks, dtype)?.into_array())
         }
         .boxed())
     }
@@ -340,6 +343,7 @@ mod test {
     use vortex_array::expr::root;
     use vortex_buffer::buffer;
     use vortex_io::runtime::single::block_on;
+    use vortex_io::session::RuntimeSessionExt;
 
     use crate::LayoutRef;
     use crate::LayoutStrategy;
@@ -360,22 +364,26 @@ mod test {
         let segments = Arc::new(TestSegments::default());
         let strategy = ChunkedLayoutStrategy::new(FlatLayoutStrategy::default());
         let (mut sequence_id, eof) = SequenceId::root().split();
-        let layout = block_on(|handle| {
-            strategy.write_stream(
-                ctx,
-                segments.clone(),
-                SequentialStreamAdapter::new(
-                    DType::Primitive(PType::I32, NonNullable),
-                    stream::iter([
-                        Ok((sequence_id.advance(), buffer![1, 2, 3].into_array())),
-                        Ok((sequence_id.advance(), buffer![4, 5, 6].into_array())),
-                        Ok((sequence_id.advance(), buffer![7, 8, 9].into_array())),
-                    ]),
+        let segments2 = Arc::<TestSegments>::clone(&segments);
+        let layout = block_on(|handle| async move {
+            let session = SESSION.clone().with_handle(handle);
+            strategy
+                .write_stream(
+                    ctx,
+                    segments2,
+                    SequentialStreamAdapter::new(
+                        DType::Primitive(PType::I32, NonNullable),
+                        stream::iter([
+                            Ok((sequence_id.advance(), buffer![1, 2, 3].into_array())),
+                            Ok((sequence_id.advance(), buffer![4, 5, 6].into_array())),
+                            Ok((sequence_id.advance(), buffer![7, 8, 9].into_array())),
+                        ]),
+                    )
+                    .sendable(),
+                    eof,
+                    &session,
                 )
-                .sendable(),
-                eof,
-                handle,
-            )
+                .await
         })
         .unwrap();
 
@@ -400,7 +408,7 @@ mod test {
                 .unwrap();
 
             let expected = buffer![1i32, 2, 3, 4, 5, 6, 7, 8, 9].into_array();
-            assert_arrays_eq!(result.as_ref(), expected.as_ref());
+            assert_arrays_eq!(result, expected);
         })
     }
 }

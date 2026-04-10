@@ -3,13 +3,13 @@
 
 use vortex_error::VortexResult;
 
-use crate::arrays::ConstantArray;
-use crate::arrays::ConstantVTable;
+use crate::array::ArrayView;
+use crate::array::ValidityVTable;
+use crate::arrays::Constant;
 use crate::validity::Validity;
-use crate::vtable::ValidityVTable;
 
-impl ValidityVTable<ConstantVTable> for ConstantVTable {
-    fn validity(array: &ConstantArray) -> VortexResult<Validity> {
+impl ValidityVTable<Constant> for Constant {
+    fn validity(array: ArrayView<'_, Constant>) -> VortexResult<Validity> {
         debug_assert!(array.dtype().is_nullable());
         Ok(if array.scalar().is_null() {
             Validity::AllInvalid

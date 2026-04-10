@@ -11,8 +11,6 @@ use crate::dtype::extension::ExtDType;
 use crate::dtype::extension::ExtId;
 use crate::dtype::extension::ExtVTable;
 use crate::extension::EmptyMetadata;
-use crate::scalar::ExtScalar;
-use crate::scalar::PValue;
 use crate::scalar::Scalar;
 use crate::scalar::ScalarValue;
 
@@ -34,18 +32,12 @@ impl ExtVTable for TestI32Ext {
         Ok(EmptyMetadata)
     }
 
-    fn validate_dtype(
-        &self,
-        _options: &Self::Metadata,
-        _storage_dtype: &DType,
-    ) -> VortexResult<()> {
+    fn validate_dtype(_ext_dtype: &ExtDType<Self>) -> VortexResult<()> {
         Ok(())
     }
 
     fn unpack_native<'a>(
-        &self,
-        _metadata: &'a Self::Metadata,
-        _storage_dtype: &'a DType,
+        _ext_dtype: &'a ExtDType<Self>,
         _storage_value: &'a ScalarValue,
     ) -> VortexResult<Self::NativeValue<'a>> {
         Ok("")
@@ -123,18 +115,12 @@ fn test_ext_scalar_partial_ord_different_types() {
             Ok(EmptyMetadata)
         }
 
-        fn validate_dtype(
-            &self,
-            _options: &Self::Metadata,
-            _storage_dtype: &DType,
-        ) -> VortexResult<()> {
+        fn validate_dtype(_ext_dtype: &ExtDType<Self>) -> VortexResult<()> {
             Ok(())
         }
 
         fn unpack_native<'a>(
-            &self,
-            _metadata: &'a Self::Metadata,
-            _storage_dtype: &'a DType,
+            _ext_dtype: &'a ExtDType<Self>,
             _storage_value: &'a ScalarValue,
         ) -> VortexResult<Self::NativeValue<'a>> {
             Ok("")
@@ -292,15 +278,6 @@ fn test_ext_scalar_cast_null_to_non_nullable() {
 }
 
 #[test]
-fn test_ext_scalar_try_new_non_extension() {
-    let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-    let value = ScalarValue::Primitive(PValue::I32(42));
-
-    let result = ExtScalar::try_new(&dtype, Some(&value));
-    assert!(result.is_err());
-}
-
-#[test]
 fn test_ext_scalar_with_metadata() {
     #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
     struct TestExtMetadata;
@@ -320,18 +297,12 @@ fn test_ext_scalar_with_metadata() {
             vortex_bail!("not implemented")
         }
 
-        fn validate_dtype(
-            &self,
-            _options: &Self::Metadata,
-            _storage_dtype: &DType,
-        ) -> VortexResult<()> {
+        fn validate_dtype(_ext_dtype: &ExtDType<Self>) -> VortexResult<()> {
             Ok(())
         }
 
         fn unpack_native<'a>(
-            &self,
-            _metadata: &'a Self::Metadata,
-            _storage_dtype: &'a DType,
+            _ext_dtype: &'a ExtDType<Self>,
             _storage_value: &'a ScalarValue,
         ) -> VortexResult<Self::NativeValue<'a>> {
             Ok("")

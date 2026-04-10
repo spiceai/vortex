@@ -26,7 +26,7 @@ use datafusion_physical_plan::collect;
 use futures::StreamExt;
 use parking_lot::Mutex;
 use tokio::fs::File;
-use vortex::scan::api::DataSourceRef;
+use vortex::scan::DataSourceRef;
 use vortex_bench::Benchmark;
 use vortex_bench::BenchmarkArg;
 use vortex_bench::CompactionStrategy;
@@ -39,6 +39,8 @@ use vortex_bench::conversions::convert_parquet_directory_to_vortex;
 use vortex_bench::create_benchmark;
 use vortex_bench::create_output_writer;
 use vortex_bench::display::DisplayFormat;
+use vortex_bench::runner::BenchmarkMode;
+use vortex_bench::runner::BenchmarkQueryResult;
 use vortex_bench::runner::SqlBenchmarkRunner;
 use vortex_bench::runner::filter_queries;
 use vortex_bench::setup_logging_and_tracing;
@@ -94,9 +96,6 @@ struct Args {
 
     #[arg(long, default_value_t = false)]
     explain: bool,
-
-    #[arg(long, default_value_t = false)]
-    explain_analyze: bool,
 
     #[arg(long, value_delimiter = ',', value_parser = value_parser!(Format))]
     formats: Vec<Format>,
@@ -162,10 +161,18 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(Mutex::new(Vec::new()));
     let show_metrics = args.show_metrics;
 
+    let mode = if args.explain {
+        BenchmarkMode::Explain
+    } else {
+        BenchmarkMode::Run {
+            iterations: args.iterations,
+        }
+    };
+
     runner
         .run_all_async(
             &filtered_queries,
-            args.iterations,
+            mode,
             |format| {
                 let benchmark = &*benchmark;
                 async move {
@@ -187,7 +194,6 @@ async fn main() -> anyhow::Result<()> {
                             .with_labelset(get_labelset_from_global())
                             .await?;
                         let time = timer.elapsed();
-                        let row_count = batches.iter().map(|batch| batch.num_rows()).sum::<usize>();
 
                         // Store plan for metrics (only store once per query/format combination)
                         if show_metrics {
@@ -197,11 +203,11 @@ async fn main() -> anyhow::Result<()> {
                                 .iter()
                                 .any(|(idx, f, _)| *idx == query_idx && *f == *format)
                             {
-                                plans_mut.push((query_idx, *format, plan.clone()));
+                                plans_mut.push((query_idx, *format, Arc::clone(&plan)));
                             }
                         }
 
-                        anyhow::Ok((row_count, Some(time), plan))
+                        anyhow::Ok((Some(time), DataFusionQueryResult(batches)))
                     }
                     .with_labelset(labelset),
                 )
@@ -209,15 +215,17 @@ async fn main() -> anyhow::Result<()> {
         )
         .await?;
 
-    // Print metrics if requested
-    if show_metrics {
-        let plans = collected_plans.lock();
-        print_metrics(plans.as_ref());
-    }
+    if !args.explain {
+        // Print metrics if requested
+        if show_metrics {
+            let plans = collected_plans.lock();
+            print_metrics(plans.as_ref());
+        }
 
-    let benchmark_id = format!("datafusion-{}", benchmark.dataset_name());
-    let writer = create_output_writer(&args.display_format, args.output_path, &benchmark_id)?;
-    runner.export_to(&args.display_format, writer)?;
+        let benchmark_id = format!("datafusion-{}", benchmark.dataset_name());
+        let writer = create_output_writer(&args.display_format, args.output_path, &benchmark_id)?;
+        runner.export_to(&args.display_format, writer)?;
+    }
 
     Ok(())
 }
@@ -244,7 +252,7 @@ async fn register_benchmark_tables<B: Benchmark + ?Sized>(
                 let pattern = benchmark.pattern(table.name, format);
                 let table_url = ListingTableUrl::try_new(benchmark_base.clone(), pattern)?;
 
-                let mut listing_options = ListingOptions::new(file_format.clone())
+                let mut listing_options = ListingOptions::new(Arc::clone(&file_format))
                     .with_session_config_options(session.state().config());
                 if benchmark.dataset_name() == "polarsignals" && format == Format::Parquet {
                     // Work around a DataFusion bug (fixed in 53.0.0) where the
@@ -283,7 +291,7 @@ async fn register_v2_tables<B: Benchmark + ?Sized>(
     use vortex::file::multi::MultiFileDataSource;
     use vortex::io::object_store::ObjectStoreFileSystem;
     use vortex::io::session::RuntimeSessionExt;
-    use vortex::scan::api::DataSource as _;
+    use vortex::scan::DataSource as _;
     use vortex_datafusion::v2::VortexTable;
 
     let benchmark_base = benchmark.data_url().join(&format!("{}/", format.name()))?;
@@ -296,8 +304,10 @@ async fn register_v2_tables<B: Benchmark + ?Sized>(
             .runtime_env()
             .object_store(table_url.object_store())?;
 
-        let fs: vortex::io::filesystem::FileSystemRef =
-            Arc::new(ObjectStoreFileSystem::new(store.clone(), SESSION.handle()));
+        let fs: vortex::io::filesystem::FileSystemRef = Arc::new(ObjectStoreFileSystem::new(
+            Arc::clone(&store),
+            SESSION.handle(),
+        ));
         let base_prefix = benchmark_base.path().trim_start_matches('/').to_string();
         let fs = fs.with_prefix(base_prefix);
 
@@ -379,6 +389,21 @@ async fn register_arrow_tables<B: Benchmark + ?Sized>(
     Ok(())
 }
 
+/// Wrapper around DataFusion record batches implementing `BenchmarkQueryResult`.
+pub struct DataFusionQueryResult(pub Vec<RecordBatch>);
+
+impl BenchmarkQueryResult for DataFusionQueryResult {
+    fn row_count(&self) -> usize {
+        self.0.iter().map(|batch| batch.num_rows()).sum()
+    }
+
+    fn display(self) -> String {
+        datafusion::arrow::util::pretty::pretty_format_batches(&self.0)
+            .map(|d| d.to_string())
+            .unwrap_or_else(|e| format!("<error: {e}>"))
+    }
+}
+
 pub async fn execute_query(
     ctx: &SessionContext,
     query: &str,
@@ -393,7 +418,7 @@ pub async fn execute_query(
         .create_physical_plan()
         .with_labelset(get_labelset_from_global())
         .await?;
-    let result = collect(plan.clone(), task_ctx)
+    let result = collect(Arc::clone(&plan), task_ctx)
         .with_labelset(get_labelset_from_global())
         .await?;
 

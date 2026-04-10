@@ -22,7 +22,6 @@ use cudarc::driver::CudaEvent;
 use cudarc::driver::CudaStream;
 use cudarc::driver::sys;
 use cudarc::runtime::sys::cudaEvent_t;
-use vortex::array::Array;
 use vortex::array::ArrayRef;
 use vortex::array::buffer::BufferHandle;
 use vortex::array::validity::Validity;
@@ -182,7 +181,7 @@ impl PrivateData {
 }
 
 #[async_trait]
-pub trait DeviceArrayExt: Array {
+pub trait DeviceArrayExt {
     async fn export_device_array(
         self,
         ctx: &mut CudaExecutionCtx,

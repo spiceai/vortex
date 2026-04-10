@@ -12,6 +12,7 @@ use std::time::Duration;
 use criterion::BenchmarkId;
 use criterion::Criterion;
 use criterion::Throughput;
+use cudarc::driver::CudaSlice;
 use cudarc::driver::DevicePtr;
 use cudarc::driver::LaunchConfig;
 use cudarc::driver::PushKernelArg;
@@ -23,13 +24,18 @@ use vortex::array::arrays::PrimitiveArray;
 use vortex::array::scalar::Scalar;
 use vortex::array::validity::Validity::NonNullable;
 use vortex::buffer::Buffer;
-use vortex::encodings::alp::ALPArray;
+use vortex::dtype::PType;
+use vortex::encodings::alp::ALP;
+use vortex::encodings::alp::ALPArrayExt;
+use vortex::encodings::alp::ALPArraySlotsExt;
 use vortex::encodings::alp::ALPFloat;
 use vortex::encodings::alp::Exponents;
 use vortex::encodings::alp::alp_encode;
-use vortex::encodings::fastlanes::BitPackedArray;
-use vortex::encodings::fastlanes::FoRArray;
-use vortex::encodings::runend::RunEndArray;
+use vortex::encodings::fastlanes::BitPackedData;
+use vortex::encodings::fastlanes::FoR;
+use vortex::encodings::fastlanes::FoRArrayExt;
+use vortex::encodings::fastlanes::FoRData;
+use vortex::encodings::runend::RunEnd;
 use vortex::error::VortexExpect;
 use vortex::error::VortexResult;
 use vortex::error::vortex_err;
@@ -37,8 +43,9 @@ use vortex::session::VortexSession;
 use vortex_cuda::CudaDeviceBuffer;
 use vortex_cuda::CudaExecutionCtx;
 use vortex_cuda::CudaSession;
-use vortex_cuda::dynamic_dispatch;
-use vortex_cuda::dynamic_dispatch::DynamicDispatchPlan;
+use vortex_cuda::dynamic_dispatch::CudaDispatchPlan;
+use vortex_cuda::dynamic_dispatch::DispatchPlan;
+use vortex_cuda::dynamic_dispatch::MaterializedPlan;
 use vortex_cuda_macros::cuda_available;
 use vortex_cuda_macros::cuda_not_available;
 
@@ -49,14 +56,18 @@ const BENCH_ARGS: &[(usize, &str)] = &[
 ];
 
 /// Launch the dynamic_dispatch kernel and return GPU-timed duration.
+///
+/// This deliberately does not use `CudaDispatchPlan::execute` because the
+/// benchmark pre-allocates the output buffer and device plan once, then reuses
+/// them across iterations.
 fn run_timed(
     cuda_ctx: &mut CudaExecutionCtx,
     array_len: usize,
     output_buf: &CudaDeviceBuffer,
-    device_plan: &Arc<cudarc::driver::CudaSlice<DynamicDispatchPlan>>,
+    device_plan: &Arc<CudaSlice<u8>>,
     shared_mem_bytes: u32,
 ) -> VortexResult<Duration> {
-    let cuda_function = cuda_ctx.load_function("dynamic_dispatch", &["u32"])?;
+    let cuda_function = cuda_ctx.load_function("dynamic_dispatch", &[PType::U32])?;
     let array_len_u64 = array_len as u64;
     let output_view = output_buf.as_view::<u32>();
     let (output_ptr, record_output) = output_view.device_ptr(cuda_ctx.stream());
@@ -106,40 +117,44 @@ fn run_timed(
 
 /// Benchmark runner: builds a dynamic plan and launches the kernel.
 struct BenchRunner {
-    _plan: DynamicDispatchPlan,
+    _plan: CudaDispatchPlan,
     smem_bytes: u32,
     len: usize,
-    // Keep alive
-    device_plan: Arc<cudarc::driver::CudaSlice<DynamicDispatchPlan>>,
+    device_plan: Arc<CudaSlice<u8>>,
     output_buf: CudaDeviceBuffer,
     _plan_buffers: Vec<vortex::array::buffer::BufferHandle>,
 }
 
 impl BenchRunner {
     fn new(array: &vortex::array::ArrayRef, len: usize, cuda_ctx: &CudaExecutionCtx) -> Self {
-        let (plan, plan_buffers) =
-            dynamic_dispatch::build_plan(array, cuda_ctx).vortex_expect("build_plan");
-        let smem_bytes = plan.shared_mem_bytes::<u32>();
+        let plan = match DispatchPlan::new(array).vortex_expect("build_dyn_dispatch_plan") {
+            DispatchPlan::Fused(plan) => plan,
+            _ => unreachable!("encoding not fusable"),
+        };
+        let MaterializedPlan {
+            dispatch_plan,
+            device_buffers,
+            shared_mem_bytes,
+        } = plan.materialize(cuda_ctx).vortex_expect("materialize plan");
 
         let device_plan = Arc::new(
             cuda_ctx
                 .stream()
-                .clone_htod(std::slice::from_ref(&plan))
+                .clone_htod(dispatch_plan.as_bytes())
                 .expect("htod plan"),
         );
 
-        let output_slice = cuda_ctx
-            .device_alloc::<u32>(len.next_multiple_of(1024))
-            .expect("alloc output");
-        let output_buf = CudaDeviceBuffer::new(output_slice);
-
         Self {
-            _plan: plan,
-            smem_bytes,
+            _plan: dispatch_plan,
+            smem_bytes: shared_mem_bytes,
             len,
             device_plan,
-            output_buf,
-            _plan_buffers: plan_buffers,
+            output_buf: CudaDeviceBuffer::new(
+                cuda_ctx
+                    .device_alloc::<u32>(len.next_multiple_of(1024))
+                    .expect("alloc output"),
+            ),
+            _plan_buffers: device_buffers,
         }
     }
 
@@ -175,10 +190,10 @@ fn bench_for_bitpacked(c: &mut Criterion) {
             .map(|i| (i as u64 % (max_val + 1)) as u32)
             .collect();
         let prim = PrimitiveArray::new(Buffer::from(residuals), NonNullable);
-        let bp = BitPackedArray::encode(prim.as_ref(), bit_width).vortex_expect("bitpack");
-        let for_arr =
-            FoRArray::try_new(bp.into_array(), Scalar::from(reference)).vortex_expect("for");
-        let array = for_arr.to_array();
+        let bp = BitPackedData::encode(&prim.into_array(), bit_width).vortex_expect("bitpack");
+        let array = FoR::try_new(bp.into_array(), Scalar::from(reference))
+            .vortex_expect("for")
+            .into_array();
 
         group.bench_with_input(
             BenchmarkId::new("dynamic_dispatch_u32", len_str),
@@ -219,11 +234,11 @@ fn bench_dict_bp_codes(c: &mut Criterion) {
 
         let codes: Vec<u32> = (0..*len).map(|i| (i % dict_size) as u32).collect();
         let codes_prim = PrimitiveArray::new(Buffer::from(codes), NonNullable);
-        let codes_bp = BitPackedArray::encode(codes_prim.as_ref(), dict_bit_width)
+        let codes_bp = BitPackedData::encode(&codes_prim.into_array(), dict_bit_width)
             .vortex_expect("bitpack codes");
         let values_prim = PrimitiveArray::new(Buffer::from(dict_values.clone()), NonNullable);
         let dict = DictArray::new(codes_bp.into_array(), values_prim.into_array());
-        let array = dict.to_array();
+        let array = dict.into_array();
 
         group.bench_with_input(
             BenchmarkId::new("dynamic_dispatch_u32", len_str),
@@ -266,8 +281,8 @@ fn bench_runend(c: &mut Criterion) {
 
         let ends_arr = PrimitiveArray::new(Buffer::from(ends), NonNullable).into_array();
         let values_arr = PrimitiveArray::new(Buffer::from(values), NonNullable).into_array();
-        let re = RunEndArray::new(ends_arr, values_arr);
-        let array = re.to_array();
+        let re = RunEnd::new(ends_arr, values_arr);
+        let array = re.into_array();
 
         group.bench_with_input(
             BenchmarkId::new("dynamic_dispatch_u32", len_str),
@@ -307,21 +322,21 @@ fn bench_dict_bp_codes_bp_for_values(c: &mut Criterion) {
     // Dict values: residuals 0..63 bitpacked, FoR adds 1_000_000
     let dict_residuals: Vec<u32> = (0..dict_size as u32).collect();
     let dict_prim = PrimitiveArray::new(Buffer::from(dict_residuals), NonNullable);
-    let dict_bp =
-        BitPackedArray::encode(dict_prim.as_ref(), dict_bit_width).vortex_expect("bitpack dict");
-    let dict_for = FoRArray::try_new(dict_bp.into_array(), Scalar::from(dict_reference))
-        .vortex_expect("for dict");
+    let dict_bp = BitPackedData::encode(&dict_prim.into_array(), dict_bit_width)
+        .vortex_expect("bitpack dict");
+    let dict_for =
+        FoR::try_new(dict_bp.into_array(), Scalar::from(dict_reference)).vortex_expect("for dict");
 
     for (len, len_str) in BENCH_ARGS {
         group.throughput(Throughput::Bytes((len * size_of::<u32>()) as u64));
 
         let codes: Vec<u32> = (0..*len).map(|i| (i % dict_size) as u32).collect();
         let codes_prim = PrimitiveArray::new(Buffer::from(codes), NonNullable);
-        let codes_bp = BitPackedArray::encode(codes_prim.as_ref(), codes_bit_width)
+        let codes_bp = BitPackedData::encode(&codes_prim.into_array(), codes_bit_width)
             .vortex_expect("bitpack codes");
 
-        let dict = DictArray::new(codes_bp.into_array(), dict_for.to_array());
-        let array = dict.to_array();
+        let dict = DictArray::new(codes_bp.into_array(), dict_for.clone().into_array());
+        let array = dict.into_array();
 
         group.bench_with_input(
             BenchmarkId::new("dynamic_dispatch_u32", len_str),
@@ -368,18 +383,18 @@ fn bench_alp_for_bitpacked(c: &mut Criterion) {
         // Encode: ALP → FoR → BitPacked
         let alp = alp_encode(&float_prim, Some(exponents)).vortex_expect("alp_encode");
         assert!(alp.patches().is_none());
-        let for_arr = FoRArray::encode(alp.encoded().to_primitive()).vortex_expect("for encode");
+        let for_arr = FoRData::encode(alp.encoded().to_primitive()).vortex_expect("for encode");
         let bp =
-            BitPackedArray::encode(for_arr.encoded(), bit_width).vortex_expect("bitpack encode");
+            BitPackedData::encode(for_arr.encoded(), bit_width).vortex_expect("bitpack encode");
 
-        let tree = ALPArray::new(
-            FoRArray::try_new(bp.into_array(), for_arr.reference_scalar().clone())
+        let tree = ALP::new(
+            FoR::try_new(bp.into_array(), for_arr.reference_scalar().clone())
                 .vortex_expect("for_new")
                 .into_array(),
             exponents,
             None,
         );
-        let array = tree.to_array();
+        let array = tree.into_array();
 
         group.bench_with_input(
             BenchmarkId::new("dynamic_dispatch_f32", len_str),

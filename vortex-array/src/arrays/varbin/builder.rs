@@ -7,8 +7,8 @@ use vortex_buffer::BufferMut;
 use vortex_error::vortex_panic;
 
 use crate::IntoArray;
-use crate::arrays::primitive::PrimitiveArray;
-use crate::arrays::varbin::VarBinArray;
+use crate::arrays::PrimitiveArray;
+use crate::arrays::VarBinArray;
 use crate::dtype::DType;
 use crate::dtype::IntegerPType;
 use crate::expr::stats::Precision;
@@ -122,6 +122,7 @@ impl<O: IntegerPType> VarBinBuilder<O> {
 mod tests {
     use vortex_error::VortexResult;
 
+    use crate::arrays::varbin::VarBinArrayExt;
     use crate::arrays::varbin::builder::VarBinBuilder;
     use crate::dtype::DType;
     use crate::dtype::Nullability::Nullable;

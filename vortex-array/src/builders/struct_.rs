@@ -11,10 +11,10 @@ use vortex_error::vortex_ensure;
 use vortex_error::vortex_panic;
 use vortex_mask::Mask;
 
-use crate::Array;
 use crate::ArrayRef;
 use crate::IntoArray;
 use crate::arrays::StructArray;
+use crate::arrays::struct_::StructArrayExt;
 use crate::builders::ArrayBuilder;
 use crate::builders::DEFAULT_BUILDER_CAPACITY;
 use crate::builders::LazyBitBufferBuilder;
@@ -165,22 +165,18 @@ impl ArrayBuilder for StructBuilder {
         self.append_value(scalar.as_struct())
     }
 
-    unsafe fn extend_from_array_unchecked(&mut self, array: &dyn Array) {
+    unsafe fn extend_from_array_unchecked(&mut self, array: &ArrayRef) {
         let array = array.to_struct();
 
         for (a, builder) in array
-            .unmasked_fields()
-            .iter()
+            .iter_unmasked_fields()
             .zip_eq(self.builders.iter_mut())
         {
-            builder.extend_from_array(a.as_ref());
+            builder.extend_from_array(a);
         }
 
-        self.nulls.append_validity_mask(
-            array
-                .validity_mask()
-                .vortex_expect("validity_mask in extend_from_array_unchecked"),
-        );
+        self.nulls
+            .append_validity_mask(array.validity_mask().vortex_expect("validity_mask"));
     }
 
     fn reserve_exact(&mut self, capacity: usize) {
@@ -208,10 +204,10 @@ impl ArrayBuilder for StructBuilder {
 mod tests {
     use crate::IntoArray;
     use crate::arrays::PrimitiveArray;
-    use crate::arrays::StructArray;
     use crate::arrays::VarBinArray;
     use crate::assert_arrays_eq;
     use crate::builders::ArrayBuilder;
+    use crate::builders::struct_::StructArray;
     use crate::builders::struct_::StructBuilder;
     use crate::dtype::DType;
     use crate::dtype::Nullability;

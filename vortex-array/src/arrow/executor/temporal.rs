@@ -25,11 +25,11 @@ use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
 
-use crate::Array;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::arrays::ExtensionArray;
 use crate::arrays::PrimitiveArray as VortexPrimitiveArray;
+use crate::arrays::extension::ExtensionArrayExt;
 use crate::arrow::null_buffer::to_null_buffer;
 use crate::dtype::NativePType;
 use crate::extension::datetime::AnyTemporal;
@@ -147,7 +147,7 @@ where
 
     let ext_array = array.execute::<ExtensionArray>(ctx)?;
     let primitive = ext_array
-        .storage()
+        .storage_array()
         .clone()
         .execute::<VortexPrimitiveArray>(ctx)?;
     vortex_ensure!(

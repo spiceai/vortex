@@ -8,7 +8,7 @@ use anyhow::Result;
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use parquet::arrow::ArrowWriter;
-use rand::Rng;
+use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use vortex::array::ArrayRef;
@@ -17,7 +17,8 @@ use vortex::array::arrays::ChunkedArray;
 use vortex::array::arrays::ListArray;
 use vortex::array::arrays::PrimitiveArray;
 use vortex::array::arrays::StructArray;
-use vortex::array::arrays::recursive_list_from_list_view;
+use vortex::array::arrays::chunked::ChunkedArrayExt;
+use vortex::array::arrays::listview::recursive_list_from_list_view;
 use vortex::array::validity::Validity;
 use vortex::dtype::FieldNames;
 
@@ -115,15 +116,14 @@ impl Dataset for StructListOfInts {
             let array = self.to_vortex_array().await?;
 
             // Convert to Arrow RecordBatches and write to parquet
-            let chunked = array.as_::<vortex::array::arrays::ChunkedVTable>();
-            let chunks = chunked.chunks();
+            let chunked = array.as_::<vortex::array::arrays::Chunked>();
 
             let file = File::create(&temp_path)?;
             let mut writer: Option<ArrowWriter<File>> = None;
 
-            for chunk in chunks.iter() {
+            for chunk in chunked.iter_chunks() {
                 let converted = recursive_list_from_list_view(chunk.clone())?;
-                let batch = RecordBatch::try_from(converted.as_ref())?;
+                let batch = RecordBatch::try_from(&converted)?;
 
                 if writer.is_none() {
                     writer = Some(ArrowWriter::try_new(

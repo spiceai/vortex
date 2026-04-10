@@ -3,7 +3,6 @@
 
 use std::cmp::Ordering;
 
-use vortex_array::Array;
 use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
 use vortex_array::ToCanonical;
@@ -12,6 +11,7 @@ use vortex_array::arrays::BoolArray;
 use vortex_array::arrays::DecimalArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::VarBinViewArray;
+use vortex_array::arrays::bool::BoolArrayExt;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::NativePType;
 use vortex_array::match_each_decimal_value_type;
@@ -21,7 +21,7 @@ use vortex_error::VortexResult;
 
 use crate::array::take_canonical_array_non_nullable_indices;
 
-pub fn sort_canonical_array(array: &dyn Array) -> VortexResult<ArrayRef> {
+pub fn sort_canonical_array(array: &ArrayRef) -> VortexResult<ArrayRef> {
     match array.dtype() {
         DType::Bool(_) => {
             let bool_array = array.to_bool();
@@ -81,7 +81,7 @@ pub fn sort_canonical_array(array: &dyn Array) -> VortexResult<ArrayRef> {
             });
             take_canonical_array_non_nullable_indices(array, &sort_indices)
         }
-        d @ (DType::Null | DType::Extension(_)) => {
+        d @ (DType::Null | DType::Extension(_) | DType::Variant(_)) => {
             unreachable!("DType {d} not supported for fuzzing")
         }
     }

@@ -2,29 +2,30 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use vortex_array::ArrayRef;
+use vortex_array::ArrayView;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
-use vortex_array::arrays::FilterKernel;
+use vortex_array::arrays::filter::FilterKernel;
 use vortex_error::VortexResult;
 use vortex_mask::Mask;
 
-use crate::ALPRDArray;
-use crate::ALPRDVTable;
+use crate::ALPRD;
+use crate::ALPRDArrayExt;
 
-impl FilterKernel for ALPRDVTable {
+impl FilterKernel for ALPRD {
     fn filter(
-        array: &ALPRDArray,
+        array: ArrayView<'_, Self>,
         mask: &Mask,
-        _ctx: &mut ExecutionCtx,
+        ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
         let left_parts_exceptions = array
             .left_parts_patches()
-            .map(|patches| patches.filter(mask))
+            .map(|patches| patches.filter(mask, ctx))
             .transpose()?
             .flatten();
 
         Ok(Some(
-            ALPRDArray::try_new(
+            ALPRD::try_new(
                 array.dtype().clone(),
                 array.left_parts().filter(mask.clone())?,
                 array.left_parts_dictionary().clone(),
@@ -48,6 +49,7 @@ mod test {
     use vortex_buffer::buffer;
     use vortex_mask::Mask;
 
+    use crate::ALPRDArrayExt;
     use crate::ALPRDFloat;
     use crate::RDEncoder;
 

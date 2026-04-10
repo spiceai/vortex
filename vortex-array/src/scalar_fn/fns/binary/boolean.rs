@@ -6,10 +6,10 @@ use arrow_schema::DataType;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
 
-use crate::Array;
 use crate::ArrayRef;
+use crate::IntoArray;
+use crate::arrays::Constant;
 use crate::arrays::ConstantArray;
-use crate::arrays::ConstantVTable;
 use crate::arrow::FromArrowArray;
 use crate::arrow::IntoArrowArray;
 use crate::builtins::ArrayBuiltins;
@@ -19,14 +19,14 @@ use crate::scalar_fn::fns::operators::Operator;
 
 /// Point-wise Kleene logical _and_ between two Boolean arrays.
 #[deprecated(note = "Use `ArrayBuiltins::binary` instead")]
-pub fn and_kleene(lhs: &dyn Array, rhs: &dyn Array) -> VortexResult<ArrayRef> {
-    lhs.to_array().binary(rhs.to_array(), Operator::And)
+pub fn and_kleene(lhs: &ArrayRef, rhs: &ArrayRef) -> VortexResult<ArrayRef> {
+    lhs.clone().binary(rhs.clone(), Operator::And)
 }
 
 /// Point-wise Kleene logical _or_ between two Boolean arrays.
 #[deprecated(note = "Use `ArrayBuiltins::binary` instead")]
-pub fn or_kleene(lhs: &dyn Array, rhs: &dyn Array) -> VortexResult<ArrayRef> {
-    lhs.to_array().binary(rhs.to_array(), Operator::Or)
+pub fn or_kleene(lhs: &ArrayRef, rhs: &ArrayRef) -> VortexResult<ArrayRef> {
+    lhs.clone().binary(rhs.clone(), Operator::Or)
 }
 
 /// Execute a Kleene boolean operation between two arrays.
@@ -34,14 +34,14 @@ pub fn or_kleene(lhs: &dyn Array, rhs: &dyn Array) -> VortexResult<ArrayRef> {
 /// This is the entry point for boolean operations from the binary expression.
 /// Handles constant-constant directly, otherwise falls back to Arrow.
 pub(crate) fn execute_boolean(
-    lhs: &dyn Array,
-    rhs: &dyn Array,
+    lhs: &ArrayRef,
+    rhs: &ArrayRef,
     op: Operator,
 ) -> VortexResult<ArrayRef> {
     if let Some(result) = constant_boolean(lhs, rhs, op)? {
         return Ok(result);
     }
-    arrow_execute_boolean(lhs.to_array(), rhs.to_array(), op)
+    arrow_execute_boolean(lhs.clone(), rhs.clone(), op)
 }
 
 /// Arrow implementation for Kleene boolean operations using [`Operator`].
@@ -62,14 +62,11 @@ fn arrow_execute_boolean(lhs: ArrayRef, rhs: ArrayRef, op: Operator) -> VortexRe
 
 /// Constant-folds a boolean operation between two constant arrays.
 fn constant_boolean(
-    lhs: &dyn Array,
-    rhs: &dyn Array,
+    lhs: &ArrayRef,
+    rhs: &ArrayRef,
     op: Operator,
 ) -> VortexResult<Option<ArrayRef>> {
-    let (Some(lhs), Some(rhs)) = (
-        lhs.as_opt::<ConstantVTable>(),
-        rhs.as_opt::<ConstantVTable>(),
-    ) else {
+    let (Some(lhs), Some(rhs)) = (lhs.as_opt::<Constant>(), rhs.as_opt::<Constant>()) else {
         return Ok(None);
     };
 
@@ -100,7 +97,7 @@ fn constant_boolean(
         .map(|b| Scalar::bool(b, nullable.into()))
         .unwrap_or_else(|| Scalar::null(DType::Bool(nullable.into())));
 
-    Ok(Some(ConstantArray::new(scalar, length).to_array()))
+    Ok(Some(ConstantArray::new(scalar, length).into_array()))
 }
 
 #[cfg(test)]

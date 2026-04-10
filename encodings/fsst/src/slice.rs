@@ -4,26 +4,29 @@
 use std::ops::Range;
 
 use vortex_array::ArrayRef;
+use vortex_array::ArrayView;
 use vortex_array::IntoArray;
-use vortex_array::arrays::SliceReduce;
-use vortex_array::arrays::VarBinVTable;
+use vortex_array::arrays::VarBin;
+use vortex_array::arrays::slice::SliceReduce;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
 
-use crate::FSSTArray;
-use crate::FSSTVTable;
+use crate::FSST;
+use crate::FSSTArrayExt;
 
-impl SliceReduce for FSSTVTable {
-    fn slice(array: &Self::Array, range: Range<usize>) -> VortexResult<Option<ArrayRef>> {
+impl SliceReduce for FSST {
+    fn slice(array: ArrayView<'_, Self>, range: Range<usize>) -> VortexResult<Option<ArrayRef>> {
         // SAFETY: slicing the `codes` leaves the symbol table intact
         Ok(Some(
             unsafe {
-                FSSTArray::new_unchecked(
+                FSST::new_unchecked(
                     array.dtype().clone(),
                     array.symbols().clone(),
                     array.symbol_lengths().clone(),
-                    VarBinVTable::_slice(array.codes().as_::<VarBinVTable>(), range.clone())?
-                        .try_into::<VarBinVTable>()
+                    array
+                        .codes()
+                        .slice(range.clone())?
+                        .try_downcast::<VarBin>()
                         .map_err(|_| vortex_err!("cannot fail conversion"))?,
                     array.uncompressed_lengths().slice(range)?,
                 )

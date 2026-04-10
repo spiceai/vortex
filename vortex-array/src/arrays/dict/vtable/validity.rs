@@ -3,18 +3,19 @@
 
 use vortex_error::VortexResult;
 
-use super::DictVTable;
-use crate::Array;
+use super::Dict;
 use crate::IntoArray;
-use crate::arrays::dict::DictArray;
+use crate::array::ArrayView;
+use crate::array::ValidityVTable;
+use crate::arrays::DictArray;
+use crate::arrays::dict::DictArraySlotsExt;
 use crate::builtins::ArrayBuiltins;
 use crate::dtype::Nullability;
 use crate::scalar::Scalar;
 use crate::validity::Validity;
-use crate::vtable::ValidityVTable;
 
-impl ValidityVTable<DictVTable> for DictVTable {
-    fn validity(array: &DictArray) -> VortexResult<Validity> {
+impl ValidityVTable<Dict> for Dict {
+    fn validity(array: ArrayView<'_, Dict>) -> VortexResult<Validity> {
         Ok(
             match (array.codes().validity()?, array.values().validity()?) {
                 (

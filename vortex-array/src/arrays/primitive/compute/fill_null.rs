@@ -9,26 +9,26 @@ use vortex_error::VortexResult;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::IntoArray;
-use crate::ToCanonical;
-use crate::arrays::PrimitiveVTable;
-use crate::arrays::primitive::PrimitiveArray;
+use crate::array::ArrayView;
+use crate::arrays::BoolArray;
+use crate::arrays::Primitive;
+use crate::arrays::PrimitiveArray;
 use crate::match_each_native_ptype;
 use crate::scalar::Scalar;
 use crate::scalar_fn::fns::fill_null::FillNullKernel;
 use crate::validity::Validity;
-use crate::vtable::ValidityHelper;
 
-impl FillNullKernel for PrimitiveVTable {
+impl FillNullKernel for Primitive {
     fn fill_null(
-        array: &PrimitiveArray,
+        array: ArrayView<'_, Primitive>,
         fill_value: &Scalar,
-        _ctx: &mut ExecutionCtx,
+        ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
         let result_validity = Validity::from(fill_value.dtype().nullability());
 
-        Ok(Some(match array.validity() {
+        Ok(Some(match array.validity()? {
             Validity::Array(is_valid) => {
-                let is_invalid = is_valid.to_bool().to_bit_buffer().not();
+                let is_invalid = is_valid.execute::<BoolArray>(ctx)?.into_bit_buffer().not();
                 match_each_native_ptype!(array.ptype(), |T| {
                     let mut buffer = array.to_buffer::<T>().into_mut();
                     let fill_value = fill_value
@@ -51,8 +51,8 @@ mod test {
     use vortex_buffer::buffer;
 
     use crate::IntoArray;
-    use crate::arrays::BoolArray;
-    use crate::arrays::primitive::PrimitiveArray;
+    use crate::arrays::PrimitiveArray;
+    use crate::arrays::primitive::compute::fill_null::BoolArray;
     use crate::assert_arrays_eq;
     use crate::builtins::ArrayBuiltins;
     use crate::canonical::ToCanonical;
@@ -63,7 +63,7 @@ mod test {
     fn fill_null_leading_none() {
         let arr = PrimitiveArray::from_option_iter([None, Some(8u8), None, Some(10), None]);
         let p = arr
-            .to_array()
+            .into_array()
             .fill_null(Scalar::from(42u8))
             .unwrap()
             .to_primitive();
@@ -76,7 +76,7 @@ mod test {
         let arr = PrimitiveArray::from_option_iter([Option::<u8>::None, None, None, None, None]);
 
         let p = arr
-            .to_array()
+            .into_array()
             .fill_null(Scalar::from(255u8))
             .unwrap()
             .to_primitive();
@@ -91,7 +91,7 @@ mod test {
             Validity::Array(BoolArray::from_iter([true, true, true, true, true]).into_array()),
         );
         let p = arr
-            .to_array()
+            .into_array()
             .fill_null(Scalar::from(255u8))
             .unwrap()
             .to_primitive();

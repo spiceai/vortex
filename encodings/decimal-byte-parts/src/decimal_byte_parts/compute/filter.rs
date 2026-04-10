@@ -2,17 +2,25 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use vortex_array::ArrayRef;
-use vortex_array::arrays::FilterReduce;
+use vortex_array::ArrayView;
+use vortex_array::IntoArray;
+use vortex_array::arrays::filter::FilterReduce;
+use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_mask::Mask;
 
-use crate::DecimalBytePartsArray;
-use crate::DecimalBytePartsVTable;
-
-impl FilterReduce for DecimalBytePartsVTable {
-    fn filter(array: &DecimalBytePartsArray, mask: &Mask) -> VortexResult<Option<ArrayRef>> {
-        DecimalBytePartsArray::try_new(array.msp.filter(mask.clone())?, *array.decimal_dtype())
-            .map(|d| Some(d.to_array()))
+use crate::DecimalByteParts;
+use crate::decimal_byte_parts::DecimalBytePartsArrayExt;
+impl FilterReduce for DecimalByteParts {
+    fn filter(array: ArrayView<'_, Self>, mask: &Mask) -> VortexResult<Option<ArrayRef>> {
+        DecimalByteParts::try_new(
+            array.msp().filter(mask.clone())?,
+            *array
+                .dtype()
+                .as_decimal_opt()
+                .vortex_expect("must be a decimal dtype"),
+        )
+        .map(|d| Some(d.into_array()))
     }
 }
 
@@ -24,7 +32,7 @@ mod test {
     use vortex_array::dtype::DecimalDType;
     use vortex_buffer::buffer;
 
-    use crate::DecimalBytePartsArray;
+    use crate::DecimalByteParts;
 
     #[test]
     fn test_filter_decimal_byte_parts() {
@@ -32,15 +40,15 @@ mod test {
         let msp = buffer![100i32, 200, 300, 400, 500].into_array();
 
         let decimal_dtype = DecimalDType::new(8, 2);
-        let array = DecimalBytePartsArray::try_new(msp, decimal_dtype).unwrap();
-        test_filter_conformance(array.as_ref());
+        let array = DecimalByteParts::try_new(msp, decimal_dtype).unwrap();
+        test_filter_conformance(&array.into_array());
 
         // Test with nullable values
         let msp = PrimitiveArray::from_option_iter([Some(10i64), None, Some(30), Some(40), None])
             .into_array();
 
         let decimal_dtype = DecimalDType::new(18, 4);
-        let array = DecimalBytePartsArray::try_new(msp, decimal_dtype).unwrap();
-        test_filter_conformance(array.as_ref());
+        let array = DecimalByteParts::try_new(msp, decimal_dtype).unwrap();
+        test_filter_conformance(&array.into_array());
     }
 }

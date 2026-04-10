@@ -2,33 +2,31 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use vortex_array::ArrayRef;
+use vortex_array::ArrayView;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
-use vortex_array::arrays::ConstantArray;
-use vortex_array::arrays::FilterKernel;
+use vortex_array::arrays::filter::FilterKernel;
 use vortex_error::VortexResult;
 use vortex_mask::Mask;
 
-use crate::SparseArray;
-use crate::SparseVTable;
-
-impl FilterKernel for SparseVTable {
+use crate::ConstantArray;
+use crate::Sparse;
+impl FilterKernel for Sparse {
     fn filter(
-        array: &SparseArray,
+        array: ArrayView<'_, Self>,
         mask: &Mask,
-        _ctx: &mut ExecutionCtx,
+        ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
         let new_length = mask.true_count();
 
-        let Some(new_patches) = array.patches().filter(mask)? else {
+        let Some(new_patches) = array.patches().filter(mask, ctx)? else {
             return Ok(Some(
                 ConstantArray::new(array.fill_scalar().clone(), new_length).into_array(),
             ));
         };
 
         Ok(Some(
-            SparseArray::try_new_from_patches(new_patches, array.fill_scalar().clone())?
-                .into_array(),
+            Sparse::try_new_from_patches(new_patches, array.fill_scalar().clone())?.into_array(),
         ))
     }
 }
@@ -37,7 +35,6 @@ impl FilterKernel for SparseVTable {
 mod tests {
     use rstest::fixture;
     use rstest::rstest;
-    use vortex_array::Array;
     use vortex_array::ArrayRef;
     use vortex_array::IntoArray;
     use vortex_array::arrays::PrimitiveArray;
@@ -52,11 +49,11 @@ mod tests {
     use vortex_buffer::buffer;
     use vortex_mask::Mask;
 
-    use crate::SparseArray;
+    use crate::Sparse;
 
     #[fixture]
     fn array() -> ArrayRef {
-        SparseArray::try_new(
+        Sparse::try_new(
             buffer![2u64, 9, 15].into_array(),
             PrimitiveArray::new(buffer![33_i32, 44, 55], Validity::AllValid).into_array(),
             20,
@@ -76,7 +73,7 @@ mod tests {
 
         // Construct expected SparseArray: index 2 was kept, which had value 33.
         // The new index is 0 (since it's the only element).
-        let expected = SparseArray::try_new(
+        let expected = Sparse::try_new(
             buffer![0u64].into_array(),
             PrimitiveArray::new(buffer![33_i32], Validity::AllValid).into_array(),
             1,
@@ -90,7 +87,7 @@ mod tests {
     #[test]
     fn true_fill_value() {
         let mask = Mask::from_iter([false, true, false, true, false, true, true]);
-        let array = SparseArray::try_new(
+        let array = Sparse::try_new(
             buffer![0_u64, 3, 6].into_array(),
             PrimitiveArray::new(buffer![33_i32, 44, 55], Validity::AllValid).into_array(),
             7,
@@ -105,7 +102,7 @@ mod tests {
         // Mask keeps indices 1, 3, 5, 6 -> new indices 0, 1, 2, 3.
         // Index 3 (value 44) maps to new index 1.
         // Index 6 (value 55) maps to new index 3.
-        let expected = SparseArray::try_new(
+        let expected = Sparse::try_new(
             buffer![1u64, 3].into_array(),
             PrimitiveArray::new(buffer![44_i32, 55], Validity::AllValid).into_array(),
             4,
@@ -120,7 +117,7 @@ mod tests {
     fn test_filter_sparse_array() {
         let null_fill_value = Scalar::null(DType::Primitive(PType::I32, Nullability::Nullable));
         test_filter_conformance(
-            SparseArray::try_new(
+            &Sparse::try_new(
                 buffer![1u64, 2, 4].into_array(),
                 buffer![100i32, 200, 300]
                     .into_array()
@@ -130,19 +127,19 @@ mod tests {
                 null_fill_value,
             )
             .unwrap()
-            .as_ref(),
+            .into_array(),
         );
 
         let ten_fill_value = Scalar::from(10i32);
         test_filter_conformance(
-            SparseArray::try_new(
+            &Sparse::try_new(
                 buffer![1u64, 2, 4].into_array(),
                 buffer![100i32, 200, 300].into_array(),
                 5,
                 ten_fill_value,
             )
             .unwrap()
-            .as_ref(),
+            .into_array(),
         )
     }
 }

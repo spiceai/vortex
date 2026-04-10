@@ -1,27 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use vortex_array::Array;
 use vortex_array::ArrayRef;
+use vortex_array::ArrayView;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
-use vortex_array::arrays::ConstantArray;
-use vortex_array::arrays::TakeExecute;
+use vortex_array::arrays::dict::TakeExecute;
 use vortex_error::VortexResult;
 
-use crate::SparseArray;
-use crate::SparseVTable;
-
-impl TakeExecute for SparseVTable {
+use crate::ConstantArray;
+use crate::Sparse;
+impl TakeExecute for Sparse {
     fn take(
-        array: &SparseArray,
-        indices: &dyn Array,
-        _ctx: &mut ExecutionCtx,
+        array: ArrayView<'_, Self>,
+        indices: &ArrayRef,
+        ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
         let patches_take = if array.fill_scalar().is_null() {
-            array.patches().take(indices)?
+            array.patches().take(indices, ctx)?
         } else {
-            array.patches().take_with_nulls(indices)?
+            array.patches().take_with_nulls(indices, ctx)?
         };
 
         let Some(new_patches) = patches_take else {
@@ -41,7 +39,7 @@ impl TakeExecute for SparseVTable {
         }
 
         Ok(Some(
-            SparseArray::try_new_from_patches(
+            Sparse::try_new_from_patches(
                 new_patches,
                 array.fill_scalar().cast(
                     &array
@@ -57,7 +55,6 @@ impl TakeExecute for SparseVTable {
 #[cfg(test)]
 mod test {
     use rstest::rstest;
-    use vortex_array::Array;
     use vortex_array::ArrayRef;
     use vortex_array::IntoArray;
     use vortex_array::arrays::ConstantArray;
@@ -68,6 +65,7 @@ mod test {
     use vortex_array::validity::Validity;
     use vortex_buffer::buffer;
 
+    use crate::Sparse;
     use crate::SparseArray;
 
     fn test_array_fill_value() -> Scalar {
@@ -76,7 +74,7 @@ mod test {
     }
 
     fn sparse_array() -> ArrayRef {
-        SparseArray::try_new(
+        Sparse::try_new(
             buffer![0u64, 37, 47, 99].into_array(),
             PrimitiveArray::new(buffer![1.23f64, 0.47, 9.99, 3.5], Validity::AllValid).into_array(),
             100,
@@ -92,7 +90,7 @@ mod test {
         let sparse = sparse.slice(30..40).unwrap();
         let taken = sparse.take(buffer![6, 7, 8].into_array()).unwrap();
         let expected = PrimitiveArray::from_option_iter([Option::<f64>::None, Some(0.47), None]);
-        assert_arrays_eq!(taken, expected.to_array());
+        assert_arrays_eq!(taken, expected.into_array());
     }
 
     #[test]
@@ -106,7 +104,7 @@ mod test {
             Some(1.23),
             Some(3.5),
         ]);
-        assert_arrays_eq!(taken, expected.to_array());
+        assert_arrays_eq!(taken, expected.into_array());
     }
 
     #[test]
@@ -124,12 +122,12 @@ mod test {
         let taken = sparse.take(buffer![69, 37].into_array()).unwrap();
         // Index 69 is not in sparse array (fill value is null), index 37 has value 0.47
         let expected = PrimitiveArray::from_option_iter([Option::<f64>::None, Some(0.47f64)]);
-        assert_arrays_eq!(taken, expected.to_array());
+        assert_arrays_eq!(taken, expected.into_array());
     }
 
     #[test]
     fn nullable_take() {
-        let arr = SparseArray::try_new(
+        let arr = Sparse::try_new(
             buffer![1u32].into_array(),
             buffer![10].into_array(),
             10,
@@ -140,17 +138,17 @@ mod test {
         let taken = arr
             .take(
                 PrimitiveArray::from_option_iter([Some(2u32), Some(1u32), Option::<u32>::None])
-                    .to_array(),
+                    .into_array(),
             )
             .unwrap();
 
         let expected = PrimitiveArray::from_option_iter([Some(1), Some(10), Option::<i32>::None]);
-        assert_arrays_eq!(taken, expected.to_array());
+        assert_arrays_eq!(taken, expected.into_array());
     }
 
     #[test]
     fn nullable_take_with_many_patches() {
-        let arr = SparseArray::try_new(
+        let arr = Sparse::try_new(
             buffer![1u32, 3, 7, 8, 9].into_array(),
             buffer![10, 8, 3, 2, 1].into_array(),
             10,
@@ -161,22 +159,22 @@ mod test {
         let taken = arr
             .take(
                 PrimitiveArray::from_option_iter([Some(2u32), Some(1u32), Option::<u32>::None])
-                    .to_array(),
+                    .into_array(),
             )
             .unwrap();
 
         let expected = PrimitiveArray::from_option_iter([Some(1), Some(10), Option::<i32>::None]);
-        assert_arrays_eq!(taken, expected.to_array());
+        assert_arrays_eq!(taken, expected.into_array());
     }
 
     #[rstest]
-    #[case(SparseArray::try_new(
+    #[case(Sparse::try_new(
         buffer![0u64, 37, 47, 99].into_array(),
         PrimitiveArray::new(buffer![1.23f64, 0.47, 9.99, 3.5], Validity::AllValid).into_array(),
         100,
         Scalar::null_native::<f64>(),
     ).unwrap())]
-    #[case(SparseArray::try_new(
+    #[case(Sparse::try_new(
         buffer![1u32, 3, 7, 8, 9].into_array(),
         buffer![10, 8, 3, 2, 1].into_array(),
         10,
@@ -184,14 +182,14 @@ mod test {
     ).unwrap())]
     #[case({
         let nullable_values = PrimitiveArray::from_option_iter([Some(100i64), None, Some(300)]);
-        SparseArray::try_new(
+        Sparse::try_new(
             buffer![2u64, 4, 6].into_array(),
             nullable_values.into_array(),
             10,
             Scalar::null_native::<i64>(),
         ).unwrap()
     })]
-    #[case(SparseArray::try_new(
+    #[case(Sparse::try_new(
         buffer![5u64].into_array(),
         buffer![999i32].into_array(),
         20,
@@ -199,6 +197,6 @@ mod test {
     ).unwrap())]
     fn test_take_sparse_conformance(#[case] sparse: SparseArray) {
         use vortex_array::compute::conformance::take::test_take_conformance;
-        test_take_conformance(sparse.as_ref());
+        test_take_conformance(&sparse.into_array());
     }
 }

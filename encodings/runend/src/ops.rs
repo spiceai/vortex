@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use vortex_array::Array;
+use vortex_array::ArrayRef;
+use vortex_array::ArrayView;
+use vortex_array::ExecutionCtx;
 use vortex_array::scalar::PValue;
 use vortex_array::scalar::Scalar;
 use vortex_array::search_sorted::SearchResult;
@@ -10,11 +12,15 @@ use vortex_array::search_sorted::SearchSortedSide;
 use vortex_array::vtable::OperationsVTable;
 use vortex_error::VortexResult;
 
-use crate::RunEndArray;
-use crate::RunEndVTable;
+use crate::RunEnd;
+use crate::array::RunEndArrayExt;
 
-impl OperationsVTable<RunEndVTable> for RunEndVTable {
-    fn scalar_at(array: &RunEndArray, index: usize) -> VortexResult<Scalar> {
+impl OperationsVTable<RunEnd> for RunEnd {
+    fn scalar_at(
+        array: ArrayView<'_, RunEnd>,
+        index: usize,
+        _ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Scalar> {
         array.values().scalar_at(array.find_physical_index(index)?)
     }
 }
@@ -23,7 +29,7 @@ impl OperationsVTable<RunEndVTable> for RunEndVTable {
 ///
 /// If the index exists in the array we want to take that position (as we are searching from the right)
 /// otherwise we want to take the next one
-pub(crate) fn find_slice_end_index(array: &dyn Array, index: usize) -> VortexResult<usize> {
+pub(crate) fn find_slice_end_index(array: &ArrayRef, index: usize) -> VortexResult<usize> {
     let result = array
         .as_primitive_typed()
         .search_sorted(&PValue::from(index), SearchSortedSide::Right)?;
@@ -42,23 +48,22 @@ pub(crate) fn find_slice_end_index(array: &dyn Array, index: usize) -> VortexRes
 #[cfg(test)]
 mod tests {
 
-    use vortex_array::Array;
     use vortex_array::IntoArray;
+    use vortex_array::LEGACY_SESSION;
+    use vortex_array::VortexSessionExecute;
+    use vortex_array::aggregate_fn::fns::is_constant::is_constant;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::assert_arrays_eq;
-    use vortex_array::compute::Cost;
-    use vortex_array::compute::IsConstantOpts;
-    use vortex_array::compute::is_constant_opts;
     use vortex_array::dtype::DType;
     use vortex_array::dtype::Nullability;
     use vortex_array::dtype::PType;
     use vortex_buffer::buffer;
 
-    use crate::RunEndArray;
+    use crate::RunEnd;
 
     #[test]
     fn slice_array() {
-        let arr = RunEndArray::try_new(
+        let arr = RunEnd::try_new(
             buffer![2u32, 5, 10].into_array(),
             buffer![1i32, 2, 3].into_array(),
         )
@@ -77,7 +82,7 @@ mod tests {
 
     #[test]
     fn double_slice() {
-        let arr = RunEndArray::try_new(
+        let arr = RunEnd::try_new(
             buffer![2u32, 5, 10].into_array(),
             buffer![1i32, 2, 3].into_array(),
         )
@@ -94,7 +99,7 @@ mod tests {
 
     #[test]
     fn slice_end_inclusive() {
-        let arr = RunEndArray::try_new(
+        let arr = RunEnd::try_new(
             buffer![2u32, 5, 10].into_array(),
             buffer![1i32, 2, 3].into_array(),
         )
@@ -113,7 +118,7 @@ mod tests {
 
     #[test]
     fn slice_at_end() {
-        let re_array = RunEndArray::try_new(
+        let re_array = RunEnd::try_new(
             buffer![7_u64, 10].into_array(),
             buffer![2_u64, 3].into_array(),
         )
@@ -127,7 +132,7 @@ mod tests {
 
     #[test]
     fn slice_single_end() {
-        let re_array = RunEndArray::try_new(
+        let re_array = RunEnd::try_new(
             buffer![7_u64, 10].into_array(),
             buffer![2_u64, 3].into_array(),
         )
@@ -137,21 +142,13 @@ mod tests {
 
         let sliced_array = re_array.slice(2..5).unwrap();
 
-        assert!(
-            is_constant_opts(
-                &sliced_array,
-                &IsConstantOpts {
-                    cost: Cost::Canonicalize
-                }
-            )
-            .unwrap()
-            .unwrap_or_default()
-        )
+        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        assert!(is_constant(&sliced_array, &mut ctx).unwrap())
     }
 
     #[test]
     fn ree_scalar_at_end() {
-        let scalar = RunEndArray::encode(buffer![1, 1, 1, 4, 4, 4, 2, 2, 5, 5, 5, 5].into_array())
+        let scalar = RunEnd::encode(buffer![1, 1, 1, 4, 4, 4, 2, 2, 5, 5, 5, 5].into_array())
             .unwrap()
             .scalar_at(11)
             .unwrap();
@@ -163,7 +160,7 @@ mod tests {
     fn slice_along_run_boundaries() {
         // Create a runend array with runs: [1, 1, 1] [4, 4, 4] [2, 2] [5, 5, 5, 5]
         // Run ends at indices: 3, 6, 8, 12
-        let arr = RunEndArray::try_new(
+        let arr = RunEnd::try_new(
             buffer![3u32, 6, 8, 12].into_array(),
             buffer![1i32, 4, 2, 5].into_array(),
         )

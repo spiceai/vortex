@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use vortex_array::ArrayRef;
+use vortex_array::ArrayView;
 use vortex_array::IntoArray;
 use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::DType;
@@ -9,11 +10,12 @@ use vortex_array::patches::Patches;
 use vortex_array::scalar_fn::fns::cast::CastReduce;
 use vortex_error::VortexResult;
 
-use crate::alp::ALPArray;
-use crate::alp::ALPVTable;
+use crate::ALPArrayExt;
+use crate::ALPArraySlotsExt;
+use crate::alp::ALP;
 
-impl CastReduce for ALPVTable {
-    fn cast(array: &ALPArray, dtype: &DType) -> VortexResult<Option<ArrayRef>> {
+impl CastReduce for ALP {
+    fn cast(array: ArrayView<'_, Self>, dtype: &DType) -> VortexResult<Option<ArrayRef>> {
         // Check if this is just a nullability change
         if array.dtype().eq_ignore_nullability(dtype) {
             // For nullability-only changes, we can avoid decoding
@@ -29,7 +31,7 @@ impl CastReduce for ALPVTable {
                 .patches()
                 .map(|p| {
                     if p.values().dtype() == dtype {
-                        Ok(p.clone())
+                        Ok(p)
                     } else {
                         Patches::new(
                             p.array_len(),
@@ -45,13 +47,7 @@ impl CastReduce for ALPVTable {
             // SAFETY: casting nullability doesn't alter the invariants
             unsafe {
                 Ok(Some(
-                    ALPArray::new_unchecked(
-                        new_encoded,
-                        array.exponents(),
-                        new_patches,
-                        dtype.clone(),
-                    )
-                    .into_array(),
+                    ALP::new_unchecked(new_encoded, array.exponents(), new_patches).into_array(),
                 ))
             }
         } else {
@@ -76,6 +72,7 @@ mod tests {
     use vortex_error::VortexExpect;
     use vortex_error::VortexResult;
 
+    use crate::alp::array::ALPArrayExt;
     use crate::alp_encode;
 
     #[test]
@@ -89,7 +86,7 @@ mod tests {
         );
 
         let nullable_dtype = DType::Primitive(PType::F32, Nullability::Nullable);
-        let casted = alp.to_array().cast(nullable_dtype.clone())?;
+        let casted = alp.into_array().cast(nullable_dtype.clone())?;
 
         let expected = values.cast(nullable_dtype)?;
 
@@ -104,7 +101,7 @@ mod tests {
         let alp = alp_encode(&values.to_primitive(), None)?;
 
         let casted = alp
-            .to_array()
+            .into_array()
             .cast(DType::Primitive(PType::F64, Nullability::NonNullable))?;
         assert_eq!(
             casted.dtype(),
@@ -126,7 +123,7 @@ mod tests {
         let alp = alp_encode(&values.to_primitive(), None)?;
 
         let casted = alp
-            .to_array()
+            .into_array()
             .cast(DType::Primitive(PType::I32, Nullability::NonNullable))?;
         assert_eq!(
             casted.dtype(),
@@ -147,7 +144,7 @@ mod tests {
     #[case(buffer![0.0f32, -1.5, 2.5, -3.5, 4.5].into_array())]
     fn test_cast_alp_conformance(#[case] array: vortex_array::ArrayRef) -> VortexResult<()> {
         let alp = alp_encode(&array.to_primitive(), None).vortex_expect("cannot fail");
-        test_cast_conformance(alp.as_ref());
+        test_cast_conformance(&alp.into_array());
 
         Ok(())
     }

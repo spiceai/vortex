@@ -23,8 +23,11 @@ use vortex_error::VortexResult;
 
 use crate::ArrayRef;
 use crate::IntoArray;
+use crate::array::ArrayView;
 use crate::arrays::PrimitiveArray;
+use crate::arrays::primitive::PrimitiveArrayExt;
 use crate::arrays::primitive::compute::take::TakeImpl;
+use crate::arrays::primitive::vtable::Primitive;
 use crate::dtype::NativePType;
 use crate::dtype::PType;
 use crate::dtype::UnsignedPType;
@@ -38,8 +41,8 @@ pub(super) struct TakeKernelPortableSimd;
 impl TakeImpl for TakeKernelPortableSimd {
     fn take(
         &self,
-        array: &PrimitiveArray,
-        unsigned_indices: &PrimitiveArray,
+        array: ArrayView<'_, Primitive>,
+        unsigned_indices: ArrayView<'_, Primitive>,
         validity: Validity,
     ) -> VortexResult<ArrayRef> {
         if array.ptype() == PType::F16 {
@@ -79,7 +82,6 @@ const SIMD_WIDTH: usize = 64;
 ///
 /// This function handles the type matching required to satisfy [`simd::SimdElement`] bounds. For
 /// `f16` values, it reinterprets them as `u16` since `f16` doesn't implement `SimdElement`.
-#[inline]
 fn take_portable<T: NativePType, I: UnsignedPType>(buffer: &[T], indices: &[I]) -> Buffer<T> {
     if T::PTYPE == PType::F16 {
         assert_eq!(size_of::<f16>(), size_of::<T>());
@@ -106,7 +108,6 @@ fn take_portable<T: NativePType, I: UnsignedPType>(buffer: &[T], indices: &[I]) 
 /// Helper that matches on index type and calls [`take_portable_simd`].
 ///
 /// We separate this code out from above to add the [`simd::SimdElement`] constraint.
-#[inline]
 fn take_with_indices<T: NativePType + simd::SimdElement, I: UnsignedPType>(
     buffer: &[T],
     indices: &[I],

@@ -2,13 +2,15 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 mod array;
-pub use array::ListViewArray;
-pub use array::ListViewArrayParts;
+pub use array::ListViewArrayExt;
+pub use array::ListViewData;
+pub use array::ListViewDataParts;
+pub use vtable::ListViewArray;
 
 pub(crate) mod compute;
 
 mod vtable;
-pub use vtable::ListViewVTable;
+pub use vtable::ListView;
 
 mod conversion;
 pub use conversion::list_from_list_view;

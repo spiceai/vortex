@@ -14,13 +14,12 @@ use vortex_buffer::BufferMut;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 
-use crate::Array;
 use crate::ArrayRef;
 use crate::IntoArray;
-use crate::ToCanonical;
-use crate::arrays::PrimitiveVTable;
-use crate::arrays::TakeExecute;
-use crate::arrays::primitive::PrimitiveArray;
+use crate::array::ArrayView;
+use crate::arrays::Primitive;
+use crate::arrays::PrimitiveArray;
+use crate::arrays::dict::TakeExecute;
 use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
 use crate::dtype::IntegerPType;
@@ -29,7 +28,6 @@ use crate::executor::ExecutionCtx;
 use crate::match_each_integer_ptype;
 use crate::match_each_native_ptype;
 use crate::validity::Validity;
-use crate::vtable::ValidityHelper;
 
 // Kernel selection happens on the first call to `take` and uses a combination of compile-time
 // and runtime feature detection to infer the best kernel for the platform.
@@ -56,8 +54,8 @@ static PRIMITIVE_TAKE_KERNEL: LazyLock<&'static dyn TakeImpl> = LazyLock::new(||
 trait TakeImpl: Send + Sync {
     fn take(
         &self,
-        array: &PrimitiveArray,
-        indices: &PrimitiveArray,
+        array: ArrayView<'_, Primitive>,
+        indices: ArrayView<'_, Primitive>,
         validity: Validity,
     ) -> VortexResult<ArrayRef>;
 }
@@ -68,8 +66,8 @@ struct TakeKernelScalar;
 impl TakeImpl for TakeKernelScalar {
     fn take(
         &self,
-        array: &PrimitiveArray,
-        indices: &PrimitiveArray,
+        array: ArrayView<'_, Primitive>,
+        indices: ArrayView<'_, Primitive>,
         validity: Validity,
     ) -> VortexResult<ArrayRef> {
         match_each_native_ptype!(array.ptype(), |T| {
@@ -81,31 +79,36 @@ impl TakeImpl for TakeKernelScalar {
     }
 }
 
-impl TakeExecute for PrimitiveVTable {
+impl TakeExecute for Primitive {
     fn take(
-        array: &PrimitiveArray,
-        indices: &dyn Array,
-        _ctx: &mut ExecutionCtx,
+        array: ArrayView<'_, Primitive>,
+        indices: &ArrayRef,
+        ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
         let DType::Primitive(ptype, null) = indices.dtype() else {
             vortex_bail!("Invalid indices dtype: {}", indices.dtype())
         };
 
         let unsigned_indices = if ptype.is_unsigned_int() {
-            indices.to_primitive()
+            indices.clone().execute::<PrimitiveArray>(ctx)?
         } else {
             // This will fail if all values cannot be converted to unsigned
             indices
-                .to_array()
+                .clone()
                 .cast(DType::Primitive(ptype.to_unsigned(), *null))?
-                .to_primitive()
+                .execute::<PrimitiveArray>(ctx)?
         };
 
-        let validity = array.validity().take(unsigned_indices.as_ref())?;
+        let validity = array
+            .validity()?
+            .take(&unsigned_indices.clone().into_array())?;
         // Delegate to the best kernel based on the target CPU
-        PRIMITIVE_TAKE_KERNEL
-            .take(array, &unsigned_indices, validity)
-            .map(Some)
+        {
+            let unsigned_indices = unsigned_indices.as_view();
+            PRIMITIVE_TAKE_KERNEL
+                .take(array, unsigned_indices, validity)
+                .map(Some)
+        }
     }
 }
 
@@ -141,7 +144,6 @@ mod test {
     use vortex_buffer::buffer;
     use vortex_error::VortexExpect;
 
-    use crate::Array;
     use crate::IntoArray;
     use crate::arrays::BoolArray;
     use crate::arrays::PrimitiveArray;
@@ -167,7 +169,7 @@ mod test {
             buffer![0, 3, 4],
             Validity::Array(BoolArray::from_iter([true, true, false]).into_array()),
         );
-        let actual = values.take(indices.to_array()).unwrap();
+        let actual = values.take(indices.into_array()).unwrap();
         assert_eq!(
             actual.scalar_at(0).vortex_expect("no fail"),
             Scalar::from(Some(1))
@@ -196,6 +198,6 @@ mod test {
     ))]
     #[case(PrimitiveArray::from_option_iter([Some(1), None, Some(3), Some(4), None]))]
     fn test_take_primitive_conformance(#[case] array: PrimitiveArray) {
-        test_take_conformance(array.as_ref());
+        test_take_conformance(&array.into_array());
     }
 }

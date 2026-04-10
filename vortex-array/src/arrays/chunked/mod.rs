@@ -2,12 +2,15 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 mod array;
-pub use array::ChunkedArray;
+pub use array::ChunkedArrayExt;
+pub use array::ChunkedData;
+pub use vtable::ChunkedArray;
 
-mod compute;
+pub(crate) mod compute;
+pub(crate) mod paired_chunks;
 
 mod vtable;
-pub use vtable::ChunkedVTable;
+pub use vtable::Chunked;
 
 #[cfg(test)]
 mod tests;

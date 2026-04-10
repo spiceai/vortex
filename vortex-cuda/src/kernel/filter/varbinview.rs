@@ -3,10 +3,9 @@
 
 use vortex::array::Canonical;
 use vortex::array::arrays::VarBinViewArray;
-use vortex::array::arrays::VarBinViewArrayParts;
+use vortex::array::arrays::varbinview::VarBinViewDataParts;
 use vortex::error::VortexResult;
 use vortex::mask::Mask;
-use vortex_cuda_macros::cuda_tests;
 
 use crate::CudaExecutionCtx;
 use crate::kernel::filter::filter_sized;
@@ -16,12 +15,12 @@ pub(super) async fn filter_varbinview(
     mask: Mask,
     ctx: &mut CudaExecutionCtx,
 ) -> VortexResult<Canonical> {
-    let VarBinViewArrayParts {
+    let VarBinViewDataParts {
         views,
         buffers,
         validity,
         dtype,
-    } = array.into_parts();
+    } = array.into_data_parts();
 
     let filtered_validity = validity.filter(&mask)?;
 
@@ -37,7 +36,7 @@ pub(super) async fn filter_varbinview(
     )))
 }
 
-#[cuda_tests]
+#[cfg(test)]
 mod tests {
     use rstest::rstest;
     use vortex::array::IntoArray;
@@ -65,7 +64,7 @@ mod tests {
         ),
         Mask::from_iter([true, true, true, true, true, true, true, true, false])
     )]
-    #[tokio::test]
+    #[crate::test]
     async fn test_gpu_filter_strings(
         #[case] input: VarBinViewArray,
         #[case] mask: Mask,

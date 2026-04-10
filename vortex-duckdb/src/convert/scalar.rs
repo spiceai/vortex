@@ -79,6 +79,9 @@ impl ToDuckDBScalar for Scalar {
             DType::Utf8(_) => self.as_utf8().try_to_duckdb_scalar(),
             DType::Binary(_) => self.as_binary().try_to_duckdb_scalar(),
             DType::Struct(..) | DType::List(..) | DType::FixedSizeList(..) => todo!(),
+            DType::Variant(_) => {
+                vortex_bail!("Vortex Variant scalars aren't supported in DuckDB")
+            }
         }
     }
 }
@@ -252,6 +255,9 @@ impl<'a> TryFrom<&'a ValueRef> for Scalar {
             ExtractedValue::BigInt(v) => Ok(Scalar::primitive(v, Nullable)),
             ExtractedValue::HugeInt(_) => {
                 vortex_bail!("DuckDB HugeInt is not yet supported in Vortex");
+            }
+            ExtractedValue::UHugeInt(_) => {
+                vortex_bail!("DuckDB UHugeInt is not yet supported in Vortex");
             }
             ExtractedValue::UTinyInt(v) => Ok(Scalar::primitive(v, Nullable)),
             ExtractedValue::USmallInt(v) => Ok(Scalar::primitive(v, Nullable)),

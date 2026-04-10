@@ -3,37 +3,38 @@
 
 use vortex_error::VortexResult;
 
-use crate::Array;
 use crate::ArrayRef;
 use crate::IntoArray;
-use crate::arrays::FilterArray;
-use crate::arrays::FilterVTable;
+use crate::array::ArrayView;
+use crate::arrays::Filter;
+use crate::arrays::ListView;
 use crate::arrays::ListViewArray;
-use crate::arrays::ListViewVTable;
-use crate::arrays::SliceReduceAdaptor;
+use crate::arrays::dict::TakeReduceAdaptor;
+use crate::arrays::listview::ListViewArrayExt;
+use crate::arrays::slice::SliceReduceAdaptor;
 use crate::optimizer::rules::ArrayParentReduceRule;
 use crate::optimizer::rules::ParentRuleSet;
 use crate::scalar_fn::fns::cast::CastReduceAdaptor;
 use crate::scalar_fn::fns::mask::MaskReduceAdaptor;
-use crate::vtable::ValidityHelper;
 
-pub(crate) const PARENT_RULES: ParentRuleSet<ListViewVTable> = ParentRuleSet::new(&[
+pub(crate) const PARENT_RULES: ParentRuleSet<ListView> = ParentRuleSet::new(&[
     ParentRuleSet::lift(&ListViewFilterPushDown),
-    ParentRuleSet::lift(&CastReduceAdaptor(ListViewVTable)),
-    ParentRuleSet::lift(&MaskReduceAdaptor(ListViewVTable)),
-    ParentRuleSet::lift(&SliceReduceAdaptor(ListViewVTable)),
+    ParentRuleSet::lift(&CastReduceAdaptor(ListView)),
+    ParentRuleSet::lift(&MaskReduceAdaptor(ListView)),
+    ParentRuleSet::lift(&SliceReduceAdaptor(ListView)),
+    ParentRuleSet::lift(&TakeReduceAdaptor(ListView)),
 ]);
 
 #[derive(Debug)]
 struct ListViewFilterPushDown;
 
-impl ArrayParentReduceRule<ListViewVTable> for ListViewFilterPushDown {
-    type Parent = FilterVTable;
+impl ArrayParentReduceRule<ListView> for ListViewFilterPushDown {
+    type Parent = Filter;
 
     fn reduce_parent(
         &self,
-        array: &ListViewArray,
-        parent: &FilterArray,
+        array: ArrayView<'_, ListView>,
+        parent: ArrayView<'_, Filter>,
         _child_idx: usize,
     ) -> VortexResult<Option<ArrayRef>> {
         // NOTE(ngates): if the filter is super selective, we maybe ought to consider masking
@@ -46,7 +47,7 @@ impl ArrayParentReduceRule<ListViewVTable> for ListViewFilterPushDown {
                     array.elements().clone(),
                     array.offsets().filter(parent.filter_mask().clone())?,
                     array.sizes().filter(parent.filter_mask().clone())?,
-                    array.validity().filter(parent.filter_mask())?,
+                    array.validity()?.filter(parent.filter_mask())?,
                 )
             }
             .into_array(),

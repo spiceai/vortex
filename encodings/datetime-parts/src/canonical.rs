@@ -19,6 +19,7 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_panic;
 
 use crate::DateTimePartsArray;
+use crate::array::DateTimePartsArrayExt;
 
 /// Decode an [Array] into a [TemporalArray].
 ///
@@ -54,7 +55,7 @@ pub fn decode_to_temporal(
     // We split this into separate passes because often the seconds and/org subseconds components
     // are constant.
     let mut values: BufferMut<i64> = days_buf
-        .into_buffer_mut::<i64>()
+        .into_buffer::<i64>()
         .map_each_in_place(|d| d * 86_400 * divisor);
 
     if let Some(seconds) = array.seconds().as_constant() {
@@ -95,8 +96,11 @@ pub fn decode_to_temporal(
     }
 
     Ok(TemporalArray::new_timestamp(
-        PrimitiveArray::new(values.freeze(), Validity::copy_from_array(array.as_ref())?)
-            .into_array(),
+        PrimitiveArray::new(
+            values.freeze(),
+            Validity::copy_from_array(&array.clone().into_array())?,
+        )
+        .into_array(),
         options.unit,
         options.tz.clone(),
     ))
@@ -107,18 +111,16 @@ mod test {
     use rstest::rstest;
     use vortex_array::ExecutionCtx;
     use vortex_array::IntoArray;
-    use vortex_array::ToCanonical;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::arrays::TemporalArray;
     use vortex_array::assert_arrays_eq;
     use vortex_array::extension::datetime::TimeUnit;
     use vortex_array::validity::Validity;
-    use vortex_array::vtable::ValidityHelper;
     use vortex_buffer::buffer;
     use vortex_error::VortexResult;
     use vortex_session::VortexSession;
 
-    use crate::DateTimePartsArray;
+    use crate::DateTimeParts;
     use crate::canonical::decode_to_temporal;
 
     #[rstest]
@@ -138,25 +140,33 @@ mod test {
             ],
             validity.clone(),
         );
-        let date_times = DateTimePartsArray::try_from(TemporalArray::new_timestamp(
+        let date_times = DateTimeParts::try_from_temporal(TemporalArray::new_timestamp(
             milliseconds.clone().into_array(),
             TimeUnit::Milliseconds,
             Some("UTC".into()),
-        ))
-        .unwrap();
-
-        assert_eq!(
-            date_times.validity_mask().unwrap(),
-            validity.to_mask(date_times.len())
-        );
+        ))?;
 
         let mut ctx = ExecutionCtx::new(VortexSession::empty());
+
+        assert!(
+            date_times
+                .as_array()
+                .validity()?
+                .mask_eq(&validity, &mut ctx)?
+        );
+
         let primitive_values = decode_to_temporal(&date_times, &mut ctx)?
             .temporal_values()
-            .to_primitive();
+            .clone()
+            .execute::<PrimitiveArray>(&mut ctx)?;
 
         assert_arrays_eq!(primitive_values, milliseconds);
-        assert_eq!(primitive_values.validity(), &validity);
+        assert!(
+            primitive_values
+                .validity()
+                .unwrap()
+                .mask_eq(&validity, &mut ctx)?
+        );
         Ok(())
     }
 }

@@ -4,10 +4,10 @@
 use pyo3::PyRef;
 use pyo3::pyclass;
 use pyo3::pymethods;
-use vortex::array::arrays::ChunkedVTable;
+use vortex::array::arrays::Chunked;
+use vortex::array::arrays::chunked::ChunkedArrayExt;
 
 use crate::arrays::PyArrayRef;
-use crate::arrays::native::AsArrayRef;
 use crate::arrays::native::EncodingSubclass;
 use crate::arrays::native::PyNativeArray;
 
@@ -16,16 +16,17 @@ use crate::arrays::native::PyNativeArray;
 pub(crate) struct PyChunkedArray;
 
 impl EncodingSubclass for PyChunkedArray {
-    type VTable = ChunkedVTable;
+    type VTable = Chunked;
 }
 
 #[pymethods]
 impl PyChunkedArray {
     pub fn chunks(self_: PyRef<'_, Self>) -> Vec<PyArrayRef> {
         self_
-            .as_array_ref()
-            .chunks()
-            .iter()
+            .as_super()
+            .inner()
+            .as_::<Chunked>()
+            .iter_chunks()
             .map(|chunk| PyArrayRef::from(chunk.clone()))
             .collect()
     }

@@ -8,16 +8,17 @@ pub use kernel::*;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
-use vortex_error::vortex_err;
 use vortex_session::VortexSession;
 
 use crate::ArrayRef;
 use crate::Canonical;
+use crate::ExecutionCtx;
 use crate::IntoArray;
 use crate::arrays::BoolArray;
+use crate::arrays::Constant;
 use crate::arrays::ConstantArray;
-use crate::arrays::ConstantVTable;
-use crate::arrays::mask_validity_canonical;
+use crate::arrays::bool::BoolArrayExt;
+use crate::arrays::masked::mask_validity_canonical;
 use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
 use crate::dtype::Nullability;
@@ -94,17 +95,20 @@ impl ScalarFnVTable for Mask {
         Ok(arg_dtypes[0].as_nullable())
     }
 
-    fn execute(&self, _options: &Self::Options, args: ExecutionArgs) -> VortexResult<ArrayRef> {
-        let [input, mask_array]: [ArrayRef; _] = args
-            .inputs
-            .try_into()
-            .map_err(|_| vortex_err!("Wrong arg count"))?;
+    fn execute(
+        &self,
+        _options: &Self::Options,
+        args: &dyn ExecutionArgs,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<ArrayRef> {
+        let input = args.get(0)?;
+        let mask_array = args.get(1)?;
 
         if let Some(result) = execute_constant(&input, &mask_array)? {
             return Ok(result);
         }
 
-        execute_canonical(input, mask_array, args.ctx)
+        execute_canonical(input, mask_array, ctx)
     }
 
     fn simplify(
@@ -150,7 +154,7 @@ impl ScalarFnVTable for Mask {
 fn execute_constant(input: &ArrayRef, mask_array: &ArrayRef) -> VortexResult<Option<ArrayRef>> {
     let len = input.len();
 
-    if let Some(constant_mask) = mask_array.as_opt::<ConstantVTable>() {
+    if let Some(constant_mask) = mask_array.as_opt::<Constant>() {
         let mask_value = constant_mask.scalar().as_bool().value().unwrap_or(false);
         return if mask_value {
             input.cast(input.dtype().as_nullable()).map(Some)
@@ -161,7 +165,7 @@ fn execute_constant(input: &ArrayRef, mask_array: &ArrayRef) -> VortexResult<Opt
         };
     }
 
-    if let Some(constant_input) = input.as_opt::<ConstantVTable>()
+    if let Some(constant_input) = input.as_opt::<Constant>()
         && constant_input.scalar().is_null()
     {
         return Ok(Some(
@@ -176,7 +180,7 @@ fn execute_constant(input: &ArrayRef, mask_array: &ArrayRef) -> VortexResult<Opt
 fn execute_canonical(
     input: ArrayRef,
     mask_array: ArrayRef,
-    ctx: &mut crate::executor::ExecutionCtx,
+    ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
     let mask_bool = mask_array.execute::<BoolArray>(ctx)?;
     let validity_mask = vortex_mask::Mask::from(mask_bool.to_bit_buffer());

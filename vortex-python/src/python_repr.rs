@@ -23,6 +23,7 @@ impl PythonRepr for DType {
     }
 }
 
+// TODO(connor): We should probably just use the `Display` impl on `DType`.
 impl Display for DTypePythonRepr<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let DTypePythonRepr(dtype) = self;
@@ -102,6 +103,7 @@ impl Display for DTypePythonRepr<'_> {
                 }
                 write!(f, ")")
             }
+            DType::Variant(_) => write!(f, "variant()"),
         }
     }
 }

@@ -4,7 +4,6 @@
 use itertools::Itertools;
 use vortex_error::VortexResult;
 
-use crate::Array;
 use crate::ArrayRef;
 use crate::IntoArray;
 use crate::arrays::ConstantArray;
@@ -14,12 +13,12 @@ use crate::optimizer::ArrayOptimizer;
 use crate::scalar_fn::fns::literal::Literal;
 use crate::scalar_fn::fns::root::Root;
 
-impl dyn Array + '_ {
+impl ArrayRef {
     /// Apply the expression to this array, producing a new array in constant time.
-    pub fn apply(&self, expr: &Expression) -> VortexResult<ArrayRef> {
+    pub fn apply(self, expr: &Expression) -> VortexResult<ArrayRef> {
         // If the expression is a root, return self.
         if expr.is::<Root>() {
-            return Ok(self.to_array());
+            return Ok(self);
         }
 
         // Manually convert literals to ConstantArray.
@@ -31,7 +30,7 @@ impl dyn Array + '_ {
         let children: Vec<_> = expr
             .children()
             .iter()
-            .map(|e| self.apply(e))
+            .map(|e| self.clone().apply(e))
             .try_collect()?;
 
         // And wrap the scalar function up in an array.

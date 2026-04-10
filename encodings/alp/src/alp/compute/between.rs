@@ -3,8 +3,8 @@
 
 use std::fmt::Debug;
 
-use vortex_array::Array;
 use vortex_array::ArrayRef;
+use vortex_array::ArrayView;
 use vortex_array::IntoArray;
 use vortex_array::arrays::ConstantArray;
 use vortex_array::builtins::ArrayBuiltins;
@@ -17,16 +17,17 @@ use vortex_array::scalar_fn::fns::between::BetweenReduce;
 use vortex_array::scalar_fn::fns::between::StrictComparison;
 use vortex_error::VortexResult;
 
-use crate::ALPArray;
+use crate::ALP;
 use crate::ALPFloat;
-use crate::ALPVTable;
+use crate::alp::array::ALPArrayExt;
+use crate::alp::array::ALPArraySlotsExt;
 use crate::match_each_alp_float_ptype;
 
-impl BetweenReduce for ALPVTable {
+impl BetweenReduce for ALP {
     fn between(
-        array: &ALPArray,
-        lower: &dyn Array,
-        upper: &dyn Array,
+        array: ArrayView<'_, Self>,
+        lower: &ArrayRef,
+        upper: &ArrayRef,
         options: &BetweenOptions,
     ) -> VortexResult<Option<ArrayRef>> {
         let (Some(lower), Some(upper)) = (lower.as_constant(), upper.as_constant()) else {
@@ -39,7 +40,7 @@ impl BetweenReduce for ALPVTable {
 
         let nullability =
             array.dtype().nullability() | lower.dtype().nullability() | upper.dtype().nullability();
-        match_each_alp_float_ptype!(array.ptype(), |F| {
+        match_each_alp_float_ptype!(array.dtype().as_ptype(), |F| {
             between_impl::<F>(
                 array,
                 F::try_from(&lower)?,
@@ -53,7 +54,7 @@ impl BetweenReduce for ALPVTable {
 }
 
 fn between_impl<T: NativePType + ALPFloat>(
-    array: &ALPArray,
+    array: ArrayView<'_, ALP>,
     lower: T,
     upper: T,
     nullability: Nullability,
@@ -102,6 +103,7 @@ mod tests {
     use vortex_array::scalar_fn::fns::between::StrictComparison;
 
     use crate::ALPArray;
+    use crate::alp::array::ALPArrayExt;
     use crate::alp::compute::between::between_impl;
     use crate::alp_encode;
 
@@ -112,7 +114,8 @@ mod tests {
         options: &BetweenOptions,
         expected: bool,
     ) {
-        let res = between_impl(arr, lower, upper, Nullability::Nullable, options).unwrap();
+        let res =
+            between_impl(arr.as_view(), lower, upper, Nullability::Nullable, options).unwrap();
         assert_arrays_eq!(res, BoolArray::from_iter([Some(expected)]));
     }
 
