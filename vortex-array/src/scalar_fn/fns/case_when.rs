@@ -1,20 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! CASE WHEN expression for conditional value selection.
+//! SQL-style CASE WHEN: evaluates `(condition, value)` pairs in order and returns
+//! the value from the first matching condition (first-match-wins). NULL conditions
+//! are treated as false. If no ELSE clause is provided, unmatched rows produce NULL;
+//! otherwise they get the ELSE value.
 //!
-//! This expression evaluates a series of WHEN conditions and returns the corresponding
-//! THEN value for the first condition that evaluates to true. If no conditions match
-//! and an ELSE clause is provided, the ELSE value is returned; otherwise, NULL is returned.
-//!
-//! # Structure
-//!
-//! The expression has children in the following order:
-//! - pairs of (condition, value) for each WHEN/THEN clause
-//! - optionally, a final ELSE value
-//!
-//! For example, `CASE WHEN a THEN 1 WHEN b THEN 2 ELSE 3 END` has children:
-//! `[a, 1, b, 2, 3]`
+//! Unlike SQL which coerces all branches to a common supertype, all THEN/ELSE
+//! branches must share the same base dtype (ignoring nullability). The result
+//! nullability is the union of all branches (forced nullable if no ELSE).
 
 use std::fmt;
 use std::fmt::Formatter;
@@ -22,36 +16,47 @@ use std::hash::Hash;
 use std::sync::Arc;
 
 use prost::Message;
-use vortex_dtype::DType;
-use vortex_dtype::Nullability;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
+use vortex_mask::AllOr;
+use vortex_mask::Mask;
 use vortex_proto::expr as pb;
-use vortex_scalar::Scalar;
-use vortex_vector::Datum;
-use vortex_vector::VectorOps;
+use vortex_session::VortexSession;
 
 use crate::ArrayRef;
+use crate::ExecutionCtx;
 use crate::IntoArray;
-use crate::ToCanonical;
 use crate::arrays::BoolArray;
 use crate::arrays::ConstantArray;
-use crate::compute::zip;
-use crate::expr::Arity;
-use crate::expr::ChildName;
-use crate::expr::ExecutionArgs;
-use crate::expr::ExprId;
-use crate::expr::VTable;
-use crate::expr::VTableExt;
-use crate::expr::expression::Expression;
+use crate::arrays::bool::BoolArrayExt;
+use crate::builders::ArrayBuilder;
+use crate::builders::builder_with_capacity;
+use crate::builtins::ArrayBuiltins;
+use crate::dtype::DType;
+use crate::expr::Expression;
+use crate::scalar::Scalar;
+use crate::scalar_fn::Arity;
+use crate::scalar_fn::ChildName;
+use crate::scalar_fn::ExecutionArgs;
+use crate::scalar_fn::ScalarFnId;
+use crate::scalar_fn::ScalarFnVTable;
+use crate::scalar_fn::fns::zip::zip_impl;
 
-/// Options for the CaseWhen expression.
+/// Options for the n-ary CaseWhen expression.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CaseWhenOptions {
-    /// Number of WHEN/THEN pairs (each pair contributes 2 children)
+    /// Number of WHEN/THEN pairs.
     pub num_when_then_pairs: u32,
-    /// Whether an ELSE clause is present (contributes 1 child at the end)
+    /// Whether an ELSE clause is present.
+    /// If false, unmatched rows return NULL.
     pub has_else: bool,
+}
+
+impl CaseWhenOptions {
+    /// Total number of child expressions: 2 per WHEN/THEN pair, plus 1 if ELSE is present.
+    pub fn num_children(&self) -> usize {
+        self.num_when_then_pairs as usize * 2 + usize::from(self.has_else)
+    }
 }
 
 impl fmt::Display for CaseWhenOptions {
@@ -64,61 +69,61 @@ impl fmt::Display for CaseWhenOptions {
     }
 }
 
-/// A CASE WHEN expression.
+/// An n-ary CASE WHEN expression.
 ///
-/// Evaluates conditions in order and returns the value corresponding to the
-/// first matching condition.
+/// Children are in order: `[when_0, then_0, when_1, then_1, ..., else?]`.
+#[derive(Clone)]
 pub struct CaseWhen;
 
-impl VTable for CaseWhen {
+impl ScalarFnVTable for CaseWhen {
     type Options = CaseWhenOptions;
 
-    fn id(&self) -> ExprId {
-        ExprId::from("vortex.case_when")
+    fn id(&self) -> ScalarFnId {
+        ScalarFnId::from("vortex.case_when")
     }
 
-    fn serialize(&self, options: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
-        Ok(Some(
-            pb::CaseWhenOpts {
-                num_when_then_pairs: options.num_when_then_pairs,
-                has_else: options.has_else,
-            }
-            .encode_to_vec(),
-        ))
+    fn serialize(&self, _options: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
+        // let num_children = options.num_when_then_pairs * 2 + u32::from(options.has_else);
+        // Ok(Some(pb::CaseWhenOpts { num_children }.encode_to_vec()))
+        // stabilize the expr
+        vortex_bail!("cannot serialize")
     }
 
-    fn deserialize(&self, metadata: &[u8]) -> VortexResult<Self::Options> {
+    fn deserialize(
+        &self,
+        metadata: &[u8],
+        _session: &VortexSession,
+    ) -> VortexResult<Self::Options> {
         let opts = pb::CaseWhenOpts::decode(metadata)?;
+        if opts.num_children < 2 {
+            vortex_bail!(
+                "CaseWhen expects at least 2 children, got {}",
+                opts.num_children
+            );
+        }
         Ok(CaseWhenOptions {
-            num_when_then_pairs: opts.num_when_then_pairs,
-            has_else: opts.has_else,
+            num_when_then_pairs: opts.num_children / 2,
+            has_else: opts.num_children % 2 == 1,
         })
     }
 
     fn arity(&self, options: &Self::Options) -> Arity {
-        let num_children =
-            options.num_when_then_pairs as usize * 2 + if options.has_else { 1 } else { 0 };
-        Arity::Exact(num_children)
+        Arity::Exact(options.num_children())
     }
 
     fn child_name(&self, options: &Self::Options, child_idx: usize) -> ChildName {
-        let pair_count = options.num_when_then_pairs as usize;
-        let num_when_then_children = pair_count * 2;
-
-        if child_idx < num_when_then_children {
+        let num_pair_children = options.num_when_then_pairs as usize * 2;
+        if child_idx < num_pair_children {
             let pair_idx = child_idx / 2;
-            if child_idx % 2 == 0 {
-                ChildName::from(Arc::from(format!("when_{}", pair_idx)))
+            if child_idx.is_multiple_of(2) {
+                ChildName::from(Arc::from(format!("when_{pair_idx}")))
             } else {
-                ChildName::from(Arc::from(format!("then_{}", pair_idx)))
+                ChildName::from(Arc::from(format!("then_{pair_idx}")))
             }
-        } else if options.has_else && child_idx == num_when_then_children {
+        } else if options.has_else && child_idx == num_pair_children {
             ChildName::from("else")
         } else {
-            unreachable!(
-                "Invalid child index {} for CaseWhen expression with {} pairs",
-                child_idx, pair_count
-            )
+            unreachable!("Invalid child index {} for CaseWhen", child_idx)
         }
     }
 
@@ -145,316 +150,219 @@ impl VTable for CaseWhen {
     }
 
     fn return_dtype(&self, options: &Self::Options, arg_dtypes: &[DType]) -> VortexResult<DType> {
-        // The return dtype is based on the THEN expressions
         if options.num_when_then_pairs == 0 {
             vortex_bail!("CaseWhen must have at least one WHEN/THEN pair");
         }
 
-        // Get the first THEN expression's dtype (index 1)
-        let first_then_dtype = &arg_dtypes[1];
-
-        // If there's no ELSE, the result is always nullable (unmatched rows are NULL)
-        if !options.has_else {
-            Ok(first_then_dtype.as_nullable())
-        } else {
-            Ok(first_then_dtype.clone())
+        let expected_len = options.num_children();
+        if arg_dtypes.len() != expected_len {
+            vortex_bail!(
+                "CaseWhen expects {expected_len} argument dtypes, got {}",
+                arg_dtypes.len()
+            );
         }
+
+        // Unlike SQL which coerces all branches to a common supertype, we require
+        // all THEN/ELSE branches to have the same base dtype (ignoring nullability).
+        // The result nullability is the union of all branches.
+        let first_then = &arg_dtypes[1];
+        let mut result_dtype = first_then.clone();
+
+        for i in 1..options.num_when_then_pairs as usize {
+            let then_i = &arg_dtypes[i * 2 + 1];
+            if !first_then.eq_ignore_nullability(then_i) {
+                vortex_bail!(
+                    "CaseWhen THEN dtypes must match (ignoring nullability), got {} and {}",
+                    first_then,
+                    then_i
+                );
+            }
+            result_dtype = result_dtype.union_nullability(then_i.nullability());
+        }
+
+        if options.has_else {
+            let else_dtype = &arg_dtypes[options.num_when_then_pairs as usize * 2];
+            if !result_dtype.eq_ignore_nullability(else_dtype) {
+                vortex_bail!(
+                    "CaseWhen THEN and ELSE dtypes must match (ignoring nullability), got {} and {}",
+                    first_then,
+                    else_dtype
+                );
+            }
+            result_dtype = result_dtype.union_nullability(else_dtype.nullability());
+        } else {
+            // No ELSE means unmatched rows are NULL
+            result_dtype = result_dtype.as_nullable();
+        }
+
+        Ok(result_dtype)
     }
 
-    fn evaluate(
+    fn execute(
         &self,
         options: &Self::Options,
-        expr: &Expression,
-        scope: &ArrayRef,
+        args: &dyn ExecutionArgs,
+        ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
-        use vortex_buffer::BitBuffer;
-        use vortex_mask::Mask;
+        // Inspired by https://datafusion.apache.org/blog/2026/02/02/datafusion_case/
+        //
+        // TODO: shrink input to `remaining` rows between WHEN iterations (batch reduction).
+        // TODO: project to only referenced columns before batch reduction (column projection).
+        // TODO: evaluate THEN/ELSE on compact matching/non-matching rows and scatter-merge the results.
+        // TODO: for constant WHEN/THEN values, compile to a hash table for a single-pass lookup.
+        let row_count = args.row_count();
+        let num_pairs = options.num_when_then_pairs as usize;
 
-        use crate::compute::filter;
+        let mut remaining = Mask::new_true(row_count);
+        let mut branches: Vec<(Mask, ArrayRef)> = Vec::with_capacity(num_pairs);
 
-        let len = scope.len();
+        for i in 0..num_pairs {
+            if remaining.all_false() {
+                break;
+            }
 
-        // Determine output dtype from first THEN expression
-        let output_dtype = expr.child(1).return_dtype(scope.dtype())?;
-        let else_idx = options.num_when_then_pairs as usize * 2;
-
-        // Track which rows have matched a condition (using BitBuffer for boolean ops)
-        let mut matched_bits = BitBuffer::new_unset(len);
-
-        // Start with null result - we'll fill in values as conditions match
-        let mut result: ArrayRef =
-            ConstantArray::new(Scalar::null(output_dtype.as_nullable()), len).into_array();
-
-        // Process when/then pairs in order (first match wins)
-        for i in 0..options.num_when_then_pairs as usize {
-            // Evaluate condition
-            let cond = expr.child(i * 2).evaluate(scope)?;
-            let cond_bool = cond.to_bool();
+            let condition = args.get(i * 2)?;
+            let cond_bool = condition.execute::<BoolArray>(ctx)?;
             let cond_mask = cond_bool.to_mask_fill_null_false();
-            let cond_bits = cond_mask.to_bit_buffer();
+            let effective_mask = &remaining & &cond_mask;
 
-            // Compute which rows match THIS condition AND haven't matched a previous one
-            // effective_cond = cond AND NOT(already_matched)
-            let effective_bits = &cond_bits & &(!&matched_bits);
-            let effective_mask = Mask::from_buffer(effective_bits.clone());
-
-            // Short-circuit: skip THEN evaluation if no rows match this condition
             if effective_mask.all_false() {
                 continue;
             }
 
-            // Evaluate THEN expression
-            let then_val = if effective_mask.all_true() {
-                // All rows match - safe to evaluate on full scope
-                expr.child(i * 2 + 1).evaluate(scope)?
-            } else {
-                // Filter scope to only matching rows, evaluate, then scatter back
-                let filtered_scope = filter(scope, &effective_mask)?;
-                let filtered_result = expr.child(i * 2 + 1).evaluate(&filtered_scope)?;
-
-                // Scatter the filtered result back using builder
-                scatter_with_mask(&filtered_result, &effective_mask, &output_dtype, len)?
-            };
-
-            // Merge into result: use zip to overlay then_val where effective_mask is true
-            result = zip(&then_val, &result, &effective_mask)?;
-
-            // Update matched_bits
-            matched_bits = &matched_bits | &effective_bits;
-
-            // Short-circuit: if all rows have matched, we're done
-            if matched_bits.true_count() == len {
-                break;
-            }
+            let then_value = args.get(i * 2 + 1)?;
+            remaining = remaining.bitand_not(&cond_mask);
+            branches.push((effective_mask, then_value));
         }
 
-        // Handle ELSE clause for unmatched rows
-        let unmatched_bits = !&matched_bits;
-        let unmatched_mask = Mask::from_buffer(unmatched_bits);
-
-        if !unmatched_mask.all_false() {
-            let else_val = if options.has_else {
-                // Evaluate ELSE for unmatched rows
-                if unmatched_mask.all_true() {
-                    expr.child(else_idx).evaluate(scope)?
-                } else {
-                    let filtered_scope = filter(scope, &unmatched_mask)?;
-                    let filtered_else = expr.child(else_idx).evaluate(&filtered_scope)?;
-                    scatter_with_mask(&filtered_else, &unmatched_mask, &output_dtype, len)?
-                }
-            } else {
-                // No ELSE - unmatched rows stay null (already set in result)
-                return Ok(result);
-            };
-
-            result = zip(&else_val, &result, &unmatched_mask)?;
-        }
-
-        Ok(result)
-    }
-
-    fn execute(&self, options: &Self::Options, args: ExecutionArgs) -> VortexResult<Datum> {
-        let row_count = args.row_count;
-        let mut datums = args.datums;
-
-        // Check if all inputs are scalars (for returning scalar result)
-        let all_scalars = datums.iter().all(|d| matches!(d, Datum::Scalar(_)));
-
-        // Collect when/then pairs from datums
-        let mut when_then_pairs = Vec::with_capacity(options.num_when_then_pairs as usize);
-        for i in 0..options.num_when_then_pairs as usize {
-            let cond = datums[i * 2].clone();
-            let then_val = datums[i * 2 + 1].clone();
-            when_then_pairs.push((cond, then_val));
-        }
-
-        // Get the else value if present
-        let else_value = options.has_else.then(|| {
-            let else_idx = options.num_when_then_pairs as usize * 2;
-            datums.remove(else_idx)
-        });
-
-        // Determine output dtype from return_dtype
-        let output_dtype = args.return_dtype;
-
-        // Create the result by starting from the else value or null
-        let mut result: Datum = if let Some(else_val) = else_value {
-            else_val
+        let else_value: ArrayRef = if options.has_else {
+            args.get(num_pairs * 2)?
         } else {
-            // Create a null scalar of the output dtype, which will be repeated as needed
-            use vortex_vector::Scalar as VScalar;
-            Datum::Scalar(VScalar::null(&output_dtype))
+            let then_dtype = args.get(1)?.dtype().as_nullable();
+            ConstantArray::new(Scalar::null(then_dtype), row_count).into_array()
         };
 
-        // Process when/then pairs in reverse order
-        // For each (condition, then_value), we select from then_value where condition is true
-        for (cond, then_val) in when_then_pairs.into_iter().rev() {
-            result = execute_zip(then_val, result, cond, row_count, &output_dtype)?;
+        if branches.is_empty() {
+            return Ok(else_value);
         }
 
-        // If all inputs were scalars and result is still length 1, return as scalar
-        if all_scalars
-            && let Datum::Vector(v) = &result
-            && v.len() == 1
-        {
-            return Ok(Datum::Scalar(v.scalar_at(0)));
-        }
+        merge_case_branches(branches, else_value)
+    }
 
-        Ok(result)
+    fn is_null_sensitive(&self, _options: &Self::Options) -> bool {
+        true
+    }
+
+    fn is_fallible(&self, _options: &Self::Options) -> bool {
+        false
     }
 }
 
-/// Helper function to perform zip operation on Datum values.
-/// Selects from `if_true` where `condition` is true, otherwise from `if_false`.
-fn execute_zip(
-    if_true: Datum,
-    if_false: Datum,
-    condition: Datum,
-    row_count: usize,
-    output_dtype: &DType,
-) -> VortexResult<Datum> {
-    use vortex_mask::Mask;
-    use vortex_vector::BoolDatum;
+/// Average run length at which slicing + `extend_from_array` becomes cheaper than `scalar_at`.
+/// Measured empirically via benchmarks.
+const SLICE_CROSSOVER_RUN_LEN: usize = 4;
 
-    use crate::LEGACY_SESSION;
-    use crate::VectorExecutor;
-    use crate::vectors::VectorIntoArray;
-
-    let cond_bool = condition.into_bool();
-
-    // Convert condition to Mask using the same pattern as evaluate()
-    let mask = match cond_bool {
-        BoolDatum::Scalar(s) => {
-            let value = s.value().unwrap_or(false); // NULL treated as false
-            Mask::new(row_count, value)
-        }
-        BoolDatum::Vector(v) => {
-            // Convert to BoolArray and use to_mask_fill_null_false() for DRY
-            let bool_dtype = DType::Bool(Nullability::Nullable);
-            let bool_array: BoolArray = v.into_array(&bool_dtype);
-            bool_array.to_mask_fill_null_false()
-        }
-    };
-
-    // Short-circuit: if mask is all true, return if_true; if all false, return if_false
-    if mask.all_true() {
-        return Ok(if_true);
-    }
-    if mask.all_false() {
-        return Ok(if_false);
-    }
-
-    // Convert datums to vectors for zip
-    let true_vector = if_true.unwrap_into_vector(row_count);
-    let false_vector = if_false.unwrap_into_vector(row_count);
-
-    // Convert vectors to arrays for zip operation
-    let true_array = true_vector.into_array(output_dtype);
-    let false_array = false_vector.into_array(output_dtype);
-
-    // Perform zip
-    let result_array = zip(&true_array, &false_array, &mask)?;
-
-    // Convert back to vector
-    let result_vector = result_array.execute_vector(&LEGACY_SESSION)?;
-
-    Ok(Datum::Vector(result_vector))
-}
-
-/// Creates a CASE WHEN expression with an ELSE clause.
+/// Merges disjoint `(mask, then_value)` branch pairs with an `else_value` into a single array.
 ///
-/// The children should be provided as: condition1, then1, condition2, then2, ..., else_value
-///
-/// # Example
-/// ```ignore
-/// // CASE WHEN x > 0 THEN 'positive' WHEN x < 0 THEN 'negative' ELSE 'zero' END
-/// case_when(vec![
-///     gt(col("x"), lit(0)), lit("positive"),
-///     lt(col("x"), lit(0)), lit("negative"),
-///     lit("zero"),
-/// ])
-/// ```
-pub fn case_when<I: IntoIterator<Item = Expression>>(children: I) -> Expression {
-    let children: Vec<_> = children.into_iter().collect();
-    let num_children = children.len();
-
-    // Must have odd number of children (pairs + else)
-    assert!(
-        num_children >= 3 && num_children % 2 == 1,
-        "case_when requires at least one when/then pair and an else: got {} children",
-        num_children
-    );
-
-    #[allow(clippy::cast_possible_truncation)]
-    let num_when_then_pairs = ((num_children - 1) / 2) as u32;
-    let options = CaseWhenOptions {
-        num_when_then_pairs,
-        has_else: true,
-    };
-
-    CaseWhen.new_expr(options, children)
-}
-
-/// Creates a CASE WHEN expression without an ELSE clause (returns NULL when no conditions match).
-///
-/// The children should be provided as: condition1, then1, condition2, then2, ...
-///
-/// # Example
-/// ```ignore
-/// // CASE WHEN x > 0 THEN 'positive' WHEN x < 0 THEN 'negative' END
-/// // (returns NULL when x = 0)
-/// case_when_no_else(vec![
-///     gt(col("x"), lit(0)), lit("positive"),
-///     lt(col("x"), lit(0)), lit("negative"),
-/// ])
-/// ```
-pub fn case_when_no_else<I: IntoIterator<Item = Expression>>(children: I) -> Expression {
-    let children: Vec<_> = children.into_iter().collect();
-    let num_children = children.len();
-
-    // Must have even number of children (pairs only)
-    assert!(
-        num_children >= 2 && num_children % 2 == 0,
-        "case_when_no_else requires at least one when/then pair: got {} children",
-        num_children
-    );
-
-    #[allow(clippy::cast_possible_truncation)]
-    let num_when_then_pairs = (num_children / 2) as u32;
-    let options = CaseWhenOptions {
-        num_when_then_pairs,
-        has_else: false,
-    };
-
-    CaseWhen.new_expr(options, children)
-}
-
-/// Scatter values from a filtered (shorter) array back to their original positions.
-/// The mask indicates which positions in the output should receive values from the source.
-/// Positions where mask is false will be null.
-fn scatter_with_mask(
-    source: &ArrayRef,
-    mask: &vortex_mask::Mask,
-    dtype: &DType,
-    output_len: usize,
+/// Branch masks are guaranteed disjoint by the remaining-row tracking in [`CaseWhen::execute`].
+fn merge_case_branches(
+    branches: Vec<(Mask, ArrayRef)>,
+    else_value: ArrayRef,
 ) -> VortexResult<ArrayRef> {
-    use crate::builders::builder_with_capacity;
+    if branches.len() == 1 {
+        let (mask, then_value) = &branches[0];
+        return zip_impl(then_value, &else_value, mask);
+    }
 
-    let nullable_dtype = dtype.as_nullable();
-    let mut builder = builder_with_capacity(&nullable_dtype, output_len);
-    let mut source_idx = 0;
+    let output_nullability = branches
+        .iter()
+        .fold(else_value.dtype().nullability(), |acc, (_, arr)| {
+            acc | arr.dtype().nullability()
+        });
+    let output_dtype = else_value.dtype().with_nullability(output_nullability);
+    let branch_arrays: Vec<&ArrayRef> = branches.iter().map(|(_, arr)| arr).collect();
 
-    for i in 0..output_len {
-        if mask.value(i) {
-            // Copy value from source, casting to nullable if needed
-            let scalar = source.scalar_at(source_idx);
-            let nullable_scalar = scalar.cast(&nullable_dtype)?;
-            builder.append_scalar(&nullable_scalar)?;
-            source_idx += 1;
-        } else {
-            // Insert null
-            builder.append_null();
+    let mut spans: Vec<(usize, usize, usize)> = Vec::new();
+    for (branch_idx, (mask, _)) in branches.iter().enumerate() {
+        match mask.slices() {
+            AllOr::All => return branch_arrays[branch_idx].cast(output_dtype),
+            AllOr::None => {}
+            AllOr::Some(slices) => {
+                for &(start, end) in slices {
+                    spans.push((start, end, branch_idx));
+                }
+            }
         }
+    }
+    spans.sort_unstable_by_key(|&(start, ..)| start);
+
+    if spans.is_empty() {
+        return else_value.cast(output_dtype);
+    }
+
+    let builder = builder_with_capacity(&output_dtype, else_value.len());
+
+    let fragmented = spans.len() > else_value.len() / SLICE_CROSSOVER_RUN_LEN;
+    if fragmented {
+        merge_row_by_row(&branch_arrays, &else_value, &spans, &output_dtype, builder)
+    } else {
+        merge_run_by_run(&branch_arrays, &else_value, &spans, &output_dtype, builder)
+    }
+}
+
+/// Iterates spans directly, emitting one `scalar_at` per row.
+/// Zero per-run allocations; preferred for fragmented masks (avg run < [`SLICE_CROSSOVER_RUN_LEN`]).
+fn merge_row_by_row(
+    branch_arrays: &[&ArrayRef],
+    else_value: &ArrayRef,
+    spans: &[(usize, usize, usize)],
+    output_dtype: &DType,
+    mut builder: Box<dyn ArrayBuilder>,
+) -> VortexResult<ArrayRef> {
+    let mut pos = 0;
+    for &(start, end, branch_idx) in spans {
+        for row in pos..start {
+            let scalar = else_value.scalar_at(row)?;
+            builder.append_scalar(&scalar.cast(output_dtype)?)?;
+        }
+        for row in start..end {
+            let scalar = branch_arrays[branch_idx].scalar_at(row)?;
+            builder.append_scalar(&scalar.cast(output_dtype)?)?;
+        }
+        pos = end;
+    }
+    for row in pos..else_value.len() {
+        let scalar = else_value.scalar_at(row)?;
+        builder.append_scalar(&scalar.cast(output_dtype)?)?;
+    }
+
+    Ok(builder.finish())
+}
+
+/// Bulk-copies each span via `slice()` + `extend_from_array`.
+/// Preferred when runs are long enough that memcpy dominates over per-slice allocation cost.
+/// Lazy cast via `arr.cast(output_dtype)` is executed once per span as a block.
+fn merge_run_by_run(
+    branch_arrays: &[&ArrayRef],
+    else_value: &ArrayRef,
+    spans: &[(usize, usize, usize)],
+    output_dtype: &DType,
+    mut builder: Box<dyn ArrayBuilder>,
+) -> VortexResult<ArrayRef> {
+    let else_value = else_value.cast(output_dtype.clone())?;
+    let len = else_value.len();
+    for (start, end, branch_idx) in spans {
+        if builder.len() < *start {
+            builder.extend_from_array(&else_value.slice(builder.len()..*start)?);
+        }
+        builder.extend_from_array(
+            &branch_arrays[*branch_idx]
+                .cast(output_dtype.clone())?
+                .slice(*start..*end)?,
+        );
+    }
+    if builder.len() < len {
+        builder.extend_from_array(&else_value.slice(builder.len()..len)?);
     }
 
     Ok(builder.finish())
@@ -462,52 +370,78 @@ fn scatter_with_mask(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use vortex_buffer::buffer;
-    use vortex_dtype::DType;
-    use vortex_dtype::Nullability;
-    use vortex_dtype::PType;
     use vortex_error::VortexExpect as _;
-    use vortex_scalar::Scalar;
+    use vortex_session::VortexSession;
 
     use super::*;
+    use crate::Canonical;
     use crate::IntoArray;
-    use crate::ToCanonical;
+    use crate::VortexSessionExecute as _;
     use crate::arrays::BoolArray;
     use crate::arrays::PrimitiveArray;
     use crate::arrays::StructArray;
-    use crate::expr::exprs::binary::eq;
-    use crate::expr::exprs::binary::gt;
-    use crate::expr::exprs::get_item::col;
-    use crate::expr::exprs::get_item::get_item;
-    use crate::expr::exprs::literal::lit;
-    use crate::expr::exprs::root::root;
+    use crate::assert_arrays_eq;
+    use crate::dtype::DType;
+    use crate::dtype::Nullability;
+    use crate::dtype::PType;
+    use crate::expr::case_when;
+    use crate::expr::case_when_no_else;
+    use crate::expr::col;
+    use crate::expr::eq;
+    use crate::expr::get_item;
+    use crate::expr::gt;
+    use crate::expr::lit;
+    use crate::expr::nested_case_when;
+    use crate::expr::root;
     use crate::expr::test_harness;
+    use crate::scalar::Scalar;
+    use crate::session::ArraySession;
+
+    static SESSION: LazyLock<VortexSession> =
+        LazyLock::new(|| VortexSession::empty().with::<ArraySession>());
+
+    /// Helper to evaluate an expression using the apply+execute pattern
+    fn evaluate_expr(expr: &Expression, array: &ArrayRef) -> ArrayRef {
+        let mut ctx = SESSION.create_execution_ctx();
+        array
+            .clone()
+            .apply(expr)
+            .unwrap()
+            .execute::<Canonical>(&mut ctx)
+            .unwrap()
+            .into_array()
+    }
 
     // ==================== Serialization Tests ====================
 
     #[test]
+    #[should_panic(expected = "cannot serialize")]
     fn test_serialization_roundtrip() {
         let options = CaseWhenOptions {
-            num_when_then_pairs: 2,
+            num_when_then_pairs: 1,
             has_else: true,
         };
-
         let serialized = CaseWhen.serialize(&options).unwrap().unwrap();
-        let deserialized = CaseWhen.deserialize(&serialized).unwrap();
-
+        let deserialized = CaseWhen
+            .deserialize(&serialized, &VortexSession::empty())
+            .unwrap();
         assert_eq!(options, deserialized);
     }
 
     #[test]
+    #[should_panic(expected = "cannot serialize")]
     fn test_serialization_no_else() {
         let options = CaseWhenOptions {
-            num_when_then_pairs: 3,
+            num_when_then_pairs: 1,
             has_else: false,
         };
-
         let serialized = CaseWhen.serialize(&options).unwrap().unwrap();
-        let deserialized = CaseWhen.deserialize(&serialized).unwrap();
-
+        let deserialized = CaseWhen
+            .deserialize(&serialized, &VortexSession::empty())
+            .unwrap();
         assert_eq!(options, deserialized);
     }
 
@@ -515,12 +449,7 @@ mod tests {
 
     #[test]
     fn test_display_with_else() {
-        // CASE WHEN col > 0 THEN 100 ELSE 0 END
-        let condition = gt(col("value"), lit(0i32));
-        let then_val = lit(100i32);
-        let else_val = lit(0i32);
-
-        let expr = case_when([condition, then_val, else_val]);
+        let expr = case_when(gt(col("value"), lit(0i32)), lit(100i32), lit(0i32));
         let display = format!("{}", expr);
         assert!(display.contains("CASE"));
         assert!(display.contains("WHEN"));
@@ -531,11 +460,7 @@ mod tests {
 
     #[test]
     fn test_display_no_else() {
-        // CASE WHEN col > 0 THEN 100 END
-        let condition = gt(col("value"), lit(0i32));
-        let then_val = lit(100i32);
-
-        let expr = case_when_no_else([condition, then_val]);
+        let expr = case_when_no_else(gt(col("value"), lit(0i32)), lit(100i32));
         let display = format!("{}", expr);
         assert!(display.contains("CASE"));
         assert!(display.contains("WHEN"));
@@ -545,16 +470,17 @@ mod tests {
     }
 
     #[test]
-    fn test_display_multiple_conditions() {
-        let expr = case_when([
-            gt(col("x"), lit(10i32)),
-            lit("high"),
-            gt(col("x"), lit(5i32)),
-            lit("medium"),
-            lit("low"),
-        ]);
+    fn test_display_nested_nary() {
+        // CASE WHEN x > 10 THEN 'high' WHEN x > 5 THEN 'medium' ELSE 'low' END
+        let expr = nested_case_when(
+            vec![
+                (gt(col("x"), lit(10i32)), lit("high")),
+                (gt(col("x"), lit(5i32)), lit("medium")),
+            ],
+            Some(lit("low")),
+        );
         let display = format!("{}", expr);
-        // Should contain two WHEN clauses
+        assert_eq!(display.matches("CASE").count(), 1);
         assert_eq!(display.matches("WHEN").count(), 2);
         assert_eq!(display.matches("THEN").count(), 2);
     }
@@ -563,14 +489,9 @@ mod tests {
 
     #[test]
     fn test_return_dtype_with_else() {
-        let condition = lit(true);
-        let then_val = lit(100i32);
-        let else_val = lit(0i32);
-
-        let expr = case_when([condition, then_val, else_val]);
+        let expr = case_when(lit(true), lit(100i32), lit(0i32));
         let input_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
         let result_dtype = expr.return_dtype(&input_dtype).unwrap();
-        // With else, result dtype matches the then expression
         assert_eq!(
             result_dtype,
             DType::Primitive(PType::I32, Nullability::NonNullable)
@@ -578,14 +499,28 @@ mod tests {
     }
 
     #[test]
-    fn test_return_dtype_without_else_is_nullable() {
-        let condition = lit(true);
-        let then_val = lit(100i32);
-
-        let expr = case_when_no_else([condition, then_val]);
+    fn test_return_dtype_with_nullable_else() {
+        let expr = case_when(
+            lit(true),
+            lit(100i32),
+            lit(Scalar::null(DType::Primitive(
+                PType::I32,
+                Nullability::Nullable,
+            ))),
+        );
         let input_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
         let result_dtype = expr.return_dtype(&input_dtype).unwrap();
-        // Without else, result is always nullable
+        assert_eq!(
+            result_dtype,
+            DType::Primitive(PType::I32, Nullability::Nullable)
+        );
+    }
+
+    #[test]
+    fn test_return_dtype_without_else_is_nullable() {
+        let expr = case_when_no_else(lit(true), lit(100i32));
+        let input_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+        let result_dtype = expr.return_dtype(&input_dtype).unwrap();
         assert_eq!(
             result_dtype,
             DType::Primitive(PType::I32, Nullability::Nullable)
@@ -595,18 +530,26 @@ mod tests {
     #[test]
     fn test_return_dtype_with_struct_input() {
         let dtype = test_harness::struct_dtype();
-
-        // CASE WHEN $.col1 > 10 THEN 100 ELSE 0 END
-        let expr = case_when([
+        let expr = case_when(
             gt(get_item("col1", root()), lit(10u16)),
             lit(100i32),
             lit(0i32),
-        ]);
-
+        );
         let result_dtype = expr.return_dtype(&dtype).unwrap();
         assert_eq!(
             result_dtype,
             DType::Primitive(PType::I32, Nullability::NonNullable)
+        );
+    }
+
+    #[test]
+    fn test_return_dtype_mismatched_then_else_errors() {
+        let expr = case_when(lit(true), lit(100i32), lit("zero"));
+        let input_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+        let err = expr.return_dtype(&input_dtype).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("THEN and ELSE dtypes must match (ignoring nullability)")
         );
     }
 
@@ -615,31 +558,19 @@ mod tests {
     #[test]
     fn test_arity_with_else() {
         let options = CaseWhenOptions {
-            num_when_then_pairs: 2,
+            num_when_then_pairs: 1,
             has_else: true,
         };
-        // 2 pairs (4 children) + 1 else = 5 children
-        assert_eq!(CaseWhen.arity(&options), Arity::Exact(5));
+        assert_eq!(CaseWhen.arity(&options), Arity::Exact(3));
     }
 
     #[test]
     fn test_arity_without_else() {
         let options = CaseWhenOptions {
-            num_when_then_pairs: 2,
+            num_when_then_pairs: 1,
             has_else: false,
         };
-        // 2 pairs (4 children) = 4 children
-        assert_eq!(CaseWhen.arity(&options), Arity::Exact(4));
-    }
-
-    #[test]
-    fn test_arity_single_condition() {
-        let options = CaseWhenOptions {
-            num_when_then_pairs: 1,
-            has_else: true,
-        };
-        // 1 pair (2 children) + 1 else = 3 children
-        assert_eq!(CaseWhen.arity(&options), Arity::Exact(3));
+        assert_eq!(CaseWhen.arity(&options), Arity::Exact(2));
     }
 
     // ==================== Child Name Tests ====================
@@ -647,22 +578,130 @@ mod tests {
     #[test]
     fn test_child_names() {
         let options = CaseWhenOptions {
-            num_when_then_pairs: 2,
+            num_when_then_pairs: 1,
             has_else: true,
         };
+        assert_eq!(CaseWhen.child_name(&options, 0).to_string(), "when_0");
+        assert_eq!(CaseWhen.child_name(&options, 1).to_string(), "then_0");
+        assert_eq!(CaseWhen.child_name(&options, 2).to_string(), "else");
+    }
 
+    // ==================== N-ary Serialization Tests ====================
+
+    #[test]
+    #[should_panic(expected = "cannot serialize")]
+    fn test_serialization_roundtrip_nary() {
+        let options = CaseWhenOptions {
+            num_when_then_pairs: 3,
+            has_else: true,
+        };
+        let serialized = CaseWhen.serialize(&options).unwrap().unwrap();
+        let deserialized = CaseWhen
+            .deserialize(&serialized, &VortexSession::empty())
+            .unwrap();
+        assert_eq!(options, deserialized);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot serialize")]
+    fn test_serialization_roundtrip_nary_no_else() {
+        let options = CaseWhenOptions {
+            num_when_then_pairs: 4,
+            has_else: false,
+        };
+        let serialized = CaseWhen.serialize(&options).unwrap().unwrap();
+        let deserialized = CaseWhen
+            .deserialize(&serialized, &VortexSession::empty())
+            .unwrap();
+        assert_eq!(options, deserialized);
+    }
+
+    // ==================== N-ary Arity Tests ====================
+
+    #[test]
+    fn test_arity_nary_with_else() {
+        let options = CaseWhenOptions {
+            num_when_then_pairs: 3,
+            has_else: true,
+        };
+        // 3 pairs * 2 children + 1 else = 7
+        assert_eq!(CaseWhen.arity(&options), Arity::Exact(7));
+    }
+
+    #[test]
+    fn test_arity_nary_without_else() {
+        let options = CaseWhenOptions {
+            num_when_then_pairs: 3,
+            has_else: false,
+        };
+        // 3 pairs * 2 children = 6
+        assert_eq!(CaseWhen.arity(&options), Arity::Exact(6));
+    }
+
+    // ==================== N-ary Child Name Tests ====================
+
+    #[test]
+    fn test_child_names_nary() {
+        let options = CaseWhenOptions {
+            num_when_then_pairs: 3,
+            has_else: true,
+        };
         assert_eq!(CaseWhen.child_name(&options, 0).to_string(), "when_0");
         assert_eq!(CaseWhen.child_name(&options, 1).to_string(), "then_0");
         assert_eq!(CaseWhen.child_name(&options, 2).to_string(), "when_1");
         assert_eq!(CaseWhen.child_name(&options, 3).to_string(), "then_1");
-        assert_eq!(CaseWhen.child_name(&options, 4).to_string(), "else");
+        assert_eq!(CaseWhen.child_name(&options, 4).to_string(), "when_2");
+        assert_eq!(CaseWhen.child_name(&options, 5).to_string(), "then_2");
+        assert_eq!(CaseWhen.child_name(&options, 6).to_string(), "else");
+    }
+
+    // ==================== N-ary DType Tests ====================
+
+    #[test]
+    fn test_return_dtype_nary_mismatched_then_types_errors() {
+        let expr = nested_case_when(
+            vec![(lit(true), lit(100i32)), (lit(false), lit("oops"))],
+            Some(lit(0i32)),
+        );
+        let input_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+        let err = expr.return_dtype(&input_dtype).unwrap_err();
+        assert!(err.to_string().contains("THEN dtypes must match"));
+    }
+
+    #[test]
+    fn test_return_dtype_nary_mixed_nullability() {
+        // When some THEN branches are nullable and others are not,
+        // the result should be nullable (union of nullabilities).
+        let non_null_then = lit(100i32);
+        let nullable_then = lit(Scalar::null(DType::Primitive(
+            PType::I32,
+            Nullability::Nullable,
+        )));
+        let expr = nested_case_when(
+            vec![(lit(true), non_null_then), (lit(false), nullable_then)],
+            Some(lit(0i32)),
+        );
+        let input_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+        let result = expr.return_dtype(&input_dtype).unwrap();
+        assert_eq!(result, DType::Primitive(PType::I32, Nullability::Nullable));
+    }
+
+    #[test]
+    fn test_return_dtype_nary_no_else_is_nullable() {
+        let expr = nested_case_when(
+            vec![(lit(true), lit(10i32)), (lit(false), lit(20i32))],
+            None,
+        );
+        let input_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+        let result = expr.return_dtype(&input_dtype).unwrap();
+        assert_eq!(result, DType::Primitive(PType::I32, Nullability::Nullable));
     }
 
     // ==================== Expression Manipulation Tests ====================
 
     #[test]
     fn test_replace_children() {
-        let expr = case_when([lit(true), lit(1i32), lit(0i32)]);
+        let expr = case_when(lit(true), lit(1i32), lit(0i32));
         expr.with_children([lit(false), lit(2i32), lit(3i32)])
             .vortex_expect("operation should succeed in test");
     }
@@ -671,182 +710,203 @@ mod tests {
 
     #[test]
     fn test_evaluate_simple_condition() {
-        // Test: CASE WHEN value > 2 THEN 100 ELSE 0 END
-        // Input: [1, 2, 3, 4, 5]
-        // Expected: [0, 0, 100, 100, 100]
         let test_array =
             StructArray::from_fields(&[("value", buffer![1i32, 2, 3, 4, 5].into_array())])
                 .unwrap()
                 .into_array();
 
-        let expr = case_when([
+        let expr = case_when(
             gt(get_item("value", root()), lit(2i32)),
             lit(100i32),
             lit(0i32),
-        ]);
+        );
 
-        let result = expr.evaluate(&test_array).unwrap().to_primitive();
-        assert_eq!(result.as_slice::<i32>(), &[0, 0, 100, 100, 100]);
+        let result = evaluate_expr(&expr, &test_array);
+        assert_arrays_eq!(result, buffer![0i32, 0, 100, 100, 100].into_array());
     }
 
     #[test]
-    fn test_evaluate_multiple_conditions() {
-        // Test: CASE WHEN value == 1 THEN 10 WHEN value == 3 THEN 30 ELSE 0 END
-        // Input: [1, 2, 3, 4, 5]
-        // Expected: [10, 0, 30, 0, 0]
+    fn test_evaluate_nary_multiple_conditions() {
+        // Test n-ary via nested_case_when
         let test_array =
             StructArray::from_fields(&[("value", buffer![1i32, 2, 3, 4, 5].into_array())])
                 .unwrap()
                 .into_array();
 
-        let expr = case_when([
-            eq(get_item("value", root()), lit(1i32)),
-            lit(10i32),
-            eq(get_item("value", root()), lit(3i32)),
-            lit(30i32),
-            lit(0i32),
-        ]);
+        let expr = nested_case_when(
+            vec![
+                (eq(get_item("value", root()), lit(1i32)), lit(10i32)),
+                (eq(get_item("value", root()), lit(3i32)), lit(30i32)),
+            ],
+            Some(lit(0i32)),
+        );
 
-        let result = expr.evaluate(&test_array).unwrap().to_primitive();
-        assert_eq!(result.as_slice::<i32>(), &[10, 0, 30, 0, 0]);
+        let result = evaluate_expr(&expr, &test_array);
+        assert_arrays_eq!(result, buffer![10i32, 0, 30, 0, 0].into_array());
     }
 
     #[test]
-    fn test_evaluate_first_match_wins() {
-        // Test: CASE WHEN value > 2 THEN 100 WHEN value > 3 THEN 200 ELSE 0 END
-        // Input: [1, 2, 3, 4, 5]
-        // Expected: [0, 0, 100, 100, 100] - first condition wins for values 3, 4, 5
+    fn test_evaluate_nary_first_match_wins() {
         let test_array =
             StructArray::from_fields(&[("value", buffer![1i32, 2, 3, 4, 5].into_array())])
                 .unwrap()
                 .into_array();
 
-        let expr = case_when([
-            gt(get_item("value", root()), lit(2i32)),
-            lit(100i32),
-            gt(get_item("value", root()), lit(3i32)),
-            lit(200i32),
-            lit(0i32),
-        ]);
+        // Both conditions match for values > 3, but first one wins
+        let expr = nested_case_when(
+            vec![
+                (gt(get_item("value", root()), lit(2i32)), lit(100i32)),
+                (gt(get_item("value", root()), lit(3i32)), lit(200i32)),
+            ],
+            Some(lit(0i32)),
+        );
 
-        let result = expr.evaluate(&test_array).unwrap().to_primitive();
-        // First match wins: 3, 4, 5 all get 100 (from first condition)
-        assert_eq!(result.as_slice::<i32>(), &[0, 0, 100, 100, 100]);
+        let result = evaluate_expr(&expr, &test_array);
+        assert_arrays_eq!(result, buffer![0i32, 0, 100, 100, 100].into_array());
     }
 
     #[test]
     fn test_evaluate_no_else_returns_null() {
-        // Test: CASE WHEN value > 3 THEN 100 END
-        // Input: [1, 2, 3, 4, 5]
-        // Expected: [null, null, null, 100, 100]
         let test_array =
             StructArray::from_fields(&[("value", buffer![1i32, 2, 3, 4, 5].into_array())])
                 .unwrap()
                 .into_array();
 
-        let expr = case_when_no_else([gt(get_item("value", root()), lit(3i32)), lit(100i32)]);
+        let expr = case_when_no_else(gt(get_item("value", root()), lit(3i32)), lit(100i32));
 
-        let result = expr.evaluate(&test_array).unwrap();
-
-        // Check the dtype is nullable
+        let result = evaluate_expr(&expr, &test_array);
         assert!(result.dtype().is_nullable());
-
-        // Positions 0, 1, 2 should be null, 3, 4 should be 100
-        assert_eq!(result.scalar_at(0), Scalar::null(result.dtype().clone()));
-        assert_eq!(result.scalar_at(1), Scalar::null(result.dtype().clone()));
-        assert_eq!(result.scalar_at(2), Scalar::null(result.dtype().clone()));
-        assert_eq!(
-            result.scalar_at(3),
-            Scalar::from(100i32).cast(result.dtype()).unwrap()
-        );
-        assert_eq!(
-            result.scalar_at(4),
-            Scalar::from(100i32).cast(result.dtype()).unwrap()
+        assert_arrays_eq!(
+            result,
+            PrimitiveArray::from_option_iter([None::<i32>, None, None, Some(100), Some(100)])
+                .into_array()
         );
     }
 
     #[test]
     fn test_evaluate_all_conditions_false() {
-        // Test: CASE WHEN value > 100 THEN 1 ELSE 0 END
-        // Input: [1, 2, 3, 4, 5]
-        // Expected: [0, 0, 0, 0, 0] - no conditions match
         let test_array =
             StructArray::from_fields(&[("value", buffer![1i32, 2, 3, 4, 5].into_array())])
                 .unwrap()
                 .into_array();
 
-        let expr = case_when([
+        let expr = case_when(
             gt(get_item("value", root()), lit(100i32)),
             lit(1i32),
             lit(0i32),
-        ]);
+        );
 
-        let result = expr.evaluate(&test_array).unwrap().to_primitive();
-        assert_eq!(result.as_slice::<i32>(), &[0, 0, 0, 0, 0]);
+        let result = evaluate_expr(&expr, &test_array);
+        assert_arrays_eq!(result, buffer![0i32, 0, 0, 0, 0].into_array());
     }
 
     #[test]
     fn test_evaluate_all_conditions_true() {
-        // Test: CASE WHEN value > 0 THEN 100 ELSE 0 END
-        // Input: [1, 2, 3, 4, 5]
-        // Expected: [100, 100, 100, 100, 100] - all match
         let test_array =
             StructArray::from_fields(&[("value", buffer![1i32, 2, 3, 4, 5].into_array())])
                 .unwrap()
                 .into_array();
 
-        let expr = case_when([
+        let expr = case_when(
             gt(get_item("value", root()), lit(0i32)),
             lit(100i32),
             lit(0i32),
-        ]);
+        );
 
-        let result = expr.evaluate(&test_array).unwrap().to_primitive();
-        assert_eq!(result.as_slice::<i32>(), &[100, 100, 100, 100, 100]);
+        let result = evaluate_expr(&expr, &test_array);
+        assert_arrays_eq!(result, buffer![100i32, 100, 100, 100, 100].into_array());
+    }
+
+    #[test]
+    fn test_evaluate_all_true_no_else_returns_correct_dtype() {
+        // CASE WHEN value > 0 THEN 100 END — condition is always true, no ELSE.
+        // Result must be Nullable because the implicit ELSE is NULL.
+        let test_array = StructArray::from_fields(&[("value", buffer![1i32, 2, 3].into_array())])
+            .unwrap()
+            .into_array();
+
+        let expr = case_when_no_else(gt(get_item("value", root()), lit(0i32)), lit(100i32));
+
+        let result = evaluate_expr(&expr, &test_array);
+        assert!(
+            result.dtype().is_nullable(),
+            "result dtype must be Nullable, got {:?}",
+            result.dtype()
+        );
+        assert_arrays_eq!(
+            result,
+            PrimitiveArray::from_option_iter([Some(100i32), Some(100), Some(100)]).into_array()
+        );
+    }
+
+    #[test]
+    fn test_merge_case_branches_widens_nullability_of_later_branch() -> VortexResult<()> {
+        // When a later THEN branch is Nullable and branches[0] and ELSE are NonNullable,
+        // the result dtype must still be Nullable.
+        //
+        // CASE WHEN value = 0 THEN 10          -- NonNullable
+        //      WHEN value = 1 THEN nullable(20) -- Nullable
+        //      ELSE 0                           -- NonNullable
+        // → result must be Nullable(i32)
+        let test_array = StructArray::from_fields(&[("value", buffer![0i32, 1, 2].into_array())])
+            .unwrap()
+            .into_array();
+
+        let nullable_20 =
+            Scalar::from(20i32).cast(&DType::Primitive(PType::I32, Nullability::Nullable))?;
+
+        let expr = nested_case_when(
+            vec![
+                (eq(get_item("value", root()), lit(0i32)), lit(10i32)),
+                (eq(get_item("value", root()), lit(1i32)), lit(nullable_20)),
+            ],
+            Some(lit(0i32)),
+        );
+
+        let result = evaluate_expr(&expr, &test_array);
+        assert!(
+            result.dtype().is_nullable(),
+            "result dtype must be Nullable, got {:?}",
+            result.dtype()
+        );
+        assert_arrays_eq!(
+            result,
+            PrimitiveArray::from_option_iter([Some(10), Some(20), Some(0)]).into_array()
+        );
+        Ok(())
     }
 
     #[test]
     fn test_evaluate_with_literal_condition() {
-        // Test: CASE WHEN true THEN 100 ELSE 0 END (constant true condition)
         let test_array = buffer![1i32, 2, 3].into_array();
+        let expr = case_when(lit(true), lit(100i32), lit(0i32));
+        let result = evaluate_expr(&expr, &test_array);
 
-        let expr = case_when([lit(true), lit(100i32), lit(0i32)]);
-
-        let result = expr.evaluate(&test_array).unwrap();
-        // Constant folding should produce a constant array
-        if let Some(constant) = result.as_constant() {
-            assert_eq!(constant, Scalar::from(100i32));
-        } else {
-            let prim = result.to_primitive();
-            assert_eq!(prim.as_slice::<i32>(), &[100, 100, 100]);
-        }
+        assert_arrays_eq!(result, buffer![100i32, 100, 100].into_array());
     }
 
     #[test]
     fn test_evaluate_with_bool_column_result() {
-        // Test: CASE WHEN value > 2 THEN true ELSE false END
         let test_array =
             StructArray::from_fields(&[("value", buffer![1i32, 2, 3, 4, 5].into_array())])
                 .unwrap()
                 .into_array();
 
-        let expr = case_when([
+        let expr = case_when(
             gt(get_item("value", root()), lit(2i32)),
             lit(true),
             lit(false),
-        ]);
+        );
 
-        let result = expr.evaluate(&test_array).unwrap().to_bool();
-        assert_eq!(
-            result.bit_buffer().iter().collect::<Vec<_>>(),
-            vec![false, false, true, true, true]
+        let result = evaluate_expr(&expr, &test_array);
+        assert_arrays_eq!(
+            result,
+            BoolArray::from_iter([false, false, true, true, true]).into_array()
         );
     }
 
     #[test]
     fn test_evaluate_with_nullable_condition() {
-        // Test: CASE WHEN nullable_bool THEN 100 ELSE 0 END
-        // Where the condition has null values - nulls should be treated as false
         let test_array = StructArray::from_fields(&[(
             "cond",
             BoolArray::from_iter([Some(true), None, Some(false), None, Some(true)]).into_array(),
@@ -854,16 +914,14 @@ mod tests {
         .unwrap()
         .into_array();
 
-        let expr = case_when([get_item("cond", root()), lit(100i32), lit(0i32)]);
+        let expr = case_when(get_item("cond", root()), lit(100i32), lit(0i32));
 
-        let result = expr.evaluate(&test_array).unwrap().to_primitive();
-        // true -> 100, null -> 0 (treated as false), false -> 0
-        assert_eq!(result.as_slice::<i32>(), &[100, 0, 0, 0, 100]);
+        let result = evaluate_expr(&expr, &test_array);
+        assert_arrays_eq!(result, buffer![100i32, 0, 0, 0, 100].into_array());
     }
 
     #[test]
     fn test_evaluate_with_nullable_result_values() {
-        // Test: CASE WHEN value > 2 THEN nullable_value ELSE 0 END
         let test_array = StructArray::from_fields(&[
             ("value", buffer![1i32, 2, 3, 4, 5].into_array()),
             (
@@ -875,26 +933,22 @@ mod tests {
         .unwrap()
         .into_array();
 
-        let expr = case_when([
+        let expr = case_when(
             gt(get_item("value", root()), lit(2i32)),
             get_item("result", root()),
             lit(0i32),
-        ]);
+        );
 
-        let result = expr.evaluate(&test_array).unwrap();
-        let prim = result.to_primitive();
-
-        // Values 1, 2 don't match -> 0
-        // Value 3 matches -> 30 (from result column)
-        // Value 4 matches -> 40
-        // Value 5 matches -> 50
-        assert_eq!(prim.as_slice::<i32>(), &[0, 0, 30, 40, 50]);
+        let result = evaluate_expr(&expr, &test_array);
+        assert_arrays_eq!(
+            result,
+            PrimitiveArray::from_option_iter([Some(0i32), Some(0), Some(30), Some(40), Some(50)])
+                .into_array()
+        );
     }
 
     #[test]
     fn test_evaluate_with_all_null_condition() {
-        // Test: CASE WHEN all_nulls THEN 100 ELSE 0 END
-        // All null conditions should be treated as false
         let test_array = StructArray::from_fields(&[(
             "cond",
             BoolArray::from_iter([None, None, None]).into_array(),
@@ -902,516 +956,254 @@ mod tests {
         .unwrap()
         .into_array();
 
-        let expr = case_when([get_item("cond", root()), lit(100i32), lit(0i32)]);
+        let expr = case_when(get_item("cond", root()), lit(100i32), lit(0i32));
 
-        let result = expr.evaluate(&test_array).unwrap().to_primitive();
-        // All null -> treated as false -> else value
-        assert_eq!(result.as_slice::<i32>(), &[0, 0, 0]);
+        let result = evaluate_expr(&expr, &test_array);
+        assert_arrays_eq!(result, buffer![0i32, 0, 0].into_array());
     }
 
-    // ==================== Execute Tests ====================
+    // ==================== N-ary Evaluate Tests ====================
 
     #[test]
-    fn test_execute_with_scalar_inputs() {
-        use vortex_dtype::PTypeDowncast;
-        use vortex_vector::Scalar as VScalar;
-        use vortex_vector::bool::BoolScalar;
-        use vortex_vector::primitive::PScalar;
+    fn test_evaluate_nary_no_else_returns_null() {
+        let test_array =
+            StructArray::from_fields(&[("value", buffer![1i32, 2, 3, 4, 5].into_array())])
+                .unwrap()
+                .into_array();
 
-        // CASE WHEN true THEN 100 ELSE 0 END with all scalars
-        let options = CaseWhenOptions {
-            num_when_then_pairs: 1,
-            has_else: true,
-        };
-
-        let cond_dtype = DType::Bool(Nullability::NonNullable);
-        let then_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-        let else_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-        let return_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-
-        let datums = vec![
-            Datum::Scalar(VScalar::from(BoolScalar::new(Some(true)))),
-            Datum::Scalar(VScalar::from(PScalar::new(Some(100i32)))),
-            Datum::Scalar(VScalar::from(PScalar::new(Some(0i32)))),
-        ];
-
-        let args = ExecutionArgs {
-            datums,
-            dtypes: vec![cond_dtype, then_dtype, else_dtype],
-            row_count: 1,
-            return_dtype,
-        };
-
-        let result = CaseWhen.execute(&options, args).unwrap();
-
-        // Should return scalar since all inputs were scalars
-        match result {
-            Datum::Scalar(s) => {
-                let prim = s.into_primitive().into_i32();
-                assert_eq!(prim.value(), Some(100));
-            }
-            Datum::Vector(v) => {
-                // Also acceptable: a length-1 vector
-                assert_eq!(v.len(), 1);
-            }
-        }
-    }
-
-    #[test]
-    fn test_execute_with_scalar_false_condition() {
-        use vortex_dtype::PTypeDowncast;
-        use vortex_vector::Scalar as VScalar;
-        use vortex_vector::bool::BoolScalar;
-        use vortex_vector::primitive::PScalar;
-
-        // CASE WHEN false THEN 100 ELSE 42 END
-        let options = CaseWhenOptions {
-            num_when_then_pairs: 1,
-            has_else: true,
-        };
-
-        let cond_dtype = DType::Bool(Nullability::NonNullable);
-        let then_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-        let else_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-        let return_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-
-        let datums = vec![
-            Datum::Scalar(VScalar::from(BoolScalar::new(Some(false)))),
-            Datum::Scalar(VScalar::from(PScalar::new(Some(100i32)))),
-            Datum::Scalar(VScalar::from(PScalar::new(Some(42i32)))),
-        ];
-
-        let args = ExecutionArgs {
-            datums,
-            dtypes: vec![cond_dtype, then_dtype, else_dtype],
-            row_count: 1,
-            return_dtype,
-        };
-
-        let result = CaseWhen.execute(&options, args).unwrap();
-
-        match result {
-            Datum::Scalar(s) => {
-                let prim = s.into_primitive().into_i32();
-                assert_eq!(prim.value(), Some(42));
-            }
-            Datum::Vector(v) => {
-                assert_eq!(v.len(), 1);
-                let prim = v.into_primitive().into_i32();
-                assert_eq!(prim.get(0).copied(), Some(42));
-            }
-        }
-    }
-
-    #[test]
-    fn test_execute_with_vector_condition() {
-        use vortex_dtype::PTypeDowncast;
-        use vortex_vector::Scalar as VScalar;
-        use vortex_vector::bool::BoolVector;
-        use vortex_vector::primitive::PScalar;
-
-        // CASE WHEN [true, false, true] THEN 100 ELSE 0 END
-        let options = CaseWhenOptions {
-            num_when_then_pairs: 1,
-            has_else: true,
-        };
-
-        let cond_dtype = DType::Bool(Nullability::NonNullable);
-        let then_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-        let else_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-        let return_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-
-        let cond_vector = BoolVector::from_iter([true, false, true]);
-        let datums = vec![
-            Datum::Vector(cond_vector.into()),
-            Datum::Scalar(VScalar::from(PScalar::new(Some(100i32)))),
-            Datum::Scalar(VScalar::from(PScalar::new(Some(0i32)))),
-        ];
-
-        let args = ExecutionArgs {
-            datums,
-            dtypes: vec![cond_dtype, then_dtype, else_dtype],
-            row_count: 3,
-            return_dtype,
-        };
-
-        let result = CaseWhen.execute(&options, args).unwrap();
-
-        match result {
-            Datum::Vector(v) => {
-                let prim = v.into_primitive().into_i32();
-                assert_eq!(prim.get(0).copied(), Some(100));
-                assert_eq!(prim.get(1).copied(), Some(0));
-                assert_eq!(prim.get(2).copied(), Some(100));
-            }
-            Datum::Scalar(_) => panic!("Expected vector result"),
-        }
-    }
-
-    #[test]
-    fn test_execute_with_nullable_condition() {
-        use vortex_dtype::PTypeDowncast;
-        use vortex_mask::Mask;
-        use vortex_vector::Scalar as VScalar;
-        use vortex_vector::bool::BoolVector;
-        use vortex_vector::primitive::PScalar;
-
-        // CASE WHEN [true, NULL, false, NULL] THEN 100 ELSE 0 END
-        // NULL should be treated as false
-        let options = CaseWhenOptions {
-            num_when_then_pairs: 1,
-            has_else: true,
-        };
-
-        let cond_dtype = DType::Bool(Nullability::Nullable);
-        let then_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-        let else_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-        let return_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-
-        let bits = vortex_buffer::BitBuffer::from_iter([true, true, false, false]);
-        let validity = Mask::from_iter([true, false, true, false]); // positions 1, 3 are NULL
-        let cond_vector = BoolVector::new(bits, validity);
-
-        let datums = vec![
-            Datum::Vector(cond_vector.into()),
-            Datum::Scalar(VScalar::from(PScalar::new(Some(100i32)))),
-            Datum::Scalar(VScalar::from(PScalar::new(Some(0i32)))),
-        ];
-
-        let args = ExecutionArgs {
-            datums,
-            dtypes: vec![cond_dtype, then_dtype, else_dtype],
-            row_count: 4,
-            return_dtype,
-        };
-
-        let result = CaseWhen.execute(&options, args).unwrap();
-
-        match result {
-            Datum::Vector(v) => {
-                let prim = v.into_primitive().into_i32();
-                assert_eq!(prim.get(0).copied(), Some(100)); // true -> 100
-                assert_eq!(prim.get(1).copied(), Some(0)); // NULL -> 0 (treated as false)
-                assert_eq!(prim.get(2).copied(), Some(0)); // false -> 0
-                assert_eq!(prim.get(3).copied(), Some(0)); // NULL -> 0 (treated as false)
-            }
-            Datum::Scalar(_) => panic!("Expected vector result"),
-        }
-    }
-
-    #[test]
-    fn test_execute_without_else() {
-        use vortex_dtype::PTypeDowncast;
-        use vortex_vector::Scalar as VScalar;
-        use vortex_vector::bool::BoolVector;
-        use vortex_vector::primitive::PScalar;
-
-        // CASE WHEN [true, false, true] THEN 100 END (no else)
-        let options = CaseWhenOptions {
-            num_when_then_pairs: 1,
-            has_else: false,
-        };
-
-        let cond_dtype = DType::Bool(Nullability::NonNullable);
-        let then_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-        let return_dtype = DType::Primitive(PType::I32, Nullability::Nullable);
-
-        let cond_vector = BoolVector::from_iter([true, false, true]);
-        let datums = vec![
-            Datum::Vector(cond_vector.into()),
-            Datum::Scalar(VScalar::from(PScalar::new(Some(100i32)))),
-        ];
-
-        let args = ExecutionArgs {
-            datums,
-            dtypes: vec![cond_dtype, then_dtype],
-            row_count: 3,
-            return_dtype,
-        };
-
-        let result = CaseWhen.execute(&options, args).unwrap();
-
-        match result {
-            Datum::Vector(v) => {
-                let prim = v.into_primitive().into_i32();
-                assert_eq!(prim.get(0).copied(), Some(100)); // true -> 100
-                assert_eq!(prim.get(1), None); // false -> NULL
-                assert_eq!(prim.get(2).copied(), Some(100)); // true -> 100
-            }
-            Datum::Scalar(_) => panic!("Expected vector result"),
-        }
-    }
-
-    #[test]
-    fn test_execute_multiple_conditions() {
-        use vortex_dtype::PTypeDowncast;
-        use vortex_vector::Scalar as VScalar;
-        use vortex_vector::bool::BoolVector;
-        use vortex_vector::primitive::PScalar;
-
-        // CASE WHEN [true, false, false] THEN 10
-        //      WHEN [false, true, false] THEN 20
-        //      ELSE 0 END
-        // Expected: [10, 20, 0]
-        let options = CaseWhenOptions {
-            num_when_then_pairs: 2,
-            has_else: true,
-        };
-
-        let cond_dtype = DType::Bool(Nullability::NonNullable);
-        let then_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-        let return_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-
-        let cond1 = BoolVector::from_iter([true, false, false]);
-        let cond2 = BoolVector::from_iter([false, true, false]);
-
-        let datums = vec![
-            Datum::Vector(cond1.into()),
-            Datum::Scalar(VScalar::from(PScalar::new(Some(10i32)))),
-            Datum::Vector(cond2.into()),
-            Datum::Scalar(VScalar::from(PScalar::new(Some(20i32)))),
-            Datum::Scalar(VScalar::from(PScalar::new(Some(0i32)))),
-        ];
-
-        let args = ExecutionArgs {
-            datums,
-            dtypes: vec![
-                cond_dtype.clone(),
-                then_dtype.clone(),
-                cond_dtype,
-                then_dtype.clone(),
-                then_dtype,
+        // Two conditions, no ELSE — unmatched rows should be NULL
+        let expr = nested_case_when(
+            vec![
+                (eq(get_item("value", root()), lit(1i32)), lit(10i32)),
+                (eq(get_item("value", root()), lit(3i32)), lit(30i32)),
             ],
-            row_count: 3,
-            return_dtype,
-        };
+            None,
+        );
 
-        let result = CaseWhen.execute(&options, args).unwrap();
-
-        match result {
-            Datum::Vector(v) => {
-                let prim = v.into_primitive().into_i32();
-                assert_eq!(prim.get(0).copied(), Some(10));
-                assert_eq!(prim.get(1).copied(), Some(20));
-                assert_eq!(prim.get(2).copied(), Some(0));
-            }
-            Datum::Scalar(_) => panic!("Expected vector result"),
-        }
+        let result = evaluate_expr(&expr, &test_array);
+        assert!(result.dtype().is_nullable());
+        assert_arrays_eq!(
+            result,
+            PrimitiveArray::from_option_iter([Some(10i32), None, Some(30), None, None])
+                .into_array()
+        );
     }
 
     #[test]
-    fn test_execute_all_true_short_circuit() {
-        use vortex_dtype::PTypeDowncast;
-        use vortex_vector::Scalar as VScalar;
-        use vortex_vector::bool::BoolVector;
-        use vortex_vector::primitive::PScalar;
+    fn test_evaluate_nary_many_conditions() {
+        let test_array =
+            StructArray::from_fields(&[("value", buffer![1i32, 2, 3, 4, 5].into_array())])
+                .unwrap()
+                .into_array();
 
-        // CASE WHEN [true, true, true] THEN 100 ELSE 0 END
-        // Should short-circuit and return the then value
-        let options = CaseWhenOptions {
-            num_when_then_pairs: 1,
-            has_else: true,
-        };
+        // 5 WHEN/THEN pairs: each value maps to its value * 10
+        let expr = nested_case_when(
+            vec![
+                (eq(get_item("value", root()), lit(1i32)), lit(10i32)),
+                (eq(get_item("value", root()), lit(2i32)), lit(20i32)),
+                (eq(get_item("value", root()), lit(3i32)), lit(30i32)),
+                (eq(get_item("value", root()), lit(4i32)), lit(40i32)),
+                (eq(get_item("value", root()), lit(5i32)), lit(50i32)),
+            ],
+            Some(lit(0i32)),
+        );
 
-        let cond_dtype = DType::Bool(Nullability::NonNullable);
-        let then_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-        let else_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-        let return_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-
-        let cond_vector = BoolVector::from_iter([true, true, true]);
-        let datums = vec![
-            Datum::Vector(cond_vector.into()),
-            Datum::Scalar(VScalar::from(PScalar::new(Some(100i32)))),
-            Datum::Scalar(VScalar::from(PScalar::new(Some(0i32)))),
-        ];
-
-        let args = ExecutionArgs {
-            datums,
-            dtypes: vec![cond_dtype, then_dtype, else_dtype],
-            row_count: 3,
-            return_dtype,
-        };
-
-        let result = CaseWhen.execute(&options, args).unwrap();
-
-        // Could be scalar (from short-circuit) or vector
-        match result {
-            Datum::Vector(v) => {
-                let prim = v.into_primitive().into_i32();
-                assert_eq!(prim.get(0).copied(), Some(100));
-                assert_eq!(prim.get(1).copied(), Some(100));
-                assert_eq!(prim.get(2).copied(), Some(100));
-            }
-            Datum::Scalar(s) => {
-                let prim = s.into_primitive().into_i32();
-                assert_eq!(prim.value(), Some(100));
-            }
-        }
+        let result = evaluate_expr(&expr, &test_array);
+        assert_arrays_eq!(result, buffer![10i32, 20, 30, 40, 50].into_array());
     }
 
     #[test]
-    fn test_execute_all_false_short_circuit() {
-        use vortex_dtype::PTypeDowncast;
-        use vortex_vector::Scalar as VScalar;
-        use vortex_vector::bool::BoolVector;
-        use vortex_vector::primitive::PScalar;
+    fn test_evaluate_nary_all_false_no_else() {
+        let test_array = StructArray::from_fields(&[("value", buffer![1i32, 2, 3].into_array())])
+            .unwrap()
+            .into_array();
 
-        // CASE WHEN [false, false, false] THEN 100 ELSE 42 END
-        // Should short-circuit and return the else value
-        let options = CaseWhenOptions {
-            num_when_then_pairs: 1,
-            has_else: true,
-        };
+        // All conditions are false, no ELSE — everything should be NULL
+        let expr = nested_case_when(
+            vec![
+                (gt(get_item("value", root()), lit(100i32)), lit(10i32)),
+                (gt(get_item("value", root()), lit(200i32)), lit(20i32)),
+            ],
+            None,
+        );
 
-        let cond_dtype = DType::Bool(Nullability::NonNullable);
-        let then_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-        let else_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-        let return_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-
-        let cond_vector = BoolVector::from_iter([false, false, false]);
-        let datums = vec![
-            Datum::Vector(cond_vector.into()),
-            Datum::Scalar(VScalar::from(PScalar::new(Some(100i32)))),
-            Datum::Scalar(VScalar::from(PScalar::new(Some(42i32)))),
-        ];
-
-        let args = ExecutionArgs {
-            datums,
-            dtypes: vec![cond_dtype, then_dtype, else_dtype],
-            row_count: 3,
-            return_dtype,
-        };
-
-        let result = CaseWhen.execute(&options, args).unwrap();
-
-        // Could be scalar (from short-circuit) or vector
-        match result {
-            Datum::Vector(v) => {
-                let prim = v.into_primitive().into_i32();
-                assert_eq!(prim.get(0).copied(), Some(42));
-                assert_eq!(prim.get(1).copied(), Some(42));
-                assert_eq!(prim.get(2).copied(), Some(42));
-            }
-            Datum::Scalar(s) => {
-                let prim = s.into_primitive().into_i32();
-                assert_eq!(prim.value(), Some(42));
-            }
-        }
+        let result = evaluate_expr(&expr, &test_array);
+        assert!(result.dtype().is_nullable());
+        assert_arrays_eq!(
+            result,
+            PrimitiveArray::from_option_iter([None::<i32>, None, None]).into_array()
+        );
     }
 
     #[test]
-    fn test_execute_with_null_scalar_condition() {
-        use vortex_dtype::PTypeDowncast;
-        use vortex_vector::Scalar as VScalar;
-        use vortex_vector::bool::BoolScalar;
-        use vortex_vector::primitive::PScalar;
+    fn test_evaluate_nary_overlapping_conditions_first_wins() {
+        let test_array =
+            StructArray::from_fields(&[("value", buffer![10i32, 20, 30].into_array())])
+                .unwrap()
+                .into_array();
 
-        // CASE WHEN NULL THEN 100 ELSE 42 END
-        // NULL condition should be treated as false
-        let options = CaseWhenOptions {
-            num_when_then_pairs: 1,
-            has_else: true,
-        };
+        // value=10: matches cond1 (>5) and cond2 (>0), first should win
+        // value=20: matches all three, first should win
+        // value=30: matches all three, first should win
+        let expr = nested_case_when(
+            vec![
+                (gt(get_item("value", root()), lit(5i32)), lit(1i32)),
+                (gt(get_item("value", root()), lit(0i32)), lit(2i32)),
+                (gt(get_item("value", root()), lit(15i32)), lit(3i32)),
+            ],
+            Some(lit(0i32)),
+        );
 
-        let cond_dtype = DType::Bool(Nullability::Nullable);
-        let then_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-        let else_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-        let return_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-
-        let null_bool = BoolScalar::null();
-        let datums = vec![
-            Datum::Scalar(VScalar::from(null_bool)),
-            Datum::Scalar(VScalar::from(PScalar::new(Some(100i32)))),
-            Datum::Scalar(VScalar::from(PScalar::new(Some(42i32)))),
-        ];
-
-        let args = ExecutionArgs {
-            datums,
-            dtypes: vec![cond_dtype, then_dtype, else_dtype],
-            row_count: 1,
-            return_dtype,
-        };
-
-        let result = CaseWhen.execute(&options, args).unwrap();
-
-        // NULL condition -> treated as false -> else value
-        match result {
-            Datum::Scalar(s) => {
-                let prim = s.into_primitive().into_i32();
-                assert_eq!(prim.value(), Some(42));
-            }
-            Datum::Vector(v) => {
-                let prim = v.into_primitive().into_i32();
-                assert_eq!(prim.get(0).copied(), Some(42));
-            }
-        }
+        let result = evaluate_expr(&expr, &test_array);
+        // First matching condition always wins
+        assert_arrays_eq!(result, buffer![1i32, 1, 1].into_array());
     }
 
     #[test]
-    fn test_evaluate_divide_by_zero_protected_by_case_when() {
-        // This test verifies that CASE WHEN properly short-circuits evaluation
-        // to avoid divide-by-zero errors.
-        // Pattern: CASE WHEN denominator > 0 THEN numerator/denominator ELSE NULL END
-        // With input where some denominators are 0, the division should NOT be evaluated
-        // for those rows.
+    fn test_evaluate_nary_early_exit_when_remaining_empty() {
+        // After branch 0 claims all rows, remaining becomes all_false.
+        // The loop breaks before evaluating branch 1's condition.
+        let test_array = StructArray::from_fields(&[("value", buffer![1i32, 2, 3].into_array())])
+            .unwrap()
+            .into_array();
 
-        use vortex_buffer::buffer;
-        use vortex_dtype::PType;
+        let expr = nested_case_when(
+            vec![
+                (gt(get_item("value", root()), lit(0i32)), lit(100i32)),
+                // Never evaluated due to early exit; 999 must never appear in output.
+                (gt(get_item("value", root()), lit(0i32)), lit(999i32)),
+            ],
+            Some(lit(0i32)),
+        );
 
-        use crate::arrays::StructArray;
-        use crate::expr::VTableExt;
-        use crate::expr::exprs::binary::Binary;
-        use crate::expr::exprs::operators::Operator;
-        use crate::expr::get_item;
-        use crate::expr::gt;
-        use crate::expr::lit;
-        use crate::expr::root;
+        let result = evaluate_expr(&expr, &test_array);
+        assert_arrays_eq!(result, buffer![100i32, 100, 100].into_array());
+    }
 
-        // Create test data: numerator=[10, 20, 30], denominator=[2, 0, 5]
-        // Expected: CASE WHEN denominator > 0 THEN numerator/denominator ELSE NULL END
-        //         = [5, NULL, 6]
+    #[test]
+    fn test_evaluate_nary_skips_branch_with_empty_effective_mask() {
+        // Branch 0 claims value=1. Branch 1 targets the same rows but they are already
+        // matched → effective_mask is all_false → branch 1 is skipped (THEN not used).
+        let test_array = StructArray::from_fields(&[("value", buffer![1i32, 2, 3].into_array())])
+            .unwrap()
+            .into_array();
+
+        let expr = nested_case_when(
+            vec![
+                (eq(get_item("value", root()), lit(1i32)), lit(10i32)),
+                // Same condition as branch 0 — all matching rows already claimed → skipped.
+                // 999 must never appear in output.
+                (eq(get_item("value", root()), lit(1i32)), lit(999i32)),
+                (eq(get_item("value", root()), lit(2i32)), lit(20i32)),
+            ],
+            Some(lit(0i32)),
+        );
+
+        let result = evaluate_expr(&expr, &test_array);
+        assert_arrays_eq!(result, buffer![10i32, 20, 0].into_array());
+    }
+
+    #[test]
+    fn test_evaluate_nary_string_output() -> VortexResult<()> {
+        // Exercises merge_case_branches with a non-primitive (Utf8) builder.
+        let test_array =
+            StructArray::from_fields(&[("value", buffer![1i32, 2, 3, 4].into_array())])
+                .unwrap()
+                .into_array();
+
+        // CASE WHEN value > 2 THEN 'high' WHEN value > 0 THEN 'low' ELSE 'none' END
+        // value=1,2 → 'low' (branch 1 after branch 0 claims 3,4)
+        // value=3,4 → 'high' (branch 0)
+        let expr = nested_case_when(
+            vec![
+                (gt(get_item("value", root()), lit(2i32)), lit("high")),
+                (gt(get_item("value", root()), lit(0i32)), lit("low")),
+            ],
+            Some(lit("none")),
+        );
+
+        let result = evaluate_expr(&expr, &test_array);
+        assert_eq!(
+            result.scalar_at(0)?,
+            Scalar::utf8("low", Nullability::NonNullable)
+        );
+        assert_eq!(
+            result.scalar_at(1)?,
+            Scalar::utf8("low", Nullability::NonNullable)
+        );
+        assert_eq!(
+            result.scalar_at(2)?,
+            Scalar::utf8("high", Nullability::NonNullable)
+        );
+        assert_eq!(
+            result.scalar_at(3)?,
+            Scalar::utf8("high", Nullability::NonNullable)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_evaluate_nary_with_nullable_conditions() {
         let test_array = StructArray::from_fields(&[
-            ("numerator", buffer![10i32, 20, 30].into_array()),
-            ("denominator", buffer![2i32, 0, 5].into_array()),
+            (
+                "cond1",
+                BoolArray::from_iter([Some(true), None, Some(false)]).into_array(),
+            ),
+            (
+                "cond2",
+                BoolArray::from_iter([Some(false), Some(true), None]).into_array(),
+            ),
         ])
         .unwrap()
         .into_array();
 
-        // Build: CASE WHEN $.denominator > 0 THEN $.numerator / $.denominator ELSE null END
-        let condition = gt(get_item("denominator", root()), lit(0i32));
-        let division = Binary
-            .try_new_expr(
-                Operator::Div,
-                [
-                    get_item("numerator", root()),
-                    get_item("denominator", root()),
-                ],
-            )
-            .unwrap();
-        let null_dtype = DType::Primitive(PType::I32, Nullability::Nullable);
-        let null_val = lit(Scalar::null(null_dtype));
-
-        let expr = case_when([condition, division, null_val]);
-
-        // This should NOT panic with divide-by-zero
-        let result = expr.evaluate(&test_array).unwrap();
-
-        // Verify results
-        assert_eq!(result.len(), 3);
-
-        // Row 0: 10/2 = 5
-        assert_eq!(
-            result.scalar_at(0),
-            Scalar::from(5i32).cast(result.dtype()).unwrap()
+        let expr = nested_case_when(
+            vec![
+                (get_item("cond1", root()), lit(10i32)),
+                (get_item("cond2", root()), lit(20i32)),
+            ],
+            Some(lit(0i32)),
         );
 
-        // Row 1: denominator=0, so result is NULL (division was NOT evaluated)
-        assert_eq!(result.scalar_at(1), Scalar::null(result.dtype().clone()));
+        let result = evaluate_expr(&expr, &test_array);
+        // row 0: cond1=true → 10
+        // row 1: cond1=NULL(→false), cond2=true → 20
+        // row 2: cond1=false, cond2=NULL(→false) → else=0
+        assert_arrays_eq!(result, buffer![10i32, 20, 0].into_array());
+    }
 
-        // Row 2: 30/5 = 6
-        assert_eq!(
-            result.scalar_at(2),
-            Scalar::from(6i32).cast(result.dtype()).unwrap()
+    #[test]
+    fn test_merge_case_branches_alternating_mask() -> VortexResult<()> {
+        // Exercises the scalar path: alternating rows produce one slice per row (no runs),
+        // triggering the per-row cursor path in merge_case_branches.
+        let n = 100usize;
+
+        // Branch 0: even rows → 0, Branch 1: odd rows → 1, Else: never reached.
+        let branch0_mask = Mask::from_indices(n, (0..n).step_by(2).collect());
+        let branch1_mask = Mask::from_indices(n, (1..n).step_by(2).collect());
+
+        let result = merge_case_branches(
+            vec![
+                (
+                    branch0_mask,
+                    PrimitiveArray::from_option_iter(vec![Some(0i32); n]).into_array(),
+                ),
+                (
+                    branch1_mask,
+                    PrimitiveArray::from_option_iter(vec![Some(1i32); n]).into_array(),
+                ),
+            ],
+            PrimitiveArray::from_option_iter(vec![Some(99i32); n]).into_array(),
+        )?;
+
+        // Even rows → 0, odd rows → 1.
+        let expected: Vec<Option<i32>> = (0..n)
+            .map(|v| if v % 2 == 0 { Some(0) } else { Some(1) })
+            .collect();
+        assert_arrays_eq!(
+            result,
+            PrimitiveArray::from_option_iter(expected).into_array()
         );
+        Ok(())
     }
 }

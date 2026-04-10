@@ -8,22 +8,22 @@ use async_trait::async_trait;
 use cudarc::driver::DeviceRepr;
 use cudarc::driver::PushKernelArg;
 use tracing::instrument;
-use vortex::array::Array;
 use vortex::array::ArrayRef;
 use vortex::array::Canonical;
 use vortex::array::arrays::PrimitiveArray;
-use vortex::array::arrays::PrimitiveArrayParts;
+use vortex::array::arrays::primitive::PrimitiveDataParts;
 use vortex::array::buffer::BufferHandle;
 use vortex::array::match_each_unsigned_integer_ptype;
 use vortex::dtype::NativePType;
+use vortex::encodings::alp::ALP;
 use vortex::encodings::alp::ALPArray;
+use vortex::encodings::alp::ALPArrayExt;
+use vortex::encodings::alp::ALPArraySlotsExt;
 use vortex::encodings::alp::ALPFloat;
-use vortex::encodings::alp::ALPVTable;
 use vortex::encodings::alp::match_each_alp_float_ptype;
 use vortex::error::VortexResult;
 use vortex::error::vortex_ensure;
 use vortex::error::vortex_err;
-use vortex_cuda_macros::cuda_tests;
 
 use crate::CudaBufferExt;
 use crate::CudaDeviceBuffer;
@@ -45,10 +45,12 @@ impl CudaExecute for ALPExecutor {
         ctx: &mut CudaExecutionCtx,
     ) -> VortexResult<Canonical> {
         let array = array
-            .try_into::<ALPVTable>()
+            .try_downcast::<ALP>()
             .map_err(|_| vortex_err!("Expected ALPArray"))?;
 
-        match_each_alp_float_ptype!(array.ptype(), |A| { decode_alp::<A>(array, ctx).await })
+        match_each_alp_float_ptype!(array.dtype().as_ptype(), |A| {
+            decode_alp::<A>(array, ctx).await
+        })
     }
 }
 
@@ -68,9 +70,9 @@ where
     // Execute child and copy to device
     let canonical = array.encoded().clone().execute_cuda(ctx).await?;
     let primitive = canonical.into_primitive();
-    let PrimitiveArrayParts {
+    let PrimitiveDataParts {
         buffer, validity, ..
-    } = primitive.into_parts();
+    } = primitive.into_data_parts();
 
     let device_input = ctx.ensure_on_device(buffer).await?;
 
@@ -86,7 +88,7 @@ where
 
     // Load kernel function
     let kernel_ptypes = [A::ALPInt::PTYPE, A::PTYPE];
-    let cuda_function = ctx.load_function_ptype("alp", &kernel_ptypes)?;
+    let cuda_function = ctx.load_function("alp", &kernel_ptypes)?;
 
     ctx.launch_kernel(&cuda_function, array_len, |args| {
         args.arg(&input_view)
@@ -116,7 +118,7 @@ where
     )))
 }
 
-#[cuda_tests]
+#[cfg(test)]
 mod tests {
     use vortex::array::IntoArray;
     use vortex::array::arrays::PrimitiveArray;
@@ -125,7 +127,7 @@ mod tests {
     use vortex::array::validity::Validity;
     use vortex::buffer::Buffer;
     use vortex::buffer::buffer;
-    use vortex::encodings::alp::ALPArray;
+    use vortex::encodings::alp::ALP;
     use vortex::encodings::alp::Exponents;
     use vortex::error::VortexExpect;
     use vortex::session::VortexSession;
@@ -134,7 +136,7 @@ mod tests {
     use crate::CanonicalCudaExt;
     use crate::session::CudaSession;
 
-    #[tokio::test]
+    #[crate::test]
     async fn test_cuda_alp_decompression_f32() -> VortexResult<()> {
         let mut cuda_ctx = CudaSession::create_execution_ctx(&VortexSession::empty())
             .vortex_expect("failed to create execution context");
@@ -156,7 +158,7 @@ mod tests {
         )
         .unwrap();
 
-        let alp_array = ALPArray::try_new(
+        let alp_array = ALP::try_new(
             PrimitiveArray::new(Buffer::from(encoded_data.clone()), Validity::NonNullable)
                 .into_array(),
             exponents,
@@ -166,7 +168,7 @@ mod tests {
         let cpu_result = alp_array.to_canonical()?.into_array();
 
         let gpu_result = ALPExecutor
-            .execute(alp_array.to_array(), &mut cuda_ctx)
+            .execute(alp_array.into_array(), &mut cuda_ctx)
             .await
             .vortex_expect("GPU decompression failed")
             .into_host()

@@ -2,44 +2,52 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use vortex_array::ArrayRef;
+use vortex_array::ArrayView;
 use vortex_array::ExecutionCtx;
+use vortex_array::IntoArray;
 use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::scalar_fn::fns::mask::MaskKernel;
 use vortex_array::scalar_fn::fns::mask::MaskReduce;
 use vortex_array::validity::Validity;
 use vortex_error::VortexResult;
 
-use crate::ALPArray;
-use crate::ALPVTable;
+use crate::ALP;
+use crate::ALPArrayExt;
+use crate::ALPArraySlotsExt;
 
-impl MaskReduce for ALPVTable {
-    fn mask(array: &ALPArray, mask: &ArrayRef) -> VortexResult<Option<ArrayRef>> {
+impl MaskReduce for ALP {
+    fn mask(array: ArrayView<'_, Self>, mask: &ArrayRef) -> VortexResult<Option<ArrayRef>> {
         // Masking sparse patches requires reading indices, fall back to kernel.
         if array.patches().is_some() {
             return Ok(None);
         }
         let masked_encoded = array.encoded().clone().mask(mask.clone())?;
         Ok(Some(
-            ALPArray::new(masked_encoded, array.exponents(), None).to_array(),
+            ALP::new(masked_encoded, array.exponents(), None).into_array(),
         ))
     }
 }
 
-impl MaskKernel for ALPVTable {
+impl MaskKernel for ALP {
     fn mask(
-        array: &ALPArray,
+        array: ArrayView<'_, Self>,
         mask: &ArrayRef,
-        _ctx: &mut ExecutionCtx,
+        ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
-        let vortex_mask = Validity::Array(mask.not()?).to_mask(array.len());
+        let vortex_mask = Validity::Array(mask.not()?).execute_mask(array.len(), ctx)?;
         let masked_encoded = array.encoded().clone().mask(mask.clone())?;
+        let masked_dtype = array
+            .dtype()
+            .with_nullability(masked_encoded.dtype().nullability());
         let masked_patches = array
             .patches()
-            .map(|p| p.mask(&vortex_mask))
+            .map(|p| p.mask(&vortex_mask, ctx))
             .transpose()?
-            .flatten();
+            .flatten()
+            .map(|patches| patches.cast_values(&masked_dtype))
+            .transpose()?;
         Ok(Some(
-            ALPArray::new(masked_encoded, array.exponents(), masked_patches).to_array(),
+            ALP::new(masked_encoded, array.exponents(), masked_patches).into_array(),
         ))
     }
 }
@@ -48,11 +56,17 @@ impl MaskKernel for ALPVTable {
 mod test {
     use rstest::rstest;
     use vortex_array::IntoArray;
+    use vortex_array::LEGACY_SESSION;
     use vortex_array::ToCanonical;
+    use vortex_array::VortexSessionExecute;
+    use vortex_array::arrays::BoolArray;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::compute::conformance::mask::test_mask_conformance;
+    use vortex_array::dtype::Nullability;
+    use vortex_array::scalar_fn::fns::mask::MaskKernel;
     use vortex_buffer::buffer;
 
+    use crate::alp::array::ALPArrayExt;
     use crate::alp_encode;
 
     #[rstest]
@@ -66,7 +80,7 @@ mod test {
     ].into_array())]
     fn test_mask_alp_conformance(#[case] array: vortex_array::ArrayRef) {
         let alp = alp_encode(&array.to_primitive(), None).unwrap();
-        test_mask_conformance(alp.as_ref());
+        test_mask_conformance(&alp.into_array());
     }
 
     #[test]
@@ -79,6 +93,25 @@ mod test {
         let array = PrimitiveArray::from_iter(values);
         let alp = alp_encode(&array, None).unwrap();
         assert!(alp.patches().is_some(), "expected patches");
-        test_mask_conformance(alp.as_ref());
+        test_mask_conformance(&alp.into_array());
+    }
+
+    #[test]
+    fn test_mask_alp_with_patches_casts_surviving_patch_values_to_nullable() {
+        let values = PrimitiveArray::from_iter([1.234f32, f32::NAN, 2.345, f32::INFINITY, 3.456]);
+        let alp = alp_encode(&values, None).unwrap();
+        assert!(alp.patches().is_some(), "expected patches");
+
+        let keep_mask = BoolArray::from_iter([false, true, true, true, true]).into_array();
+        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let masked = <crate::ALP as MaskKernel>::mask(alp.as_view(), &keep_mask, &mut ctx)
+            .unwrap()
+            .unwrap();
+
+        let masked_alp = masked.as_opt::<crate::ALP>().unwrap();
+        let masked_patches = masked_alp.patches().unwrap();
+
+        assert_eq!(masked.dtype().nullability(), Nullability::Nullable);
+        assert_eq!(masked_patches.dtype().nullability(), Nullability::Nullable);
     }
 }

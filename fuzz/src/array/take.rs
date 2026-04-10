@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use vortex_array::Array;
 use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
 use vortex_array::ToCanonical;
@@ -11,6 +10,8 @@ use vortex_array::arrays::DecimalArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::StructArray;
 use vortex_array::arrays::VarBinViewArray;
+use vortex_array::arrays::bool::BoolArrayExt;
+use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::builders::builder_with_capacity;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::DecimalDType;
@@ -25,7 +26,7 @@ use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 
 pub fn take_canonical_array_non_nullable_indices(
-    array: &dyn Array,
+    array: &ArrayRef,
     indices: &[usize],
 ) -> VortexResult<ArrayRef> {
     take_canonical_array(
@@ -38,10 +39,7 @@ pub fn take_canonical_array_non_nullable_indices(
     )
 }
 
-pub fn take_canonical_array(
-    array: &dyn Array,
-    indices: &[Option<usize>],
-) -> VortexResult<ArrayRef> {
+pub fn take_canonical_array(array: &ArrayRef, indices: &[Option<usize>]) -> VortexResult<ArrayRef> {
     let nullable: Nullability = indices.contains(&None).into();
 
     let validity = if array.dtype().is_nullable() || nullable == Nullability::Nullable {
@@ -109,8 +107,7 @@ pub fn take_canonical_array(
         DType::Struct(..) => {
             let struct_array = array.to_struct();
             let taken_children = struct_array
-                .unmasked_fields()
-                .iter()
+                .iter_unmasked_fields()
                 .map(|c| take_canonical_array_non_nullable_indices(c, indices_slice_non_opt))
                 .collect::<VortexResult<Vec<_>>>()?;
 
@@ -141,7 +138,7 @@ pub fn take_canonical_array(
             }
             Ok(builder.finish())
         }
-        d @ (DType::Null | DType::Extension(_)) => {
+        d @ (DType::Null | DType::Extension(_) | DType::Variant(_)) => {
             unreachable!("DType {d} not supported for fuzzing")
         }
     }

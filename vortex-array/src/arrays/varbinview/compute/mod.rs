@@ -2,10 +2,7 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 mod cast;
-mod is_constant;
-mod is_sorted;
 mod mask;
-mod min_max;
 pub(crate) mod rules;
 mod slice;
 mod take;
@@ -17,7 +14,6 @@ mod tests {
 
     use crate::IntoArray;
     use crate::accessor::ArrayAccessor;
-    use crate::array::Array;
     use crate::arrays::VarBinViewArray;
     use crate::canonical::ToCanonical;
     #[test]
@@ -82,6 +78,6 @@ mod tests {
         None::<&str>, None, None, None
     ]))]
     fn test_varbinview_consistency(#[case] array: VarBinViewArray) {
-        test_array_consistency(array.as_ref());
+        test_array_consistency(&array.into_array());
     }
 }

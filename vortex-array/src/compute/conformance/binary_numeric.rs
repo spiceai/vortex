@@ -18,10 +18,8 @@
 //!
 //! - Addition (`+`)
 //! - Subtraction (`-`)
-//! - Reverse Subtraction (scalar - array)
 //! - Multiplication (`*`)
 //! - Division (`/`)
-//! - Reverse Division (scalar / array)
 
 use itertools::Itertools;
 use num_traits::Num;
@@ -29,7 +27,6 @@ use vortex_error::VortexExpect;
 use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
 
-use crate::Array;
 use crate::ArrayRef;
 use crate::IntoArray;
 use crate::LEGACY_SESSION;
@@ -45,7 +42,7 @@ use crate::scalar::NumericOperator;
 use crate::scalar::PrimitiveScalar;
 use crate::scalar::Scalar;
 
-fn to_vec_of_scalar(array: &dyn Array) -> Vec<Scalar> {
+fn to_vec_of_scalar(array: &ArrayRef) -> Vec<Scalar> {
     // Not fast, but obviously correct
     (0..array.len())
         .map(|index| {
@@ -113,12 +110,12 @@ where
     ];
 
     for operator in operators {
-        let op = operator.into();
+        let op = operator;
         let rhs_const = ConstantArray::new(scalar_one.clone(), array.len()).into_array();
 
         // Test array operator scalar (e.g., array + 1)
         let result = array
-            .binary(rhs_const.clone(), op)
+            .binary(rhs_const.clone(), op.into())
             .vortex_expect("apply shouldn't fail")
             .execute::<RecursiveCanonical>(&mut LEGACY_SESSION.create_execution_ctx())
             .map(|c| c.0.into_array());
@@ -129,9 +126,6 @@ where
             continue;
         };
 
-        println!("result {}", result.display_tree());
-        println!("result {}", result.display_values());
-
         let actual_values = to_vec_of_scalar(&result);
 
         // Check each element for overflow/underflow
@@ -139,7 +133,7 @@ where
             .iter()
             .map(|x| {
                 x.as_primitive()
-                    .checked_binary_numeric(&scalar_one.as_primitive(), operator)
+                    .checked_binary_numeric(&scalar_one.as_primitive(), op)
                     .map(<Scalar as From<PrimitiveScalar<'_>>>::from)
             })
             .collect();
@@ -160,7 +154,7 @@ where
         }
 
         // Test scalar operator array (e.g., 1 + array)
-        let result = rhs_const.binary(array.clone(), op).and_then(|a| {
+        let result = rhs_const.binary(array.clone(), op.into()).and_then(|a| {
             a.execute::<RecursiveCanonical>(&mut LEGACY_SESSION.create_execution_ctx())
                 .map(|c| c.0.into_array())
         });
@@ -178,7 +172,7 @@ where
             .map(|x| {
                 scalar_one
                     .as_primitive()
-                    .checked_binary_numeric(&x.as_primitive(), operator)
+                    .checked_binary_numeric(&x.as_primitive(), op)
                     .map(<Scalar as From<PrimitiveScalar<'_>>>::from)
             })
             .collect();
@@ -359,12 +353,12 @@ where
     };
 
     for operator in operators {
-        let op = operator.into();
+        let op = operator;
         let rhs_const = ConstantArray::new(scalar.clone(), array.len()).into_array();
 
         // Test array operator scalar
         let result = array
-            .binary(rhs_const, op)
+            .binary(rhs_const, op.into())
             .vortex_expect("apply failed")
             .execute::<RecursiveCanonical>(&mut LEGACY_SESSION.create_execution_ctx())
             .map(|x| x.0.into_array());
@@ -383,7 +377,7 @@ where
             .iter()
             .map(|x| {
                 x.as_primitive()
-                    .checked_binary_numeric(&scalar.as_primitive(), operator)
+                    .checked_binary_numeric(&scalar.as_primitive(), op)
                     .map(<Scalar as From<PrimitiveScalar<'_>>>::from)
             })
             .collect();

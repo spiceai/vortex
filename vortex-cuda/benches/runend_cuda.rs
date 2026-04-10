@@ -23,6 +23,7 @@ use vortex::array::arrays::PrimitiveArray;
 use vortex::array::validity::Validity;
 use vortex::buffer::Buffer;
 use vortex::dtype::NativePType;
+use vortex::encodings::runend::RunEnd;
 use vortex::encodings::runend::RunEndArray;
 use vortex::session::VortexSession;
 use vortex_cuda::CudaSession;
@@ -54,7 +55,7 @@ where
     let ends_array = PrimitiveArray::new(Buffer::from(ends), Validity::NonNullable).into_array();
     let values_array =
         PrimitiveArray::new(Buffer::from(values), Validity::NonNullable).into_array();
-    RunEndArray::new(ends_array, values_array)
+    RunEnd::new(ends_array, values_array)
 }
 
 /// Benchmark run-end decoding for a specific type with varying run lengths
@@ -89,7 +90,13 @@ where
                                 .with_launch_strategy(Arc::new(timed));
 
                         for _ in 0..iters {
-                            block_on(runend_array.to_array().execute_cuda(&mut cuda_ctx)).unwrap();
+                            block_on(
+                                runend_array
+                                    .clone()
+                                    .into_array()
+                                    .execute_cuda(&mut cuda_ctx),
+                            )
+                            .unwrap();
                         }
 
                         Duration::from_nanos(timer.load(Ordering::Relaxed))

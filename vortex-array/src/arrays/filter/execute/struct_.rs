@@ -10,15 +10,19 @@ use crate::ArrayRef;
 use crate::arrays::StructArray;
 use crate::arrays::filter::execute::filter_validity;
 use crate::arrays::filter::execute::values_to_mask;
-use crate::vtable::ValidityHelper;
+use crate::arrays::struct_::StructArrayExt;
 
 pub fn filter_struct(array: &StructArray, mask: &Arc<MaskValues>) -> StructArray {
-    let filtered_validity = filter_validity(array.validity().clone(), mask);
+    let filtered_validity = filter_validity(
+        array
+            .validity()
+            .vortex_expect("struct validity should be derivable"),
+        mask,
+    );
 
     let mask_for_filter = values_to_mask(mask);
     let fields: Vec<ArrayRef> = array
-        .unmasked_fields()
-        .iter()
+        .iter_unmasked_fields()
         .map(|field| {
             field
                 .filter(mask_for_filter.clone())
@@ -64,7 +68,7 @@ mod test {
         ];
         let array =
             StructArray::try_new(["a", "b"].into(), fields, 5, Validity::NonNullable).unwrap();
-        test_filter_conformance(array.as_ref());
+        test_filter_conformance(&array.into_array());
     }
 
     #[test]
@@ -77,7 +81,7 @@ mod test {
         ];
         let array =
             StructArray::try_new(["a", "b"].into(), fields, 5, Validity::NonNullable).unwrap();
-        test_filter_conformance(array.as_ref());
+        test_filter_conformance(&array.into_array());
     }
 
     #[test]
@@ -138,9 +142,9 @@ mod test {
     #[test]
     fn test_filter_empty_struct_conformance() {
         test_filter_conformance(
-            StructArray::try_new(FieldNames::empty(), vec![], 5, Validity::NonNullable)
+            &StructArray::try_new(FieldNames::empty(), vec![], 5, Validity::NonNullable)
                 .unwrap()
-                .as_ref(),
+                .into_array(),
         );
     }
 
@@ -156,7 +160,7 @@ mod test {
             BoolArray::from_iter([Some(true), Some(true), None, None, Some(false)]).into_array();
 
         test_filter_conformance(
-            StructArray::try_new(
+            &StructArray::try_new(
                 ["xs", "ys", "zs"].into(),
                 vec![
                     StructArray::try_new(
@@ -174,7 +178,7 @@ mod test {
                 Validity::NonNullable,
             )
             .unwrap()
-            .as_ref(),
+            .into_array(),
         );
     }
 }

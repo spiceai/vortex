@@ -12,6 +12,7 @@ __pycache__/
 # Distribution / packaging
 .Python
 build/
+ninja-build/
 develop-eggs/
 dist/
 downloads/
@@ -218,6 +219,9 @@ profile.json.gz
 # Clang compilation database (https://clang.llvm.org/docs/JSONCompilationDatabase.html)
 compile_commands.json
 
+# Commands
+/justfile
+
 # AI Agents
 .claude
 .opencode
@@ -234,3 +238,6 @@ sweep.timestamp
 # Perfetto
 trace*.json
 trace*.pb
+
+# pytest-benchmark output
+vortex-python/.benchmarks/

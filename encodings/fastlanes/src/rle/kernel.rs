@@ -4,23 +4,24 @@
 use std::ops::Range;
 
 use vortex_array::ArrayRef;
+use vortex_array::ArrayView;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
-use vortex_array::arrays::SliceExecuteAdaptor;
-use vortex_array::arrays::SliceKernel;
+use vortex_array::arrays::slice::SliceExecuteAdaptor;
+use vortex_array::arrays::slice::SliceKernel;
 use vortex_array::kernel::ParentKernelSet;
 use vortex_error::VortexResult;
 
 use crate::FL_CHUNK_SIZE;
-use crate::RLEArray;
-use crate::RLEVTable;
+use crate::RLE;
+use crate::rle::RLEArrayExt;
 
-pub(crate) static PARENT_KERNELS: ParentKernelSet<RLEVTable> =
-    ParentKernelSet::new(&[ParentKernelSet::lift(&SliceExecuteAdaptor(RLEVTable))]);
+pub(crate) static PARENT_KERNELS: ParentKernelSet<RLE> =
+    ParentKernelSet::new(&[ParentKernelSet::lift(&SliceExecuteAdaptor(RLE))]);
 
-impl SliceKernel for RLEVTable {
+impl SliceKernel for RLE {
     fn slice(
-        array: &RLEArray,
+        array: ArrayView<'_, Self>,
         range: Range<usize>,
         _ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
@@ -45,18 +46,16 @@ impl SliceKernel for RLEVTable {
             .indices()
             .slice(chunk_start_idx * FL_CHUNK_SIZE..chunk_end_idx * FL_CHUNK_SIZE)?;
 
-        // SAFETY: Slicing preserves all invariants.
-        Ok(Some(unsafe {
-            RLEArray::new_unchecked(
+        Ok(Some(
+            RLE::try_new(
                 sliced_values,
                 sliced_indices,
                 sliced_values_idx_offsets,
-                array.dtype().clone(),
                 // Keep the offset relative to the first chunk.
                 (array.offset() + range.start) % FL_CHUNK_SIZE,
                 range.len(),
-            )
-            .into_array()
-        }))
+            )?
+            .into_array(),
+        ))
     }
 }

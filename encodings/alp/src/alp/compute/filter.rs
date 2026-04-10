@@ -2,36 +2,38 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use vortex_array::ArrayRef;
+use vortex_array::ArrayView;
 use vortex_array::ExecutionCtx;
-use vortex_array::arrays::FilterKernel;
+use vortex_array::IntoArray;
+use vortex_array::arrays::filter::FilterKernel;
 use vortex_error::VortexResult;
 use vortex_mask::Mask;
 
-use crate::ALPArray;
-use crate::ALPVTable;
+use crate::ALP;
+use crate::ALPArrayExt;
+use crate::ALPArraySlotsExt;
 
-impl FilterKernel for ALPVTable {
+impl FilterKernel for ALP {
     fn filter(
-        array: &ALPArray,
+        array: ArrayView<'_, Self>,
         mask: &Mask,
-        _ctx: &mut ExecutionCtx,
+        ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
         let patches = array
             .patches()
-            .map(|p| p.filter(mask))
+            .map(|p| p.filter(mask, ctx))
             .transpose()?
             .flatten();
 
         // SAFETY: filtering the values does not change correctness
         unsafe {
             Ok(Some(
-                ALPArray::new_unchecked(
+                ALP::new_unchecked(
                     array.encoded().filter(mask.clone())?,
                     array.exponents(),
                     patches,
-                    array.dtype().clone(),
                 )
-                .to_array(),
+                .into_array(),
             ))
         }
     }
@@ -60,6 +62,6 @@ mod test {
     ].into_array())]
     fn test_filter_alp_conformance(#[case] array: ArrayRef) {
         let alp = alp_encode(&array.to_primitive(), None).unwrap();
-        test_filter_conformance(alp.as_ref());
+        test_filter_conformance(&alp.into_array());
     }
 }

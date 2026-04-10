@@ -1,17 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use vortex_array::Array;
 use vortex_array::ArrayRef;
+use vortex_array::ArrayView;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
-use vortex_array::ToCanonical;
 use vortex_array::arrays::BoolArray;
 use vortex_array::arrays::ConstantArray;
 use vortex_array::builtins::ArrayBuiltins;
-use vortex_array::compute::compare_lengths_to_empty;
 use vortex_array::dtype::DType;
-use vortex_array::match_each_integer_ptype;
 use vortex_array::scalar::Scalar;
 use vortex_array::scalar_fn::fns::binary::CompareKernel;
 use vortex_array::scalar_fn::fns::operators::CompareOperator;
@@ -23,18 +20,17 @@ use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 
-use crate::FSSTArray;
-use crate::FSSTVTable;
-
-impl CompareKernel for FSSTVTable {
+use crate::FSST;
+use crate::FSSTArrayExt;
+impl CompareKernel for FSST {
     fn compare(
-        lhs: &FSSTArray,
-        rhs: &dyn Array,
+        lhs: ArrayView<'_, Self>,
+        rhs: &ArrayRef,
         operator: CompareOperator,
-        _ctx: &mut ExecutionCtx,
+        ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
         match rhs.as_constant() {
-            Some(constant) => compare_fsst_constant(lhs, &constant, operator),
+            Some(constant) => compare_fsst_constant(lhs, &constant, operator, ctx),
             // Otherwise, fall back to the default comparison behavior.
             _ => Ok(None),
         }
@@ -43,9 +39,10 @@ impl CompareKernel for FSSTVTable {
 
 /// Specialized compare function implementation used when performing against a constant
 fn compare_fsst_constant(
-    left: &FSSTArray,
+    left: ArrayView<'_, FSST>,
     right: &Scalar,
     operator: CompareOperator,
+    ctx: &mut ExecutionCtx,
 ) -> VortexResult<Option<ArrayRef>> {
     let is_rhs_empty = match right.dtype() {
         DType::Binary(_) => right
@@ -64,21 +61,23 @@ fn compare_fsst_constant(
             CompareOperator::Gte => BitBuffer::new_set(left.len()),
             // No value is lt ""
             CompareOperator::Lt => BitBuffer::new_unset(left.len()),
-            _ => {
-                let uncompressed_lengths = left.uncompressed_lengths().to_primitive();
-                match_each_integer_ptype!(uncompressed_lengths.ptype(), |P| {
-                    compare_lengths_to_empty(
-                        uncompressed_lengths.as_slice::<P>().iter().copied(),
-                        operator,
+            _ => left
+                .uncompressed_lengths()
+                .binary(
+                    ConstantArray::new(
+                        Scalar::zero_value(left.uncompressed_lengths().dtype()),
+                        left.uncompressed_lengths().len(),
                     )
-                })
-            }
+                    .into_array(),
+                    operator.into(),
+                )?
+                .execute(ctx)?,
         };
 
         return Ok(Some(
             BoolArray::new(
                 buffer,
-                Validity::copy_from_array(left.as_ref())?
+                Validity::copy_from_array(left.array())?
                     .union_nullability(right.dtype().nullability()),
             )
             .into_array(),
@@ -116,14 +115,14 @@ fn compare_fsst_constant(
 
     let rhs = ConstantArray::new(encoded_scalar, left.len());
     left.codes()
-        .to_array()
+        .into_array()
         .binary(rhs.into_array(), Operator::from(operator))
         .map(Some)
 }
 
 #[cfg(test)]
 mod tests {
-    use vortex_array::Array;
+    use vortex_array::IntoArray;
     use vortex_array::ToCanonical;
     use vortex_array::arrays::BoolArray;
     use vortex_array::arrays::ConstantArray;
@@ -152,14 +151,17 @@ mod tests {
             DType::Utf8(Nullability::Nullable),
         );
         let compressor = fsst_train_compressor(&lhs);
-        let lhs = fsst_compress(lhs, &compressor);
+        let len = lhs.len();
+        let dtype = lhs.dtype().clone();
+        let lhs = fsst_compress(lhs, len, &dtype, &compressor);
 
         let rhs = ConstantArray::new("world", lhs.len());
 
         // Ensure fastpath for Eq exists, and returns correct answer
         let equals = lhs
-            .to_array()
-            .binary(rhs.to_array(), Operator::Eq)
+            .clone()
+            .into_array()
+            .binary(rhs.clone().into_array(), Operator::Eq)
             .unwrap()
             .to_bool();
 
@@ -172,8 +174,9 @@ mod tests {
 
         // Ensure fastpath for Eq exists, and returns correct answer
         let not_equals = lhs
-            .to_array()
-            .binary(rhs.to_array(), Operator::NotEq)
+            .clone()
+            .into_array()
+            .binary(rhs.into_array(), Operator::NotEq)
             .unwrap()
             .to_bool();
 
@@ -187,8 +190,9 @@ mod tests {
         let null_rhs =
             ConstantArray::new(Scalar::null(DType::Utf8(Nullability::Nullable)), lhs.len());
         let equals_null = lhs
-            .to_array()
-            .binary(null_rhs.to_array(), Operator::Eq)
+            .clone()
+            .into_array()
+            .binary(null_rhs.clone().into_array(), Operator::Eq)
             .unwrap();
         assert_arrays_eq!(
             &equals_null,
@@ -196,8 +200,8 @@ mod tests {
         );
 
         let noteq_null = lhs
-            .to_array()
-            .binary(null_rhs.to_array(), Operator::NotEq)
+            .into_array()
+            .binary(null_rhs.into_array(), Operator::NotEq)
             .unwrap();
         assert_arrays_eq!(
             &noteq_null,

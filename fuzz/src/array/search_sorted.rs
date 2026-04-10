@@ -4,9 +4,10 @@
 use std::cmp::Ordering;
 use std::fmt::Debug;
 
-use vortex_array::Array;
+use vortex_array::ArrayRef;
 use vortex_array::ToCanonical;
 use vortex_array::accessor::ArrayAccessor;
+use vortex_array::arrays::bool::BoolArrayExt;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::NativePType;
 use vortex_array::match_each_decimal_value_type;
@@ -56,7 +57,7 @@ impl<T: NativePType> IndexOrd<Option<T>> for SearchPrimitiveSlice<T> {
 }
 
 pub fn search_sorted_canonical_array(
-    array: &dyn Array,
+    array: &ArrayRef,
     scalar: &Scalar,
     side: SearchSortedSide,
 ) -> VortexResult<SearchResult> {
@@ -130,7 +131,7 @@ pub fn search_sorted_canonical_array(
                 .collect::<VortexResult<Vec<_>>>()?;
             scalar_vals.search_sorted(&scalar.cast(array.dtype())?, side)
         }
-        d @ (DType::Null | DType::Extension(_)) => {
+        d @ (DType::Null | DType::Extension(_) | DType::Variant(_)) => {
             unreachable!("DType {d} not supported for fuzzing")
         }
     }

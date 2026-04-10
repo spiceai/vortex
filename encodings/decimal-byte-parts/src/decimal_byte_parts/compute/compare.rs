@@ -3,9 +3,10 @@
 
 use Sign::Negative;
 use num_traits::NumCast;
-use vortex_array::Array;
 use vortex_array::ArrayRef;
+use vortex_array::ArrayView;
 use vortex_array::ExecutionCtx;
+use vortex_array::IntoArray;
 use vortex_array::arrays::ConstantArray;
 use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::IntegerPType;
@@ -23,13 +24,14 @@ use vortex_array::scalar_fn::fns::operators::Operator;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 
-use crate::DecimalBytePartsVTable;
+use crate::DecimalByteParts;
+use crate::decimal_byte_parts::DecimalBytePartsArrayExt;
 use crate::decimal_byte_parts::compute::compare::Sign::Positive;
 
-impl CompareKernel for DecimalBytePartsVTable {
+impl CompareKernel for DecimalByteParts {
     fn compare(
-        lhs: &Self::Array,
-        rhs: &dyn Array,
+        lhs: ArrayView<'_, Self>,
+        rhs: &ArrayRef,
         operator: CompareOperator,
         _ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
@@ -37,21 +39,23 @@ impl CompareKernel for DecimalBytePartsVTable {
             return Ok(None);
         };
 
-        let nullability = lhs.dtype.nullability() | rhs.dtype().nullability();
-        let scalar_type = lhs.msp.dtype().with_nullability(nullability);
+        let nullability = lhs.dtype().nullability() | rhs.dtype().nullability();
+        let scalar_type = lhs.msp().dtype().with_nullability(nullability);
 
         let rhs_decimal = rhs_const
             .as_decimal()
             .decimal_value()
             .vortex_expect("checked for null in entry func");
 
-        match decimal_value_wrapper_to_primitive(rhs_decimal, lhs.msp.as_primitive_typed().ptype())
-        {
+        match decimal_value_wrapper_to_primitive(
+            rhs_decimal,
+            lhs.msp().as_primitive_typed().ptype(),
+        ) {
             Ok(value) => {
                 let encoded_scalar = Scalar::try_new(scalar_type, Some(value))?;
                 let encoded_const = ConstantArray::new(encoded_scalar, rhs.len());
-                lhs.msp
-                    .binary(encoded_const.to_array(), Operator::from(operator))
+                lhs.msp()
+                    .binary(encoded_const.into_array(), Operator::from(operator))
                     .map(Some)
             }
 
@@ -61,13 +65,13 @@ impl CompareKernel for DecimalBytePartsVTable {
                 // (depending on the `sign`) than all values in MSP.
                 // If the LHS or the RHS contain nulls, then we must fallback to the canonicalized
                 // implementation which does null-checking instead.
-                if lhs.all_valid()? && rhs.all_valid()? {
+                if lhs.array().all_valid()? && rhs.all_valid()? {
                     Ok(Some(
                         ConstantArray::new(
                             unconvertible_value(sign, operator, nullability),
                             lhs.len(),
                         )
-                        .to_array(),
+                        .into_array(),
                     ))
                 } else {
                     Ok(None)
@@ -140,7 +144,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use vortex_array::Array;
     use vortex_array::IntoArray;
     use vortex_array::arrays::BoolArray;
     use vortex_array::arrays::ConstantArray;
@@ -157,24 +160,24 @@ mod tests {
     use vortex_buffer::buffer;
     use vortex_error::VortexResult;
 
-    use crate::DecimalBytePartsArray;
+    use crate::DecimalByteParts;
 
     #[test]
     fn compare_decimal_const() {
         let decimal_dtype = DecimalDType::new(8, 2);
         let dtype = DType::Decimal(decimal_dtype, Nullability::Nullable);
-        let lhs = DecimalBytePartsArray::try_new(
-            PrimitiveArray::new(buffer![100i32, 200i32, 400i32], Validity::AllValid).to_array(),
+        let lhs = DecimalByteParts::try_new(
+            PrimitiveArray::new(buffer![100i32, 200i32, 400i32], Validity::AllValid).into_array(),
             decimal_dtype,
         )
         .unwrap()
-        .to_array();
+        .into_array();
         let rhs = ConstantArray::new(
             Scalar::try_new(dtype, Some(DecimalValue::I64(400).into())).unwrap(),
             lhs.len(),
         );
 
-        let res = lhs.binary(rhs.to_array(), Operator::Eq).unwrap();
+        let res = lhs.binary(rhs.into_array(), Operator::Eq).unwrap();
 
         let expected = BoolArray::from_iter([Some(false), Some(false), Some(true)]).into_array();
         assert_arrays_eq!(res, expected);
@@ -183,7 +186,7 @@ mod tests {
     #[test]
     fn test_byteparts_compare_nullable() -> VortexResult<()> {
         let decimal_type = DecimalDType::new(19, -11);
-        let lhs = DecimalBytePartsArray::try_new(
+        let lhs = DecimalByteParts::try_new(
             PrimitiveArray::new(
                 buffer![1i64, 2i64, 3i64, 4i64],
                 Validity::Array(BoolArray::from_iter([false, true, true, true]).into_array()),
@@ -202,7 +205,7 @@ mod tests {
         )
         .into_array();
 
-        let res = lhs.to_array().binary(rhs, Operator::Lte)?;
+        let res = lhs.into_array().binary(rhs, Operator::Lte)?;
         let expected =
             BoolArray::from_iter([None, Some(true), Some(true), Some(true)]).into_array();
         assert_arrays_eq!(res, expected);
@@ -214,12 +217,12 @@ mod tests {
     fn compare_decimal_const_unconvertible_comparison() {
         let decimal_dtype = DecimalDType::new(40, 2);
         let dtype = DType::Decimal(decimal_dtype, Nullability::Nullable);
-        let lhs = DecimalBytePartsArray::try_new(
-            PrimitiveArray::new(buffer![100i32, 200i32, 400i32], Validity::AllValid).to_array(),
+        let lhs = DecimalByteParts::try_new(
+            PrimitiveArray::new(buffer![100i32, 200i32, 400i32], Validity::AllValid).into_array(),
             decimal_dtype,
         )
         .unwrap()
-        .to_array();
+        .into_array();
         // This cannot be converted to a i32.
         let rhs = ConstantArray::new(
             Scalar::try_new(
@@ -230,15 +233,15 @@ mod tests {
             lhs.len(),
         );
 
-        let res = lhs.binary(rhs.to_array(), Operator::Eq).unwrap();
+        let res = lhs.binary(rhs.clone().into_array(), Operator::Eq).unwrap();
         let expected = BoolArray::from_iter([Some(false), Some(false), Some(false)]).into_array();
         assert_arrays_eq!(res, expected);
 
-        let res = lhs.binary(rhs.to_array(), Operator::Gt).unwrap();
+        let res = lhs.binary(rhs.clone().into_array(), Operator::Gt).unwrap();
         let expected = BoolArray::from_iter([Some(true), Some(true), Some(true)]).into_array();
         assert_arrays_eq!(res, expected);
 
-        let res = lhs.binary(rhs.to_array(), Operator::Lt).unwrap();
+        let res = lhs.binary(rhs.into_array(), Operator::Lt).unwrap();
         let expected = BoolArray::from_iter([Some(false), Some(false), Some(false)]).into_array();
         assert_arrays_eq!(res, expected);
 
@@ -248,15 +251,15 @@ mod tests {
             lhs.len(),
         );
 
-        let res = lhs.binary(rhs.to_array(), Operator::Eq).unwrap();
+        let res = lhs.binary(rhs.clone().into_array(), Operator::Eq).unwrap();
         let expected = BoolArray::from_iter([Some(false), Some(false), Some(false)]).into_array();
         assert_arrays_eq!(res, expected);
 
-        let res = lhs.binary(rhs.to_array(), Operator::Gt).unwrap();
+        let res = lhs.binary(rhs.clone().into_array(), Operator::Gt).unwrap();
         let expected = BoolArray::from_iter([Some(false), Some(false), Some(false)]).into_array();
         assert_arrays_eq!(res, expected);
 
-        let res = lhs.binary(rhs.to_array(), Operator::Lt).unwrap();
+        let res = lhs.binary(rhs.into_array(), Operator::Lt).unwrap();
         let expected = BoolArray::from_iter([Some(true), Some(true), Some(true)]).into_array();
         assert_arrays_eq!(res, expected);
     }

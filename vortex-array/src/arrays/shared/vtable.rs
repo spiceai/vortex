@@ -1,160 +1,134 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::hash::Hash;
+use std::hash::Hasher;
 
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
+use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
 
-use crate::ArrayBufferVisitor;
-use crate::ArrayChildVisitor;
+use crate::ArrayEq;
+use crate::ArrayHash;
 use crate::ArrayRef;
 use crate::Canonical;
-use crate::EmptyMetadata;
 use crate::ExecutionCtx;
+use crate::ExecutionResult;
 use crate::Precision;
-use crate::arrays::shared::SharedArray;
+use crate::array::Array;
+use crate::array::ArrayId;
+use crate::array::ArrayView;
+use crate::array::OperationsVTable;
+use crate::array::VTable;
+use crate::array::ValidityVTable;
+use crate::arrays::shared::SharedArrayExt;
+use crate::arrays::shared::SharedData;
+use crate::arrays::shared::array::SLOT_NAMES;
 use crate::buffer::BufferHandle;
 use crate::dtype::DType;
-use crate::hash::ArrayEq;
-use crate::hash::ArrayHash;
 use crate::scalar::Scalar;
-use crate::stats::StatsSetRef;
 use crate::validity::Validity;
-use crate::vtable;
-use crate::vtable::ArrayId;
-use crate::vtable::BaseArrayVTable;
-use crate::vtable::OperationsVTable;
-use crate::vtable::VTable;
-use crate::vtable::ValidityVTable;
-use crate::vtable::VisitorVTable;
 
-vtable!(Shared);
+/// A [`Shared`]-encoded Vortex array.
+pub type SharedArray = Array<Shared>;
 
 // TODO(ngates): consider hooking Shared into the iterative execution model. Cache either the
 //  most executed, or after each iteration, and return a shared cache for each execution.
-#[derive(Debug)]
-pub struct SharedVTable;
+#[derive(Clone, Debug)]
+pub struct Shared;
 
-impl SharedVTable {
+impl Shared {
     pub const ID: ArrayId = ArrayId::new_ref("vortex.shared");
 }
 
-impl VTable for SharedVTable {
-    type Array = SharedArray;
-    type Metadata = EmptyMetadata;
+impl ArrayHash for SharedData {
+    fn array_hash<H: Hasher>(&self, _state: &mut H, _precision: Precision) {}
+}
 
-    type ArrayVTable = Self;
+impl ArrayEq for SharedData {
+    fn array_eq(&self, _other: &Self, _precision: Precision) -> bool {
+        true
+    }
+}
+
+impl VTable for Shared {
+    type ArrayData = SharedData;
     type OperationsVTable = Self;
     type ValidityVTable = Self;
-    type VisitorVTable = Self;
 
-    fn id(_array: &Self::Array) -> ArrayId {
+    fn id(&self) -> ArrayId {
         Self::ID
     }
 
-    fn metadata(_array: &Self::Array) -> VortexResult<Self::Metadata> {
-        Ok(EmptyMetadata)
+    fn validate(
+        &self,
+        _data: &SharedData,
+        dtype: &DType,
+        len: usize,
+        slots: &[Option<ArrayRef>],
+    ) -> VortexResult<()> {
+        let source = slots[0]
+            .as_ref()
+            .vortex_expect("SharedArray source slot must be present");
+        vortex_error::vortex_ensure!(source.dtype() == dtype, "SharedArray dtype mismatch");
+        vortex_error::vortex_ensure!(source.len() == len, "SharedArray len mismatch");
+        Ok(())
     }
 
-    fn serialize(_metadata: Self::Metadata) -> VortexResult<Option<Vec<u8>>> {
+    fn nbuffers(_array: ArrayView<'_, Self>) -> usize {
+        0
+    }
+
+    fn buffer(_array: ArrayView<'_, Self>, _idx: usize) -> BufferHandle {
+        vortex_panic!("SharedArray has no buffers")
+    }
+
+    fn buffer_name(_array: ArrayView<'_, Self>, _idx: usize) -> Option<String> {
+        None
+    }
+
+    fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {
+        SLOT_NAMES[idx].to_string()
+    }
+
+    fn serialize(
+        _array: ArrayView<'_, Self>,
+        _session: &VortexSession,
+    ) -> VortexResult<Option<Vec<u8>>> {
         vortex_error::vortex_bail!("Shared array is not serializable")
     }
 
     fn deserialize(
-        _bytes: &[u8],
+        &self,
         _dtype: &DType,
         _len: usize,
+        _metadata: &[u8],
+
         _buffers: &[BufferHandle],
+        _children: &dyn crate::serde::ArrayChildren,
         _session: &VortexSession,
-    ) -> VortexResult<Self::Metadata> {
+    ) -> VortexResult<crate::array::ArrayParts<Self>> {
         vortex_error::vortex_bail!("Shared array is not serializable")
     }
 
-    fn build(
-        dtype: &DType,
-        len: usize,
-        _metadata: &Self::Metadata,
-        _buffers: &[BufferHandle],
-        children: &dyn crate::serde::ArrayChildren,
-    ) -> VortexResult<SharedArray> {
-        let child = children.get(0, dtype, len)?;
-        Ok(SharedArray::new(child))
-    }
-
-    fn with_children(array: &mut Self::Array, children: Vec<ArrayRef>) -> VortexResult<()> {
-        vortex_error::vortex_ensure!(
-            children.len() == 1,
-            "SharedArray expects exactly 1 child, got {}",
-            children.len()
-        );
-        let child = children
-            .into_iter()
-            .next()
-            .vortex_expect("children length already validated");
-        array.set_source(child);
-        Ok(())
-    }
-
-    fn execute(array: &Self::Array, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
-        array.get_or_compute(|source| source.clone().execute::<Canonical>(ctx))
+    fn execute(array: Array<Self>, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
+        array
+            .get_or_compute(|source| source.clone().execute::<Canonical>(ctx))
+            .map(ExecutionResult::done)
     }
 }
-
-impl BaseArrayVTable<SharedVTable> for SharedVTable {
-    fn len(array: &SharedArray) -> usize {
-        array.current_array_ref().len()
-    }
-
-    fn dtype(array: &SharedArray) -> &DType {
-        &array.dtype
-    }
-
-    fn stats(array: &SharedArray) -> StatsSetRef<'_> {
-        array.stats.to_ref(array.as_ref())
-    }
-
-    fn array_hash<H: std::hash::Hasher>(array: &SharedArray, state: &mut H, precision: Precision) {
-        let current = array.current_array_ref();
-        current.array_hash(state, precision);
-        array.dtype.hash(state);
-    }
-
-    fn array_eq(array: &SharedArray, other: &SharedArray, precision: Precision) -> bool {
-        let current = array.current_array_ref();
-        let other_current = other.current_array_ref();
-        current.array_eq(other_current, precision) && array.dtype == other.dtype
-    }
-}
-
-impl OperationsVTable<SharedVTable> for SharedVTable {
-    fn scalar_at(array: &SharedArray, index: usize) -> VortexResult<Scalar> {
+impl OperationsVTable<Shared> for Shared {
+    fn scalar_at(
+        array: ArrayView<'_, Shared>,
+        index: usize,
+        _ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Scalar> {
         array.current_array_ref().scalar_at(index)
     }
 }
 
-impl ValidityVTable<SharedVTable> for SharedVTable {
-    fn validity(array: &SharedArray) -> VortexResult<Validity> {
+impl ValidityVTable<Shared> for Shared {
+    fn validity(array: ArrayView<'_, Shared>) -> VortexResult<Validity> {
         array.current_array_ref().validity()
-    }
-}
-
-impl VisitorVTable<SharedVTable> for SharedVTable {
-    fn visit_buffers(_array: &SharedArray, _visitor: &mut dyn ArrayBufferVisitor) {}
-
-    fn visit_children(array: &SharedArray, visitor: &mut dyn ArrayChildVisitor) {
-        visitor.visit_child("source", array.current_array_ref());
-    }
-
-    fn nchildren(_array: &SharedArray) -> usize {
-        1
-    }
-
-    fn nth_child(array: &SharedArray, idx: usize) -> Option<ArrayRef> {
-        match idx {
-            0 => Some(array.current_array_ref().clone()),
-            _ => None,
-        }
     }
 }

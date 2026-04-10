@@ -9,6 +9,7 @@ use pyo3::PyAny;
 use pyo3::PyErr;
 use pyo3::PyResult;
 use pyo3::Python;
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::PyAnyMethods;
 use pyo3::prelude::PyDictMethods;
 use pyo3::types::PyBytes;
@@ -30,6 +31,7 @@ use vortex::scalar::Scalar;
 use vortex::scalar::StructScalar;
 
 use crate::PyVortex;
+use crate::classes::decimal_class;
 
 impl<'py> IntoPyObject<'py> for PyVortex<&'_ Scalar> {
     type Target = PyAny;
@@ -85,6 +87,9 @@ impl<'py> IntoPyObject<'py> for PyVortex<&'_ Scalar> {
             DType::Extension(_) => {
                 PyVortex(&self.0.as_extension().to_storage_scalar()).into_pyobject(py)
             }
+            DType::Variant(_) => Err(PyValueError::new_err(
+                "Variant scalars are not supported in Python yet",
+            )),
         }
     }
 }
@@ -200,8 +205,7 @@ fn decimal_value_to_py(
     scale: i8,
     decimal_value: DecimalValue,
 ) -> PyResult<Bound<PyAny>> {
-    let m = py.import("decimal")?;
-    let decimal_class = m.getattr("Decimal")?;
+    let decimal_class = decimal_class(py)?;
 
     match_each_decimal_value!(decimal_value, |value| {
         let (whole, decimal) = value.decimal_parts(scale);

@@ -3,8 +3,8 @@
 
 use std::fmt::Debug;
 
-use vortex_array::Array;
 use vortex_array::ArrayRef;
+use vortex_array::ArrayView;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::arrays::ConstantArray;
@@ -18,17 +18,18 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
 
-use crate::ALPArray;
+use crate::ALP;
+use crate::ALPArrayExt;
+use crate::ALPArraySlotsExt;
 use crate::ALPFloat;
-use crate::ALPVTable;
 use crate::match_each_alp_float_ptype;
 
 // TODO(joe): add fuzzing.
 
-impl CompareKernel for ALPVTable {
+impl CompareKernel for ALP {
     fn compare(
-        lhs: &ALPArray,
-        rhs: &dyn Array,
+        lhs: ArrayView<'_, Self>,
+        rhs: &ArrayRef,
         operator: CompareOperator,
         _ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
@@ -70,7 +71,7 @@ impl CompareKernel for ALPVTable {
 /// the encoded value to the encoded values in the ALPArray. There are fixups when the value doesn't
 /// encode into the ALP domain.
 fn alp_scalar_compare<F: ALPFloat + Into<Scalar>>(
-    alp: &ALPArray,
+    alp: ArrayView<ALP>,
     value: F,
     operator: CompareOperator,
 ) -> VortexResult<Option<ArrayRef>>
@@ -168,7 +169,7 @@ mod tests {
     use crate::alp_encode;
 
     fn test_alp_compare<F: ALPFloat + Into<Scalar>>(
-        alp: &ALPArray,
+        alp: ArrayView<ALP>,
         value: F,
         operator: CompareOperator,
     ) -> Option<ArrayRef>
@@ -189,13 +190,13 @@ mod tests {
             vec![1234; 1025]
         );
 
-        let r = alp_scalar_compare(&encoded, 1.3_f32, CompareOperator::Eq)
+        let r = alp_scalar_compare(encoded.as_view(), 1.3_f32, CompareOperator::Eq)
             .unwrap()
             .unwrap();
         let expected = BoolArray::from_iter([false; 1025]);
         assert_arrays_eq!(r, expected);
 
-        let r = alp_scalar_compare(&encoded, 1.234f32, CompareOperator::Eq)
+        let r = alp_scalar_compare(encoded.as_view(), 1.234f32, CompareOperator::Eq)
             .unwrap()
             .unwrap();
         let expected = BoolArray::from_iter([true; 1025]);
@@ -213,14 +214,14 @@ mod tests {
         );
 
         #[allow(clippy::excessive_precision)]
-        let r_eq = alp_scalar_compare(&encoded, 1.234444_f32, CompareOperator::Eq)
+        let r_eq = alp_scalar_compare(encoded.as_view(), 1.234444_f32, CompareOperator::Eq)
             .unwrap()
             .unwrap();
         let expected = BoolArray::from_iter([false; 1025]);
         assert_arrays_eq!(r_eq, expected);
 
         #[allow(clippy::excessive_precision)]
-        let r_neq = alp_scalar_compare(&encoded, 1.234444f32, CompareOperator::NotEq)
+        let r_neq = alp_scalar_compare(encoded.as_view(), 1.234444f32, CompareOperator::NotEq)
             .unwrap()
             .unwrap();
         let expected = BoolArray::from_iter([true; 1025]);
@@ -238,28 +239,28 @@ mod tests {
         );
 
         // !(0.0605_f32 >= 0.06051_f32);
-        let r_gte = alp_scalar_compare(&encoded, 0.06051_f32, CompareOperator::Gte)
+        let r_gte = alp_scalar_compare(encoded.as_view(), 0.06051_f32, CompareOperator::Gte)
             .unwrap()
             .unwrap();
         let expected = BoolArray::from_iter([false; 10]);
         assert_arrays_eq!(r_gte, expected);
 
         // (0.0605_f32 > 0.06051_f32);
-        let r_gt = alp_scalar_compare(&encoded, 0.06051_f32, CompareOperator::Gt)
+        let r_gt = alp_scalar_compare(encoded.as_view(), 0.06051_f32, CompareOperator::Gt)
             .unwrap()
             .unwrap();
         let expected = BoolArray::from_iter([false; 10]);
         assert_arrays_eq!(r_gt, expected);
 
         // 0.0605_f32 <= 0.06051_f32;
-        let r_lte = alp_scalar_compare(&encoded, 0.06051_f32, CompareOperator::Lte)
+        let r_lte = alp_scalar_compare(encoded.as_view(), 0.06051_f32, CompareOperator::Lte)
             .unwrap()
             .unwrap();
         let expected = BoolArray::from_iter([true; 10]);
         assert_arrays_eq!(r_lte, expected);
 
         //0.0605_f32 < 0.06051_f32;
-        let r_lt = alp_scalar_compare(&encoded, 0.06051_f32, CompareOperator::Lt)
+        let r_lt = alp_scalar_compare(encoded.as_view(), 0.06051_f32, CompareOperator::Lt)
             .unwrap()
             .unwrap();
         let expected = BoolArray::from_iter([true; 10]);
@@ -276,31 +277,33 @@ mod tests {
             vec![0; 10]
         );
 
-        let r_gte = test_alp_compare(&encoded, -0.00000001_f32, CompareOperator::Gte).unwrap();
+        let r_gte =
+            test_alp_compare(encoded.as_view(), -0.00000001_f32, CompareOperator::Gte).unwrap();
         let expected = BoolArray::from_iter([true; 10]);
         assert_arrays_eq!(r_gte, expected);
 
-        let r_gte = test_alp_compare(&encoded, -0.0_f32, CompareOperator::Gte).unwrap();
+        let r_gte = test_alp_compare(encoded.as_view(), -0.0_f32, CompareOperator::Gte).unwrap();
         let expected = BoolArray::from_iter([true; 10]);
         assert_arrays_eq!(r_gte, expected);
 
-        let r_gt = test_alp_compare(&encoded, -0.0000000001f32, CompareOperator::Gt).unwrap();
+        let r_gt =
+            test_alp_compare(encoded.as_view(), -0.0000000001f32, CompareOperator::Gt).unwrap();
         let expected = BoolArray::from_iter([true; 10]);
         assert_arrays_eq!(r_gt, expected);
 
-        let r_gte = test_alp_compare(&encoded, -0.0_f32, CompareOperator::Gt).unwrap();
+        let r_gte = test_alp_compare(encoded.as_view(), -0.0_f32, CompareOperator::Gt).unwrap();
         let expected = BoolArray::from_iter([true; 10]);
         assert_arrays_eq!(r_gte, expected);
 
-        let r_lte = test_alp_compare(&encoded, 0.06051_f32, CompareOperator::Lte).unwrap();
+        let r_lte = test_alp_compare(encoded.as_view(), 0.06051_f32, CompareOperator::Lte).unwrap();
         let expected = BoolArray::from_iter([true; 10]);
         assert_arrays_eq!(r_lte, expected);
 
-        let r_lt = test_alp_compare(&encoded, 0.06051_f32, CompareOperator::Lt).unwrap();
+        let r_lt = test_alp_compare(encoded.as_view(), 0.06051_f32, CompareOperator::Lt).unwrap();
         let expected = BoolArray::from_iter([true; 10]);
         assert_arrays_eq!(r_lt, expected);
 
-        let r_lt = test_alp_compare(&encoded, -0.00001_f32, CompareOperator::Lt).unwrap();
+        let r_lt = test_alp_compare(encoded.as_view(), -0.00001_f32, CompareOperator::Lt).unwrap();
         let expected = BoolArray::from_iter([false; 10]);
         assert_arrays_eq!(r_lt, expected);
     }
@@ -314,7 +317,7 @@ mod tests {
 
         // Not supported!
         assert!(
-            alp_scalar_compare(&encoded, 1_000_000.9_f32, CompareOperator::Eq)
+            alp_scalar_compare(encoded.as_view(), 1_000_000.9_f32, CompareOperator::Eq)
                 .unwrap()
                 .is_none()
         )
@@ -348,7 +351,7 @@ mod tests {
         let array = PrimitiveArray::from_iter([1.234f32; 10]);
         let encoded = alp_encode(&array, None).unwrap();
 
-        let r = test_alp_compare(&encoded, value, CompareOperator::Gt).unwrap();
+        let r = test_alp_compare(encoded.as_view(), value, CompareOperator::Gt).unwrap();
         let expected = BoolArray::from_iter([result; 10]);
         assert_arrays_eq!(r, expected);
     }
@@ -362,7 +365,7 @@ mod tests {
         let array = PrimitiveArray::from_iter([1.234f32; 10]);
         let encoded = alp_encode(&array, None).unwrap();
 
-        let r = test_alp_compare(&encoded, value, CompareOperator::Lt).unwrap();
+        let r = test_alp_compare(encoded.as_view(), value, CompareOperator::Lt).unwrap();
         let expected = BoolArray::from_iter([result; 10]);
         assert_arrays_eq!(r, expected);
     }

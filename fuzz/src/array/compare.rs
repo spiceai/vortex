@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use vortex_array::Array;
 use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
 use vortex_array::ToCanonical;
 use vortex_array::accessor::ArrayAccessor;
 use vortex_array::arrays::BoolArray;
-use vortex_array::arrays::NativeValue;
+use vortex_array::arrays::bool::BoolArrayExt;
+use vortex_array::arrays::primitive::NativeValue;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
 use vortex_array::match_each_decimal_value_type;
@@ -21,7 +21,7 @@ use vortex_error::VortexExpect;
 use vortex_error::vortex_panic;
 
 pub fn compare_canonical_array(
-    array: &dyn Array,
+    array: &ArrayRef,
     value: &Scalar,
     operator: CompareOperator,
 ) -> ArrayRef {
@@ -134,14 +134,15 @@ pub fn compare_canonical_array(
             let scalar_vals: Vec<Scalar> = (0..array.len())
                 .map(|i| array.scalar_at(i).vortex_expect("scalar_at"))
                 .collect();
-            BoolArray::from_iter(
-                scalar_vals
-                    .iter()
-                    .map(|v| scalar_cmp(v, value, operator).as_bool().value()),
-            )
+            BoolArray::from_iter(scalar_vals.iter().map(|v| {
+                scalar_cmp(v, value, operator)
+                    .vortex_expect("tried to compare different typed scalars")
+                    .as_bool()
+                    .value()
+            }))
             .into_array()
         }
-        d @ (DType::Null | DType::Extension(_)) => {
+        d @ (DType::Null | DType::Extension(_) | DType::Variant(_)) => {
             unreachable!("DType {d} not supported for fuzzing")
         }
     }

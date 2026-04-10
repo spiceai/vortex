@@ -4,29 +4,33 @@
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 
-use crate::Array;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
-use crate::arrays::ExactScalarFn;
-use crate::arrays::ScalarFnArrayView;
+use crate::array::ArrayView;
+use crate::array::VTable;
 use crate::arrays::ScalarFnVTable;
+use crate::arrays::scalar_fn::ExactScalarFn;
+use crate::arrays::scalar_fn::ScalarFnArrayExt;
+use crate::arrays::scalar_fn::ScalarFnArrayView;
 use crate::kernel::ExecuteParentKernel;
 use crate::optimizer::rules::ArrayParentReduceRule;
 use crate::scalar_fn::fns::list_contains::ListContains as ListContainsExpr;
-use crate::vtable::VTable;
 
 /// Check list-contains without reading buffers (metadata-only).
 ///
 /// This trait dispatches on the **element** (needle) child at index 1 of the `ListContains`
 /// expression. `Self::Array` is the concrete element encoding, while the list (haystack) is
-/// passed as an opaque `&dyn Array`.
+/// passed as an opaque `&ArrayRef`.
 ///
 /// A future `ListContainsListReduce` could dispatch on the list side (child 0) for encodings
 /// with specialized list representations.
 ///
 /// Return `None` if the operation cannot be resolved from metadata alone.
 pub trait ListContainsElementReduce: VTable {
-    fn list_contains(list: &dyn Array, element: &Self::Array) -> VortexResult<Option<ArrayRef>>;
+    fn list_contains(
+        list: &ArrayRef,
+        element: ArrayView<'_, Self>,
+    ) -> VortexResult<Option<ArrayRef>>;
 }
 
 /// Check list-contains, potentially reading buffers.
@@ -36,8 +40,8 @@ pub trait ListContainsElementReduce: VTable {
 /// the provided [`ExecutionCtx`].
 pub trait ListContainsElementKernel: VTable {
     fn list_contains(
-        list: &dyn Array,
-        element: &Self::Array,
+        list: &ArrayRef,
+        element: ArrayView<'_, Self>,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>>;
 }
@@ -54,7 +58,7 @@ where
 
     fn reduce_parent(
         &self,
-        array: &V::Array,
+        array: ArrayView<'_, V>,
         parent: ScalarFnArrayView<'_, ListContainsExpr>,
         child_idx: usize,
     ) -> VortexResult<Option<ArrayRef>> {
@@ -65,8 +69,8 @@ where
         let scalar_fn_array = parent
             .as_opt::<ScalarFnVTable>()
             .vortex_expect("ExactScalarFn matcher confirmed ScalarFnArray");
-        let list = &scalar_fn_array.children()[0];
-        <V as ListContainsElementReduce>::list_contains(list.as_ref(), array)
+        let list = scalar_fn_array.get_child(0);
+        <V as ListContainsElementReduce>::list_contains(list, array)
     }
 }
 
@@ -82,7 +86,7 @@ where
 
     fn execute_parent(
         &self,
-        array: &V::Array,
+        array: ArrayView<'_, V>,
         parent: ScalarFnArrayView<'_, ListContainsExpr>,
         child_idx: usize,
         ctx: &mut ExecutionCtx,
@@ -94,7 +98,7 @@ where
         let scalar_fn_array = parent
             .as_opt::<ScalarFnVTable>()
             .vortex_expect("ExactScalarFn matcher confirmed ScalarFnArray");
-        let list = &scalar_fn_array.children()[0];
-        <V as ListContainsElementKernel>::list_contains(list.as_ref(), array, ctx)
+        let list = scalar_fn_array.get_child(0);
+        <V as ListContainsElementKernel>::list_contains(list, array, ctx)
     }
 }

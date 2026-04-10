@@ -1,17 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+pub mod types;
+
+#[rustfmt::skip]
+#[allow(warnings, clippy::all, clippy::pedantic, clippy::nursery)]
+pub mod gpu {
+    include!(concat!(env!("OUT_DIR"), "/patches.rs"));
+}
+
 use cudarc::driver::DeviceRepr;
 use cudarc::driver::PushKernelArg;
 use tracing::instrument;
-use vortex::array::arrays::PrimitiveArrayParts;
+use vortex::array::arrays::primitive::PrimitiveDataParts;
 use vortex::array::patches::Patches;
 use vortex::array::validity::Validity;
-use vortex::array::vtable::ValidityHelper;
 use vortex::dtype::NativePType;
 use vortex::error::VortexResult;
 use vortex::error::vortex_ensure;
-use vortex_cuda_macros::cuda_tests;
 
 use crate::CudaBufferExt;
 use crate::CudaDeviceBuffer;
@@ -36,7 +42,7 @@ pub(crate) async fn execute_patches<
     let values = values.execute_cuda(ctx).await?.into_primitive();
 
     let supported = matches!(
-        values.validity(),
+        values.validity()?,
         Validity::NonNullable | Validity::AllValid
     );
     vortex_ensure!(
@@ -61,15 +67,15 @@ pub(crate) async fn execute_patches<
     let patches_len = indices.len();
     let patches_len_u64 = patches_len as u64;
 
-    let PrimitiveArrayParts {
+    let PrimitiveDataParts {
         buffer: indices_buffer,
         ..
-    } = indices.into_parts();
+    } = indices.into_data_parts();
 
-    let PrimitiveArrayParts {
+    let PrimitiveDataParts {
         buffer: values_buffer,
         ..
-    } = values.into_parts();
+    } = values.into_data_parts();
 
     let d_patch_indices = ctx.ensure_on_device(indices_buffer).await?;
     let d_patch_values = ctx.ensure_on_device(values_buffer).await?;
@@ -78,7 +84,7 @@ pub(crate) async fn execute_patches<
     let d_patch_indices_view = d_patch_indices.cuda_view::<IndicesT>()?;
     let d_patch_values_view = d_patch_values.cuda_view::<ValuesT>()?;
 
-    let kernel_func = ctx.load_function_ptype("patches", &[ValuesT::PTYPE, IndicesT::PTYPE])?;
+    let kernel_func = ctx.load_function("patches", &[ValuesT::PTYPE, IndicesT::PTYPE])?;
 
     ctx.launch_kernel(&kernel_func, patches_len, |args| {
         args.arg(&d_target_view)
@@ -90,15 +96,16 @@ pub(crate) async fn execute_patches<
     Ok(target)
 }
 
-#[cuda_tests]
+#[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use cudarc::driver::DeviceRepr;
     use vortex::array::IntoArray;
     use vortex::array::ToCanonical;
+    use vortex::array::VortexSessionExecute;
     use vortex::array::arrays::PrimitiveArray;
-    use vortex::array::arrays::PrimitiveArrayParts;
+    use vortex::array::arrays::primitive::PrimitiveDataParts;
     use vortex::array::assert_arrays_eq;
     use vortex::array::buffer::BufferHandle;
     use vortex::array::builtins::ArrayBuiltins;
@@ -115,27 +122,25 @@ mod tests {
     use crate::CudaSession;
     use crate::kernel::patches::execute_patches;
 
-    #[tokio::test]
-    async fn test_patches() {
-        test_case::<u8>().await;
-        test_case::<u16>().await;
-        test_case::<u32>().await;
-        test_case::<u64>().await;
-
-        test_case::<i8>().await;
-        test_case::<i16>().await;
-        test_case::<i32>().await;
-        test_case::<i64>().await;
-
-        test_case::<f32>().await;
-        test_case::<f64>().await;
-    }
-
-    async fn test_case<Values: NativePType + DeviceRepr>() {
-        full_test_case::<Values, u8>().await;
-        full_test_case::<Values, u16>().await;
-        full_test_case::<Values, u32>().await;
-        full_test_case::<Values, u64>().await;
+    #[rstest::rstest]
+    #[case::u8(0_u8)]
+    #[case::u16(0_u16)]
+    #[case::u32(0_u32)]
+    #[case::u64(0_u64)]
+    #[case::i8(0_i8)]
+    #[case::i16(0_i16)]
+    #[case::i32(0_i32)]
+    #[case::i64(0_i64)]
+    #[case::f32(0_f32)]
+    #[case::f64(0_f64)]
+    #[crate::test]
+    async fn test_patches<Values: NativePType + DeviceRepr>(#[case] _v: Values) {
+        tokio::join!(
+            full_test_case::<Values, u8>(),
+            full_test_case::<Values, u16>(),
+            full_test_case::<Values, u32>(),
+            full_test_case::<Values, u64>(),
+        );
     }
 
     async fn full_test_case<Values: NativePType + DeviceRepr, Indices: NativePType + DeviceRepr>() {
@@ -154,12 +159,18 @@ mod tests {
         let patches =
             Patches::new(128, 0, patch_idx.into_array(), patch_val.into_array(), None).unwrap();
 
-        let cpu_result = values.clone().patch(&patches).unwrap();
+        let cpu_result = values
+            .clone()
+            .patch(
+                &patches,
+                &mut vortex::array::LEGACY_SESSION.create_execution_ctx(),
+            )
+            .unwrap();
 
-        let PrimitiveArrayParts {
+        let PrimitiveDataParts {
             buffer: cuda_buffer,
             ..
-        } = values.into_parts();
+        } = values.into_data_parts();
 
         let handle = ctx.ensure_on_device(cuda_buffer).await.unwrap();
         let device_buf = handle
@@ -190,7 +201,7 @@ mod tests {
 
     fn force_cast<T: NativePType>(array: PrimitiveArray) -> PrimitiveArray {
         array
-            .to_array()
+            .into_array()
             .cast(DType::Primitive(T::PTYPE, Nullability::NonNullable))
             .unwrap()
             .to_primitive()

@@ -13,25 +13,22 @@ use async_trait::async_trait;
 use futures::FutureExt;
 use futures::StreamExt;
 use futures::future::BoxFuture;
-use vortex::array::Array;
 use vortex::array::ArrayContext;
+use vortex::array::ArrayId;
 use vortex::array::ArrayRef;
-use vortex::array::ArrayVisitor;
-use vortex::array::ArrayVisitorExt;
 use vortex::array::DeserializeMetadata;
 use vortex::array::MaskFuture;
 use vortex::array::ProstMetadata;
 use vortex::array::VortexSessionExecute;
-use vortex::array::arrays::ConstantVTable;
+use vortex::array::arrays::Constant;
 use vortex::array::expr::Expression;
 use vortex::array::expr::stats::Precision;
 use vortex::array::expr::stats::Stat;
 use vortex::array::expr::stats::StatsProvider;
 use vortex::array::normalize::NormalizeOptions;
 use vortex::array::normalize::Operation;
-use vortex::array::serde::ArrayParts;
 use vortex::array::serde::SerializeOptions;
-use vortex::array::session::ArrayRegistry;
+use vortex::array::serde::SerializedArray;
 use vortex::array::stats::StatsSetRef;
 use vortex::buffer::BufferString;
 use vortex::buffer::ByteBuffer;
@@ -64,7 +61,9 @@ use vortex::scalar::ScalarTruncation;
 use vortex::scalar::lower_bound;
 use vortex::scalar::upper_bound;
 use vortex::session::VortexSession;
+use vortex::session::registry::ReadContext;
 use vortex::utils::aliases::hash_map::HashMap;
+use vortex::utils::aliases::hash_set::HashSet;
 
 /// A buffer inlined into layout metadata for host-side access.
 #[derive(Clone, prost::Message)]
@@ -94,7 +93,7 @@ pub struct CudaFlatLayout {
     row_count: u64,
     dtype: DType,
     segment_id: SegmentId,
-    ctx: ArrayContext,
+    ctx: ReadContext,
     array_tree: ByteBuffer,
     /// Small buffers kept on host, keyed by global buffer index.
     host_buffers: Arc<HashMap<u32, ByteBuffer>>,
@@ -107,7 +106,7 @@ impl CudaFlatLayout {
     }
 
     #[inline]
-    pub fn array_ctx(&self) -> &ArrayContext {
+    pub fn array_ctx(&self) -> &ReadContext {
         &self.ctx
     }
 
@@ -122,7 +121,7 @@ impl CudaFlatLayout {
     }
 }
 
-impl VTable for CudaFlatVTable {
+impl VTable for CudaFlat {
     type Layout = CudaFlatLayout;
     type Encoding = CudaFlatLayoutEncoding;
     type Metadata = ProstMetadata<CudaFlatLayoutMetadata>;
@@ -195,7 +194,7 @@ impl VTable for CudaFlatVTable {
         metadata: &<Self::Metadata as DeserializeMetadata>::Output,
         segment_ids: Vec<SegmentId>,
         _children: &dyn LayoutChildren,
-        ctx: &ArrayContext,
+        ctx: &ReadContext,
     ) -> VortexResult<Self::Layout> {
         if segment_ids.len() != 1 {
             vortex_bail!("CudaFlatLayout must have exactly one segment ID");
@@ -247,11 +246,11 @@ impl CudaFlatReader {
                 let session = self.session.clone();
                 let dtype = self.layout.dtype.clone();
                 let array_tree = self.layout.array_tree.clone();
-                let host_buffers = self.layout.host_buffers.clone();
+                let host_buffers = Arc::clone(&self.layout.host_buffers);
 
                 async move {
                     let segment = segment_fut.await?;
-                    let parts = ArrayParts::from_flatbuffer_and_segment_with_overrides(
+                    let parts = SerializedArray::from_flatbuffer_and_segment_with_overrides(
                         array_tree,
                         segment,
                         &host_buffers,
@@ -309,7 +308,7 @@ impl LayoutReader for CudaFlatReader {
             .vortex_expect("Row range begin must fit within CudaFlatLayout size")
             ..usize::try_from(row_range.end)
                 .vortex_expect("Row range end must fit within CudaFlatLayout size");
-        let name = self.name.clone();
+        let name = Arc::clone(&self.name);
         let array = self.array_future();
         let expr = expr.clone();
         let session = self.session.clone();
@@ -357,7 +356,7 @@ impl LayoutReader for CudaFlatReader {
             .vortex_expect("Row range begin must fit within CudaFlatLayout size")
             ..usize::try_from(row_range.end)
                 .vortex_expect("Row range end must fit within CudaFlatLayout size");
-        let name = self.name.clone();
+        let name = Arc::clone(&self.name);
         let array = self.array_future();
         let expr = expr.clone();
 
@@ -392,7 +391,7 @@ pub struct CudaFlatLayoutStrategy {
     /// Maximum length of variable length statistics.
     pub max_variable_length_statistics_size: usize,
     /// Optional set of allowed array encodings for normalization.
-    pub allowed_encodings: Option<ArrayRegistry>,
+    pub allowed_encodings: Option<HashSet<ArrayId>>,
 }
 
 impl Default for CudaFlatLayoutStrategy {
@@ -416,7 +415,7 @@ impl CudaFlatLayoutStrategy {
         self
     }
 
-    pub fn with_allow_encodings(mut self, allow_encodings: ArrayRegistry) -> Self {
+    pub fn with_allow_encodings(mut self, allow_encodings: HashSet<ArrayId>) -> Self {
         self.allowed_encodings = Some(allow_encodings);
         self
     }
@@ -446,7 +445,7 @@ impl LayoutStrategy for CudaFlatLayoutStrategy {
         segment_sink: SegmentSinkRef,
         mut stream: SendableSequentialStream,
         _eof: SequencePointer,
-        _handle: vortex::io::runtime::Handle,
+        session: &VortexSession,
     ) -> VortexResult<LayoutRef> {
         let ctx = ctx.clone();
         let options = self.clone();
@@ -506,10 +505,11 @@ impl LayoutStrategy for CudaFlatLayoutStrategy {
         };
 
         // Scan for constant array buffers before serialization (while data is still on host).
-        let host_buffers = extract_constant_buffers(&*chunk);
+        let host_buffers = extract_constant_buffers(&chunk);
 
         let buffers = chunk.serialize(
             &ctx,
+            session,
             &SerializeOptions {
                 offset: 0,
                 include_padding: options.include_padding,
@@ -535,7 +535,7 @@ impl LayoutStrategy for CudaFlatLayoutStrategy {
             row_count,
             dtype: stream.dtype().clone(),
             segment_id,
-            ctx: ctx.clone(),
+            ctx: ReadContext::new(ctx.to_ids()),
             array_tree,
             host_buffers: Arc::new(host_buffer_map),
         }
@@ -546,12 +546,12 @@ impl LayoutStrategy for CudaFlatLayoutStrategy {
 /// Walk the array tree depth-first and extract buffer data for all `ConstantArray` nodes.
 ///
 /// The buffer ordering matches `Array::serialize()` because both use depth-first traversal.
-fn extract_constant_buffers(chunk: &dyn Array) -> Vec<InlinedBuffer> {
+fn extract_constant_buffers(chunk: &ArrayRef) -> Vec<InlinedBuffer> {
     let mut result = Vec::new();
     let mut buffer_idx = 0u32;
     for array in chunk.depth_first_traversal() {
         let n = array.nbuffers();
-        if array.encoding_id() == ConstantVTable::ID {
+        if array.encoding_id() == Constant::ID {
             for buf in array.buffers() {
                 result.push(InlinedBuffer {
                     buffer_index: buffer_idx,

@@ -114,7 +114,6 @@ impl Hash for StructScalar<'_> {
 
 impl<'a> StructScalar<'a> {
     /// Creates a new [`StructScalar`] from a [`DType`] and optional [`ScalarValue`].
-    #[inline]
     pub(crate) fn try_new(dtype: &'a DType, value: Option<&'a ScalarValue>) -> VortexResult<Self> {
         if !matches!(dtype, DType::Struct(..)) {
             vortex_bail!("Expected struct scalar, found {}", dtype)
@@ -279,12 +278,13 @@ impl<'a> StructScalar<'a> {
 }
 
 impl Scalar {
-    /// Creates a new struct scalar with the given fields.
-    pub fn struct_(dtype: DType, children: Vec<Scalar>) -> Self {
+    /// Creates a new struct scalar with the given fields, checking dtypes at runtime.
+    pub fn struct_(dtype: DType, children: impl IntoIterator<Item = Scalar>) -> Self {
         let DType::Struct(struct_fields, _) = &dtype else {
             vortex_panic!("Expected struct dtype, found {}", dtype);
         };
 
+        let children: Vec<Scalar> = children.into_iter().collect();
         let field_dtypes = struct_fields.fields();
         if children.len() != field_dtypes.len() {
             vortex_panic!(
@@ -305,11 +305,25 @@ impl Scalar {
             }
         }
 
-        let mut value_children = Vec::with_capacity(children.len());
-        value_children.extend(children.into_iter().map(|x| x.into_value()));
-
+        let value_children: Vec<_> = children.into_iter().map(|x| x.into_value()).collect();
         Self::try_new(dtype, Some(ScalarValue::List(value_children)))
             .vortex_expect("unable to construct a struct `Scalar`")
+    }
+
+    /// Creates a new struct scalar from an iterator of field scalars, skipping dtype checks.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure:
+    /// - `dtype` is `DType::Struct`
+    /// - The iterator yields exactly as many scalars as `dtype` has fields
+    /// - Each scalar's dtype matches the corresponding field dtype in `dtype`
+    pub unsafe fn struct_unchecked(
+        dtype: DType,
+        children: impl IntoIterator<Item = Scalar>,
+    ) -> Self {
+        let value_children: Vec<_> = children.into_iter().map(|s| s.into_value()).collect();
+        unsafe { Self::new_unchecked(dtype, Some(ScalarValue::List(value_children))) }
     }
 }
 

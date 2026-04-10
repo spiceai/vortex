@@ -14,6 +14,138 @@ pub use vortex_buffer::UnalignedBitChunk
 
 pub use vortex_buffer::UnalignedBitChunkIterator
 
+pub mod vortex_buffer::trusted_len
+
+pub struct vortex_buffer::trusted_len::TrustedLenAdapter<I>
+
+impl<I: core::iter::traits::iterator::Iterator> core::iter::traits::iterator::Iterator for vortex_buffer::trusted_len::TrustedLenAdapter<I>
+
+pub type vortex_buffer::trusted_len::TrustedLenAdapter<I>::Item = <I as core::iter::traits::iterator::Iterator>::Item
+
+pub fn vortex_buffer::trusted_len::TrustedLenAdapter<I>::next(&mut self) -> core::option::Option<Self::Item>
+
+pub fn vortex_buffer::trusted_len::TrustedLenAdapter<I>::size_hint(&self) -> (usize, core::option::Option<usize>)
+
+impl<I: core::iter::traits::iterator::Iterator> vortex_buffer::trusted_len::TrustedLen for vortex_buffer::trusted_len::TrustedLenAdapter<I>
+
+pub unsafe trait vortex_buffer::trusted_len::TrustedLen: core::iter::traits::iterator::Iterator
+
+impl vortex_buffer::trusted_len::TrustedLen for core::iter::adapters::step_by::StepBy<core::ops::range::Range<i16>>
+
+impl vortex_buffer::trusted_len::TrustedLen for core::iter::adapters::step_by::StepBy<core::ops::range::Range<i32>>
+
+impl vortex_buffer::trusted_len::TrustedLen for core::iter::adapters::step_by::StepBy<core::ops::range::Range<i64>>
+
+impl vortex_buffer::trusted_len::TrustedLen for core::iter::adapters::step_by::StepBy<core::ops::range::Range<i8>>
+
+impl vortex_buffer::trusted_len::TrustedLen for core::iter::adapters::step_by::StepBy<core::ops::range::Range<u16>>
+
+impl vortex_buffer::trusted_len::TrustedLen for core::iter::adapters::step_by::StepBy<core::ops::range::Range<u32>>
+
+impl vortex_buffer::trusted_len::TrustedLen for core::iter::adapters::step_by::StepBy<core::ops::range::Range<u64>>
+
+impl vortex_buffer::trusted_len::TrustedLen for core::iter::adapters::step_by::StepBy<core::ops::range::Range<u8>>
+
+impl vortex_buffer::trusted_len::TrustedLen for core::iter::adapters::step_by::StepBy<core::ops::range::Range<usize>>
+
+impl vortex_buffer::trusted_len::TrustedLen for core::iter::adapters::step_by::StepBy<core::ops::range::RangeInclusive<i16>>
+
+impl vortex_buffer::trusted_len::TrustedLen for core::iter::adapters::step_by::StepBy<core::ops::range::RangeInclusive<i32>>
+
+impl vortex_buffer::trusted_len::TrustedLen for core::iter::adapters::step_by::StepBy<core::ops::range::RangeInclusive<i64>>
+
+impl vortex_buffer::trusted_len::TrustedLen for core::iter::adapters::step_by::StepBy<core::ops::range::RangeInclusive<i8>>
+
+impl vortex_buffer::trusted_len::TrustedLen for core::iter::adapters::step_by::StepBy<core::ops::range::RangeInclusive<u16>>
+
+impl vortex_buffer::trusted_len::TrustedLen for core::iter::adapters::step_by::StepBy<core::ops::range::RangeInclusive<u32>>
+
+impl vortex_buffer::trusted_len::TrustedLen for core::iter::adapters::step_by::StepBy<core::ops::range::RangeInclusive<u64>>
+
+impl vortex_buffer::trusted_len::TrustedLen for core::iter::adapters::step_by::StepBy<core::ops::range::RangeInclusive<u8>>
+
+impl vortex_buffer::trusted_len::TrustedLen for core::iter::adapters::step_by::StepBy<core::ops::range::RangeInclusive<usize>>
+
+impl vortex_buffer::trusted_len::TrustedLen for core::ops::range::Range<i16>
+
+impl vortex_buffer::trusted_len::TrustedLen for core::ops::range::Range<i32>
+
+impl vortex_buffer::trusted_len::TrustedLen for core::ops::range::Range<i64>
+
+impl vortex_buffer::trusted_len::TrustedLen for core::ops::range::Range<i8>
+
+impl vortex_buffer::trusted_len::TrustedLen for core::ops::range::Range<u16>
+
+impl vortex_buffer::trusted_len::TrustedLen for core::ops::range::Range<u32>
+
+impl vortex_buffer::trusted_len::TrustedLen for core::ops::range::Range<u64>
+
+impl vortex_buffer::trusted_len::TrustedLen for core::ops::range::Range<u8>
+
+impl vortex_buffer::trusted_len::TrustedLen for core::ops::range::Range<usize>
+
+impl vortex_buffer::trusted_len::TrustedLen for core::ops::range::RangeInclusive<i16>
+
+impl vortex_buffer::trusted_len::TrustedLen for core::ops::range::RangeInclusive<i32>
+
+impl vortex_buffer::trusted_len::TrustedLen for core::ops::range::RangeInclusive<i64>
+
+impl vortex_buffer::trusted_len::TrustedLen for core::ops::range::RangeInclusive<i8>
+
+impl vortex_buffer::trusted_len::TrustedLen for core::ops::range::RangeInclusive<u16>
+
+impl vortex_buffer::trusted_len::TrustedLen for core::ops::range::RangeInclusive<u32>
+
+impl vortex_buffer::trusted_len::TrustedLen for core::ops::range::RangeInclusive<u64>
+
+impl vortex_buffer::trusted_len::TrustedLen for core::ops::range::RangeInclusive<u8>
+
+impl vortex_buffer::trusted_len::TrustedLen for core::ops::range::RangeInclusive<usize>
+
+impl<'a, I, T: 'a, E: 'a> vortex_buffer::trusted_len::TrustedLen for itertools::process_results_impl::ProcessResults<'a, I, E> where I: vortex_buffer::trusted_len::TrustedLen<Item = core::result::Result<T, E>>
+
+impl<'a, I, T> vortex_buffer::trusted_len::TrustedLen for core::iter::adapters::cloned::Cloned<I> where I: vortex_buffer::trusted_len::TrustedLen<Item = &'a T>, T: core::clone::Clone + 'a
+
+impl<'a, I, T> vortex_buffer::trusted_len::TrustedLen for core::iter::adapters::copied::Copied<I> where I: vortex_buffer::trusted_len::TrustedLen<Item = &'a T>, T: core::marker::Copy + 'a
+
+impl<'a> vortex_buffer::trusted_len::TrustedLen for arrow_buffer::util::bit_chunk_iterator::BitChunkIterator<'a>
+
+impl<'a> vortex_buffer::trusted_len::TrustedLen for arrow_buffer::util::bit_chunk_iterator::UnalignedBitChunkIterator<'a>
+
+impl<'a> vortex_buffer::trusted_len::TrustedLen for arrow_buffer::util::bit_iterator::BitIterator<'a>
+
+impl<B, I, F> vortex_buffer::trusted_len::TrustedLen for core::iter::adapters::map::Map<I, F> where I: vortex_buffer::trusted_len::TrustedLen, F: core::ops::function::FnMut(<I as core::iter::traits::iterator::Iterator>::Item) -> B
+
+impl<I, T> vortex_buffer::trusted_len::TrustedLen for core::iter::adapters::enumerate::Enumerate<I> where I: vortex_buffer::trusted_len::TrustedLen<Item = T>
+
+impl<I: core::iter::traits::iterator::Iterator> vortex_buffer::trusted_len::TrustedLen for vortex_buffer::trusted_len::TrustedLenAdapter<I>
+
+impl<I> vortex_buffer::trusted_len::TrustedLen for core::iter::adapters::skip::Skip<I> where I: vortex_buffer::trusted_len::TrustedLen
+
+impl<T, U> vortex_buffer::trusted_len::TrustedLen for core::iter::adapters::zip::Zip<T, U> where T: vortex_buffer::trusted_len::TrustedLen, U: vortex_buffer::trusted_len::TrustedLen
+
+impl<T, const N: usize> vortex_buffer::trusted_len::TrustedLen for core::array::iter::IntoIter<T, N>
+
+impl<T: core::clone::Clone> vortex_buffer::trusted_len::TrustedLen for core::iter::sources::repeat_n::RepeatN<T>
+
+impl<T: core::marker::Copy> vortex_buffer::trusted_len::TrustedLen for vortex_buffer::BufferIterator<T>
+
+impl<T> vortex_buffer::trusted_len::TrustedLen for alloc::vec::into_iter::IntoIter<T>
+
+impl<T> vortex_buffer::trusted_len::TrustedLen for core::slice::iter::Iter<'_, T>
+
+impl<T> vortex_buffer::trusted_len::TrustedLen for core::slice::iter::IterMut<'_, T>
+
+impl<T> vortex_buffer::trusted_len::TrustedLen for vortex_buffer::Iter<'_, T>
+
+pub trait vortex_buffer::trusted_len::TrustedLenExt: core::iter::traits::iterator::Iterator + core::marker::Sized
+
+pub unsafe fn vortex_buffer::trusted_len::TrustedLenExt::trusted_len(self) -> vortex_buffer::trusted_len::TrustedLenAdapter<Self>
+
+impl<I: core::iter::traits::iterator::Iterator> vortex_buffer::trusted_len::TrustedLenExt for I
+
+pub unsafe fn I::trusted_len(self) -> vortex_buffer::trusted_len::TrustedLenAdapter<Self>
+
 pub macro vortex_buffer::bitbuffer!
 
 pub macro vortex_buffer::bitbuffer_mut!
@@ -170,13 +302,7 @@ impl vortex_buffer::BitBuffer
 
 pub fn vortex_buffer::BitBuffer::into_inner(self) -> (usize, usize, vortex_buffer::ByteBuffer)
 
-pub fn vortex_buffer::BitBuffer::into_mut(self) -> vortex_buffer::BitBufferMut
-
 pub fn vortex_buffer::BitBuffer::try_into_mut(self) -> core::result::Result<vortex_buffer::BitBufferMut, Self>
-
-impl vortex_buffer::BitBuffer
-
-pub fn vortex_buffer::BitBuffer::iter_bit_views<const NB: usize>(&self) -> impl core::iter::traits::iterator::Iterator<Item = vortex_buffer::BitView<'_, NB>> + '_
 
 impl core::clone::Clone for vortex_buffer::BitBuffer
 
@@ -205,6 +331,10 @@ impl core::convert::From<vortex_buffer::BitBuffer> for arrow_buffer::buffer::boo
 pub fn arrow_buffer::buffer::boolean::BooleanBuffer::from(value: vortex_buffer::BitBuffer) -> Self
 
 impl core::fmt::Debug for vortex_buffer::BitBuffer
+
+pub fn vortex_buffer::BitBuffer::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+
+impl core::fmt::Display for vortex_buffer::BitBuffer
 
 pub fn vortex_buffer::BitBuffer::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 
@@ -320,6 +450,10 @@ pub fn vortex_buffer::BitBufferMut::empty() -> Self
 
 pub fn vortex_buffer::BitBufferMut::false_count(&self) -> usize
 
+pub fn vortex_buffer::BitBufferMut::fill_range(&mut self, start: usize, end: usize, value: bool)
+
+pub unsafe fn vortex_buffer::BitBufferMut::fill_range_unchecked(&mut self, start: usize, end: usize, value: bool)
+
 pub fn vortex_buffer::BitBufferMut::freeze(self) -> vortex_buffer::BitBuffer
 
 pub fn vortex_buffer::BitBufferMut::from_buffer(buffer: vortex_buffer::ByteBufferMut, offset: usize, len: usize) -> Self
@@ -372,10 +506,6 @@ pub unsafe fn vortex_buffer::BitBufferMut::value_unchecked(&self, index: usize) 
 
 pub fn vortex_buffer::BitBufferMut::with_capacity(capacity: usize) -> Self
 
-impl vortex_buffer::BitBufferMut
-
-pub fn vortex_buffer::BitBufferMut::iter_bit_views<const NB: usize>(&self) -> impl core::iter::traits::iterator::Iterator<Item = vortex_buffer::BitView<'_, NB>> + '_
-
 impl core::clone::Clone for vortex_buffer::BitBufferMut
 
 pub fn vortex_buffer::BitBufferMut::clone(&self) -> vortex_buffer::BitBufferMut
@@ -411,52 +541,6 @@ impl core::ops::bit::Not for vortex_buffer::BitBufferMut
 pub type vortex_buffer::BitBufferMut::Output = vortex_buffer::BitBufferMut
 
 pub fn vortex_buffer::BitBufferMut::not(self) -> Self::Output
-
-pub struct vortex_buffer::BitSlice
-
-pub vortex_buffer::BitSlice::len: usize
-
-pub vortex_buffer::BitSlice::start: usize
-
-pub struct vortex_buffer::BitView<'a, const NB: usize>
-
-impl<'a, const NB: usize> vortex_buffer::BitView<'a, NB>
-
-pub const vortex_buffer::BitView<'a, NB>::N: usize
-
-pub const vortex_buffer::BitView<'a, NB>::N_WORDS: usize
-
-pub fn vortex_buffer::BitView<'a, NB>::as_raw(&self) -> &[u8; NB]
-
-pub fn vortex_buffer::BitView<'a, NB>::from_slice(bits: &'a [u8]) -> Self
-
-pub fn vortex_buffer::BitView<'a, NB>::iter_ones<F>(&self, f: F) where F: core::ops::function::FnMut(usize)
-
-pub fn vortex_buffer::BitView<'a, NB>::iter_slices<F>(&self, f: F) where F: core::ops::function::FnMut(vortex_buffer::BitSlice)
-
-pub fn vortex_buffer::BitView<'a, NB>::iter_words(&self) -> impl core::iter::traits::iterator::Iterator<Item = usize> + '_
-
-pub fn vortex_buffer::BitView<'a, NB>::iter_zeros<F>(&self, f: F) where F: core::ops::function::FnMut(usize)
-
-pub fn vortex_buffer::BitView<'a, NB>::new(bits: &'a [u8; NB]) -> Self
-
-pub fn vortex_buffer::BitView<'a, NB>::new_owned(bits: [u8; NB]) -> Self
-
-pub fn vortex_buffer::BitView<'a, NB>::true_count(&self) -> usize
-
-pub fn vortex_buffer::BitView<'a, NB>::try_iter_ones<F>(&self, f: F) -> vortex_error::VortexResult<()> where F: core::ops::function::FnMut(usize) -> vortex_error::VortexResult<()>
-
-pub fn vortex_buffer::BitView<'a, NB>::with_prefix(n_true: usize) -> Self
-
-impl<const NB: usize> vortex_buffer::BitView<'static, NB>
-
-pub const fn vortex_buffer::BitView<'static, NB>::all_false() -> Self
-
-pub const fn vortex_buffer::BitView<'static, NB>::all_true() -> Self
-
-impl<const NB: usize> core::fmt::Debug for vortex_buffer::BitView<'_, NB>
-
-pub fn vortex_buffer::BitView<'_, NB>::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 
 pub struct vortex_buffer::Buffer<T>
 
@@ -521,6 +605,8 @@ pub fn vortex_buffer::Buffer<T>::is_empty(&self) -> bool
 pub fn vortex_buffer::Buffer<T>::iter(&self) -> vortex_buffer::Iter<'_, T>
 
 pub fn vortex_buffer::Buffer<T>::len(&self) -> usize
+
+pub fn vortex_buffer::Buffer<T>::map_each_in_place<R, F>(self, f: F) -> vortex_buffer::BufferMut<R> where T: core::marker::Copy, F: core::ops::function::FnMut(T) -> R
 
 pub fn vortex_buffer::Buffer<T>::slice(&self, range: impl core::ops::range::RangeBounds<usize>) -> Self
 
@@ -626,7 +712,9 @@ pub type vortex_buffer::Buffer<T>::Target = [T]
 
 pub fn vortex_buffer::Buffer<T>::deref(&self) -> &Self::Target
 
-pub struct vortex_buffer::BufferIterator<T>
+pub struct vortex_buffer::BufferIterator<T: core::marker::Copy>
+
+impl<T: core::marker::Copy> core::iter::traits::exact_size::ExactSizeIterator for vortex_buffer::BufferIterator<T>
 
 impl<T: core::marker::Copy> core::iter::traits::iterator::Iterator for vortex_buffer::BufferIterator<T>
 
@@ -635,6 +723,8 @@ pub type vortex_buffer::BufferIterator<T>::Item = T
 pub fn vortex_buffer::BufferIterator<T>::next(&mut self) -> core::option::Option<Self::Item>
 
 pub fn vortex_buffer::BufferIterator<T>::size_hint(&self) -> (usize, core::option::Option<usize>)
+
+impl<T: core::marker::Copy> vortex_buffer::trusted_len::TrustedLen for vortex_buffer::BufferIterator<T>
 
 pub struct vortex_buffer::BufferMut<T>
 
@@ -920,6 +1010,8 @@ impl<T> core::iter::traits::exact_size::ExactSizeIterator for vortex_buffer::Ite
 
 pub fn vortex_buffer::Iter<'_, T>::len(&self) -> usize
 
+impl<T> vortex_buffer::trusted_len::TrustedLen for vortex_buffer::Iter<'_, T>
+
 pub const vortex_buffer::ALIGNMENT_TO_HOST_COPY: vortex_buffer::Alignment
 
 pub trait vortex_buffer::AlignedBuf: bytes::buf::buf_impl::Buf
@@ -929,6 +1021,10 @@ pub fn vortex_buffer::AlignedBuf::copy_to_aligned(&mut self, len: usize, alignme
 pub fn vortex_buffer::AlignedBuf::copy_to_const_aligned<const A: usize>(&mut self, len: usize) -> vortex_buffer::ConstByteBuffer<A>
 
 impl<B: bytes::buf::buf_impl::Buf> vortex_buffer::AlignedBuf for B
+
+pub fn B::copy_to_aligned(&mut self, len: usize, alignment: vortex_buffer::Alignment) -> vortex_buffer::ByteBuffer
+
+pub fn B::copy_to_const_aligned<const A: usize>(&mut self, len: usize) -> vortex_buffer::ConstByteBuffer<A>
 
 pub fn vortex_buffer::get_bit(buf: &[u8], index: usize) -> bool
 

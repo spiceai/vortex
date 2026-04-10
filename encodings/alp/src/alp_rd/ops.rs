@@ -1,17 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use vortex_array::Array;
+use vortex_array::ArrayView;
+use vortex_array::ExecutionCtx;
+use vortex_array::dtype::PType;
 use vortex_array::scalar::Scalar;
 use vortex_array::vtable::OperationsVTable;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 
-use crate::ALPRDArray;
-use crate::ALPRDVTable;
+use crate::ALPRD;
+use crate::ALPRDArrayExt;
 
-impl OperationsVTable<ALPRDVTable> for ALPRDVTable {
-    fn scalar_at(array: &ALPRDArray, index: usize) -> VortexResult<Scalar> {
+impl OperationsVTable<ALPRD> for ALPRD {
+    fn scalar_at(
+        array: ArrayView<'_, ALPRD>,
+        index: usize,
+        _ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Scalar> {
         // The left value can either be a direct value, or an exception.
         // The exceptions array represents exception positions with non-null values.
         let maybe_patched_value = match array.left_parts_patches() {
@@ -35,7 +41,7 @@ impl OperationsVTable<ALPRDVTable> for ALPRDVTable {
         };
 
         // combine left and right values
-        Ok(if array.is_f32() {
+        Ok(if array.dtype().as_ptype() == PType::F32 {
             let right: u32 = array
                 .right_parts()
                 .scalar_at(index)?
@@ -64,6 +70,7 @@ mod test {
     use vortex_array::assert_arrays_eq;
     use vortex_array::scalar::Scalar;
 
+    use crate::ALPRDArrayExt;
     use crate::ALPRDFloat;
     use crate::RDEncoder;
 

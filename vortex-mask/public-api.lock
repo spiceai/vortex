@@ -68,6 +68,8 @@ pub fn vortex_mask::Mask::into_bit_buffer(self) -> vortex_buffer::bit::buf::BitB
 
 pub fn vortex_mask::Mask::is_empty(&self) -> bool
 
+pub fn vortex_mask::Mask::last(&self) -> core::option::Option<usize>
+
 pub fn vortex_mask::Mask::len(&self) -> usize
 
 pub fn vortex_mask::Mask::limit(self, limit: usize) -> Self
@@ -95,6 +97,10 @@ pub fn vortex_mask::Mask::valid_counts_for_indices(&self, indices: &[usize]) -> 
 pub fn vortex_mask::Mask::value(&self, idx: usize) -> bool
 
 pub fn vortex_mask::Mask::values(&self) -> core::option::Option<&vortex_mask::MaskValues>
+
+impl vortex_mask::Mask
+
+pub fn vortex_mask::Mask::bitand_not(self, rhs: &vortex_mask::Mask) -> vortex_mask::Mask
 
 impl vortex_mask::Mask
 

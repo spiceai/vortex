@@ -12,8 +12,8 @@ use vortex::array::Canonical;
 use vortex::array::IntoArray;
 use vortex::array::arrays::ConstantArray;
 use vortex::array::arrays::PrimitiveArray;
-use vortex::array::arrays::PrimitiveArrayParts;
 use vortex::array::arrays::TemporalArray;
+use vortex::array::arrays::primitive::PrimitiveDataParts;
 use vortex::array::buffer::BufferHandle;
 use vortex::array::match_each_signed_integer_ptype;
 use vortex::array::validity::Validity;
@@ -21,14 +21,14 @@ use vortex::dtype::DType;
 use vortex::dtype::NativePType;
 use vortex::dtype::Nullability;
 use vortex::dtype::PType;
-use vortex::encodings::datetime_parts::DateTimePartsVTable;
+use vortex::encodings::datetime_parts::DateTimeParts;
+use vortex::encodings::datetime_parts::DateTimePartsArrayExt;
 use vortex::error::VortexResult;
 use vortex::error::vortex_bail;
 use vortex::error::vortex_err;
 use vortex::extension::datetime::TimeUnit;
 use vortex::extension::datetime::Timestamp;
 use vortex::scalar::Scalar;
-use vortex_cuda_macros::cuda_tests;
 
 use crate::CudaBufferExt;
 use crate::CudaDeviceBuffer;
@@ -52,7 +52,7 @@ impl CudaExecute for DateTimePartsExecutor {
     ) -> VortexResult<Canonical> {
         let output_len = array.len();
         let array = array
-            .try_into::<DateTimePartsVTable>()
+            .try_downcast::<DateTimeParts>()
             .map_err(|_| vortex_err!("Expected DateTimePartsArray"))?;
 
         // Extract the temporal metadata from the dtype
@@ -66,7 +66,7 @@ impl CudaExecute for DateTimePartsExecutor {
 
         let time_unit = options.unit;
         let time_zone = options.tz.clone();
-        let validity = Validity::copy_from_array(array.as_ref())?;
+        let validity = Validity::copy_from_array(&array.clone().into_array())?;
 
         if output_len == 0 {
             return Ok(Canonical::empty(array.dtype()));
@@ -148,18 +148,18 @@ where
 {
     let output_len = days.len();
 
-    let PrimitiveArrayParts {
+    let PrimitiveDataParts {
         buffer: days_buffer,
         ..
-    } = days.into_parts();
-    let PrimitiveArrayParts {
+    } = days.into_data_parts();
+    let PrimitiveDataParts {
         buffer: seconds_buffer,
         ..
-    } = seconds.into_parts();
-    let PrimitiveArrayParts {
+    } = seconds.into_data_parts();
+    let PrimitiveDataParts {
         buffer: subseconds_buffer,
         ..
-    } = subseconds.into_parts();
+    } = subseconds.into_data_parts();
 
     // Move buffers to device if not already there
     let days_device = ctx.ensure_on_device(days_buffer).await?;
@@ -175,13 +175,10 @@ where
     let subseconds_view = subseconds_device.cuda_view::<SubsecondsT>()?;
     let output_view = output_device.as_view::<i64>();
 
-    let kernel_suffixes = [
-        DaysT::PTYPE.to_string(),
-        SecondsT::PTYPE.to_string(),
-        SubsecondsT::PTYPE.to_string(),
-    ];
-    let kernel_suffix_strs: Vec<&str> = kernel_suffixes.iter().map(|s| s.as_str()).collect();
-    let cuda_function = ctx.load_function("date_time_parts", &kernel_suffix_strs)?;
+    let cuda_function = ctx.load_function(
+        "date_time_parts",
+        &[DaysT::PTYPE, SecondsT::PTYPE, SubsecondsT::PTYPE],
+    )?;
 
     let array_len_u64 = output_len as u64;
 
@@ -202,7 +199,7 @@ where
     ))
 }
 
-#[cuda_tests]
+#[cfg(test)]
 mod tests {
     use rstest::rstest;
     use vortex::array::IntoArray;
@@ -212,6 +209,7 @@ mod tests {
     use vortex::array::validity::Validity;
     use vortex::buffer::Buffer;
     use vortex::buffer::buffer;
+    use vortex::encodings::datetime_parts::DateTimeParts;
     use vortex::encodings::datetime_parts::DateTimePartsArray;
     use vortex::error::VortexExpect;
     use vortex::error::VortexResult;
@@ -241,7 +239,7 @@ mod tests {
             None,
         );
 
-        DateTimePartsArray::try_new(
+        DateTimeParts::try_new(
             temporal.dtype().clone(),
             days_arr,
             seconds_arr,
@@ -275,7 +273,7 @@ mod tests {
         vec![123456789i64, 0, 0],
         TimeUnit::Nanoseconds
     )]
-    #[tokio::test]
+    #[crate::test]
     async fn test_cuda_datetimeparts_decompression(
         #[case] days: Vec<i32>,
         #[case] seconds: Vec<i32>,
@@ -289,7 +287,7 @@ mod tests {
         let cpu_result = dtp_array.to_canonical()?;
 
         let gpu_result = DateTimePartsExecutor
-            .execute(dtp_array.to_array(), &mut cuda_ctx)
+            .execute(dtp_array.into_array(), &mut cuda_ctx)
             .await
             .vortex_expect("GPU decompression failed")
             .into_host()
@@ -301,7 +299,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[crate::test]
     async fn test_cuda_datetimeparts_large_array() -> VortexResult<()> {
         let mut cuda_ctx = CudaSession::create_execution_ctx(&VortexSession::empty())
             .vortex_expect("failed to create execution context");
@@ -315,7 +313,7 @@ mod tests {
         let cpu_result = dtp_array.to_canonical()?;
 
         let gpu_result = DateTimePartsExecutor
-            .execute(dtp_array.to_array(), &mut cuda_ctx)
+            .execute(dtp_array.into_array(), &mut cuda_ctx)
             .await
             .vortex_expect("GPU decompression failed")
             .into_host()
@@ -327,7 +325,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[crate::test]
     async fn test_cuda_datetimeparts_with_nulls() -> VortexResult<()> {
         let mut cuda_ctx = CudaSession::create_execution_ctx(&VortexSession::empty())
             .vortex_expect("failed to create execution context");
@@ -352,7 +350,7 @@ mod tests {
             None,
         );
 
-        let dtp_array = DateTimePartsArray::try_new(
+        let dtp_array = DateTimeParts::try_new(
             temporal.dtype().clone(),
             days_arr,
             seconds_arr,
@@ -363,7 +361,7 @@ mod tests {
         let cpu_result = dtp_array.to_canonical()?;
 
         let gpu_result = DateTimePartsExecutor
-            .execute(dtp_array.to_array(), &mut cuda_ctx)
+            .execute(dtp_array.into_array(), &mut cuda_ctx)
             .await
             .vortex_expect("GPU decompression failed")
             .into_host()

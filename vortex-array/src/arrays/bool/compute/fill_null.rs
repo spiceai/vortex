@@ -7,31 +7,32 @@ use vortex_error::vortex_err;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::IntoArray;
-use crate::ToCanonical;
+use crate::array::ArrayView;
+use crate::arrays::Bool;
 use crate::arrays::BoolArray;
-use crate::arrays::BoolVTable;
+use crate::arrays::bool::BoolArrayExt;
 use crate::scalar::Scalar;
 use crate::scalar_fn::fns::fill_null::FillNullKernel;
 use crate::validity::Validity;
-use crate::vtable::ValidityHelper;
 
-impl FillNullKernel for BoolVTable {
+impl FillNullKernel for Bool {
     fn fill_null(
-        array: &BoolArray,
+        array: ArrayView<'_, Bool>,
         fill_value: &Scalar,
-        _ctx: &mut ExecutionCtx,
+        ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
         let fill = fill_value
             .as_bool()
             .value()
             .ok_or_else(|| vortex_err!("Fill value must be non null"))?;
 
-        Ok(Some(match array.validity() {
+        Ok(Some(match array.validity()? {
             Validity::Array(v) => {
+                let v_bool = v.execute::<BoolArray>(ctx)?;
                 let bool_buffer = if fill {
-                    array.to_bit_buffer() | &!v.to_bool().to_bit_buffer()
+                    array.to_bit_buffer() | &!v_bool.to_bit_buffer()
                 } else {
-                    array.to_bit_buffer() & v.to_bool().to_bit_buffer()
+                    array.to_bit_buffer() & v_bool.to_bit_buffer()
                 };
                 BoolArray::new(bool_buffer, fill_value.dtype().nullability().into()).into_array()
             }
@@ -46,7 +47,9 @@ mod tests {
     use vortex_buffer::BitBuffer;
     use vortex_buffer::bitbuffer;
 
+    use crate::IntoArray;
     use crate::arrays::BoolArray;
+    use crate::arrays::bool::BoolArrayExt;
     use crate::builtins::ArrayBuiltins;
     use crate::canonical::ToCanonical;
     use crate::dtype::DType;
@@ -63,7 +66,7 @@ mod tests {
             Validity::from_iter([true, false, true, false]),
         );
         let non_null_array = bool_array
-            .to_array()
+            .into_array()
             .fill_null(Scalar::from(fill_value))
             .unwrap()
             .to_bool();

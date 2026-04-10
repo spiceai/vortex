@@ -1,30 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use vortex_array::arrays::FilterExecuteAdaptor;
-use vortex_array::arrays::TakeExecuteAdaptor;
+use vortex_array::arrays::dict::TakeExecuteAdaptor;
+use vortex_array::arrays::filter::FilterExecuteAdaptor;
 use vortex_array::kernel::ParentKernelSet;
 use vortex_array::scalar_fn::fns::binary::CompareExecuteAdaptor;
+use vortex_array::scalar_fn::fns::like::LikeExecuteAdaptor;
 
-use crate::FSSTVTable;
+use crate::FSST;
 
-pub(super) const PARENT_KERNELS: ParentKernelSet<FSSTVTable> = ParentKernelSet::new(&[
-    ParentKernelSet::lift(&CompareExecuteAdaptor(FSSTVTable)),
-    ParentKernelSet::lift(&FilterExecuteAdaptor(FSSTVTable)),
-    ParentKernelSet::lift(&TakeExecuteAdaptor(FSSTVTable)),
+pub(super) const PARENT_KERNELS: ParentKernelSet<FSST> = ParentKernelSet::new(&[
+    ParentKernelSet::lift(&CompareExecuteAdaptor(FSST)),
+    ParentKernelSet::lift(&FilterExecuteAdaptor(FSST)),
+    ParentKernelSet::lift(&TakeExecuteAdaptor(FSST)),
+    ParentKernelSet::lift(&LikeExecuteAdaptor(FSST)),
 ]);
 
 #[cfg(test)]
 mod tests {
     use std::sync::LazyLock;
 
-    use vortex_array::Array;
     use vortex_array::ArrayRef;
     use vortex_array::Canonical;
     use vortex_array::IntoArray;
     use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::FilterArray;
-    use vortex_array::arrays::builder::VarBinBuilder;
+    use vortex_array::arrays::varbin::builder::VarBinBuilder;
     use vortex_array::assert_arrays_eq;
     use vortex_array::dtype::DType;
     use vortex_array::dtype::Nullability;
@@ -33,7 +34,7 @@ mod tests {
     use vortex_mask::Mask;
     use vortex_session::VortexSession;
 
-    use crate::FSSTVTable;
+    use crate::FSST;
     use crate::fsst_compress;
     use crate::fsst_train_compressor;
 
@@ -55,13 +56,15 @@ mod tests {
         let input = builder.finish(DType::Utf8(Nullability::NonNullable));
 
         let compressor = fsst_train_compressor(&input);
-        fsst_compress(input, &compressor).into_array()
+        let len = input.len();
+        let dtype = input.dtype().clone();
+        fsst_compress(input, len, &dtype, &compressor).into_array()
     }
 
     #[test]
     fn test_fsst_filter_simple() -> VortexResult<()> {
         let fsst_array = build_test_fsst_array();
-        assert!(fsst_array.is::<FSSTVTable>());
+        assert!(fsst_array.is::<FSST>());
         assert_eq!(fsst_array.len(), 10);
 
         // Filter 1/5 elements (every 5th element: indices 0 and 5)
@@ -128,14 +131,15 @@ mod tests {
         let input = builder.finish(DType::Utf8(Nullability::Nullable));
 
         let compressor = fsst_train_compressor(&input);
-        let fsst_array: ArrayRef = fsst_compress(input.clone(), &compressor).into_array();
+        let fsst_array: ArrayRef =
+            fsst_compress(input.clone(), input.len(), input.dtype(), &compressor).into_array();
 
         // Filter: only select the last element (index 22)
         let mut mask = vec![false; 22];
         mask.push(true);
         let mask = Mask::from_iter(mask);
 
-        let filter_array = FilterArray::new(fsst_array.clone(), mask.clone()).into_array();
+        let filter_array = FilterArray::new(fsst_array, mask.clone()).into_array();
         let mut ctx = SESSION.create_execution_ctx();
         let result = filter_array.execute::<Canonical>(&mut ctx)?;
 
@@ -156,11 +160,12 @@ mod tests {
         let input = builder.finish(DType::Utf8(Nullability::Nullable));
 
         let compressor = fsst_train_compressor(&input);
-        let fsst_array: ArrayRef = fsst_compress(input.clone(), &compressor).into_array();
+        let fsst_array: ArrayRef =
+            fsst_compress(input.clone(), input.len(), input.dtype(), &compressor).into_array();
 
         let mask = Mask::from_iter([true, false, true]);
 
-        let filter_array = FilterArray::new(fsst_array.clone(), mask.clone()).into_array();
+        let filter_array = FilterArray::new(fsst_array, mask.clone()).into_array();
         let mut ctx = SESSION.create_execution_ctx();
         let result = filter_array.execute::<Canonical>(&mut ctx)?;
 

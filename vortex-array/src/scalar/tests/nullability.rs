@@ -130,11 +130,11 @@ mod tests {
     fn test_scalar_nbytes_with_nulls() {
         // Test null string
         let null_utf8 = Scalar::null(DType::Utf8(Nullability::Nullable));
-        assert_eq!(null_utf8.nbytes(), 0);
+        assert_eq!(null_utf8.approx_nbytes(), 0);
 
         // Test null binary
         let null_binary = Scalar::null(DType::Binary(Nullability::Nullable));
-        assert_eq!(null_binary.nbytes(), 0);
+        assert_eq!(null_binary.approx_nbytes(), 0);
 
         // Test struct with null fields
         let struct_with_null = Scalar::struct_(
@@ -151,7 +151,7 @@ mod tests {
             ],
         );
         // Primitive null fields still count their byte width
-        assert_eq!(struct_with_null.nbytes(), 4 + 8);
+        assert_eq!(struct_with_null.approx_nbytes(), 4 + 8);
 
         // Test list with null elements
         let list_with_null = Scalar::list(
@@ -164,7 +164,7 @@ mod tests {
             Nullability::NonNullable,
         );
         // Primitive null elements still count their byte width
-        assert_eq!(list_with_null.nbytes(), 3 * 4); // 3 i32 values (including null)
+        assert_eq!(list_with_null.approx_nbytes(), 3 * 4); // 3 i32 values (including null)
     }
 
     #[test]
@@ -589,7 +589,10 @@ mod tests {
             Nullability::Nullable,
         ));
 
-        let middle_dtype = Arc::new(DType::List(innermost_dtype.clone(), Nullability::Nullable));
+        let middle_dtype = Arc::new(DType::List(
+            Arc::clone(&innermost_dtype),
+            Nullability::Nullable,
+        ));
 
         // Create innermost FixedSizeLists with different null patterns.
         let inner1 = Scalar::fixed_size_list(
@@ -618,7 +621,7 @@ mod tests {
 
         // Create middle Lists.
         let middle1 = Scalar::list(
-            innermost_dtype.clone(),
+            Arc::clone(&innermost_dtype),
             vec![inner1, inner2],
             Nullability::Nullable,
         );

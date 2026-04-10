@@ -3,21 +3,18 @@
 
 pub(crate) mod rules;
 mod slice;
-pub(crate) use min_max::varbin_compute_min_max;
 
 mod cast;
 mod compare;
 mod filter;
-mod is_constant;
-mod is_sorted;
 mod mask;
-mod min_max;
 mod take;
 
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
 
+    use crate::IntoArray;
     use crate::arrays::VarBinArray;
     use crate::compute::conformance::consistency::test_array_consistency;
     use crate::dtype::DType;
@@ -63,6 +60,6 @@ mod tests {
         DType::Utf8(Nullability::NonNullable),
     ))]
     fn test_varbin_consistency(#[case] array: VarBinArray) {
-        test_array_consistency(array.as_ref());
+        test_array_consistency(&array.into_array());
     }
 }

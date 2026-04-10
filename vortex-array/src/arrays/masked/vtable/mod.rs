@@ -1,143 +1,170 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
-
-mod array;
 mod canonical;
 mod operations;
 mod validity;
 
-use kernel::PARENT_KERNELS;
+use std::hash::Hasher;
+
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
+use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
 
-use crate::ArrayBufferVisitor;
-use crate::ArrayChildVisitor;
+use crate::AnyCanonical;
+use crate::ArrayEq;
+use crate::ArrayHash;
 use crate::ArrayRef;
 use crate::Canonical;
-use crate::EmptyMetadata;
 use crate::IntoArray;
+use crate::Precision;
+use crate::array::Array;
+use crate::array::ArrayId;
+use crate::array::ArrayView;
+use crate::array::VTable;
+use crate::array::validity_to_child;
 use crate::arrays::ConstantArray;
-use crate::arrays::masked::MaskedArray;
+use crate::arrays::masked::MaskedArrayExt;
+use crate::arrays::masked::MaskedData;
+use crate::arrays::masked::array::CHILD_SLOT;
+use crate::arrays::masked::array::SLOT_NAMES;
+use crate::arrays::masked::array::VALIDITY_SLOT;
 use crate::arrays::masked::compute::rules::PARENT_RULES;
 use crate::arrays::masked::mask_validity_canonical;
 use crate::buffer::BufferHandle;
 use crate::dtype::DType;
 use crate::executor::ExecutionCtx;
+use crate::executor::ExecutionResult;
+use crate::require_child;
+use crate::require_validity;
 use crate::scalar::Scalar;
 use crate::serde::ArrayChildren;
 use crate::validity::Validity;
-use crate::vtable;
-use crate::vtable::ArrayId;
-use crate::vtable::VTable;
-use crate::vtable::ValidityVTableFromValidityHelper;
-use crate::vtable::VisitorVTable;
-use crate::vtable::validity_nchildren;
-use crate::vtable::validity_to_child;
+/// A [`Masked`]-encoded Vortex array.
+pub type MaskedArray = Array<Masked>;
 
-mod kernel;
+#[derive(Clone, Debug)]
+pub struct Masked;
 
-vtable!(Masked);
-
-#[derive(Debug)]
-pub struct MaskedVTable;
-
-impl MaskedVTable {
+impl Masked {
     pub const ID: ArrayId = ArrayId::new_ref("vortex.masked");
 }
 
-impl VisitorVTable<MaskedVTable> for MaskedVTable {
-    fn visit_buffers(_array: &MaskedArray, _visitor: &mut dyn ArrayBufferVisitor) {}
+impl ArrayHash for MaskedData {
+    fn array_hash<H: Hasher>(&self, _state: &mut H, _precision: Precision) {}
+}
 
-    fn visit_children(array: &MaskedArray, visitor: &mut dyn ArrayChildVisitor) {
-        visitor.visit_child("child", &array.child);
-        visitor.visit_validity(&array.validity, array.child.len());
-    }
-
-    fn nchildren(array: &MaskedArray) -> usize {
-        1 + validity_nchildren(&array.validity)
-    }
-
-    fn nth_child(array: &MaskedArray, idx: usize) -> Option<ArrayRef> {
-        match idx {
-            0 => Some(array.child.clone()),
-            1 => validity_to_child(&array.validity, array.child.len()),
-            _ => None,
-        }
+impl ArrayEq for MaskedData {
+    fn array_eq(&self, _other: &Self, _precision: Precision) -> bool {
+        true
     }
 }
 
-impl VTable for MaskedVTable {
-    type Array = MaskedArray;
+impl VTable for Masked {
+    type ArrayData = MaskedData;
 
-    type Metadata = EmptyMetadata;
-
-    type ArrayVTable = Self;
     type OperationsVTable = Self;
-    type ValidityVTable = ValidityVTableFromValidityHelper;
-    type VisitorVTable = Self;
+    type ValidityVTable = Self;
 
-    fn id(_array: &Self::Array) -> ArrayId {
+    fn id(&self) -> ArrayId {
         Self::ID
     }
 
-    fn metadata(_array: &MaskedArray) -> VortexResult<Self::Metadata> {
-        Ok(EmptyMetadata)
+    fn validate(
+        &self,
+        _data: &MaskedData,
+        dtype: &DType,
+        len: usize,
+        slots: &[Option<ArrayRef>],
+    ) -> VortexResult<()> {
+        vortex_ensure!(
+            slots[CHILD_SLOT].is_some(),
+            "MaskedArray child slot must be present"
+        );
+        let child = slots[CHILD_SLOT]
+            .as_ref()
+            .vortex_expect("validated child slot");
+        vortex_ensure!(child.len() == len, "MaskedArray child length mismatch");
+        vortex_ensure!(
+            child.dtype().as_nullable() == *dtype,
+            "MaskedArray dtype does not match child and validity"
+        );
+        Ok(())
     }
 
-    fn serialize(_metadata: Self::Metadata) -> VortexResult<Option<Vec<u8>>> {
+    fn nbuffers(_array: ArrayView<'_, Self>) -> usize {
+        0
+    }
+
+    fn buffer(_array: ArrayView<'_, Self>, _idx: usize) -> BufferHandle {
+        vortex_panic!("MaskedArray has no buffers")
+    }
+
+    fn buffer_name(_array: ArrayView<'_, Self>, _idx: usize) -> Option<String> {
+        None
+    }
+
+    fn serialize(
+        _array: ArrayView<'_, Self>,
+        _session: &VortexSession,
+    ) -> VortexResult<Option<Vec<u8>>> {
         Ok(Some(vec![]))
     }
 
     fn deserialize(
-        _bytes: &[u8],
-        _dtype: &DType,
-        _len: usize,
-        _buffers: &[BufferHandle],
-        _session: &VortexSession,
-    ) -> VortexResult<Self::Metadata> {
-        Ok(EmptyMetadata)
-    }
-
-    fn build(
+        &self,
         dtype: &DType,
         len: usize,
-        _metadata: &Self::Metadata,
+        metadata: &[u8],
+
         buffers: &[BufferHandle],
         children: &dyn ArrayChildren,
-    ) -> VortexResult<MaskedArray> {
+        _session: &VortexSession,
+    ) -> VortexResult<crate::array::ArrayParts<Self>> {
+        if !metadata.is_empty() {
+            vortex_bail!(
+                "MaskedArray expects empty metadata, got {} bytes",
+                metadata.len()
+            );
+        }
         if !buffers.is_empty() {
             vortex_bail!("Expected 0 buffer, got {}", buffers.len());
         }
 
+        vortex_ensure!(
+            children.len() == 1 || children.len() == 2,
+            "`MaskedArray::build` expects 1 or 2 children, got {}",
+            children.len()
+        );
+
         let child = children.get(0, &dtype.as_nonnullable(), len)?;
 
-        let validity = if children.len() == 1 {
-            Validity::from(dtype.nullability())
-        } else if children.len() == 2 {
+        let validity = if children.len() == 2 {
             let validity = children.get(1, &Validity::DTYPE, len)?;
             Validity::Array(validity)
         } else {
-            vortex_bail!(
-                "`MaskedArray::build` expects 1 or 2 children, got {}",
-                children.len()
-            );
+            Validity::from(dtype.nullability())
         };
 
-        MaskedArray::try_new(child, validity)
+        let validity_slot = validity_to_child(&validity, len);
+        let data = MaskedData::try_new(len, child.all_valid()?, validity)?;
+        Ok(
+            crate::array::ArrayParts::new(self.clone(), dtype.clone(), len, data)
+                .with_slots(vec![Some(child), validity_slot]),
+        )
     }
 
-    fn execute(array: &Self::Array, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
-        let validity_mask = array.validity_mask()?;
+    fn execute(array: Array<Self>, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
+        let validity_mask = array.masked_validity_mask();
 
         // Fast path: all masked means result is all nulls.
         if validity_mask.all_false() {
-            return Ok(
+            return Ok(ExecutionResult::done(
                 ConstantArray::new(Scalar::null(array.dtype().as_nullable()), array.len())
                     .into_array(),
-            );
+            ));
         }
 
         // NB: We intentionally do NOT have a fast path for `validity_mask.all_true()`.
@@ -146,47 +173,24 @@ impl VTable for MaskedVTable {
         // While we could manually convert the dtype, `mask_validity_canonical` is already O(1) for
         // `AllTrue` masks (no data copying), so there's no benefit.
 
-        let child = array.child().clone().execute::<Canonical>(ctx)?;
-        Ok(mask_validity_canonical(child, &validity_mask, ctx)?.into_array())
+        let array = require_child!(array, array.child(), CHILD_SLOT => AnyCanonical);
+        require_validity!(array, VALIDITY_SLOT);
+
+        let child = Canonical::from(array.child().as_::<AnyCanonical>());
+        Ok(ExecutionResult::done(
+            mask_validity_canonical(child, &validity_mask, ctx)?.into_array(),
+        ))
     }
 
     fn reduce_parent(
-        array: &Self::Array,
+        array: ArrayView<'_, Self>,
         parent: &ArrayRef,
         child_idx: usize,
     ) -> VortexResult<Option<ArrayRef>> {
         PARENT_RULES.evaluate(array, parent, child_idx)
     }
-
-    fn execute_parent(
-        array: &Self::Array,
-        parent: &ArrayRef,
-        child_idx: usize,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<Option<ArrayRef>> {
-        PARENT_KERNELS.execute(array, parent, child_idx, ctx)
-    }
-
-    fn with_children(array: &mut Self::Array, children: Vec<ArrayRef>) -> VortexResult<()> {
-        vortex_ensure!(
-            children.len() == 1 || children.len() == 2,
-            "MaskedArray expects 1 or 2 children, got {}",
-            children.len()
-        );
-
-        let mut iter = children.into_iter();
-        let child = iter
-            .next()
-            .vortex_expect("children length already validated");
-        let validity = if let Some(validity_array) = iter.next() {
-            Validity::Array(validity_array)
-        } else {
-            Validity::from(array.dtype.nullability())
-        };
-
-        let new_array = MaskedArray::try_new(child, validity)?;
-        *array = new_array;
-        Ok(())
+    fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {
+        SLOT_NAMES[idx].to_string()
     }
 }
 
@@ -195,18 +199,19 @@ mod tests {
     use rstest::rstest;
     use vortex_buffer::ByteBufferMut;
     use vortex_error::VortexError;
+    use vortex_session::registry::ReadContext;
 
     use crate::ArrayContext;
     use crate::Canonical;
     use crate::IntoArray;
     use crate::LEGACY_SESSION;
     use crate::VortexSessionExecute;
+    use crate::arrays::Masked;
     use crate::arrays::MaskedArray;
-    use crate::arrays::MaskedVTable;
     use crate::arrays::PrimitiveArray;
     use crate::dtype::Nullability;
-    use crate::serde::ArrayParts;
     use crate::serde::SerializeOptions;
+    use crate::serde::SerializedArray;
     use crate::validity::Validity;
 
     #[rstest]
@@ -234,8 +239,9 @@ mod tests {
 
         let ctx = ArrayContext::empty();
         let serialized = array
-            .to_array()
-            .serialize(&ctx, &SerializeOptions::default())
+            .clone()
+            .into_array()
+            .serialize(&ctx, &LEGACY_SESSION, &SerializeOptions::default())
             .unwrap();
 
         // Concat into a single buffer.
@@ -245,10 +251,17 @@ mod tests {
         }
         let concat = concat.freeze();
 
-        let parts = ArrayParts::try_from(concat).unwrap();
-        let decoded = parts.decode(&dtype, len, &ctx, &LEGACY_SESSION).unwrap();
+        let parts = SerializedArray::try_from(concat).unwrap();
+        let decoded = parts
+            .decode(
+                &dtype,
+                len,
+                &ReadContext::new(ctx.to_ids()),
+                &LEGACY_SESSION,
+            )
+            .unwrap();
 
-        assert!(decoded.is::<MaskedVTable>());
+        assert!(decoded.is::<Masked>());
         assert_eq!(
             array.as_ref().display_values().to_string(),
             decoded.display_values().to_string()
@@ -276,7 +289,7 @@ mod tests {
         let result: Canonical = array.into_array().execute(&mut ctx)?;
 
         assert_eq!(
-            result.as_ref().dtype().nullability(),
+            result.dtype().nullability(),
             Nullability::Nullable,
             "MaskedArray execute should produce Nullable dtype"
         );

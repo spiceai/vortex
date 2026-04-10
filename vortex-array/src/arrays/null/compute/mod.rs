@@ -4,7 +4,6 @@
 mod cast;
 mod filter;
 mod mask;
-mod min_max;
 pub(crate) mod rules;
 mod slice;
 mod take;
@@ -30,7 +29,10 @@ mod test {
         let sliced = nulls.slice(0..4).unwrap().to_null();
 
         assert_eq!(sliced.len(), 4);
-        assert!(matches!(sliced.validity_mask().unwrap(), Mask::AllFalse(4)));
+        assert!(matches!(
+            sliced.as_array().validity_mask().unwrap(),
+            Mask::AllFalse(4)
+        ));
     }
 
     #[test]
@@ -42,7 +44,10 @@ mod test {
             .to_null();
 
         assert_eq!(taken.len(), 5);
-        assert!(matches!(taken.validity_mask().unwrap(), Mask::AllFalse(5)));
+        assert!(matches!(
+            taken.as_array().validity_mask().unwrap(),
+            Mask::AllFalse(5)
+        ));
     }
 
     #[test]
@@ -56,21 +61,21 @@ mod test {
 
     #[test]
     fn test_filter_null_array() {
-        test_filter_conformance(NullArray::new(5).as_ref());
-        test_filter_conformance(NullArray::new(1).as_ref());
-        test_filter_conformance(NullArray::new(10).as_ref());
+        test_filter_conformance(&NullArray::new(5).into_array());
+        test_filter_conformance(&NullArray::new(1).into_array());
+        test_filter_conformance(&NullArray::new(10).into_array());
     }
 
     #[test]
     fn test_mask_null_array() {
-        test_mask_conformance(NullArray::new(5).as_ref());
+        test_mask_conformance(&NullArray::new(5).into_array());
     }
 
     #[test]
     fn test_take_null_array_conformance() {
-        test_take_conformance(NullArray::new(5).as_ref());
-        test_take_conformance(NullArray::new(1).as_ref());
-        test_take_conformance(NullArray::new(10).as_ref());
+        test_take_conformance(&NullArray::new(5).into_array());
+        test_take_conformance(&NullArray::new(1).into_array());
+        test_take_conformance(&NullArray::new(10).into_array());
     }
 
     #[rstest]
@@ -82,6 +87,6 @@ mod test {
     #[case::null_array_large(NullArray::new(1000))]
     #[case::null_array_empty(NullArray::new(0))]
     fn test_null_consistency(#[case] array: NullArray) {
-        test_array_consistency(array.as_ref());
+        test_array_consistency(&array.into_array());
     }
 }

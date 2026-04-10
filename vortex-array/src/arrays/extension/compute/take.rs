@@ -3,21 +3,22 @@
 
 use vortex_error::VortexResult;
 
-use crate::Array;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::IntoArray;
+use crate::array::ArrayView;
+use crate::arrays::Extension;
 use crate::arrays::ExtensionArray;
-use crate::arrays::ExtensionVTable;
-use crate::arrays::TakeExecute;
+use crate::arrays::dict::TakeExecute;
+use crate::arrays::extension::ExtensionArrayExt;
 
-impl TakeExecute for ExtensionVTable {
+impl TakeExecute for Extension {
     fn take(
-        array: &ExtensionArray,
-        indices: &dyn Array,
+        array: ArrayView<'_, Extension>,
+        indices: &ArrayRef,
         _ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
-        let taken_storage = array.storage().take(indices.to_array())?;
+        let taken_storage = array.storage_array().take(indices.clone())?;
         Ok(Some(
             ExtensionArray::new(
                 array

@@ -6,10 +6,11 @@ use pyo3::PyRef;
 use pyo3::PyResult;
 use pyo3::pyclass;
 use pyo3::pymethods;
-use vortex::array::arrays::StructVTable;
+use vortex::array::arrays::Struct;
+use vortex::array::arrays::struct_::StructArrayExt;
+use vortex::error::VortexExpect;
 
 use crate::arrays::PyArrayRef;
-use crate::arrays::native::AsArrayRef;
 use crate::arrays::native::EncodingSubclass;
 use crate::arrays::native::PyNativeArray;
 use crate::error::PyVortexResult;
@@ -19,21 +20,30 @@ use crate::error::PyVortexResult;
 pub(crate) struct PyStructArray;
 
 impl EncodingSubclass for PyStructArray {
-    type VTable = StructVTable;
+    type VTable = Struct;
 }
 
 #[pymethods]
 impl PyStructArray {
     /// Returns the given field of the struct array.
     pub fn field(self_: PyRef<'_, Self>, name: &str) -> PyVortexResult<PyArrayRef> {
-        let field = self_.as_array_ref().unmasked_field_by_name(name)?.clone();
+        let field = self_
+            .as_super()
+            .inner()
+            .as_opt::<Struct>()
+            .vortex_expect("Failed to downcast array")
+            .unmasked_field_by_name(name)?
+            .clone();
         Ok(PyArrayRef::from(field))
     }
 
     /// Get an ordered list of field names for the struct fields.
     pub fn names(self_: PyRef<'_, Self>) -> PyResult<Vec<String>> {
         Ok(self_
-            .as_array_ref()
+            .as_super()
+            .inner()
+            .as_opt::<Struct>()
+            .vortex_expect("Failed to downcast array")
             .struct_fields()
             .names()
             .iter()

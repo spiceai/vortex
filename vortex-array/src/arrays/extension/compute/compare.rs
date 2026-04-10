@@ -3,21 +3,22 @@
 
 use vortex_error::VortexResult;
 
-use crate::Array;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
+use crate::IntoArray;
+use crate::array::ArrayView;
 use crate::arrays::ConstantArray;
-use crate::arrays::ExtensionArray;
-use crate::arrays::ExtensionVTable;
+use crate::arrays::Extension;
+use crate::arrays::extension::ExtensionArrayExt;
 use crate::builtins::ArrayBuiltins;
 use crate::scalar_fn::fns::binary::CompareKernel;
 use crate::scalar_fn::fns::operators::CompareOperator;
 use crate::scalar_fn::fns::operators::Operator;
 
-impl CompareKernel for ExtensionVTable {
+impl CompareKernel for Extension {
     fn compare(
-        lhs: &ExtensionArray,
-        rhs: &dyn Array,
+        lhs: ArrayView<'_, Extension>,
+        rhs: &ArrayRef,
         operator: CompareOperator,
         _ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
@@ -25,21 +26,21 @@ impl CompareKernel for ExtensionVTable {
         if let Some(const_ext) = rhs.as_constant() {
             let storage_scalar = const_ext.as_extension().to_storage_scalar();
             return lhs
-                .storage()
-                .to_array()
+                .storage_array()
+                .clone()
                 .binary(
-                    ConstantArray::new(storage_scalar, lhs.len()).to_array(),
+                    ConstantArray::new(storage_scalar, lhs.len()).into_array(),
                     Operator::from(operator),
                 )
                 .map(Some);
         }
 
         // If the RHS is an extension array matching ours, we can extract the storage.
-        if let Some(rhs_ext) = rhs.as_opt::<ExtensionVTable>() {
+        if let Some(rhs_ext) = rhs.as_opt::<Extension>() {
             return lhs
-                .storage()
-                .to_array()
-                .binary(rhs_ext.storage().to_array(), Operator::from(operator))
+                .storage_array()
+                .clone()
+                .binary(rhs_ext.storage_array().clone(), Operator::from(operator))
                 .map(Some);
         }
 

@@ -7,13 +7,14 @@ use vortex_error::VortexResult;
 use vortex_mask::Mask;
 use vortex_mask::MaskIter;
 
-use crate::Array;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::IntoArray;
+use crate::array::ArrayView;
+use crate::arrays::Chunked;
 use crate::arrays::ChunkedArray;
-use crate::arrays::ChunkedVTable;
 use crate::arrays::PrimitiveArray;
+use crate::arrays::chunked::ChunkedArrayExt;
 use crate::arrays::filter::FilterKernel;
 use crate::search_sorted::SearchSorted;
 use crate::search_sorted::SearchSortedSide;
@@ -22,9 +23,9 @@ use crate::validity::Validity;
 // This is modeled after the constant with the equivalent name in arrow-rs.
 pub(crate) const FILTER_SLICES_SELECTIVITY_THRESHOLD: f64 = 0.8;
 
-impl FilterKernel for ChunkedVTable {
+impl FilterKernel for Chunked {
     fn filter(
-        array: &ChunkedArray,
+        array: ArrayView<'_, Chunked>,
         mask: &Mask,
         _ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
@@ -62,7 +63,7 @@ pub(crate) enum ChunkFilter {
 
 /// Filter the chunks using slice ranges.
 fn filter_slices(
-    array: &ChunkedArray,
+    array: ArrayView<'_, Chunked>,
     slices: impl Iterator<Item = (usize, usize)>,
 ) -> VortexResult<Vec<ArrayRef>> {
     let mut result = Vec::with_capacity(array.nchunks());
@@ -70,7 +71,7 @@ fn filter_slices(
     let chunk_filters = chunk_filters(array, slices)?;
 
     // Now, apply the chunk filter to every slice.
-    for (chunk, chunk_filter) in array.chunks().iter().zip(chunk_filters.into_iter()) {
+    for (chunk, chunk_filter) in array.iter_chunks().zip(chunk_filters.into_iter()) {
         match chunk_filter {
             // All => preserve the entire chunk unfiltered.
             ChunkFilter::All => result.push(chunk.clone()),
@@ -87,7 +88,7 @@ fn filter_slices(
 }
 
 pub(crate) fn chunk_filters(
-    array: &ChunkedArray,
+    array: ArrayView<'_, Chunked>,
     slices: impl Iterator<Item = (usize, usize)>,
 ) -> VortexResult<Vec<ChunkFilter>> {
     let chunk_offsets = array.chunk_offsets();
@@ -95,10 +96,10 @@ pub(crate) fn chunk_filters(
     let mut chunk_filters = vec![ChunkFilter::None; array.nchunks()];
 
     for (slice_start, slice_end) in slices {
-        let (start_chunk, start_idx) = find_chunk_idx(slice_start, &chunk_offsets)?;
+        let (start_chunk, start_idx) = find_chunk_idx(slice_start, chunk_offsets)?;
         // NOTE: we adjust slice end back by one, in case it ends on a chunk boundary, we do not
         // want to index into the unused chunk.
-        let (end_chunk, end_idx) = find_chunk_idx(slice_end - 1, &chunk_offsets)?;
+        let (end_chunk, end_idx) = find_chunk_idx(slice_end - 1, chunk_offsets)?;
         // Adjust back to an exclusive range
         let end_idx = end_idx + 1;
 
@@ -117,8 +118,7 @@ pub(crate) fn chunk_filters(
             // start chunk: append a slice from (start_idx, start_chunk_end), i.e. whole chunk.
             // end chunk: append a slice from (0, end_idx).
             // chunks between start and end: append ChunkFilter::All.
-            let start_chunk_len: usize =
-                (chunk_offsets[start_chunk + 1] - chunk_offsets[start_chunk]).try_into()?;
+            let start_chunk_len = chunk_offsets[start_chunk + 1] - chunk_offsets[start_chunk];
             let start_slice = (start_idx, start_chunk_len);
             match &mut chunk_filters[start_chunk] {
                 f @ (ChunkFilter::All | ChunkFilter::None) => {
@@ -146,7 +146,7 @@ pub(crate) fn chunk_filters(
 
 /// Filter the chunks using indices.
 fn filter_indices(
-    array: &ChunkedArray,
+    array: ArrayView<'_, Chunked>,
     indices: impl Iterator<Item = usize>,
 ) -> VortexResult<Vec<ArrayRef>> {
     let mut result = Vec::with_capacity(array.nchunks());
@@ -156,15 +156,14 @@ fn filter_indices(
     let chunk_offsets = array.chunk_offsets();
 
     for set_index in indices {
-        let (chunk_id, index) = find_chunk_idx(set_index, &chunk_offsets)?;
+        let (chunk_id, index) = find_chunk_idx(set_index, chunk_offsets)?;
         if chunk_id != current_chunk_id {
             // Push the chunk we've accumulated.
             if !chunk_indices.is_empty() {
                 let chunk = array.chunk(current_chunk_id);
                 let indices =
                     PrimitiveArray::new(chunk_indices.clone().freeze(), Validity::NonNullable);
-                let filtered_chunk = chunk.take(indices.to_array())?.to_canonical()?.into_array();
-                result.push(filtered_chunk);
+                result.push(chunk.take(indices.into_array())?);
             }
 
             // Advance the chunk forward, reset the chunk indices buffer.
@@ -178,7 +177,7 @@ fn filter_indices(
     if !chunk_indices.is_empty() {
         let chunk = array.chunk(current_chunk_id);
         let indices = PrimitiveArray::new(chunk_indices.clone().freeze(), Validity::NonNullable);
-        let filtered_chunk = chunk.take(indices.to_array())?.to_canonical()?.into_array();
+        let filtered_chunk = chunk.take(indices.into_array())?;
         result.push(filtered_chunk);
     }
 
@@ -187,14 +186,12 @@ fn filter_indices(
 
 /// Mirrors the find_chunk_idx method on ChunkedArray, but avoids all of the overhead
 /// from scalars, dtypes, and metadata cloning.
-pub(crate) fn find_chunk_idx(idx: usize, chunk_ends: &[u64]) -> VortexResult<(usize, usize)> {
+pub(crate) fn find_chunk_idx(idx: usize, chunk_ends: &[usize]) -> VortexResult<(usize, usize)> {
     let chunk_id = chunk_ends
-        .search_sorted(&(idx as u64), SearchSortedSide::Right)?
+        .search_sorted(&idx, SearchSortedSide::Right)?
         .to_ends_index(chunk_ends.len())
         .saturating_sub(1);
-    let chunk_begin: usize = chunk_ends[chunk_id]
-        .try_into()
-        .vortex_expect("chunk end must fit in usize");
+    let chunk_begin = chunk_ends[chunk_id];
     let chunk_offset = idx - chunk_begin;
 
     Ok((chunk_id, chunk_offset))
@@ -206,7 +203,6 @@ mod test {
     use vortex_mask::Mask;
 
     use crate::IntoArray;
-    use crate::array::Array;
     use crate::arrays::ChunkedArray;
     use crate::arrays::PrimitiveArray;
     use crate::compute::conformance::filter::test_filter_conformance;
@@ -254,17 +250,17 @@ mod test {
         vec![
             buffer![0u64, 1].into_array(),
             buffer![2_u64].into_array(),
-            PrimitiveArray::empty::<u64>(Nullability::NonNullable).to_array(),
+            PrimitiveArray::empty::<u64>(Nullability::NonNullable).into_array(),
             buffer![3_u64, 4].into_array(),
         ],
         DType::Primitive(PType::U64, Nullability::NonNullable),
     ).unwrap())]
     #[case(ChunkedArray::try_new(
         vec![
-            PrimitiveArray::from_option_iter([Some(0u64), None]).to_array(),
-            PrimitiveArray::from_option_iter([Some(2u64)]).to_array(),
-            PrimitiveArray::empty::<u64>(Nullability::Nullable).to_array(),
-            PrimitiveArray::from_option_iter([None, Some(4u64)]).to_array(),
+            PrimitiveArray::from_option_iter([Some(0u64), None]).into_array(),
+            PrimitiveArray::from_option_iter([Some(2u64)]).into_array(),
+            PrimitiveArray::empty::<u64>(Nullability::Nullable).into_array(),
+            PrimitiveArray::from_option_iter([None, Some(4u64)]).into_array(),
         ],
         DType::Primitive(PType::U64, Nullability::Nullable),
     ).unwrap())]
@@ -279,6 +275,6 @@ mod test {
         DType::Primitive(PType::I64, Nullability::NonNullable),
     ).unwrap())]
     fn test_filter_chunked_conformance(#[case] chunked: ChunkedArray) {
-        test_filter_conformance(chunked.as_ref());
+        test_filter_conformance(&chunked.into_array());
     }
 }

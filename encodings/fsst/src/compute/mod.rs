@@ -4,43 +4,48 @@
 mod cast;
 mod compare;
 mod filter;
+mod like;
 
-use vortex_array::Array;
 use vortex_array::ArrayRef;
+use vortex_array::ArrayView;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
-use vortex_array::arrays::TakeExecute;
-use vortex_array::arrays::VarBinVTable;
+use vortex_array::arrays::VarBin;
+use vortex_array::arrays::dict::TakeExecute;
 use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::scalar::Scalar;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
 
-use crate::FSSTArray;
-use crate::FSSTVTable;
+use crate::FSST;
+use crate::FSSTArrayExt;
 
-impl TakeExecute for FSSTVTable {
+impl TakeExecute for FSST {
     fn take(
-        array: &FSSTArray,
-        indices: &dyn Array,
+        array: ArrayView<'_, Self>,
+        indices: &ArrayRef,
         _ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
         Ok(Some(
-            FSSTArray::try_new(
+            FSST::try_new(
                 array
                     .dtype()
                     .clone()
                     .union_nullability(indices.dtype().nullability()),
                 array.symbols().clone(),
                 array.symbol_lengths().clone(),
-                VarBinVTable::take(array.codes(), indices, _ctx)?
-                    .vortex_expect("cannot fail")
-                    .try_into::<VarBinVTable>()
-                    .map_err(|_| vortex_err!("take for codes must return varbin array"))?,
+                {
+                    let codes = array.codes();
+                    let codes = codes.as_view();
+                    <VarBin as TakeExecute>::take(codes, indices, _ctx)?
+                        .vortex_expect("VarBin take kernel always returns Some")
+                }
+                .try_downcast::<VarBin>()
+                .map_err(|_| vortex_err!("take for codes must return varbin array"))?,
                 array
                     .uncompressed_lengths()
-                    .take(indices.to_array())?
+                    .take(indices.clone())?
                     .fill_null(Scalar::zero_value(
                         &array.uncompressed_lengths_dtype().clone(),
                     ))?,
@@ -53,7 +58,7 @@ impl TakeExecute for FSSTVTable {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
-    use vortex_array::Array;
+    use vortex_array::IntoArray;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::arrays::VarBinArray;
     use vortex_array::compute::conformance::consistency::test_array_consistency;
@@ -69,19 +74,19 @@ mod tests {
     fn test_take_null() {
         let arr = VarBinArray::from_iter([Some("h")], DType::Utf8(Nullability::NonNullable));
         let compr = fsst_train_compressor(&arr);
-        let fsst = fsst_compress(&arr, &compr);
+        let fsst = fsst_compress(&arr, arr.len(), arr.dtype(), &compr);
 
         let idx1: PrimitiveArray = (0..1).collect();
 
         assert_eq!(
-            fsst.take(idx1.to_array()).unwrap().dtype(),
+            fsst.take(idx1.into_array()).unwrap().dtype(),
             &DType::Utf8(Nullability::NonNullable)
         );
 
         let idx2: PrimitiveArray = PrimitiveArray::from_option_iter(vec![Some(0)]);
 
         assert_eq!(
-            fsst.take(idx2.to_array()).unwrap().dtype(),
+            fsst.take(idx2.into_array()).unwrap().dtype(),
             &DType::Utf8(Nullability::Nullable)
         );
     }
@@ -101,8 +106,8 @@ mod tests {
     ))]
     fn test_take_fsst_conformance(#[case] varbin: VarBinArray) {
         let compressor = fsst_train_compressor(&varbin);
-        let array = fsst_compress(&varbin, &compressor);
-        test_take_conformance(array.as_ref());
+        let array = fsst_compress(&varbin, varbin.len(), varbin.dtype(), &compressor);
+        test_take_conformance(&array.into_array());
     }
 
     #[rstest]
@@ -113,7 +118,7 @@ mod tests {
             DType::Utf8(Nullability::NonNullable),
         );
         let compressor = fsst_train_compressor(&varbin);
-        fsst_compress(&varbin, &compressor)
+        fsst_compress(&varbin, varbin.len(), varbin.dtype(), &compressor)
     })]
     // Nullable strings
     #[case::fsst_nullable({
@@ -122,7 +127,9 @@ mod tests {
             DType::Utf8(Nullability::Nullable),
         );
         let compressor = fsst_train_compressor(&varbin);
-        fsst_compress(varbin, &compressor)
+        let len = varbin.len();
+        let dtype = varbin.dtype().clone();
+        fsst_compress(varbin, len, &dtype, &compressor)
     })]
     // Repetitive patterns (good for FSST compression)
     #[case::fsst_repetitive({
@@ -131,7 +138,7 @@ mod tests {
             DType::Utf8(Nullability::NonNullable),
         );
         let compressor = fsst_train_compressor(&varbin);
-        fsst_compress(&varbin, &compressor)
+        fsst_compress(&varbin, varbin.len(), varbin.dtype(), &compressor)
     })]
     // Edge cases
     #[case::fsst_single({
@@ -140,7 +147,7 @@ mod tests {
             DType::Utf8(Nullability::NonNullable),
         );
         let compressor = fsst_train_compressor(&varbin);
-        fsst_compress(&varbin, &compressor)
+        fsst_compress(&varbin, varbin.len(), varbin.dtype(), &compressor)
     })]
     #[case::fsst_empty_strings({
         let varbin = VarBinArray::from_iter(
@@ -148,7 +155,9 @@ mod tests {
             DType::Utf8(Nullability::NonNullable),
         );
         let compressor = fsst_train_compressor(&varbin);
-        fsst_compress(varbin, &compressor)
+        let len = varbin.len();
+        let dtype = varbin.dtype().clone();
+        fsst_compress(varbin, len, &dtype, &compressor)
     })]
     // Large arrays
     #[case::fsst_large({
@@ -168,10 +177,12 @@ mod tests {
             .collect();
         let varbin = VarBinArray::from_iter(data, DType::Utf8(Nullability::NonNullable));
         let compressor = fsst_train_compressor(&varbin);
-        fsst_compress(varbin, &compressor)
+        let len = varbin.len();
+        let dtype = varbin.dtype().clone();
+        fsst_compress(varbin, len, &dtype, &compressor)
     })]
 
     fn test_fsst_consistency(#[case] array: FSSTArray) {
-        test_array_consistency(array.as_ref());
+        test_array_consistency(&array.into_array());
     }
 }

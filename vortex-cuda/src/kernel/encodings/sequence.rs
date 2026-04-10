@@ -14,11 +14,10 @@ use vortex::array::buffer::BufferHandle;
 use vortex::array::match_each_native_ptype;
 use vortex::dtype::NativePType;
 use vortex::dtype::Nullability;
-use vortex::encodings::sequence::SequenceArrayParts;
-use vortex::encodings::sequence::SequenceVTable;
+use vortex::encodings::sequence::Sequence;
+use vortex::encodings::sequence::SequenceDataParts;
 use vortex::error::VortexResult;
 use vortex::error::vortex_err;
-use vortex_cuda_macros::cuda_tests;
 
 use crate::CudaDeviceBuffer;
 use crate::CudaExecutionCtx;
@@ -37,16 +36,17 @@ impl CudaExecute for SequenceExecutor {
         ctx: &mut CudaExecutionCtx,
     ) -> VortexResult<Canonical> {
         let array = array
-            .try_into::<SequenceVTable>()
+            .try_downcast::<Sequence>()
             .map_err(|_| vortex_err!("SequenceExecutor can only accept SequenceArray"))?;
 
-        let SequenceArrayParts {
+        let len = array.len();
+        let nullability = array.dtype().nullability();
+
+        let SequenceDataParts {
             base,
             multiplier,
-            len,
             ptype,
-            nullability,
-        } = array.into_parts();
+        } = array.into_data().into_parts();
 
         match_each_native_ptype!(ptype, |P| {
             let base = base.cast::<P>()?;
@@ -67,7 +67,7 @@ async fn execute_typed<T: NativePType + DeviceRepr>(
 
     let len_u64 = len as u64;
 
-    let kernel_func = ctx.load_function_ptype("sequence", &[T::PTYPE])?;
+    let kernel_func = ctx.load_function("sequence", &[T::PTYPE])?;
 
     ctx.launch_kernel(&kernel_func, len, |args| {
         args.arg(&buffer).arg(&base).arg(&multiplier).arg(&len_u64);
@@ -82,7 +82,7 @@ async fn execute_typed<T: NativePType + DeviceRepr>(
     )))
 }
 
-#[cuda_tests]
+#[cfg(test)]
 mod tests {
     use futures::executor::block_on;
     use rstest::rstest;
@@ -90,7 +90,7 @@ mod tests {
     use vortex::array::assert_arrays_eq;
     use vortex::dtype::NativePType;
     use vortex::dtype::Nullability;
-    use vortex::encodings::sequence::SequenceArray;
+    use vortex::encodings::sequence::Sequence;
     use vortex::scalar::PValue;
     use vortex::session::VortexSession;
 
@@ -104,6 +104,7 @@ mod tests {
     #[case::u16(10u16, 2u16, 100)]
     #[case::u32(10u32, 2u32, 1000)]
     #[case::u64(100u64, 20u64, 500)]
+    #[crate::test]
     fn test_sequence<T: NativePType + Into<PValue>>(
         #[case] base: T,
         #[case] multiplier: T,
@@ -126,7 +127,7 @@ mod tests {
     ) {
         let mut cuda_ctx = CudaSession::create_execution_ctx(&VortexSession::empty()).unwrap();
 
-        let array = SequenceArray::typed_new(base, multiplier, nullability, len).unwrap();
+        let array = Sequence::try_new_typed(base, multiplier, nullability, len).unwrap();
 
         let cpu_result = array.to_canonical().unwrap().into_array();
 

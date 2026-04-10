@@ -5,8 +5,8 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use cudarc::driver::CudaContext;
+use vortex::array::ArrayId;
 use vortex::array::VortexSessionExecute;
-use vortex::array::vtable::ArrayId;
 use vortex::error::VortexResult;
 use vortex::session::Ref;
 use vortex::session::SessionExt;
@@ -65,18 +65,18 @@ impl CudaSession {
     pub fn create_execution_ctx(
         vortex_session: &vortex::session::VortexSession,
     ) -> VortexResult<CudaExecutionCtx> {
-        let stream = vortex_session.cuda_session().new_stream()?;
+        let stream = vortex_session.cuda_session().stream()?;
         Ok(CudaExecutionCtx::new(
             stream,
             vortex_session.create_execution_ctx(),
         ))
     }
 
-    /// Gets a CUDA stream from the pool.
+    /// Returns a CUDA stream from the pool.
     ///
     /// The pool reuses existing streams in round-robin fashion.
-    pub fn new_stream(&self) -> VortexResult<VortexCudaStream> {
-        self.stream_pool.get_stream()
+    pub fn stream(&self) -> VortexResult<VortexCudaStream> {
+        self.stream_pool.stream()
     }
 
     /// Registers CUDA support for an array encoding.
