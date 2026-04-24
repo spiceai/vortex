@@ -20,7 +20,7 @@ dev = [
     "basedpyright>=1.31",
     "ipython>=8.26.0",
     "pip>=23.3.2",
-    "pytest>=7.4.0",
+    "pytest>=9.0.3",
     "ruff>=0.7.1",
     # forced transitive bumps
     "urllib3>=2.6.3",
