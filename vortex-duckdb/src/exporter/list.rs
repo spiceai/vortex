@@ -10,6 +10,7 @@ use vortex::array::arrays::ListArray;
 use vortex::array::arrays::PrimitiveArray;
 use vortex::array::arrays::list::ListDataParts;
 use vortex::array::match_each_integer_ptype;
+use vortex::array::validity::Validity;
 use vortex::dtype::IntegerPType;
 use vortex::error::VortexResult;
 use vortex::error::vortex_err;
@@ -18,6 +19,7 @@ use vortex::mask::Mask;
 use super::ConversionCache;
 use super::all_invalid;
 use super::new_array_exporter_with_flatten;
+use super::validity;
 use crate::cpp;
 use crate::duckdb::LogicalType;
 use crate::duckdb::Vector;
@@ -25,7 +27,6 @@ use crate::duckdb::VectorRef;
 use crate::exporter::ColumnExporter;
 
 struct ListExporter<O> {
-    validity: Mask,
     /// We cache the child elements of our list array so that we don't have to export it every time,
     /// and we also share it across any other exporters who want to export this array.
     ///
@@ -49,15 +50,14 @@ pub(crate) fn new_exporter(
         elements,
         offsets,
         validity,
-        dtype,
+        dtype: _dtype,
     } = array.into_data_parts();
     let num_elements = elements.len();
-    let validity = validity.to_array(array_len).execute::<Mask>(ctx)?;
 
-    if validity.all_false() {
-        let ltype = LogicalType::try_from(dtype)?;
-        return Ok(all_invalid::new_exporter(array_len, &ltype));
+    if matches!(validity, Validity::AllInvalid) {
+        return Ok(all_invalid::new_exporter());
     }
+    let validity = validity.to_array(array_len).execute::<Mask>(ctx)?;
 
     let values_key = elements.addr();
     // Check if we have a cached vector and extract it if we do.
@@ -92,7 +92,6 @@ pub(crate) fn new_exporter(
 
     let boxed = match_each_integer_ptype!(offsets.ptype(), |O| {
         Box::new(ListExporter {
-            validity,
             duckdb_elements: shared_elements,
             offsets,
             num_elements,
@@ -100,7 +99,7 @@ pub(crate) fn new_exporter(
         }) as Box<dyn ColumnExporter>
     });
 
-    Ok(boxed)
+    Ok(validity::new_exporter(validity, boxed))
 }
 
 impl<O: IntegerPType> ColumnExporter for ListExporter<O> {
@@ -111,21 +110,6 @@ impl<O: IntegerPType> ColumnExporter for ListExporter<O> {
         vector: &mut VectorRef,
         _ctx: &mut ExecutionCtx,
     ) -> VortexResult<()> {
-        // Verify that offset + len doesn't exceed the validity mask length.
-        assert!(
-            offset + len <= self.validity.len(),
-            "Export range [{}, {}) exceeds validity mask length {}",
-            offset,
-            offset + len,
-            self.validity.len()
-        );
-
-        // Set validity if necessary.
-        if unsafe { vector.set_validity(&self.validity, offset, len) } {
-            // All values are null, so no point copying the data.
-            return Ok(());
-        }
-
         let offsets = &self.offsets.as_slice::<O>()[offset..offset + len + 1];
         debug_assert_eq!(offsets.len(), len + 1);
 

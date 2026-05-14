@@ -27,6 +27,7 @@ use std::hash::Hasher;
 
 use vortex_buffer::Alignment;
 use vortex_session::VortexSession;
+use vortex_session::registry::CachedId;
 
 use crate::Precision;
 use crate::array::ArrayId;
@@ -57,7 +58,8 @@ impl VTable for Primitive {
     type ValidityVTable = Self;
 
     fn id(&self) -> ArrayId {
-        Self::ID
+        static ID: CachedId = CachedId::new("vortex.primitive");
+        *ID
     }
 
     fn nbuffers(_array: ArrayView<'_, Self>) -> usize {
@@ -101,7 +103,7 @@ impl VTable for Primitive {
             data.len(),
             len
         );
-        let validity = crate::array::child_to_validity(&slots[0], *nullability);
+        let validity = crate::array::child_to_validity(slots[0].as_ref(), *nullability);
         if let Some(validity_len) = validity.maybe_len() {
             vortex_ensure!(
                 validity_len == len,
@@ -202,10 +204,6 @@ impl VTable for Primitive {
 
 #[derive(Clone, Debug)]
 pub struct Primitive;
-
-impl Primitive {
-    pub const ID: ArrayId = ArrayId::new_ref("vortex.primitive");
-}
 
 #[cfg(test)]
 mod tests {

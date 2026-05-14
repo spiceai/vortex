@@ -47,6 +47,7 @@ use vortex_session::SessionExt;
 use vortex_session::VortexSession;
 use vortex_session::registry::ReadContext;
 
+use crate::ALLOWED_ENCODINGS;
 use crate::Footer;
 use crate::MAGIC_BYTES;
 use crate::WriteStrategyBuilder;
@@ -157,7 +158,7 @@ impl VortexWriteOptions {
             let arrays = self.session.arrays();
             arrays.registry().clone()
         };
-        let ctx = ArrayContext::new(registry.ids().sorted().collect())
+        let ctx = ArrayContext::new(ALLOWED_ENCODINGS.iter().cloned().sorted().collect())
             // Configure a registry just to ensure only known encodings are interned.
             .with_registry(registry);
         let dtype = stream.dtype().clone();
@@ -175,6 +176,7 @@ impl VortexWriteOptions {
             stream,
             self.file_statistics.clone().into(),
             self.max_variable_length_statistics_size,
+            &self.session,
         );
 
         // First, write the magic bytes.

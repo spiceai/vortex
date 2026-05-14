@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::any::Any;
 use std::sync::Arc;
 
 use vortex_session::Ref;
 use vortex_session::SessionExt;
+use vortex_session::SessionVar;
 use vortex_session::registry::Registry;
 
 use crate::scalar_fn::ScalarFnPluginRef;
@@ -14,6 +16,7 @@ use crate::scalar_fn::fns::binary::Binary;
 use crate::scalar_fn::fns::cast::Cast;
 use crate::scalar_fn::fns::fill_null::FillNull;
 use crate::scalar_fn::fns::get_item::GetItem;
+use crate::scalar_fn::fns::is_not_null::IsNotNull;
 use crate::scalar_fn::fns::is_null::IsNull;
 use crate::scalar_fn::fns::like::Like;
 use crate::scalar_fn::fns::list_contains::ListContains;
@@ -58,6 +61,7 @@ impl Default for ScalarFnSession {
         this.register(Cast);
         this.register(FillNull);
         this.register(GetItem);
+        this.register(IsNotNull);
         this.register(IsNull);
         this.register(Like);
         this.register(ListContains);
@@ -69,6 +73,16 @@ impl Default for ScalarFnSession {
         this.register(Select);
 
         this
+    }
+}
+
+impl SessionVar for ScalarFnSession {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 

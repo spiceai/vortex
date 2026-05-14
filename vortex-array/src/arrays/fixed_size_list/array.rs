@@ -228,11 +228,7 @@ pub trait FixedSizeListArrayExt: TypedArrayRef<FixedSizeList> {
 
     fn fixed_size_list_validity(&self) -> Validity {
         let (_, _, nullability) = self.dtype_parts();
-        child_to_validity(&self.as_ref().slots()[VALIDITY_SLOT], nullability)
-    }
-
-    fn fixed_size_list_validity_mask(&self) -> vortex_mask::Mask {
-        self.fixed_size_list_validity().to_mask(self.as_ref().len())
+        child_to_validity(self.as_ref().slots()[VALIDITY_SLOT].as_ref(), nullability)
     }
 
     fn fixed_size_list_elements_at(&self, index: usize) -> VortexResult<ArrayRef> {
