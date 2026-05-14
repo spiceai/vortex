@@ -94,6 +94,9 @@ struct Args {
     #[arg(long, default_value_t = false)]
     track_memory: bool,
 
+    #[arg(long, default_value = "unknown")]
+    runner: String,
+
     #[arg(long, default_value_t = false)]
     explain: bool,
 
@@ -149,6 +152,7 @@ async fn main() -> anyhow::Result<()> {
     let mut runner = SqlBenchmarkRunner::new(
         &*benchmark,
         Engine::DataFusion,
+        args.runner.clone(),
         args.formats.clone(),
         args.track_memory,
         args.hide_progress_bar,
@@ -156,7 +160,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Collect execution plans for metrics if show_metrics is enabled
     // Structure: (query_idx, format, execution_plan)
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::type_complexity)]
     let collected_plans: Arc<Mutex<Vec<(usize, Format, Arc<dyn ExecutionPlan>)>>> =
         Arc::new(Mutex::new(Vec::new()));
     let show_metrics = args.show_metrics;
@@ -317,8 +321,7 @@ async fn register_v2_tables<B: Benchmark + ?Sized>(
         };
 
         let multi_ds = MultiFileDataSource::new(SESSION.clone())
-            .with_filesystem(fs)
-            .with_glob(glob_pattern)
+            .with_glob(glob_pattern, Some(fs))
             .build()
             .await?;
 

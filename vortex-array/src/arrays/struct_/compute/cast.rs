@@ -22,7 +22,7 @@ impl CastKernel for Struct {
     fn cast(
         array: ArrayView<'_, Struct>,
         dtype: &DType,
-        _ctx: &mut ExecutionCtx,
+        ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
         let Some(target_sdtype) = dtype.as_struct_fields_opt() else {
             return Ok(None);
@@ -73,7 +73,7 @@ impl CastKernel for Struct {
 
         let validity = array
             .validity()?
-            .cast_nullability(dtype.nullability(), array.len())?;
+            .cast_nullability(dtype.nullability(), array.len(), ctx)?;
 
         StructArray::try_new(
             target_sdtype.names().clone(),
@@ -91,7 +91,8 @@ mod tests {
     use vortex_buffer::buffer;
 
     use crate::IntoArray;
-    use crate::ToCanonical;
+    #[expect(deprecated)]
+    use crate::ToCanonical as _;
     use crate::arrays::PrimitiveArray;
     use crate::arrays::StructArray;
     use crate::arrays::VarBinArray;
@@ -209,7 +210,9 @@ mod tests {
             .unwrap();
         assert_eq!(result.dtype(), &target_dtype);
         assert_eq!(result.len(), 3);
-        assert_eq!(result.to_struct().struct_fields().nfields(), 2);
+        #[expect(deprecated)]
+        let nfields = result.to_struct().struct_fields().nfields();
+        assert_eq!(nfields, 2);
     }
 
     #[test]
@@ -238,6 +241,8 @@ mod tests {
             .unwrap();
         assert_eq!(result.dtype(), &target_dtype);
         assert_eq!(result.len(), 3);
-        assert_eq!(result.to_struct().struct_fields().nfields(), 3);
+        #[expect(deprecated)]
+        let nfields = result.to_struct().struct_fields().nfields();
+        assert_eq!(nfields, 3);
     }
 }

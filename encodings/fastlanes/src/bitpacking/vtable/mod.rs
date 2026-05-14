@@ -36,6 +36,7 @@ use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
+use vortex_session::registry::CachedId;
 
 use crate::BitPackedArrayExt;
 use crate::BitPackedData;
@@ -91,7 +92,8 @@ impl VTable for BitPacked {
     type ValidityVTable = Self;
 
     fn id(&self) -> ArrayId {
-        Self::ID
+        static ID: CachedId = CachedId::new("fastlanes.bitpacked");
+        *ID
     }
 
     fn validate(
@@ -103,7 +105,7 @@ impl VTable for BitPacked {
     ) -> VortexResult<()> {
         let slots = BitPackedSlotsView::from_slots(slots);
 
-        let validity = child_to_validity(&slots.validity_child.cloned(), dtype.nullability());
+        let validity = child_to_validity(slots.validity_child, dtype.nullability());
         let patches = match (slots.patch_indices, slots.patch_values) {
             (Some(indices), Some(values)) => {
                 let patch_offset = data
@@ -149,18 +151,6 @@ impl VTable for BitPacked {
             0 => Some("packed".to_string()),
             _ => None,
         }
-    }
-
-    fn reduce_parent(
-        array: ArrayView<'_, Self>,
-        parent: &ArrayRef,
-        child_idx: usize,
-    ) -> VortexResult<Option<ArrayRef>> {
-        RULES.evaluate(array, parent, child_idx)
-    }
-
-    fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {
-        BitPackedSlots::NAMES[idx].to_string()
     }
 
     fn serialize(
@@ -281,6 +271,10 @@ impl VTable for BitPacked {
         })
     }
 
+    fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {
+        BitPackedSlots::NAMES[idx].to_string()
+    }
+
     fn execute(array: Array<Self>, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
         require_patches!(
             array,
@@ -303,14 +297,20 @@ impl VTable for BitPacked {
     ) -> VortexResult<Option<ArrayRef>> {
         PARENT_KERNELS.execute(array, parent, child_idx, ctx)
     }
+
+    fn reduce_parent(
+        array: ArrayView<'_, Self>,
+        parent: &ArrayRef,
+        child_idx: usize,
+    ) -> VortexResult<Option<ArrayRef>> {
+        RULES.evaluate(array, parent, child_idx)
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct BitPacked;
 
 impl BitPacked {
-    pub const ID: ArrayId = ArrayId::new_ref("fastlanes.bitpacked");
-
     pub fn try_new(
         packed: BufferHandle,
         ptype: PType,
@@ -353,7 +353,11 @@ impl BitPacked {
     }
 
     /// Encode an array into a bitpacked representation with the given bit width.
-    pub fn encode(array: &ArrayRef, bit_width: u8) -> VortexResult<BitPackedArray> {
-        BitPackedData::encode(array, bit_width)
+    pub fn encode(
+        array: &ArrayRef,
+        bit_width: u8,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<BitPackedArray> {
+        BitPackedData::encode(array, bit_width, ctx)
     }
 }

@@ -145,7 +145,10 @@ pub trait DecimalArrayExt: TypedArrayRef<Decimal> {
     }
 
     fn validity(&self) -> Validity {
-        child_to_validity(&self.as_ref().slots()[VALIDITY_SLOT], self.nullability())
+        child_to_validity(
+            self.as_ref().slots()[VALIDITY_SLOT].as_ref(),
+            self.nullability(),
+        )
     }
 
     fn values_type(&self) -> DecimalType {
@@ -529,7 +532,7 @@ impl Array<Decimal> {
         }
     }
 
-    #[allow(
+    #[expect(
         clippy::cognitive_complexity,
         reason = "patching depends on both patch and value physical types"
     )]

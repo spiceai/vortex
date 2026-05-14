@@ -30,6 +30,7 @@ use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
+use vortex_session::registry::CachedId;
 
 use crate::DeltaData;
 use crate::delta::array::BASES_SLOT;
@@ -38,6 +39,7 @@ use crate::delta::array::DeltaArrayExt;
 use crate::delta::array::SLOT_NAMES;
 use crate::delta::array::delta_decompress::delta_decompress;
 use crate::delta::array::lane_count;
+use crate::delta_compress;
 
 mod operations;
 mod rules;
@@ -75,7 +77,8 @@ impl VTable for Delta {
     type ValidityVTable = Self;
 
     fn id(&self) -> ArrayId {
-        Self::ID
+        static ID: CachedId = CachedId::new("fastlanes.delta");
+        *ID
     }
 
     fn validate(
@@ -180,8 +183,6 @@ impl VTable for Delta {
 pub struct Delta;
 
 impl Delta {
-    pub const ID: ArrayId = ArrayId::new_ref("fastlanes.delta");
-
     pub fn try_new(
         bases: ArrayRef,
         deltas: ArrayRef,
@@ -200,7 +201,7 @@ impl Delta {
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<DeltaArray> {
         let logical_len = array.len();
-        let (bases, deltas) = crate::delta::array::delta_compress::delta_compress(array, ctx)?;
+        let (bases, deltas) = delta_compress(array, ctx)?;
         Self::try_new(bases.into_array(), deltas.into_array(), 0, logical_len)
     }
 }
