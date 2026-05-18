@@ -107,7 +107,7 @@ impl ScalarFnVTable for CaseWhen {
 
         if child_idx < num_when_then_children {
             let pair_idx = child_idx / 2;
-            if child_idx % 2 == 0 {
+            if child_idx.is_multiple_of(2) {
                 ChildName::from(Arc::from(format!("when_{}", pair_idx)))
             } else {
                 ChildName::from(Arc::from(format!("then_{}", pair_idx)))
@@ -189,7 +189,7 @@ impl ScalarFnVTable for CaseWhen {
         let mut result = if options.has_else {
             inputs[else_idx].clone()
         } else {
-            ConstantArray::new(Scalar::null(output_dtype.clone()), row_count).into_array()
+            ConstantArray::new(Scalar::null(output_dtype), row_count).into_array()
         };
 
         for i in (0..options.num_when_then_pairs as usize).rev() {
