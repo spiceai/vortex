@@ -280,9 +280,10 @@ fn or_arrays_balanced(mut arrays: Vec<ArrayRef>) -> VortexResult<ArrayRef> {
         arrays = next;
     }
 
-    Ok(arrays
-        .pop()
-        .expect("or_arrays_balanced must be called with at least one array"))
+    let Some(array) = arrays.pop() else {
+        vortex_bail!("or_arrays_balanced must be called with at least one array");
+    };
+    Ok(array)
 }
 
 /// Returns a [`BoolArray`] where each bit represents if a list contains the scalar.
@@ -452,8 +453,6 @@ fn list_is_not_empty(
 mod tests {
     use std::sync::Arc;
 
-    use super::or_arrays_balanced;
-
     use itertools::Itertools;
     use rstest::rstest;
     use vortex_buffer::BitBuffer;
@@ -461,6 +460,7 @@ mod tests {
     use vortex_utils::aliases::hash_map::HashMap;
     use vortex_utils::aliases::hash_set::HashSet;
 
+    use super::or_arrays_balanced;
     use crate::Array;
     use crate::ArrayRef;
     use crate::IntoArray;

@@ -2,19 +2,27 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use vortex_buffer::Buffer;
+use vortex_buffer::BufferMut;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
+use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
+use vortex_mask::AllOr;
+use vortex_mask::Mask;
 
 use crate::ArrayRef;
 use crate::ExecutionCtx;
+use crate::IntoArray;
 use crate::arrays::DecimalArray;
 use crate::arrays::DecimalVTable;
+use crate::arrays::primitive::PrimitiveArray;
 use crate::dtype::DType;
 use crate::dtype::DecimalType;
 use crate::dtype::NativeDecimalType;
+use crate::dtype::NativePType;
 use crate::match_each_decimal_value_type;
+use crate::match_each_native_ptype;
 use crate::scalar_fn::fns::cast::CastKernel;
 use crate::vtable::ValidityHelper;
 
@@ -24,15 +32,37 @@ impl CastKernel for DecimalVTable {
         dtype: &DType,
         _ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
-        // Early return if not casting to decimal
-        let DType::Decimal(to_decimal_dtype, to_nullability) = dtype else {
-            return Ok(None);
-        };
         let DType::Decimal(from_decimal_dtype, _) = array.dtype() else {
             vortex_panic!(
                 "DecimalArray must have decimal dtype, got {:?}",
                 array.dtype()
             );
+        };
+
+        if let DType::Primitive(to_ptype, to_nullability) = dtype {
+            let new_validity = array
+                .validity()
+                .clone()
+                .cast_nullability(*to_nullability, array.len())?;
+            let mask = new_validity.to_mask(array.len());
+
+            return Ok(Some(match_each_native_ptype!(*to_ptype, |T| {
+                match_each_decimal_value_type!(array.values_type(), |F| {
+                    PrimitiveArray::new(
+                        cast_decimal_buffer_to_primitive::<F, T>(
+                            array.buffer::<F>(),
+                            from_decimal_dtype.scale(),
+                            mask,
+                        )?,
+                        new_validity,
+                    )
+                    .into_array()
+                })
+            })));
+        }
+
+        let DType::Decimal(to_decimal_dtype, to_nullability) = dtype else {
+            return Ok(None);
         };
 
         // Scale changes are not yet supported
@@ -139,6 +169,57 @@ fn upcast_decimal_buffer<F: NativeDecimalType, T: NativeDecimalType>(from: Buffe
         .collect()
 }
 
+fn cast_decimal_buffer_to_primitive<F, T>(
+    from: Buffer<F>,
+    scale: i8,
+    mask: Mask,
+) -> VortexResult<Buffer<T>>
+where
+    F: NativeDecimalType,
+    T: NativePType,
+{
+    let scale_factor = 10_f64.powi(i32::from(scale));
+
+    match mask.bit_buffer() {
+        AllOr::All => {
+            let mut buffer = BufferMut::<T>::with_capacity(from.len());
+            for value in from {
+                let value = cast_decimal_value_to_primitive::<F, T>(value, scale_factor)?;
+                buffer.push(value);
+            }
+            Ok(buffer.freeze())
+        }
+        AllOr::None => Ok(Buffer::zeroed(from.len())),
+        AllOr::Some(validity) => {
+            let mut buffer = BufferMut::<T>::with_capacity(from.len());
+            for (value, valid) in from.iter().zip(validity.iter()) {
+                if valid {
+                    let value = cast_decimal_value_to_primitive::<F, T>(*value, scale_factor)?;
+                    buffer.push(value);
+                } else {
+                    buffer.push(T::default());
+                }
+            }
+            Ok(buffer.freeze())
+        }
+    }
+}
+
+fn cast_decimal_value_to_primitive<F, T>(value: F, scale_factor: f64) -> VortexResult<T>
+where
+    F: NativeDecimalType,
+    T: NativePType,
+{
+    let value = value
+        .to_f64()
+        .ok_or_else(|| vortex_err!(Compute: "Failed to cast decimal value {value} to f64"))?
+        / scale_factor;
+
+    T::from(value).ok_or_else(
+        || vortex_err!(Compute: "Failed to cast decimal value {value} to {:?}", T::PTYPE),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
@@ -154,6 +235,7 @@ mod tests {
     use crate::dtype::DecimalDType;
     use crate::dtype::DecimalType;
     use crate::dtype::Nullability;
+    use crate::dtype::PType;
     use crate::validity::Validity;
     use crate::vtable::ValidityHelper;
 
@@ -280,6 +362,67 @@ mod tests {
         assert_eq!(casted.len(), 3);
         // Should be stored in i128 now (precision 38 requires i128)
         assert_eq!(casted.values_type(), DecimalType::I128);
+    }
+
+    #[test]
+    fn cast_decimal_to_f64_applies_scale() {
+        let array = DecimalArray::new(
+            buffer![12345i64, -50, 0],
+            DecimalDType::new(15, 2),
+            Validity::NonNullable,
+        );
+        let dtype = DType::Primitive(PType::F64, Nullability::NonNullable);
+
+        let casted = array.to_array().cast(dtype.clone()).unwrap().to_primitive();
+
+        assert_eq!(casted.dtype(), &dtype);
+        assert_eq!(casted.validity(), &Validity::NonNullable);
+        let values = casted.as_slice::<f64>();
+        assert!((values[0] - 123.45).abs() < 0.000000000001);
+        assert_eq!(values[1], -0.5);
+        assert_eq!(values[2], 0.0);
+    }
+
+    #[test]
+    fn cast_nullable_decimal_to_nullable_f64_preserves_validity() {
+        let array = DecimalArray::from_option_iter(
+            [Some(12345i64), None, Some(-50)],
+            DecimalDType::new(15, 2),
+        );
+        let dtype = DType::Primitive(PType::F64, Nullability::Nullable);
+
+        let casted = array.to_array().cast(dtype.clone()).unwrap().to_primitive();
+
+        assert_eq!(casted.dtype(), &dtype);
+        let mask = casted.validity_mask().unwrap();
+        assert!(mask.value(0));
+        assert!(!mask.value(1));
+        assert!(mask.value(2));
+        let values = casted.as_slice::<f64>();
+        assert!((values[0] - 123.45).abs() < 0.000000000001);
+        assert_eq!(values[2], -0.5);
+    }
+
+    #[test]
+    fn cast_nullable_decimal_to_non_nullable_f64_fails() {
+        let array = DecimalArray::from_option_iter(
+            [Some(12345i64), None, Some(-50)],
+            DecimalDType::new(15, 2),
+        );
+        let dtype = DType::Primitive(PType::F64, Nullability::NonNullable);
+
+        let result = array
+            .to_array()
+            .cast(dtype)
+            .and_then(|a| a.to_canonical().map(|c| c.into_array()));
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Cannot cast array with invalid values to non-nullable type")
+        );
     }
 
     #[test]
