@@ -7,19 +7,18 @@ use crate::ArrayRef;
 use crate::IntoArray;
 use crate::LEGACY_SESSION;
 use crate::VortexSessionExecute;
-use crate::array::ArrayView;
-use crate::array::ValidityVTable;
-use crate::arrays::scalar_fn::ScalarFnArrayExt;
+use crate::arrays::scalar_fn::array::ScalarFnArray;
 use crate::arrays::scalar_fn::vtable::ArrayExpr;
 use crate::arrays::scalar_fn::vtable::FakeEq;
-use crate::arrays::scalar_fn::vtable::ScalarFn;
+use crate::arrays::scalar_fn::vtable::ScalarFnVTable;
 use crate::expr::Expression;
 use crate::expr::lit;
-use crate::scalar_fn::TypedScalarFnInstance;
-use crate::scalar_fn::VecExecutionArgs;
+use crate::scalar_fn::ExecutionArgs;
+use crate::scalar_fn::ScalarFn;
 use crate::scalar_fn::fns::literal::Literal;
 use crate::scalar_fn::fns::root::Root;
 use crate::validity::Validity;
+use crate::vtable::ValidityVTable;
 
 /// Execute an expression tree recursively.
 ///
@@ -45,27 +44,29 @@ fn execute_expr(expr: &Expression, row_count: usize) -> VortexResult<ArrayRef> {
         .map(|child| execute_expr(child, row_count))
         .collect::<VortexResult<_>>()?;
 
-    let args = VecExecutionArgs::new(inputs, row_count);
+    let args = ExecutionArgs {
+        inputs,
+        row_count,
+        ctx: &mut ctx,
+    };
 
-    Ok(expr.scalar_fn().execute(&args, &mut ctx)?.into_array())
+    Ok(expr.scalar_fn().execute(args)?.into_array())
 }
 
-impl ValidityVTable<ScalarFn> for ScalarFn {
-    fn validity(array: ArrayView<'_, ScalarFn>) -> VortexResult<Validity> {
+impl ValidityVTable<ScalarFnVTable> for ScalarFnVTable {
+    fn validity(array: &ScalarFnArray) -> VortexResult<Validity> {
         let inputs: Vec<_> = array
-            .iter_children()
+            .children
+            .iter()
             .map(|child| {
                 if let Some(scalar) = child.as_constant() {
                     return Ok(lit(scalar));
                 }
-                Expression::try_new(
-                    TypedScalarFnInstance::new(ArrayExpr, FakeEq(child.clone())).erased(),
-                    [],
-                )
+                Expression::try_new(ScalarFn::new(ArrayExpr, FakeEq(child.clone())).erased(), [])
             })
             .collect::<VortexResult<_>>()?;
 
-        let expr = Expression::try_new(array.scalar_fn().clone(), inputs)?;
+        let expr = Expression::try_new(array.scalar_fn.clone(), inputs)?;
         let validity_expr = array.scalar_fn().validity(&expr)?;
 
         // Execute the validity expression. All leaves are ArrayExpr nodes.

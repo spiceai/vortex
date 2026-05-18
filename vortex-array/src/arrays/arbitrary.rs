@@ -2,29 +2,26 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::iter;
-use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 use arbitrary::Arbitrary;
-use arbitrary::Error::IncorrectFormat;
 use arbitrary::Result;
 use arbitrary::Unstructured;
 use vortex_buffer::BitBuffer;
 use vortex_buffer::Buffer;
 use vortex_error::VortexExpect;
 
+use super::BoolArray;
+use super::ChunkedArray;
+use super::NullArray;
+use super::PrimitiveArray;
+use super::StructArray;
+use crate::Array;
 use crate::ArrayRef;
 use crate::IntoArray;
-#[expect(deprecated)]
-use crate::ToCanonical as _;
-use crate::arrays::BoolArray;
-use crate::arrays::ChunkedArray;
-use crate::arrays::NullArray;
-use crate::arrays::PrimitiveArray;
-use crate::arrays::StructArray;
+use crate::ToCanonical;
 use crate::arrays::VarBinArray;
 use crate::arrays::VarBinViewArray;
-use crate::arrays::primitive::PrimitiveArrayExt;
 use crate::builders::ArrayBuilder;
 use crate::builders::DecimalBuilder;
 use crate::builders::FixedSizeListBuilder;
@@ -43,37 +40,16 @@ use crate::validity::Validity;
 #[derive(Clone, Debug)]
 pub struct ArbitraryArray(pub ArrayRef);
 
-/// Trait for generating arbitrary values with a caller-provided configuration.
-pub trait ArbitraryWith<'a, C>: Sized {
-    /// Generate an arbitrary value using the provided configuration.
-    fn arbitrary_with_config(u: &mut Unstructured<'a>, config: &C) -> Result<Self>;
+impl<'a> Arbitrary<'a> for ArbitraryArray {
+    fn arbitrary(u: &mut Unstructured<'a>) -> Result<Self> {
+        let dtype = u.arbitrary()?;
+        Self::arbitrary_with(u, None, &dtype)
+    }
 }
 
-/// Configuration for arbitrary array generation.
-#[derive(Clone, Debug)]
-pub struct ArbitraryArrayConfig {
-    /// Fixed dtype, or `None` to generate one from [`Unstructured`].
-    pub dtype: Option<DType>,
-    /// Inclusive range for the total array length.
-    pub len: RangeInclusive<usize>,
-}
-
-impl<'a> ArbitraryWith<'a, ArbitraryArrayConfig> for ArbitraryArray {
-    fn arbitrary_with_config(
-        u: &mut Unstructured<'a>,
-        config: &ArbitraryArrayConfig,
-    ) -> Result<Self> {
-        if config.len.is_empty() {
-            return Err(IncorrectFormat);
-        }
-
-        let dtype = match &config.dtype {
-            Some(dtype) => dtype.clone(),
-            None => u.arbitrary()?,
-        };
-        let len = u.int_in_range(config.len.clone())?;
-
-        random_array(u, &dtype, Some(len)).map(ArbitraryArray)
+impl ArbitraryArray {
+    pub fn arbitrary_with(u: &mut Unstructured, len: Option<usize>, dtype: &DType) -> Result<Self> {
+        random_array(u, dtype, len).map(ArbitraryArray)
     }
 }
 
@@ -129,14 +105,10 @@ fn random_array_chunk(
             PType::I16 => random_primitive::<i16>(u, *n, chunk_len),
             PType::I32 => random_primitive::<i32>(u, *n, chunk_len),
             PType::I64 => random_primitive::<i64>(u, *n, chunk_len),
-            PType::F16 => {
-                #[expect(deprecated)]
-                let prim = random_primitive::<u16>(u, *n, chunk_len)?
-                    .to_primitive()
-                    .reinterpret_cast(PType::F16)
-                    .into_array();
-                Ok(prim)
-            }
+            PType::F16 => Ok(random_primitive::<u16>(u, *n, chunk_len)?
+                .to_primitive()
+                .reinterpret_cast(PType::F16)
+                .into_array()),
             PType::F32 => random_primitive::<f32>(u, *n, chunk_len),
             PType::F64 => random_primitive::<f64>(u, *n, chunk_len),
         },
@@ -190,10 +162,7 @@ fn random_array_chunk(
             random_fixed_size_list(u, elem_dtype, *list_size, *null, chunk_len)
         }
         DType::Extension(..) => {
-            unimplemented!("Extension arrays are not implemented")
-        }
-        DType::Variant(_) => {
-            unimplemented!("Variant arrays are not implemented")
+            todo!("Extension arrays are not implemented")
         }
     }
 }
@@ -211,7 +180,7 @@ fn random_fixed_size_list(
     let array_length = chunk_len.unwrap_or(u.int_in_range(0..=20)?);
 
     let mut builder =
-        FixedSizeListBuilder::with_capacity(Arc::clone(elem_dtype), list_size, null, array_length);
+        FixedSizeListBuilder::with_capacity(elem_dtype.clone(), list_size, null, array_length);
 
     for _ in 0..array_length {
         if null == Nullability::Nullable && u.arbitrary::<bool>()? {
@@ -257,7 +226,7 @@ fn random_list_with_offset_type<O: IntegerPType>(
 ) -> Result<ArrayRef> {
     let array_length = chunk_len.unwrap_or(u.int_in_range(0..=20)?);
 
-    let mut builder = ListViewBuilder::<O, O>::with_capacity(Arc::clone(elem_dtype), null, 20, 10);
+    let mut builder = ListViewBuilder::<O, O>::with_capacity(elem_dtype.clone(), null, 20, 10);
 
     for _ in 0..array_length {
         if null == Nullability::Nullable && u.arbitrary::<bool>()? {
@@ -283,7 +252,7 @@ fn random_list_scalar(
     let elems = (0..list_size)
         .map(|_| random_scalar(u, elem_dtype))
         .collect::<Result<Vec<_>>>()?;
-    Ok(Scalar::list(Arc::clone(elem_dtype), elems, null))
+    Ok(Scalar::list(elem_dtype.clone(), elems, null))
 }
 
 fn random_string(

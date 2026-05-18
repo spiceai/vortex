@@ -4,38 +4,41 @@
 use arrow_array::BinaryArray;
 use arrow_array::StringArray;
 use arrow_ord::cmp;
+use itertools::Itertools;
 use vortex_buffer::BitBuffer;
 use vortex_error::VortexExpect as _;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
 
+use crate::Array;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::IntoArray;
-use crate::array::ArrayView;
+use crate::ToCanonical;
 use crate::arrays::BoolArray;
 use crate::arrays::PrimitiveArray;
-use crate::arrays::VarBin;
-use crate::arrays::VarBinViewArray;
-use crate::arrays::varbin::VarBinArrayExt;
+use crate::arrays::VarBinArray;
+use crate::arrays::VarBinVTable;
 use crate::arrow::Datum;
 use crate::arrow::from_arrow_array_with_len;
 use crate::builtins::ArrayBuiltins;
+use crate::compute::compare_lengths_to_empty;
 use crate::dtype::DType;
 use crate::dtype::IntegerPType;
 use crate::match_each_integer_ptype;
 use crate::scalar_fn::fns::binary::CompareKernel;
 use crate::scalar_fn::fns::operators::CompareOperator;
 use crate::scalar_fn::fns::operators::Operator;
+use crate::vtable::ValidityHelper;
 
 // This implementation exists so we can have custom translation of RHS to arrow that's not the same as IntoCanonical
-impl CompareKernel for VarBin {
+impl CompareKernel for VarBinVTable {
     fn compare(
-        lhs: ArrayView<'_, VarBin>,
-        rhs: &ArrayRef,
+        lhs: &VarBinArray,
+        rhs: &dyn Array,
         operator: CompareOperator,
-        ctx: &mut ExecutionCtx,
+        _ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
         if let Some(rhs_const) = rhs.as_constant() {
             let nullable = lhs.dtype().is_nullable() || rhs_const.dtype().is_nullable();
@@ -57,16 +60,13 @@ impl CompareKernel for VarBin {
                 let buffer = match operator {
                     CompareOperator::Gte => BitBuffer::new_set(len), // Every possible value is >= ""
                     CompareOperator::Lt => BitBuffer::new_unset(len), // No value is < ""
-                    CompareOperator::Eq | CompareOperator::Lte => {
-                        let lhs_offsets = lhs.offsets().clone().execute::<PrimitiveArray>(ctx)?;
+                    CompareOperator::Eq
+                    | CompareOperator::NotEq
+                    | CompareOperator::Gt
+                    | CompareOperator::Lte => {
+                        let lhs_offsets = lhs.offsets().to_primitive();
                         match_each_integer_ptype!(lhs_offsets.ptype(), |P| {
-                            compare_offsets_to_empty::<P>(lhs_offsets, true)
-                        })
-                    }
-                    CompareOperator::NotEq | CompareOperator::Gt => {
-                        let lhs_offsets = lhs.offsets().clone().execute::<PrimitiveArray>(ctx)?;
-                        match_each_integer_ptype!(lhs_offsets.ptype(), |P| {
-                            compare_offsets_to_empty::<P>(lhs_offsets, false)
+                            compare_offsets_to_empty::<P>(lhs_offsets, operator)
                         })
                     }
                 };
@@ -74,16 +74,18 @@ impl CompareKernel for VarBin {
                 return Ok(Some(
                     BoolArray::new(
                         buffer,
-                        lhs.validity()?.union_nullability(rhs.dtype().nullability()),
+                        lhs.validity()
+                            .clone()
+                            .union_nullability(rhs.dtype().nullability()),
                     )
                     .into_array(),
                 ));
             }
 
-            let lhs = Datum::try_new(lhs.array(), ctx)?;
+            let lhs = Datum::try_new(lhs.as_ref())?;
 
             // Use StringViewArray/BinaryViewArray to match the Utf8View/BinaryView types
-            // produced by Datum::try_new (which uses execute_arrow(None, ctx))
+            // produced by Datum::try_new (which uses into_arrow_preferred())
             let arrow_rhs: &dyn arrow_array::Datum = match rhs_const.dtype() {
                 DType::Utf8(_) => &rhs_const
                     .as_utf8()
@@ -112,31 +114,31 @@ impl CompareKernel for VarBin {
             .map_err(|err| vortex_err!("Failed to compare VarBin array: {}", err))?;
 
             Ok(Some(from_arrow_array_with_len(&array, len, nullable)?))
-        } else if !rhs.is::<VarBin>() {
+        } else if !rhs.is::<VarBinVTable>() {
             // NOTE: If the rhs is not a VarBin array it will be canonicalized to a VarBinView
             // Arrow doesn't support comparing VarBin to VarBinView arrays, so we convert ourselves
             // to VarBinView and re-invoke.
-            Ok(Some(
-                lhs.array()
-                    .clone()
-                    .execute::<VarBinViewArray>(ctx)?
-                    .into_array()
-                    .binary(rhs.clone(), Operator::from(operator))?,
-            ))
+            return Ok(Some(
+                lhs.to_varbinview()
+                    .to_array()
+                    .binary(rhs.to_array(), Operator::from(operator))?,
+            ));
         } else {
             Ok(None)
         }
     }
 }
 
-fn compare_offsets_to_empty<P: IntegerPType>(offsets: PrimitiveArray, eq: bool) -> BitBuffer {
-    let fn_ = if eq { P::eq } else { P::ne };
-    let offsets = offsets.as_slice::<P>();
-    BitBuffer::collect_bool(offsets.len() - 1, |idx| {
-        let left = unsafe { offsets.get_unchecked(idx) };
-        let right = unsafe { offsets.get_unchecked(idx + 1) };
-        fn_(left, right)
-    })
+fn compare_offsets_to_empty<P: IntegerPType>(
+    offsets: PrimitiveArray,
+    operator: CompareOperator,
+) -> BitBuffer {
+    let lengths_iter = offsets
+        .as_slice::<P>()
+        .iter()
+        .tuple_windows()
+        .map(|(&s, &e)| e - s);
+    compare_lengths_to_empty(lengths_iter, operator)
 }
 
 #[cfg(test)]
@@ -144,15 +146,10 @@ mod test {
     use vortex_buffer::BitBuffer;
     use vortex_buffer::ByteBuffer;
 
-    use crate::IntoArray;
-    use crate::LEGACY_SESSION;
-    #[expect(deprecated)]
-    use crate::ToCanonical as _;
-    use crate::VortexSessionExecute;
+    use crate::ToCanonical;
     use crate::arrays::ConstantArray;
     use crate::arrays::VarBinArray;
     use crate::arrays::VarBinViewArray;
-    use crate::arrays::bool::BoolArrayExt;
     use crate::builtins::ArrayBuiltins;
     use crate::dtype::DType;
     use crate::dtype::Nullability;
@@ -165,31 +162,21 @@ mod test {
             [Some(b"abc".to_vec()), None, Some(b"def".to_vec())],
             DType::Binary(Nullability::Nullable),
         );
-        #[expect(deprecated)]
         let result = array
-            .into_array()
+            .to_array()
             .binary(
                 ConstantArray::new(
                     Scalar::binary(ByteBuffer::copy_from(b"abc"), Nullability::Nullable),
                     3,
                 )
-                .into_array(),
+                .to_array(),
                 Operator::Eq,
             )
             .unwrap()
             .to_bool();
 
         assert_eq!(
-            &result
-                .as_ref()
-                .validity()
-                .unwrap()
-                .execute_mask(
-                    result.as_ref().len(),
-                    &mut LEGACY_SESSION.create_execution_ctx()
-                )
-                .unwrap()
-                .to_bit_buffer(),
+            &result.validity_mask().unwrap().to_bit_buffer(),
             &BitBuffer::from_iter([true, false, true])
         );
         assert_eq!(
@@ -208,24 +195,14 @@ mod test {
             [None, None, Some(b"def".to_vec())],
             DType::Binary(Nullability::Nullable),
         );
-        #[expect(deprecated)]
         let result = array
-            .into_array()
-            .binary(vbv.into_array(), Operator::Eq)
+            .to_array()
+            .binary(vbv.to_array(), Operator::Eq)
             .unwrap()
             .to_bool();
 
         assert_eq!(
-            result
-                .as_ref()
-                .validity()
-                .unwrap()
-                .execute_mask(
-                    result.as_ref().len(),
-                    &mut LEGACY_SESSION.create_execution_ctx()
-                )
-                .unwrap()
-                .to_bit_buffer(),
+            result.validity_mask().unwrap().to_bit_buffer(),
             BitBuffer::from_iter([false, false, true])
         );
         assert_eq!(
@@ -237,7 +214,7 @@ mod test {
 
 #[cfg(test)]
 mod tests {
-    use crate::IntoArray;
+    use crate::Array;
     use crate::arrays::ConstantArray;
     use crate::arrays::VarBinArray;
     use crate::builtins::ArrayBuiltins;
@@ -253,8 +230,8 @@ mod tests {
         let const_ = ConstantArray::new(Scalar::utf8("", Nullability::Nullable), 1);
 
         assert_eq!(
-            arr.into_array()
-                .binary(const_.into_array(), Operator::Eq)
+            arr.to_array()
+                .binary(const_.to_array(), Operator::Eq)
                 .unwrap()
                 .dtype(),
             &DType::Bool(Nullability::Nullable)

@@ -45,9 +45,7 @@ use vortex_layout::sequence::SequentialStreamAdapter;
 use vortex_layout::sequence::SequentialStreamExt;
 use vortex_session::SessionExt;
 use vortex_session::VortexSession;
-use vortex_session::registry::ReadContext;
 
-use crate::ALLOWED_ENCODINGS;
 use crate::Footer;
 use crate::MAGIC_BYTES;
 use crate::WriteStrategyBuilder;
@@ -158,7 +156,7 @@ impl VortexWriteOptions {
             let arrays = self.session.arrays();
             arrays.registry().clone()
         };
-        let ctx = ArrayContext::new(ALLOWED_ENCODINGS.iter().cloned().sorted().collect())
+        let ctx = ArrayContext::new(registry.ids().sorted().collect())
             // Configure a registry just to ensure only known encodings are interned.
             .with_registry(registry);
         let dtype = stream.dtype().clone();
@@ -176,7 +174,6 @@ impl VortexWriteOptions {
             stream,
             self.file_statistics.clone().into(),
             self.max_variable_length_statistics_size,
-            &self.session,
         );
 
         // First, write the magic bytes.
@@ -191,18 +188,10 @@ impl VortexWriteOptions {
         // We spawn the layout future so it is driven in the background while we write the
         // buffer stream, so we don't need to poll it until all buffers have been drained.
         let ctx2 = ctx.clone();
-        let session = self.session.clone();
-        let layout_fut = self.session.handle().spawn_nested(move |h| async move {
-            let session = session.with_handle(h);
+        let layout_fut = self.session.handle().spawn_nested(|h| async move {
             let layout = self
                 .strategy
-                .write_stream(
-                    ctx2,
-                    Arc::<BufferedSegmentSink>::clone(&segments),
-                    stream,
-                    eof,
-                    &session,
-                )
+                .write_stream(ctx2, segments.clone(), stream, eof, h)
                 .await?;
             Ok::<_, VortexError>((layout, segments.segment_specs()))
         });
@@ -222,7 +211,7 @@ impl VortexWriteOptions {
 
         // Assemble the Footer object now that we have all the segments.
         let mut footer = Footer::new(
-            Arc::clone(&layout),
+            layout.clone(),
             segment_specs,
             if self.file_statistics.is_empty() {
                 None
@@ -232,7 +221,7 @@ impl VortexWriteOptions {
                     &dtype,
                 ))
             },
-            ReadContext::new(ctx.to_ids()),
+            ctx,
         );
 
         // Emit the footer buffers and EOF.
@@ -270,7 +259,7 @@ impl VortexWriteOptions {
 
         let write = CountingVortexWrite::new(write);
         let bytes_written = write.counter();
-        let strategy = Arc::clone(&self.strategy);
+        let strategy = self.strategy.clone();
         let future = self.write(write, arrays).boxed_local().fuse();
 
         Writer {

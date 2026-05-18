@@ -1,42 +1,45 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use vortex_array::ArrayRef;
-use vortex_array::ExecutionCtx;
-use vortex_array::aggregate_fn::AggregateFnRef;
-use vortex_array::aggregate_fn::fns::is_constant::IsConstant;
-use vortex_array::aggregate_fn::fns::is_constant::is_constant;
-use vortex_array::aggregate_fn::kernels::DynAggregateKernel;
-use vortex_array::scalar::Scalar;
+use vortex_array::compute::IsConstantKernel;
+use vortex_array::compute::IsConstantKernelAdapter;
+use vortex_array::compute::IsConstantOpts;
+use vortex_array::compute::is_constant_opts;
+use vortex_array::register_kernel;
 use vortex_error::VortexResult;
 
-use crate::DateTimeParts;
-use crate::array::DateTimePartsArraySlotsExt;
+use crate::DateTimePartsArray;
+use crate::DateTimePartsVTable;
 
-/// DateTimeParts-specific is_constant kernel.
-///
-/// Checks each component (days, seconds, subseconds) individually.
-#[derive(Debug)]
-pub(crate) struct DateTimePartsIsConstantKernel;
-
-impl DynAggregateKernel for DateTimePartsIsConstantKernel {
-    fn aggregate(
+impl IsConstantKernel for DateTimePartsVTable {
+    fn is_constant(
         &self,
-        aggregate_fn: &AggregateFnRef,
-        batch: &ArrayRef,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<Option<Scalar>> {
-        if !aggregate_fn.is::<IsConstant>() {
-            return Ok(None);
-        }
-
-        let Some(array) = batch.as_opt::<DateTimeParts>() else {
+        array: &DateTimePartsArray,
+        opts: &IsConstantOpts,
+    ) -> VortexResult<Option<bool>> {
+        let Some(days) = is_constant_opts(array.days().as_ref(), opts)? else {
             return Ok(None);
         };
+        if !days {
+            return Ok(Some(false));
+        }
 
-        let result = is_constant(array.days(), ctx)?
-            && is_constant(array.seconds(), ctx)?
-            && is_constant(array.subseconds(), ctx)?;
-        Ok(Some(IsConstant::make_partial(batch, result, ctx)?))
+        let Some(seconds) = is_constant_opts(array.seconds().as_ref(), opts)? else {
+            return Ok(None);
+        };
+        if !seconds {
+            return Ok(Some(false));
+        }
+
+        let Some(subseconds) = is_constant_opts(array.subseconds().as_ref(), opts)? else {
+            return Ok(None);
+        };
+        if !subseconds {
+            return Ok(Some(false));
+        }
+
+        Ok(Some(true))
     }
 }
+
+register_kernel!(IsConstantKernelAdapter(DateTimePartsVTable).lift());

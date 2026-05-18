@@ -5,17 +5,16 @@ use vortex_error::VortexResult;
 
 use crate::ArrayRef;
 use crate::IntoArray;
-use crate::array::ArrayView;
-use crate::arrays::Constant;
 use crate::arrays::ConstantArray;
+use crate::arrays::ConstantVTable;
 use crate::dtype::DType;
 use crate::scalar_fn::fns::cast::CastReduce;
 
-impl CastReduce for Constant {
-    fn cast(array: ArrayView<'_, Constant>, dtype: &DType) -> VortexResult<Option<ArrayRef>> {
+impl CastReduce for ConstantVTable {
+    fn cast(array: &ConstantArray, dtype: &DType) -> VortexResult<Option<ArrayRef>> {
         match array.scalar().cast(dtype) {
             Ok(scalar) => Ok(Some(ConstantArray::new(scalar, array.len()).into_array())),
-            Err(_) => Ok(None),
+            Err(_e) => Ok(None),
         }
     }
 }
@@ -37,6 +36,6 @@ mod tests {
     #[case(ConstantArray::new(Scalar::null_native::<i32>(), 4).into_array())]
     #[case(ConstantArray::new(Scalar::from(255u8), 1).into_array())]
     fn test_cast_constant_conformance(#[case] array: crate::ArrayRef) {
-        test_cast_conformance(&array);
+        test_cast_conformance(array.as_ref());
     }
 }

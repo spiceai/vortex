@@ -25,11 +25,11 @@ use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
 
+use crate::Array;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::arrays::ExtensionArray;
 use crate::arrays::PrimitiveArray as VortexPrimitiveArray;
-use crate::arrays::extension::ExtensionArrayExt;
 use crate::arrow::null_buffer::to_null_buffer;
 use crate::dtype::NativePType;
 use crate::extension::datetime::AnyTemporal;
@@ -86,16 +86,16 @@ pub(super) fn to_arrow_temporal(
 
             match (unit, arrow_unit) {
                 (TimeUnit::Seconds, ArrowTimeUnit::Second) => {
-                    to_arrow_timestamp::<TimestampSecondType>(array, arrow_tz.as_ref(), ctx)
+                    to_arrow_timestamp::<TimestampSecondType>(array, arrow_tz, ctx)
                 }
                 (TimeUnit::Milliseconds, ArrowTimeUnit::Millisecond) => {
-                    to_arrow_timestamp::<TimestampMillisecondType>(array, arrow_tz.as_ref(), ctx)
+                    to_arrow_timestamp::<TimestampMillisecondType>(array, arrow_tz, ctx)
                 }
                 (TimeUnit::Microseconds, ArrowTimeUnit::Microsecond) => {
-                    to_arrow_timestamp::<TimestampMicrosecondType>(array, arrow_tz.as_ref(), ctx)
+                    to_arrow_timestamp::<TimestampMicrosecondType>(array, arrow_tz, ctx)
                 }
                 (TimeUnit::Nanoseconds, ArrowTimeUnit::Nanosecond) => {
-                    to_arrow_timestamp::<TimestampNanosecondType>(array, arrow_tz.as_ref(), ctx)
+                    to_arrow_timestamp::<TimestampNanosecondType>(array, arrow_tz, ctx)
                 }
                 _ => vortex_bail!(
                     "Cannot convert {} array to Arrow type {}",
@@ -125,14 +125,14 @@ where
 
 fn to_arrow_timestamp<T: ArrowTimestampType>(
     array: ArrayRef,
-    arrow_tz: Option<&Arc<str>>,
+    arrow_tz: &Option<Arc<str>>,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrowArrayRef>
 where
     T::Native: NativePType,
 {
     Ok(Arc::new(
-        to_arrow_temporal_primitive::<T>(array, ctx)?.with_timezone_opt(arrow_tz.cloned()),
+        to_arrow_temporal_primitive::<T>(array, ctx)?.with_timezone_opt(arrow_tz.clone()),
     ))
 }
 
@@ -147,7 +147,7 @@ where
 
     let ext_array = array.execute::<ExtensionArray>(ctx)?;
     let primitive = ext_array
-        .storage_array()
+        .storage()
         .clone()
         .execute::<VortexPrimitiveArray>(ctx)?;
     vortex_ensure!(
@@ -157,10 +157,7 @@ where
         primitive.ptype()
     );
 
-    let validity = primitive
-        .as_ref()
-        .validity()?
-        .execute_mask(primitive.as_ref().len(), ctx)?;
+    let validity = primitive.validity_mask()?;
     let buffer = primitive.to_buffer::<T::Native>();
 
     let values = buffer.into_arrow_scalar_buffer();

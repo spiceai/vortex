@@ -166,10 +166,6 @@ impl LogicalType {
     pub fn timestamp_tz() -> Self {
         Self::new(DUCKDB_TYPE::DUCKDB_TYPE_TIMESTAMP_TZ)
     }
-
-    pub fn date() -> Self {
-        Self::new(DUCKDB_TYPE::DUCKDB_TYPE_DATE)
-    }
 }
 
 impl LogicalTypeRef {
@@ -184,10 +180,6 @@ impl LogicalTypeRef {
                 duckdb_decimal_scale(self.as_ptr()),
             )
         }
-    }
-
-    pub fn is_decimal(&self) -> bool {
-        matches!(self.as_type_id(), DUCKDB_TYPE::DUCKDB_TYPE_DECIMAL)
     }
 
     pub fn array_child_type(&self) -> LogicalType {
@@ -371,6 +363,7 @@ floating_type!(Float, f32);
 floating_type!(Double, f64);
 
 #[cfg(test)]
+#[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
 
@@ -400,6 +393,7 @@ mod tests {
     fn test_clone_decimal_logical_type() {
         let decimal_type =
             LogicalType::decimal_type(10, 2).vortex_expect("Failed to create decimal type");
+        #[allow(clippy::redundant_clone)]
         let cloned = decimal_type.clone();
 
         assert_eq!(decimal_type.as_type_id(), cloned.as_type_id());
@@ -417,6 +411,7 @@ mod tests {
         let list_type =
             LogicalType::list_type(int_type).vortex_expect("Failed to create list type");
 
+        #[allow(clippy::redundant_clone)]
         let cloned = list_type.clone();
 
         assert_eq!(list_type.as_type_id(), cloned.as_type_id());
@@ -437,6 +432,7 @@ mod tests {
         let array_type =
             LogicalType::array_type(LogicalType::new(DUCKDB_TYPE::DUCKDB_TYPE_VARCHAR), 5)
                 .vortex_expect("Failed to create array type");
+        #[allow(clippy::redundant_clone)]
         let cloned = array_type.clone();
 
         assert_eq!(array_type.as_type_id(), cloned.as_type_id());
@@ -469,6 +465,7 @@ mod tests {
             ))
         };
 
+        #[allow(clippy::redundant_clone)]
         let cloned = map_type.clone();
 
         assert_eq!(map_type.as_type_id(), cloned.as_type_id());
@@ -499,6 +496,7 @@ mod tests {
         let struct_type = LogicalType::struct_type(member_types, member_names)
             .vortex_expect("Failed to create struct type");
 
+        #[allow(clippy::redundant_clone)]
         let cloned = struct_type.clone();
 
         assert_eq!(struct_type.as_type_id(), cloned.as_type_id());
@@ -542,6 +540,7 @@ mod tests {
             ))
         };
 
+        #[allow(clippy::redundant_clone)]
         let cloned = union_type.clone();
 
         assert_eq!(union_type.as_type_id(), cloned.as_type_id());

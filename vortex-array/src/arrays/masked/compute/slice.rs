@@ -7,17 +7,24 @@ use vortex_error::VortexResult;
 
 use crate::ArrayRef;
 use crate::IntoArray;
-use crate::array::ArrayView;
-use crate::arrays::Masked;
 use crate::arrays::MaskedArray;
-use crate::arrays::masked::MaskedArraySlotsExt;
-use crate::arrays::slice::SliceReduce;
+use crate::arrays::MaskedVTable;
+use crate::arrays::SliceReduce;
+use crate::stats::ArrayStats;
 
-impl SliceReduce for Masked {
-    fn slice(array: ArrayView<'_, Self>, range: Range<usize>) -> VortexResult<Option<ArrayRef>> {
-        let child = array.child().slice(range.clone())?;
-        let validity = array.validity()?.slice(range)?;
+impl SliceReduce for MaskedVTable {
+    fn slice(array: &Self::Array, range: Range<usize>) -> VortexResult<Option<ArrayRef>> {
+        let child = array.child.slice(range.clone())?;
+        let validity = array.validity.slice(range)?;
 
-        Ok(Some(MaskedArray::try_new(child, validity)?.into_array()))
+        Ok(Some(
+            MaskedArray {
+                child,
+                validity,
+                dtype: array.dtype.clone(),
+                stats: ArrayStats::default(),
+            }
+            .into_array(),
+        ))
     }
 }

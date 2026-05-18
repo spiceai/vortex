@@ -6,17 +6,17 @@ mod kernel;
 use std::fmt::Formatter;
 
 pub use kernel::*;
+use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_session::VortexSession;
 
+use crate::Array;
 use crate::ArrayRef;
-use crate::ExecutionCtx;
 use crate::IntoArray;
-use crate::arrays::Bool;
 use crate::arrays::BoolArray;
+use crate::arrays::BoolVTable;
 use crate::arrays::ConstantArray;
-use crate::arrays::bool::BoolArrayExt;
 use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
 use crate::expr::Expression;
@@ -36,7 +36,7 @@ impl ScalarFnVTable for Not {
     type Options = EmptyOptions;
 
     fn id(&self) -> ScalarFnId {
-        ScalarFnId::new("vortex.not")
+        ScalarFnId::from("vortex.not")
     }
 
     fn serialize(&self, _options: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
@@ -84,13 +84,8 @@ impl ScalarFnVTable for Not {
         Ok(child_dtype.clone())
     }
 
-    fn execute(
-        &self,
-        _data: &Self::Options,
-        args: &dyn ExecutionArgs,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<ArrayRef> {
-        let child = args.get(0)?;
+    fn execute(&self, _data: &Self::Options, mut args: ExecutionArgs) -> VortexResult<ArrayRef> {
+        let child = args.inputs.pop().vortex_expect("Missing input child");
 
         // For constant boolean
         if let Some(scalar) = child.as_constant() {
@@ -98,16 +93,16 @@ impl ScalarFnVTable for Not {
                 Some(b) => Scalar::bool(!b, child.dtype().nullability()),
                 None => Scalar::null(child.dtype().clone()),
             };
-            return Ok(ConstantArray::new(value, args.row_count()).into_array());
+            return Ok(ConstantArray::new(value, args.row_count).into_array());
         }
 
         // For boolean array
-        if let Some(bool) = child.as_opt::<Bool>() {
+        if let Some(bool) = child.as_opt::<BoolVTable>() {
             return Ok(BoolArray::new(!bool.to_bit_buffer(), bool.validity()?).into_array());
         }
 
         // Otherwise, execute and try again
-        child.execute::<ArrayRef>(ctx)?.not()
+        child.execute::<ArrayRef>(args.ctx)?.not()
     }
 
     fn is_null_sensitive(&self, _options: &Self::Options) -> bool {
@@ -121,10 +116,8 @@ impl ScalarFnVTable for Not {
 
 #[cfg(test)]
 mod tests {
-    use crate::IntoArray;
-    #[expect(deprecated)]
-    use crate::ToCanonical as _;
-    use crate::arrays::bool::BoolArrayExt;
+    use crate::ToCanonical;
+    use crate::arrays::BoolArray;
     use crate::dtype::DType;
     use crate::dtype::Nullability;
     use crate::expr::col;
@@ -132,16 +125,20 @@ mod tests {
     use crate::expr::not;
     use crate::expr::root;
     use crate::expr::test_harness;
-    use crate::scalar_fn::fns::not::BoolArray;
 
     #[test]
     fn invert_booleans() {
         let not_expr = not(root());
         let bools = BoolArray::from_iter([false, true, false, false, true, true]);
-        #[expect(deprecated)]
-        let result = bools.into_array().apply(&not_expr).unwrap().to_bool();
         assert_eq!(
-            result.to_bit_buffer().iter().collect::<Vec<_>>(),
+            bools
+                .to_array()
+                .apply(&not_expr)
+                .unwrap()
+                .to_bool()
+                .to_bit_buffer()
+                .iter()
+                .collect::<Vec<_>>(),
             vec![true, false, true, true, false, false]
         );
     }

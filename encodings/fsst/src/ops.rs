@@ -1,25 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use vortex_array::ArrayView;
-use vortex_array::ExecutionCtx;
-use vortex_array::arrays::varbin::varbin_scalar;
+use vortex_array::arrays::varbin_scalar;
 use vortex_array::scalar::Scalar;
 use vortex_array::vtable::OperationsVTable;
 use vortex_buffer::ByteBuffer;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 
-use crate::FSST;
-use crate::FSSTArrayExt;
+use crate::FSSTArray;
+use crate::FSSTVTable;
 
-impl OperationsVTable<FSST> for FSST {
-    fn scalar_at(
-        array: ArrayView<'_, FSST>,
-        index: usize,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<Scalar> {
-        let compressed = array.codes().execute_scalar(index, ctx)?;
+impl OperationsVTable<FSSTVTable> for FSSTVTable {
+    fn scalar_at(array: &FSSTArray, index: usize) -> VortexResult<Scalar> {
+        let compressed = array.codes().scalar_at(index)?;
         let binary_datum = compressed.as_binary().value().vortex_expect("non-null");
 
         let decoded_buffer = ByteBuffer::from(array.decompressor().decompress(binary_datum));

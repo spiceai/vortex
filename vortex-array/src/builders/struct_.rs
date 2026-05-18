@@ -11,19 +11,16 @@ use vortex_error::vortex_ensure;
 use vortex_error::vortex_panic;
 use vortex_mask::Mask;
 
+use crate::Array;
 use crate::ArrayRef;
 use crate::IntoArray;
-use crate::LEGACY_SESSION;
-use crate::VortexSessionExecute;
 use crate::arrays::StructArray;
-use crate::arrays::struct_::StructArrayExt;
 use crate::builders::ArrayBuilder;
 use crate::builders::DEFAULT_BUILDER_CAPACITY;
 use crate::builders::LazyBitBufferBuilder;
 use crate::builders::builder_with_capacity;
 use crate::canonical::Canonical;
-#[expect(deprecated)]
-use crate::canonical::ToCanonical as _;
+use crate::canonical::ToCanonical;
 use crate::dtype::DType;
 use crate::dtype::Nullability;
 use crate::dtype::StructFields;
@@ -168,23 +165,21 @@ impl ArrayBuilder for StructBuilder {
         self.append_value(scalar.as_struct())
     }
 
-    unsafe fn extend_from_array_unchecked(&mut self, array: &ArrayRef) {
-        #[expect(deprecated)]
+    unsafe fn extend_from_array_unchecked(&mut self, array: &dyn Array) {
         let array = array.to_struct();
 
         for (a, builder) in array
-            .iter_unmasked_fields()
+            .unmasked_fields()
+            .iter()
             .zip_eq(self.builders.iter_mut())
         {
-            builder.extend_from_array(a);
+            builder.extend_from_array(a.as_ref());
         }
 
         self.nulls.append_validity_mask(
             array
-                .validity()
-                .vortex_expect("validity_mask")
-                .execute_mask(array.len(), &mut LEGACY_SESSION.create_execution_ctx())
-                .vortex_expect("Failed to compute validity mask"),
+                .validity_mask()
+                .vortex_expect("validity_mask in extend_from_array_unchecked"),
         );
     }
 
@@ -212,13 +207,11 @@ impl ArrayBuilder for StructBuilder {
 #[cfg(test)]
 mod tests {
     use crate::IntoArray;
-    use crate::LEGACY_SESSION;
-    use crate::VortexSessionExecute;
     use crate::arrays::PrimitiveArray;
+    use crate::arrays::StructArray;
     use crate::arrays::VarBinArray;
     use crate::assert_arrays_eq;
     use crate::builders::ArrayBuilder;
-    use crate::builders::struct_::StructArray;
     use crate::builders::struct_::StructBuilder;
     use crate::dtype::DType;
     use crate::dtype::Nullability;
@@ -257,12 +250,7 @@ mod tests {
         let struct_ = builder.finish();
         assert_eq!(struct_.len(), 3);
         assert_eq!(struct_.dtype(), &dtype);
-        assert_eq!(
-            struct_
-                .valid_count(&mut LEGACY_SESSION.create_execution_ctx())
-                .unwrap(),
-            1
-        );
+        assert_eq!(struct_.valid_count().unwrap(), 1);
     }
 
     #[test]

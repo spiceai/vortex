@@ -3,11 +3,10 @@
 
 //! CUDA benchmarks for DateTimeParts decoding.
 
-#![expect(clippy::unwrap_used)]
-#![expect(clippy::cast_possible_truncation)]
+#![allow(clippy::unwrap_used)]
+#![allow(clippy::cast_possible_truncation)]
 
-mod bench_config;
-mod timed_launch_strategy;
+mod common;
 
 use std::mem::size_of;
 use std::sync::Arc;
@@ -25,19 +24,17 @@ use vortex::array::validity::Validity;
 use vortex::buffer::Buffer;
 use vortex::dtype::DType;
 use vortex::dtype::Nullability;
-use vortex::encodings::datetime_parts::DateTimeParts;
 use vortex::encodings::datetime_parts::DateTimePartsArray;
 use vortex::error::VortexExpect;
 use vortex::extension::datetime::TimeUnit;
 use vortex::extension::datetime::Timestamp;
 use vortex::session::VortexSession;
-use vortex_cuda::CudaDispatchMode;
 use vortex_cuda::CudaSession;
 use vortex_cuda::executor::CudaArrayExt;
 use vortex_cuda_macros::cuda_available;
 use vortex_cuda_macros::cuda_not_available;
 
-use crate::timed_launch_strategy::TimedLaunchStrategy;
+use crate::common::TimedLaunchStrategy;
 
 fn make_datetimeparts_array(len: usize, time_unit: TimeUnit) -> DateTimePartsArray {
     let days: Vec<i16> = (0..len).map(|i| (i / 1000) as i16).collect();
@@ -47,36 +44,39 @@ fn make_datetimeparts_array(len: usize, time_unit: TimeUnit) -> DateTimePartsArr
 
     let dtype = DType::Extension(Timestamp::new(time_unit, Nullability::NonNullable).erased());
 
-    DateTimeParts::try_new(dtype, days_arr, seconds_arr, subseconds_arr)
+    DateTimePartsArray::try_new(dtype, days_arr, seconds_arr, subseconds_arr)
         .vortex_expect("Failed to create DateTimePartsArray")
 }
 
 fn benchmark_datetimeparts(c: &mut Criterion) {
-    let mut group = c.benchmark_group("cuda/datetimeparts");
+    let mut group = c.benchmark_group("datetimeparts_cuda");
+    group.sample_size(10);
 
-    for &(len, len_str) in bench_config::BENCH_SIZES {
+    for (len, len_str) in [
+        (1_000_000usize, "1M"),
+        (10_000_000usize, "10M"),
+        (100_000_000usize, "100M"),
+    ] {
         group.throughput(Throughput::Bytes((len * size_of::<i64>()) as u64));
 
         let (time_unit, unit_str) = (TimeUnit::Milliseconds, "ms");
         let dtp_array = make_datetimeparts_array(len, time_unit);
 
         group.bench_with_input(
-            BenchmarkId::new(unit_str, len_str),
+            BenchmarkId::new("datetimeparts", format!("{len_str}_{unit_str}")),
             &dtp_array,
             |b, dtp_array| {
                 b.iter_custom(|iters| {
                     let timed = TimedLaunchStrategy::default();
-                    let timer = timed.timer();
+                    let timer = Arc::clone(&timed.total_time_ns);
 
                     let mut cuda_ctx = CudaSession::create_execution_ctx(&VortexSession::empty())
                         .vortex_expect("failed to create execution context")
-                        .with_dispatch_mode(CudaDispatchMode::StandaloneOnly)
                         .with_launch_strategy(Arc::new(timed));
 
                     for _ in 0..iters {
                         // block on immediately here
-                        block_on(dtp_array.clone().into_array().execute_cuda(&mut cuda_ctx))
-                            .unwrap();
+                        block_on(dtp_array.to_array().execute_cuda(&mut cuda_ctx)).unwrap();
                     }
 
                     Duration::from_nanos(timer.load(Ordering::Relaxed))
@@ -88,11 +88,7 @@ fn benchmark_datetimeparts(c: &mut Criterion) {
     group.finish();
 }
 
-criterion::criterion_group! {
-    name = benches;
-    config = bench_config::cuda_bench_config();
-    targets = benchmark_datetimeparts
-}
+criterion::criterion_group!(benches, benchmark_datetimeparts);
 
 #[cuda_available]
 criterion::criterion_main!(benches);

@@ -363,9 +363,8 @@ def cmd_report(args: argparse.Namespace) -> int:
         print(f"Commented on #{existing_issue}", file=sys.stderr)
         _write_github_output("issue_number", str(existing_issue))
     else:
-        # Use FUZZ_NAME for the title (descriptive name), fall back to FUZZ_TARGET
-        fuzz_name = variables.get("FUZZ_NAME") or variables.get("FUZZ_TARGET", "unknown")
-        title = f"Fuzzing Crash: {crash_info.error_variant} in {fuzz_name}"
+        fuzz_target = variables.get("FUZZ_TARGET", "unknown")
+        title = f"Fuzzing Crash: {crash_info.error_variant} in {fuzz_target}"
 
         body = render_template(str(TEMPLATES_DIR / "new_issue.md"), variables, use_env=False)
         body_file = Path("issue_body.md")

@@ -108,11 +108,15 @@
 //! [1] <https://chipsandcheese.com/2022/11/08/amds-zen-4-part-2-memory-subsystem-and-conclusion/>
 //! [2] <https://chipsandcheese.com/p/cortex-x2-arm-aims-high>
 
-#![expect(clippy::unwrap_used, clippy::uninit_vec)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::uninit_vec,
+    clippy::cast_possible_truncation
+)]
 
 use divan::Bencher;
 use fastlanes::BitPacking;
-use rand::RngExt;
+use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use vortex_alp::ALPFloat;

@@ -4,16 +4,14 @@
 mod array;
 mod patch;
 
-pub use array::BoolArrayExt;
-pub use array::BoolData;
-pub use array::BoolDataParts;
+pub use array::BoolArray;
+pub use array::BoolArrayParts;
 
 pub(crate) mod compute;
 
 mod vtable;
 pub use compute::rules::BoolMaskedValidityRule;
-pub use vtable::Bool;
-pub use vtable::BoolArray;
+pub use vtable::BoolVTable;
 
 #[cfg(feature = "_test-harness")]
 mod test_harness;

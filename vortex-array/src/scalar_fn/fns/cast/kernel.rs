@@ -5,15 +5,14 @@ use vortex_error::VortexResult;
 
 use crate::ArrayRef;
 use crate::ExecutionCtx;
-use crate::array::ArrayView;
-use crate::array::VTable;
-use crate::arrays::scalar_fn::ExactScalarFn;
-use crate::arrays::scalar_fn::ScalarFnArrayView;
+use crate::arrays::ExactScalarFn;
+use crate::arrays::ScalarFnArrayView;
 use crate::dtype::DType;
 use crate::kernel::ExecuteParentKernel;
 use crate::matcher::Matcher;
 use crate::optimizer::rules::ArrayParentReduceRule;
 use crate::scalar_fn::fns::cast::Cast;
+use crate::vtable::VTable;
 
 /// Reduce rule for cast: restructure the array without reading buffers.
 ///
@@ -23,7 +22,7 @@ use crate::scalar_fn::fns::cast::Cast;
 ///
 /// Returns `Ok(None)` if the rule doesn't apply to this array/dtype combination.
 pub trait CastReduce: VTable {
-    fn cast(array: ArrayView<'_, Self>, dtype: &DType) -> VortexResult<Option<ArrayRef>>;
+    fn cast(array: &Self::Array, dtype: &DType) -> VortexResult<Option<ArrayRef>>;
 }
 
 /// Execute kernel for cast: perform the actual value conversion, potentially reading buffers.
@@ -34,7 +33,7 @@ pub trait CastReduce: VTable {
 /// Returns `Ok(None)` if this kernel cannot handle the given dtype conversion.
 pub trait CastKernel: VTable {
     fn cast(
-        array: ArrayView<'_, Self>,
+        array: &Self::Array,
         dtype: &DType,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>>;
@@ -52,13 +51,13 @@ where
 
     fn reduce_parent(
         &self,
-        array: ArrayView<'_, V>,
+        array: &V::Array,
         parent: ScalarFnArrayView<'_, Cast>,
         _child_idx: usize,
     ) -> VortexResult<Option<ArrayRef>> {
         let dtype = parent.options;
         if array.dtype() == dtype {
-            return Ok(Some(array.array().clone()));
+            return Ok(Some(array.to_array()));
         }
         <V as CastReduce>::cast(array, dtype)
     }
@@ -76,14 +75,14 @@ where
 
     fn execute_parent(
         &self,
-        array: ArrayView<'_, V>,
+        array: &V::Array,
         parent: <Self::Parent as Matcher>::Match<'_>,
         _child_idx: usize,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
         let dtype = parent.options;
         if array.dtype() == dtype {
-            return Ok(Some(array.array().clone()));
+            return Ok(Some(array.to_array()));
         }
         <V as CastKernel>::cast(array, dtype, ctx)
     }

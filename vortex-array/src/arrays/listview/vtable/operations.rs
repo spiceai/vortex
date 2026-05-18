@@ -5,29 +5,23 @@ use std::sync::Arc;
 
 use vortex_error::VortexResult;
 
-use crate::ExecutionCtx;
-use crate::array::ArrayView;
-use crate::array::OperationsVTable;
-use crate::arrays::ListView;
-use crate::arrays::listview::ListViewArrayExt;
+use crate::arrays::ListViewArray;
+use crate::arrays::ListViewVTable;
 use crate::scalar::Scalar;
+use crate::vtable::OperationsVTable;
 
-impl OperationsVTable<ListView> for ListView {
-    fn scalar_at(
-        array: ArrayView<'_, ListView>,
-        index: usize,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<Scalar> {
+impl OperationsVTable<ListViewVTable> for ListViewVTable {
+    fn scalar_at(array: &ListViewArray, index: usize) -> VortexResult<Scalar> {
         // By the preconditions we know that the list scalar is not null.
         let list = array.list_elements_at(index)?;
         let children: Vec<Scalar> = (0..list.len())
-            .map(|i| list.execute_scalar(i, ctx))
+            .map(|i| list.scalar_at(i))
             .collect::<VortexResult<_>>()?;
 
         Ok(Scalar::list(
             Arc::new(list.dtype().clone()),
             children,
-            array.dtype().nullability(),
+            array.dtype.nullability(),
         ))
     }
 }

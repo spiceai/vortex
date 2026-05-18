@@ -7,14 +7,11 @@ use vortex_error::VortexExpect;
 use vortex_mask::MaskValues;
 
 use crate::arrays::BoolArray;
-use crate::arrays::bool::BoolArrayExt;
 use crate::arrays::filter::execute::bitbuffer;
 use crate::arrays::filter::execute::filter_validity;
 
 pub fn filter_bool(array: &BoolArray, mask: &Arc<MaskValues>) -> BoolArray {
-    let validity = array
-        .validity()
-        .vortex_expect("bool validity should be derivable");
+    let validity = array.validity().vortex_expect("missing BoolArray validity");
     let filtered_validity = filter_validity(validity, mask);
 
     let bit_buffer = array.to_bit_buffer();
@@ -29,10 +26,8 @@ mod test {
     use rstest::rstest;
     use vortex_mask::Mask;
 
-    use crate::IntoArray;
-    use crate::arrays::filter::execute::bool::BoolArray;
-    #[expect(deprecated)]
-    use crate::canonical::ToCanonical as _;
+    use crate::arrays::BoolArray;
+    use crate::canonical::ToCanonical;
     use crate::compute::conformance::filter::test_filter_conformance;
 
     #[test]
@@ -40,7 +35,6 @@ mod test {
         let arr = BoolArray::from_iter([true, true, false]);
         let mask = Mask::from_iter([true, false, true]);
 
-        #[expect(deprecated)]
         let filtered = arr.filter(mask).unwrap().to_bool();
         assert_eq!(2, filtered.len());
 
@@ -58,6 +52,6 @@ mod test {
     #[case(BoolArray::from_iter((0..100).map(|i| i % 2 == 0)))]
     #[case(BoolArray::from_iter((0..1024).map(|i| i % 3 != 0)))]
     fn test_filter_bool_conformance(#[case] array: BoolArray) {
-        test_filter_conformance(&array.into_array());
+        test_filter_conformance(array.as_ref());
     }
 }

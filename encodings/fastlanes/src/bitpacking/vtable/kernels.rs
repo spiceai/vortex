@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use vortex_array::arrays::dict::TakeExecuteAdaptor;
-use vortex_array::arrays::filter::FilterExecuteAdaptor;
+use vortex_array::arrays::FilterExecuteAdaptor;
+use vortex_array::arrays::SliceExecuteAdaptor;
+use vortex_array::arrays::TakeExecuteAdaptor;
 use vortex_array::kernel::ParentKernelSet;
-use vortex_array::scalar_fn::fns::cast::CastExecuteAdaptor;
 
-use crate::BitPacked;
+use crate::BitPackedVTable;
 
-pub(crate) const PARENT_KERNELS: ParentKernelSet<BitPacked> = ParentKernelSet::new(&[
-    ParentKernelSet::lift(&CastExecuteAdaptor(BitPacked)),
-    ParentKernelSet::lift(&FilterExecuteAdaptor(BitPacked)),
-    ParentKernelSet::lift(&TakeExecuteAdaptor(BitPacked)),
+pub(crate) const PARENT_KERNELS: ParentKernelSet<BitPackedVTable> = ParentKernelSet::new(&[
+    ParentKernelSet::lift(&FilterExecuteAdaptor(BitPackedVTable)),
+    ParentKernelSet::lift(&SliceExecuteAdaptor(BitPackedVTable)),
+    ParentKernelSet::lift(&TakeExecuteAdaptor(BitPackedVTable)),
 ]);

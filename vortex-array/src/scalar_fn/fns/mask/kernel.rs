@@ -6,14 +6,13 @@ use vortex_error::vortex_err;
 
 use crate::ArrayRef;
 use crate::ExecutionCtx;
-use crate::array::ArrayView;
-use crate::array::VTable;
-use crate::arrays::Bool;
-use crate::arrays::scalar_fn::ExactScalarFn;
-use crate::arrays::scalar_fn::ScalarFnArrayView;
+use crate::arrays::BoolVTable;
+use crate::arrays::ExactScalarFn;
+use crate::arrays::ScalarFnArrayView;
 use crate::kernel::ExecuteParentKernel;
 use crate::optimizer::rules::ArrayParentReduceRule;
 use crate::scalar_fn::fns::mask::Mask as MaskExpr;
+use crate::vtable::VTable;
 
 /// Mask an array without reading buffers.
 ///
@@ -28,7 +27,7 @@ use crate::scalar_fn::fns::mask::Mask as MaskExpr;
 /// The mask is guaranteed to have the same length as the array. Trivial cases
 /// (`AllValid`, `AllInvalid`, `NonNullable`) are handled by the caller before dispatch.
 pub trait MaskReduce: VTable {
-    fn mask(array: ArrayView<'_, Self>, mask: &ArrayRef) -> VortexResult<Option<ArrayRef>>;
+    fn mask(array: &Self::Array, mask: &ArrayRef) -> VortexResult<Option<ArrayRef>>;
 }
 
 /// Mask an array, potentially reading buffers.
@@ -44,7 +43,7 @@ pub trait MaskReduce: VTable {
 /// (`AllValid`, `AllInvalid`, `NonNullable`) are handled by the caller before dispatch.
 pub trait MaskKernel: VTable {
     fn mask(
-        array: ArrayView<'_, Self>,
+        array: &Self::Array,
         mask: &ArrayRef,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>>;
@@ -62,7 +61,7 @@ where
 
     fn reduce_parent(
         &self,
-        array: ArrayView<'_, V>,
+        array: &V::Array,
         parent: ScalarFnArrayView<'_, MaskExpr>,
         child_idx: usize,
     ) -> VortexResult<Option<ArrayRef>> {
@@ -72,11 +71,10 @@ where
         }
         // The mask child (child 1) is a non-nullable BoolArray where true=keep.
         // If it's not yet a BoolArray, we can't reduce without execution.
-        let parent_ref: ArrayRef = (*parent).clone();
-        let mask_child = parent_ref
+        let mask_child = parent
             .nth_child(1)
             .ok_or_else(|| vortex_err!("Mask expression must have 2 children"))?;
-        if mask_child.as_opt::<Bool>().is_none() {
+        if mask_child.as_opt::<BoolVTable>().is_none() {
             return Ok(None);
         };
         <V as MaskReduce>::mask(array, &mask_child)
@@ -95,7 +93,7 @@ where
 
     fn execute_parent(
         &self,
-        array: ArrayView<'_, V>,
+        array: &V::Array,
         parent: ScalarFnArrayView<'_, MaskExpr>,
         child_idx: usize,
         ctx: &mut ExecutionCtx,

@@ -166,16 +166,16 @@ impl Scalar {
             ListKind::FixedSize => DType::FixedSizeList(element_dtype, size, nullability),
         };
 
-        Self::try_new(dtype, Some(ScalarValue::Tuple(children)))
+        Self::try_new(dtype, Some(ScalarValue::List(children)))
             .vortex_expect("unable to construct a list `Scalar`")
     }
 
     /// Creates a new extension scalar wrapping the given storage value.
-    pub fn extension<V: ExtVTable + Default>(options: V::Metadata, storage_scalar: Scalar) -> Self {
-        let ext_dtype = ExtDType::<V>::try_new(options, storage_scalar.dtype().clone())
+    pub fn extension<V: ExtVTable + Default>(options: V::Metadata, value: Scalar) -> Self {
+        let ext_dtype = ExtDType::<V>::try_new(options, value.dtype().clone())
             .vortex_expect("Failed to create extension dtype");
-
-        Self::extension_ref(ext_dtype.erased(), storage_scalar)
+        Self::try_new(DType::Extension(ext_dtype.erased()), value.into_value())
+            .vortex_expect("unable to construct an extension `Scalar`")
     }
 
     /// Creates a new extension scalar wrapping the given storage value.
@@ -183,24 +183,10 @@ impl Scalar {
     /// # Panics
     ///
     /// Panics if the storage dtype of `ext_dtype` does not match `value`'s dtype.
-    pub fn extension_ref(ext_dtype: ExtDTypeRef, storage_scalar: Scalar) -> Self {
-        assert_eq!(ext_dtype.storage_dtype(), storage_scalar.dtype());
-
-        Self::try_new(DType::Extension(ext_dtype), storage_scalar.into_value())
+    pub fn extension_ref(ext_dtype: ExtDTypeRef, value: Scalar) -> Self {
+        assert_eq!(ext_dtype.storage_dtype(), value.dtype());
+        Self::try_new(DType::Extension(ext_dtype), value.into_value())
             .vortex_expect("unable to construct an extension `Scalar`")
-    }
-
-    /// Creates a new variant scalar from a row-specific nested scalar.
-    ///
-    /// Use [`Scalar::null(DType::Variant(Nullability::Nullable))`][Scalar::null] for a top-level
-    /// null variant value, and
-    /// `Scalar::variant(Scalar::null(DType::Null))` for a defined variant-null.
-    pub fn variant(value: Scalar) -> Self {
-        Self::try_new(
-            DType::Variant(Nullability::NonNullable),
-            Some(ScalarValue::Variant(Box::new(value))),
-        )
-        .vortex_expect("unable to construct a variant `Scalar`")
     }
 }
 

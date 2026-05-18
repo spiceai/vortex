@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::sync::Arc;
-
 use vortex_buffer::ByteBuffer;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
@@ -12,7 +10,6 @@ use vortex_flatbuffers::FlatBufferRoot;
 use vortex_flatbuffers::WriteFlatBuffer;
 use vortex_flatbuffers::WriteFlatBufferExt;
 use vortex_layout::LayoutContext;
-use vortex_session::registry::ReadContext;
 
 use crate::EOF_SIZE;
 use crate::Footer;
@@ -97,9 +94,9 @@ impl FooterSerializer {
         let (buffer, footer_segment) = write_flatbuffer(
             &mut self.offset,
             &FooterFlatBufferWriter {
-                ctx: self.footer.array_read_ctx.clone(),
-                layout_ctx: ReadContext::new(layout_ctx.to_ids()),
-                segment_specs: Arc::clone(&self.footer.segments),
+                ctx: self.footer.array_ctx.clone(),
+                layout_ctx,
+                segment_specs: self.footer.segments.clone(),
             },
         )?;
         buffers.push(buffer);

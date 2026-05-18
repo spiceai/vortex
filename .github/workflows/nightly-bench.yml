@@ -23,25 +23,38 @@ jobs:
     with:
       mode: "develop"
       machine_type: ${{ matrix.machine_type.instance_name }}
+      # datafusion:vortex uses a lot of memory
       benchmark_matrix: |
         [
+          {
+            "id": "clickbench-nvme",
+            "subcommand": "clickbench",
+            "name": "Clickbench on NVME",
+            "targets": "datafusion:parquet,datafusion:vortex,datafusion:vortex-compact,datafusion:lance,duckdb:parquet,duckdb:vortex,duckdb:vortex-compact,duckdb:duckdb",
+            "build_lance": true
+          },
           {
             "id": "tpch-nvme",
             "subcommand": "tpch",
             "name": "TPC-H on NVME",
-            "data_formats": ["parquet", "vortex"],
-            "pr_targets": [
-              {"engine": "datafusion", "format": "parquet"},
-              {"engine": "datafusion", "format": "vortex"},
-              {"engine": "duckdb", "format": "parquet"},
-              {"engine": "duckdb", "format": "vortex"}
-            ],
-            "develop_targets": [
-              {"engine": "datafusion", "format": "parquet"},
-              {"engine": "datafusion", "format": "vortex"},
-              {"engine": "duckdb", "format": "parquet"},
-              {"engine": "duckdb", "format": "vortex"}
-            ],
+            "targets": "datafusion:parquet,datafusion:vortex,datafusion:lance,duckdb:parquet,duckdb:vortex,duckdb:duckdb",
+            "scale_factor": "10.0",
+            "build_lance": true
+          },
+          {
+            "id": "tpch-s3",
+            "subcommand": "tpch",
+            "name": "TPC-H on S3",
+            "local_dir": "vortex-bench/data/tpch/10.0",
+            "remote_storage": "s3://vortex-bench-dev-eu/${{github.ref_name}}/${{github.run_id}}/tpch/10.0/",
+            "targets": "datafusion:parquet,datafusion:vortex,duckdb:parquet,duckdb:vortex",
+            "scale_factor": "10.0"
+          },
+          {
+            "id": "tpch-nvme",
+            "subcommand": "tpch",
+            "name": "TPC-H on NVME",
+            "targets": "datafusion:parquet,duckdb:parquet,duckdb:vortex",
             "scale_factor": "100"
           },
           {
@@ -49,22 +62,10 @@ jobs:
             "subcommand": "tpch",
             "name": "TPC-H on S3",
             "local_dir": "vortex-bench/data/tpch/100.0",
-            "remote_storage": "s3://vortex-ci-benchmark-datasets/${{github.ref_name}}/${{github.run_id}}/tpch/100.0/",
-            "data_formats": ["parquet", "vortex"],
-            "pr_targets": [
-              {"engine": "datafusion", "format": "parquet"},
-              {"engine": "datafusion", "format": "vortex"},
-              {"engine": "duckdb", "format": "parquet"},
-              {"engine": "duckdb", "format": "vortex"}
-            ],
-            "develop_targets": [
-              {"engine": "datafusion", "format": "parquet"},
-              {"engine": "datafusion", "format": "vortex"},
-              {"engine": "duckdb", "format": "parquet"},
-              {"engine": "duckdb", "format": "vortex"}
-            ],
+            "remote_storage": "s3://vortex-bench-dev-eu/${{github.ref_name}}/${{github.run_id}}/tpch/100.0/",
+            "targets": "datafusion:parquet,duckdb:parquet,duckdb:vortex",
             "scale_factor": "100.0"
-          }
+          },
         ]
     strategy:
       # A single run not should kill the others
@@ -72,4 +73,7 @@ jobs:
       matrix:
         machine_type:
           - id: x86
-            instance_name: i7i.metal-24xl
+            instance_name: c6id.8xlarge
+# TODO(joe): support other arch
+#          - id: arm64
+#            instance_name: c6gd.8xlarge

@@ -11,14 +11,10 @@ use super::common::create_large_listview;
 use super::common::create_nullable_listview;
 use super::common::create_overlapping_listview;
 use crate::IntoArray;
-use crate::LEGACY_SESSION;
-#[expect(deprecated)]
-use crate::ToCanonical as _;
-use crate::VortexSessionExecute;
+use crate::ToCanonical;
 use crate::arrays::ConstantArray;
 use crate::arrays::ListViewArray;
 use crate::arrays::PrimitiveArray;
-use crate::arrays::listview::ListViewArrayExt;
 use crate::assert_arrays_eq;
 use crate::compute::conformance::filter::test_filter_conformance;
 use crate::validity::Validity;
@@ -31,7 +27,7 @@ use crate::validity::Validity;
 #[case::overlapping(create_overlapping_listview())]
 #[case::large(create_large_listview())]
 fn test_filter_listview_conformance(#[case] listview: ListViewArray) {
-    test_filter_conformance(&listview.into_array());
+    test_filter_conformance(listview.as_ref());
 }
 
 #[ignore = "TODO(connor)[ListView]: Don't rebuild ListView after every `filter`"]
@@ -45,12 +41,12 @@ fn test_filter_preserves_unreferenced_elements() {
     let offsets = buffer![5u32, 2, 8, 0, 1].into_array();
     let sizes = buffer![3u32, 2, 2, 2, 4].into_array();
 
-    let listview = ListViewArray::new(elements, offsets, sizes, Validity::NonNullable).into_array();
+    let listview =
+        ListViewArray::new(elements.clone(), offsets, sizes, Validity::NonNullable).to_array();
 
     // Filter to keep only 2 lists.
     let mask = Mask::from_iter([true, false, false, true, false]);
     let result = listview.filter(mask).unwrap();
-    #[expect(deprecated)]
     let result_list = result.to_listview();
 
     assert_eq!(result_list.len(), 2, "Wrong number of filtered lists");
@@ -77,12 +73,12 @@ fn test_filter_with_gaps() {
     let offsets = buffer![0u32, 6, 10, 1, 7].into_array();
     let sizes = buffer![3u32, 3, 2, 2, 2].into_array();
 
-    let listview = ListViewArray::new(elements, offsets, sizes, Validity::NonNullable).into_array();
+    let listview =
+        ListViewArray::new(elements.clone(), offsets, sizes, Validity::NonNullable).to_array();
 
     // Filter to keep lists with gaps and overlaps.
     let mask = Mask::from_iter([false, true, true, true, false]);
     let result = listview.filter(mask).unwrap();
-    #[expect(deprecated)]
     let result_list = result.to_listview();
 
     assert_eq!(result_list.len(), 3, "Wrong filter result length");
@@ -122,11 +118,10 @@ fn test_filter_constant_arrays() {
         varying_sizes,
         Validity::NonNullable,
     )
-    .into_array();
+    .to_array();
 
     let mask1 = Mask::from_iter([true, false, true, false]);
     let result1 = const_offset_list.filter(mask1).unwrap();
-    #[expect(deprecated)]
     let result1_list = result1.to_listview();
 
     assert_eq!(result1_list.len(), 2);
@@ -146,11 +141,10 @@ fn test_filter_constant_arrays() {
         both_constant_sizes,
         Validity::NonNullable,
     )
-    .into_array();
+    .to_array();
 
     let mask2 = Mask::from_iter([true, false, true]);
     let result2 = both_const_list.filter(mask2).unwrap();
-    #[expect(deprecated)]
     let result2_list = result2.to_listview();
 
     assert_eq!(result2_list.len(), 2);
@@ -171,12 +165,12 @@ fn test_filter_extreme_offsets() {
     let offsets = buffer![0u32, 4999, 9995, 2500, 7500].into_array();
     let sizes = buffer![5u32, 2, 5, 3, 4].into_array();
 
-    let listview = ListViewArray::new(elements, offsets, sizes, Validity::NonNullable).into_array();
+    let listview =
+        ListViewArray::new(elements.clone(), offsets, sizes, Validity::NonNullable).to_array();
 
     // Filter to keep only 2 lists, demonstrating we keep all 10000 elements.
     let mask = Mask::from_iter([false, true, false, false, true]);
     let result = listview.filter(mask).unwrap();
-    #[expect(deprecated)]
     let result_list = result.to_listview();
 
     assert_eq!(result_list.len(), 2);
@@ -192,7 +186,7 @@ fn test_filter_extreme_offsets() {
     let list0 = result_list.list_elements_at(0).unwrap();
     assert_eq!(
         list0
-            .execute_scalar(0, &mut LEGACY_SESSION.create_execution_ctx())
+            .scalar_at(0)
             .unwrap()
             .as_primitive()
             .as_::<i32>()
@@ -201,7 +195,7 @@ fn test_filter_extreme_offsets() {
     );
     assert_eq!(
         list0
-            .execute_scalar(1, &mut LEGACY_SESSION.create_execution_ctx())
+            .scalar_at(1)
             .unwrap()
             .as_primitive()
             .as_::<i32>()
@@ -212,7 +206,6 @@ fn test_filter_extreme_offsets() {
     // Test sparse selection from large dataset.
     let sparse_mask = Mask::from_iter((0..5).map(|i| i == 0 || i == 4));
     let sparse_result = listview.filter(sparse_mask).unwrap();
-    #[expect(deprecated)]
     let sparse_list = sparse_result.to_listview();
 
     assert_eq!(sparse_list.len(), 2);

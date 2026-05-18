@@ -20,8 +20,10 @@ impl Display for Scalar {
             DType::Binary(_) => write!(f, "{}", self.as_binary()),
             DType::Struct(..) => write!(f, "{}", self.as_struct()),
             DType::List(..) | DType::FixedSizeList(..) => write!(f, "{}", self.as_list()),
-            DType::Extension(_) => write!(f, "{}", self.as_extension()),
-            DType::Variant(_) => write!(f, "{}", self.as_variant()),
+            DType::Extension(_) => {
+                // TODO(connor): This might need to change soon...
+                write!(f, "{}", self.as_extension())
+            }
         }
     }
 }
@@ -242,22 +244,6 @@ mod tests {
     }
 
     #[test]
-    fn display_variant_values() {
-        assert_eq!(
-            format!("{}", Scalar::null(DType::Variant(Nullable))),
-            "null"
-        );
-        assert_eq!(
-            format!("{}", Scalar::variant(Scalar::null(DType::Null))),
-            "variant(null)"
-        );
-        assert_eq!(
-            format!("{}", Scalar::variant(Scalar::from(42_u32))),
-            "variant(42u32)"
-        );
-    }
-
-    #[test]
     fn display_local_timestamp() {
         fn dtype() -> DType {
             DType::Extension(Timestamp::new(TimeUnit::Seconds, Nullable).erased())
@@ -275,7 +261,7 @@ mod tests {
                     )))
                 )
             ),
-            "1970-01-04T02:05:10Z"
+            "1970-01-04T02:05:10"
         );
     }
 

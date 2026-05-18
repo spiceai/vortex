@@ -45,7 +45,7 @@ impl CurrentThreadRuntime {
     /// By default, the pool has no worker threads; the caller must set the desired number of
     /// worker threads using the `set_workers` method on the returned pool.
     pub fn new_pool(&self) -> CurrentThreadWorkerPool {
-        CurrentThreadWorkerPool::new(Arc::clone(&self.executor))
+        CurrentThreadWorkerPool::new(self.executor.clone())
     }
 
     /// Returns an iterator wrapper around a stream, blocking the current thread for each item.
@@ -81,7 +81,7 @@ impl CurrentThreadRuntime {
             .detach();
 
         ThreadSafeIterator {
-            executor: Arc::clone(&self.executor),
+            executor: self.executor.clone(),
             results: result_rx,
         }
     }
@@ -91,7 +91,7 @@ impl BlockingRuntime for CurrentThreadRuntime {
     type BlockingIterator<'a, R: 'a> = CurrentThreadIterator<'a, R>;
 
     fn handle(&self) -> Handle {
-        let executor: Arc<dyn Executor> = Arc::clone(&self.executor) as Arc<dyn Executor>;
+        let executor: Arc<dyn Executor> = self.executor.clone();
         Handle::new(Arc::downgrade(&executor))
     }
 
@@ -108,7 +108,7 @@ impl BlockingRuntime for CurrentThreadRuntime {
         R: Send + 'a,
     {
         CurrentThreadIterator {
-            executor: Arc::clone(&self.executor),
+            executor: self.executor.clone(),
             stream: stream.boxed(),
         }
     }
@@ -138,7 +138,7 @@ pub struct ThreadSafeIterator<T> {
 impl<T> Clone for ThreadSafeIterator<T> {
     fn clone(&self) -> Self {
         Self {
-            executor: Arc::clone(&self.executor),
+            executor: self.executor.clone(),
             results: self.results.clone(),
         }
     }
@@ -152,7 +152,7 @@ impl<T> Iterator for ThreadSafeIterator<T> {
     }
 }
 
-#[expect(clippy::if_then_some_else_none)] // Clippy is wrong when if/else has await.
+#[allow(clippy::if_then_some_else_none)] // Clippy is wrong when if/else has await.
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -174,7 +174,7 @@ mod tests {
 
         // We spawn a future that sets a value on a separate thread.
         let value = Arc::new(AtomicUsize::new(0));
-        let value2 = Arc::clone(&value);
+        let value2 = value.clone();
         runtime
             .handle()
             .spawn(async move {
@@ -229,9 +229,9 @@ mod tests {
         let threads: Vec<_> = (0..num_threads)
             .map(|_| {
                 let mut iter = iter.clone();
-                let counter = Arc::clone(&counter);
-                let barrier = Arc::clone(&barrier);
-                let results = Arc::clone(&results);
+                let counter = counter.clone();
+                let barrier = barrier.clone();
+                let results = results.clone();
 
                 thread::spawn(move || {
                     barrier.wait();
@@ -290,8 +290,8 @@ mod tests {
         let threads: Vec<_> = (0..num_threads)
             .map(|thread_id| {
                 let iter = iter.clone();
-                let collected = Arc::clone(&collected);
-                let barrier = Arc::clone(&barrier);
+                let collected = collected.clone();
+                let barrier = barrier.clone();
 
                 thread::spawn(move || {
                     barrier.wait();
@@ -346,11 +346,11 @@ mod tests {
     #[test]
     fn test_block_on_stream_drop_receivers_early() {
         let counter = Arc::new(AtomicUsize::new(0));
-        let c = Arc::clone(&counter);
+        let c = counter.clone();
 
         let mut iter = CurrentThreadRuntime::new().block_on_stream({
             stream::unfold(0, move |state| {
-                let c = Arc::clone(&c);
+                let c = c.clone();
                 async move {
                     (state < 100).then(|| {
                         c.fetch_add(1, Ordering::SeqCst);
@@ -382,7 +382,7 @@ mod tests {
 
         let iter1 = iter.clone();
         let iter2 = iter;
-        let barrier1 = Arc::clone(&barrier);
+        let barrier1 = barrier.clone();
         let barrier2 = barrier;
 
         let thread1 = thread::spawn(move || {
@@ -441,8 +441,8 @@ mod tests {
         let threads: Vec<_> = (0..num_threads)
             .map(|_| {
                 let iter = iter.clone();
-                let received = Arc::clone(&received);
-                let barrier = Arc::clone(&barrier);
+                let received = received.clone();
+                let barrier = barrier.clone();
 
                 thread::spawn(move || {
                     barrier.wait();

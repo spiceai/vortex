@@ -1,56 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
-#pragma once
-#include <stdint.h>
 
 //
 // THIS FILE IS AUTO-GENERATED, DO NOT MAKE EDITS DIRECTLY
 //
 
-// https://arrow.apache.org/docs/format/CDataInterface.html#structure-definitions
-// If you want to use your own Arrow library like nanoarrow, define this macro
-// and typedef your types:
-//
-// #include "nanoarrow/common/inline_types.h"
-// #define USE_OWN_ARROW
-// typedef struct ArrowSchema FFI_ArrowSchema;
-// typedef struct ArrowArrayStream FFI_ArrowArrayStream;
-// #include "vortex.h"
-//
-#ifndef USE_OWN_ARROW
-struct ArrowSchema {
-    const char *format;
-    const char *name;
-    const char *metadata;
-    int64_t flags;
-    int64_t n_children;
-    struct ArrowSchema **children;
-    struct ArrowSchema *dictionary;
-    void (*release)(struct ArrowSchema *);
-    void *private_data;
-};
-struct ArrowArray {
-    int64_t length;
-    int64_t null_count;
-    int64_t offset;
-    int64_t n_buffers;
-    int64_t n_children;
-    const void **buffers;
-    struct ArrowArray **children;
-    struct ArrowArray *dictionary;
-    void (*release)(struct ArrowArray *);
-    void *private_data;
-};
-struct ArrowArrayStream {
-    int (*get_schema)(struct ArrowArrayStream *, struct ArrowSchema *out);
-    int (*get_next)(struct ArrowArrayStream *, struct ArrowArray *out);
-    const char *(*get_last_error)(struct ArrowArrayStream *);
-    void (*release)(struct ArrowArrayStream *);
-    void *private_data;
-};
-typedef struct ArrowSchema FFI_ArrowSchema;
-typedef struct ArrowArrayStream FFI_ArrowArrayStream;
-#endif
+#pragma once
 
 #include <stdarg.h>
 #include <stdbool.h>
@@ -62,52 +17,6 @@ typedef struct ArrowArrayStream FFI_ArrowArrayStream;
  * Maximum size of an inlined binary value.
  */
 #define BinaryView_MAX_INLINED_SIZE 12
-
-/**
- * The variant tag for a Vortex data type.
- */
-typedef enum {
-    /**
-     * Null type.
-     */
-    DTYPE_NULL = 0,
-    /**
-     * Boolean type.
-     */
-    DTYPE_BOOL = 1,
-    /**
-     * Primitive types (e.g., u8, i16, f32, etc.).
-     */
-    DTYPE_PRIMITIVE = 2,
-    /**
-     * Variable-length UTF-8 string type.
-     */
-    DTYPE_UTF8 = 3,
-    /**
-     * Variable-length binary data type.
-     */
-    DTYPE_BINARY = 4,
-    /**
-     * Nested struct type.
-     */
-    DTYPE_STRUCT = 5,
-    /**
-     * Nested list type.
-     */
-    DTYPE_LIST = 6,
-    /**
-     * User-defined extension type.
-     */
-    DTYPE_EXTENSION = 7,
-    /**
-     * Decimal type with fixed precision and scale.
-     */
-    DTYPE_DECIMAL = 8,
-    /**
-     * Nested fixed-size list type.
-     */
-    DTYPE_FIXED_SIZE_LIST = 9,
-} vx_dtype_variant;
 
 /**
  * Variant enum for Vortex primitive types.
@@ -159,100 +68,51 @@ typedef enum {
     PTYPE_F64 = 10,
 } vx_ptype;
 
-typedef enum {
-    /**
-     * Items can't be null
-     */
-    VX_VALIDITY_NON_NULLABLE = 0,
-    /**
-     * All items are valid
-     */
-    VX_VALIDITY_ALL_VALID = 1,
-    /**
-     * All items are invalid
-     */
-    VX_VALIDITY_ALL_INVALID = 2,
-    /**
-     * Items validity is determined by a boolean array. True values in boolean
-     * array are valid, false values are invalid (null)
-     */
-    VX_VALIDITY_ARRAY = 3,
-} vx_validity_type;
-
-typedef enum {
-    /**
-     * No estimate is available.
-     */
-    VX_ESTIMATE_UNKNOWN = 0,
-    /**
-     * The value in vx_estimate.estimate is exact.
-     */
-    VX_ESTIMATE_EXACT = 1,
-    /**
-     * The value in vx_estimate.estimate is an upper bound.
-     */
-    VX_ESTIMATE_INEXACT = 2,
-} vx_estimate_type;
-
 /**
- * Equalities, inequalities, and boolean operations over possibly null values.
- * For most operations, if either side is null, the result is null.
- * VX_OPERATOR_KLEENE_AND, VX_OPERATOR_KLEENE_OR obey Kleene (three-valued)
- * logic
+ * The variant tag for a Vortex data type.
  */
 typedef enum {
     /**
-     * Expressions are equal.
+     * Null type.
      */
-    VX_OPERATOR_EQ = 0,
+    DTYPE_NULL = 0,
     /**
-     * Expressions are not equal.
+     * Boolean type.
      */
-    VX_OPERATOR_NOT_EQ = 1,
+    DTYPE_BOOL = 1,
     /**
-     * Expression is greater than another
+     * Primitive types (e.g., u8, i16, f32, etc.).
      */
-    VX_OPERATOR_GT = 2,
+    DTYPE_PRIMITIVE = 2,
     /**
-     * Expression is greater or equal to another
+     * Variable-length UTF-8 string type.
      */
-    VX_OPERATOR_GTE = 3,
+    DTYPE_UTF8 = 3,
     /**
-     * Expression is less than another
+     * Variable-length binary data type.
      */
-    VX_OPERATOR_LT = 4,
+    DTYPE_BINARY = 4,
     /**
-     * Expression is less or equal to another
+     * Nested struct type.
      */
-    VX_OPERATOR_LTE = 5,
+    DTYPE_STRUCT = 5,
     /**
-     * Boolean AND /\.
+     * Nested list type.
      */
-    VX_OPERATOR_KLEENE_AND = 6,
+    DTYPE_LIST = 6,
     /**
-     * Boolean OR \/.
+     * User-defined extension type.
      */
-    VX_OPERATOR_KLEENE_OR = 7,
+    DTYPE_EXTENSION = 7,
     /**
-     * The sum of the arguments.
-     * Errors at runtime if the sum would overflow or underflow.
+     * Decimal type with fixed precision and scale.
      */
-    VX_OPERATOR_ADD = 8,
+    DTYPE_DECIMAL = 8,
     /**
-     * The difference between the arguments.
-     * Errors at runtime if the sum would overflow or underflow.
-     * The result is null at any index where either input is null.
+     * Nested fixed-size list type.
      */
-    VX_OPERATOR_SUB = 9,
-    /**
-     * Multiply two numbers
-     */
-    VX_OPERATOR_MUL = 10,
-    /**
-     * Divide the left side by the right side
-     */
-    VX_OPERATOR_DIV = 11,
-} vx_binary_operator;
+    DTYPE_FIXED_SIZE_LIST = 9,
+} vx_dtype_variant;
 
 /**
  * Log levels for the Vortex library.
@@ -283,18 +143,6 @@ typedef enum {
      */
     LOG_LEVEL_TRACE = 5,
 } vx_log_level;
-
-typedef enum {
-    VX_SELECTION_INCLUDE_ALL = 0,
-    /**
-     * Include rows at the indices in vx_scan_selection.idx.
-     */
-    VX_SELECTION_INCLUDE_RANGE = 1,
-    /**
-     * Exclude rows at the indices in vx_scan_selection.idx.
-     */
-    VX_SELECTION_EXCLUDE_RANGE = 2,
-} vx_scan_selection_include;
 
 /**
  * Physical type enum, represents the in-memory physical layout but might represent a different logical type.
@@ -385,23 +233,16 @@ typedef struct DType DType;
  */
 typedef struct Nullability Nullability;
 
-typedef struct Primitive Primitive;
-
 /**
- * Arrays are reference-counted handles to owned memory buffers that hold
- * scalars. These buffers can be held in a number of physical encodings to
- * perform lightweight compression that exploits the particular data
- * distribution of the array's values.
+ * Base type for all Vortex arrays.
  *
- * Every data type recognized by Vortex also has a canonical physical
- * encoding format, which arrays can be canonicalized into for ease of
- * access in compute functions.
+ * All built-in Vortex array types can be safely cast to this type to pass into functions that
+ * expect a generic array type. e.g.
  *
- * As an implementation detail, vx_array Arc'ed inside, so cloning an
- * array is a cheap operation.
- *
- * Unless stated explicitly, all operations with vx_array don't take
- * ownership of it, and thus it must be freed by the caller.
+ * ```cpp
+ * auto primitive_array = vx_array_primitive_new(...);
+ * vx_array_len((*vx_array) primitive_array));
+ * ```
  */
 typedef struct vx_array vx_array;
 
@@ -442,14 +283,6 @@ typedef struct vx_array_sink vx_array_sink;
 typedef struct vx_binary vx_binary;
 
 /**
- * A reference to one or more (possibly remote) paths.
- * Creating vx_data_source opens the first matched path to read the schema.
- * All other I/O is deferred until a scan is requested. Multiple scans may
- * be requested from a single data source.
- */
-typedef struct vx_data_source vx_data_source;
-
-/**
  * A Vortex data type.
  *
  * Data types in Vortex are purely logical, meaning they confer no information about how the data
@@ -463,47 +296,9 @@ typedef struct vx_dtype vx_dtype;
 typedef struct vx_error vx_error;
 
 /**
- * A node in a Vortex expression tree.
- *
- * Expressions represent scalar computations that can be performed on
- * data. Each expression consists of an encoding (vtable), heap-allocated
- * metadata, and child expressions.
- *
- * Unless stated explicitly, all expressions returned are owned and must
- * be freed by the caller.
- * Unless stated explicitly, if an operation on const vx_expression* is
- * passed NULL, NULL is returned.
- * Operations on expressions don't take ownership of input values, and so
- * input values must be freed by the caller.
- */
-typedef struct vx_expression vx_expression;
-
-/**
  * A handle to a Vortex file encapsulating the footer and logic for instantiating a reader.
  */
 typedef struct vx_file vx_file;
-
-/**
- * A partition is an independent unit of work. Call vx_partition_next repeatedly to
- * retrieve arrays, then free the partition with vx_partition_free.
- */
-typedef struct vx_partition vx_partition;
-
-/**
- * A typed scalar value.
- *
- * A `vx_scalar` represents a single value with an associated `DType`.
- * Its value is either null or a `ScalarValue`. Null values are allowed only
- * when the associated `DType` allows nulls. Non-null values are represented
- * by `ScalarValue` and interpreted using the `DType`.
- */
-typedef struct vx_scalar vx_scalar;
-
-/**
- * A scan is a single traversal of a data source with projections and
- * filters. A scan can be consumed only once.
- */
-typedef struct vx_scan vx_scan;
 
 /**
  * A handle to a Vortex session.
@@ -515,8 +310,6 @@ typedef struct vx_session vx_session;
  */
 typedef struct vx_string vx_string;
 
-typedef struct vx_struct_column_builder vx_struct_column_builder;
-
 /**
  * Represents a Vortex struct data type, without top-level nullability.
  */
@@ -526,41 +319,6 @@ typedef struct vx_struct_fields vx_struct_fields;
  * Builder for creating a [`vx_struct_fields`].
  */
 typedef struct vx_struct_fields_builder vx_struct_fields_builder;
-
-typedef struct {
-    vx_validity_type type;
-    /**
-     * If type is not VX_VALIDITY_ARRAY, this is NULL.
-     * If type is VX_VALIDITY_ARRAY, this is set to an owned boolean validity
-     * array which must be freed by the caller.
-     */
-    const vx_array *array;
-} vx_validity;
-
-/**
- * Options for creating a data source.
- */
-typedef struct {
-    /**
-     * Required: paths to files, tables, or layout trees.
-     * May be a glob pattern like "*.vortex".
-     * If you want to include multiple paths, concat them with a comma:
-     * "file1.vortex,../file2.vortex".
-     */
-    const char *paths;
-} vx_data_source_options;
-
-/**
- * Used for estimating number of partitions in a data source or number of rows
- * in a partition.
- */
-typedef struct {
-    vx_estimate_type type;
-    /**
-     * Set only when "type" is not VX_ESTIMATE_UNKNOWN.
-     */
-    uint64_t estimate;
-} vx_estimate;
 
 /**
  * Options supplied for opening a file.
@@ -624,61 +382,6 @@ typedef struct {
     unsigned long row_offset;
 } vx_file_scan_options;
 
-/**
- * Scan row selection.
- * "idx" is copied while calling vx_data_source_scan and can be freed after.
- */
-typedef struct {
-    /**
-     * Used only when "include" is not VX_SELECTION_INCLUDE_ALL.
-     * If set, must point to an array of len "idx_len" row_indices.
-     */
-    const uint64_t *idx;
-    /**
-     * Used only when "include" is not VX_SELECTION_INCLUDE_ALL
-     */
-    size_t idx_len;
-    vx_scan_selection_include include;
-} vx_scan_selection;
-
-/**
- * Scan options. All fields are optional. To return everything,
- * zero-initialize this struct.
- */
-typedef struct {
-    /**
-     * What columns to return. NULL means all columns.
-     */
-    const vx_expression *projection;
-    /**
-     * Predicate expression. NULL means no filter.
-     */
-    const vx_expression *filter;
-    /**
-     * Row range [begin, end). Setting row_range_begin and row_range_end to 0
-     * means no limit.
-     */
-    uint64_t row_range_begin;
-    uint64_t row_range_end;
-    /**
-     * Row-index filter applied after row_range.
-     */
-    vx_scan_selection selection;
-    /**
-     * Maximum number of rows to return. 0 means no limit.
-     */
-    uint64_t limit;
-    /**
-     * Upper limit for parallelism. 0 means no limit.
-     * Scan will return at most "max_threads" partitions.
-     */
-    uint64_t max_threads;
-    /**
-     * If true, return in storage order.
-     */
-    bool ordered;
-} vx_scan_options;
-
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -697,40 +400,6 @@ const vx_array *vx_array_clone(const vx_array *ptr);
 void vx_array_free(const vx_array *ptr);
 
 /**
- * Check if array's dtype is nullable.
- * As a particular example, a Null array is nullable.
- */
-bool vx_array_is_nullable(const vx_array *array);
-
-/**
- * Check array's dtype against a variant.
- * Equivalent to vx_get_dtype_variant(vx_array_dtype(array)).
- *
- * Example:
- *
- * const vx_array* array = vx_array_new_null(1);
- * assert(vx_array_has_dtype(array, DTYPE_NULL));
- * vx_array_free(array);
- *
- */
-bool vx_array_has_dtype(const vx_array *array, vx_dtype_variant variant);
-
-/**
- * Check whether array has a Primitive dtype with a specific ptype.
- *
- * const vx_array* array = vx_array_new_null(1);
- * assert(!vx_array_is_primitive(array, PTYPE_U32));
- * vx_array_free(array);
- *
- */
-bool vx_array_is_primitive(const vx_array *array, vx_ptype ptype);
-
-/**
- * Return array's validity as a type and a boolean array.
- */
-void vx_array_get_validity(const vx_array *array, vx_validity *validity, vx_error **error);
-
-/**
  * Get the length of the array.
  */
 size_t vx_array_len(const vx_array *array);
@@ -743,93 +412,57 @@ size_t vx_array_len(const vx_array *array);
  */
 const vx_dtype *vx_array_dtype(const vx_array *array);
 
-const vx_array *vx_array_get_field(const vx_array *array, size_t index, vx_error **error_out);
+const vx_array *vx_array_get_field(const vx_array *array, uint32_t index, vx_error **error_out);
 
-const vx_array *vx_array_slice(const vx_array *array, size_t start, size_t stop, vx_error **error_out);
+const vx_array *vx_array_slice(const vx_array *array, uint32_t start, uint32_t stop, vx_error **error_out);
 
-/**
- * Check whether array's element at index is invalid (null) according to the
- * validity array. Sets error if index is out of bounds or underlying validity
- * array is corrupted.
- */
-bool vx_array_element_is_invalid(const vx_array *array, size_t index, vx_error **error);
+bool vx_array_is_null(const vx_array *array, uint32_t index, vx_error **_error_out);
 
-/**
- * Check how many items in the array are invalid (null).
- */
-size_t vx_array_invalid_count(const vx_array *array, vx_error **error_out);
+uint32_t vx_array_null_count(const vx_array *array, vx_error **error_out);
 
-/**
- * Create a new array with DTYPE_NULL dtype.
- */
-const vx_array *vx_array_new_null(size_t len);
+uint8_t vx_array_get_u8(const vx_array *array, uint32_t index);
 
-/**
- * Create a new primitive array from an existing buffer.
- * It is caller's responsibility to ensure ptr points to a buffer of correct
- * type. ptr buffer contents are copied.
- * validity can't be NULL.
- *
- * Example:
- *
- * const vx_error* error = NULL;
- * vx_validity validity = {};
- * validity.type = VX_VALIDITY_NON_NULLABLE;
- * uint32_t buffer[] = {1, 2, 3};
- * const vx_array* array = vx_array_new_primitive(PTYPE_U32, buffer, 3,
- *     &validity, &error);
- * vx_array_free(array);
- *
- */
-const vx_array *vx_array_new_primitive(vx_ptype ptype,
-                                       const void *ptr,
-                                       size_t len,
-                                       const vx_validity *validity,
-                                       vx_error **error);
+uint8_t vx_array_get_storage_u8(const vx_array *array, uint32_t index);
 
-uint8_t vx_array_get_u8(const vx_array *array, size_t index);
+uint16_t vx_array_get_u16(const vx_array *array, uint32_t index);
 
-uint8_t vx_array_get_storage_u8(const vx_array *array, size_t index);
+uint16_t vx_array_get_storage_u16(const vx_array *array, uint32_t index);
 
-uint16_t vx_array_get_u16(const vx_array *array, size_t index);
+uint32_t vx_array_get_u32(const vx_array *array, uint32_t index);
 
-uint16_t vx_array_get_storage_u16(const vx_array *array, size_t index);
+uint32_t vx_array_get_storage_u32(const vx_array *array, uint32_t index);
 
-uint32_t vx_array_get_u32(const vx_array *array, size_t index);
+uint64_t vx_array_get_u64(const vx_array *array, uint32_t index);
 
-uint32_t vx_array_get_storage_u32(const vx_array *array, size_t index);
+uint64_t vx_array_get_storage_u64(const vx_array *array, uint32_t index);
 
-uint64_t vx_array_get_u64(const vx_array *array, size_t index);
+int8_t vx_array_get_i8(const vx_array *array, uint32_t index);
 
-uint64_t vx_array_get_storage_u64(const vx_array *array, size_t index);
+int8_t vx_array_get_storage_i8(const vx_array *array, uint32_t index);
 
-int8_t vx_array_get_i8(const vx_array *array, size_t index);
+int16_t vx_array_get_i16(const vx_array *array, uint32_t index);
 
-int8_t vx_array_get_storage_i8(const vx_array *array, size_t index);
+int16_t vx_array_get_storage_i16(const vx_array *array, uint32_t index);
 
-int16_t vx_array_get_i16(const vx_array *array, size_t index);
+int32_t vx_array_get_i32(const vx_array *array, uint32_t index);
 
-int16_t vx_array_get_storage_i16(const vx_array *array, size_t index);
+int32_t vx_array_get_storage_i32(const vx_array *array, uint32_t index);
 
-int32_t vx_array_get_i32(const vx_array *array, size_t index);
+int64_t vx_array_get_i64(const vx_array *array, uint32_t index);
 
-int32_t vx_array_get_storage_i32(const vx_array *array, size_t index);
+int64_t vx_array_get_storage_i64(const vx_array *array, uint32_t index);
 
-int64_t vx_array_get_i64(const vx_array *array, size_t index);
+uint16_t vx_array_get_f16(const vx_array *array, uint32_t index);
 
-int64_t vx_array_get_storage_i64(const vx_array *array, size_t index);
+uint16_t vx_array_get_storage_f16(const vx_array *array, uint32_t index);
 
-uint16_t vx_array_get_f16(const vx_array *array, size_t index);
+float vx_array_get_f32(const vx_array *array, uint32_t index);
 
-uint16_t vx_array_get_storage_f16(const vx_array *array, size_t index);
+float vx_array_get_storage_f32(const vx_array *array, uint32_t index);
 
-float vx_array_get_f32(const vx_array *array, size_t index);
+double vx_array_get_f64(const vx_array *array, uint32_t index);
 
-float vx_array_get_storage_f32(const vx_array *array, size_t index);
-
-double vx_array_get_f64(const vx_array *array, size_t index);
-
-double vx_array_get_storage_f64(const vx_array *array, size_t index);
+double vx_array_get_storage_f64(const vx_array *array, uint32_t index);
 
 /**
  * Return the utf-8 string at `index` in the array. The pointer will be null if the value at `index` is null.
@@ -842,13 +475,6 @@ const vx_string *vx_array_get_utf8(const vx_array *array, uint32_t index);
  * The caller must free the returned pointer.
  */
 const vx_binary *vx_array_get_binary(const vx_array *array, uint32_t index);
-
-/**
- * Apply the expression to the array, wrapping it with a ScalarFnArray.
- * This operation takes constant time as it doesn't execute the underlying
- * array. Executing the underlying array still takes O(n) time.
- */
-const vx_array *vx_array_apply(const vx_array *array, const vx_expression *expression, vx_error **error);
 
 /**
  * Free an owned [`vx_array_iterator`] object.
@@ -892,41 +518,6 @@ size_t vx_binary_len(const vx_binary *ptr);
  * Return the pointer to the string data.
  */
 const char *vx_binary_ptr(const vx_binary *ptr);
-
-/**
- * Clone a borrowed [`vx_data_source`], returning an owned [`vx_data_source`].
- *
- *
- * Must be released with [`vx_data_source_free`].
- */
-const vx_data_source *vx_data_source_clone(const vx_data_source *ptr);
-
-/**
- * Free an owned [`vx_data_source`] object.
- */
-void vx_data_source_free(const vx_data_source *ptr);
-
-/**
- * Create a data source.
- * The first matched file is opened eagerly. to read the schema. All other I/O
- * is deferred until a scan is requested. The returned pointer is owned by the
- * caller and must be freed with vx_data_source_free.
- *
- * On error, returns NULL and sets "err".
- */
-const vx_data_source *
-vx_data_source_new(const vx_session *session, const vx_data_source_options *options, vx_error **err);
-
-/**
- * Return the schema of the data source as a non-owned dtype.
- * The returned pointer is valid as long as "ds" is alive. Do not free it.
- */
-const vx_dtype *vx_data_source_dtype(const vx_data_source *ds);
-
-/**
- * Write data source's row count estimate into "row_count".
- */
-void vx_data_source_get_row_count(const vx_data_source *ds, vx_estimate *row_count);
 
 /**
  * Clone a borrowed [`vx_dtype`], returning an owned [`vx_dtype`].
@@ -985,7 +576,7 @@ const vx_dtype *vx_dtype_new_fixed_size_list(const vx_dtype *element, uint32_t s
  *
  * Takes ownership of the `struct_dtype` pointer.
  */
-const vx_dtype *vx_dtype_new_struct(vx_struct_fields *struct_dtype, bool is_nullable);
+const vx_dtype *vx_dtype_new_struct(const vx_struct_fields *struct_dtype, bool is_nullable);
 
 /**
  * Create a new decimal data type.
@@ -1072,13 +663,6 @@ uint8_t vx_dtype_time_unit(const DType *dtype);
 const vx_string *vx_dtype_time_zone(const DType *dtype);
 
 /**
- * Convert a dtype to ArrowSchema.
- * You can use the dtype after conversion
- * On success, returns 0. On error, sets err and returns 1.
- */
-int vx_dtype_to_arrow_schema(const vx_dtype *dtype, FFI_ArrowSchema *schema, vx_error **err);
-
-/**
  * Free an owned [`vx_error`] object.
  */
 void vx_error_free(vx_error *ptr);
@@ -1090,153 +674,6 @@ void vx_error_free(vx_error *ptr);
  * Do NOT free the returned string pointer - it shares the lifetime of the error.
  */
 const vx_string *vx_error_get_message(const vx_error *error);
-
-/**
- * Free an owned [`vx_expression`] object.
- */
-void vx_expression_free(vx_expression *ptr);
-
-/**
- * Create a root expression. A root expression, applied to an array in
- * vx_array_apply, takes the array itself as opposed to functions like
- * vx_expression_column or vx_expression_select which take the array's parts.
- *
- * Example:
- *
- * const vx_array* array = ...;
- * vx_expression* root = vx_expression_root();
- * const vx_error* error = NULL;
- * vx_array* applied_array = vx_array_apply(array, root, &error);
- * // array and applied_array are identical
- * vx_array_free(applied_array);
- * vx_expression_free(root);
- * vx_array_free(array);
- *
- */
-vx_expression *vx_expression_root(void);
-
-/**
- * Create a literal expression from a scalar.
- *
- * Literal expressions are useful for constants in expression trees, especially scan
- * predicates. For example, a caller can compare a column expression to a scalar
- * threshold and pass the resulting predicate to `vx_data_source_scan`.
- *
- * Example:
- *
- * vx_error* error = NULL;
- * const vx_data_source* data_source = ...;
- *
- * vx_expression* root = vx_expression_root();
- * vx_expression* age = vx_expression_get_item("age", root);
- *
- * vx_scalar* threshold_scalar = vx_scalar_new_u8(50, false);
- * vx_expression* threshold = vx_expression_literal(threshold_scalar, &error);
- * vx_scalar_free(threshold_scalar);
- *
- * vx_expression* predicate = vx_expression_binary(VX_OPERATOR_GTE, age, threshold);
- * vx_scan_options options = {};
- * options.filter = predicate;
- *
- * vx_scan* scan = vx_data_source_scan(data_source, &options, NULL, &error);
- *
- * vx_scan_free(scan);
- * vx_expression_free(predicate);
- * vx_expression_free(threshold);
- * vx_expression_free(age);
- * vx_expression_free(root);
- *
- */
-vx_expression *vx_expression_literal(const vx_scalar *scalar, vx_error **err);
-
-/**
- * Create an expression that selects (includes) specific fields from a child
- * expression. Child expression must have a DTYPE_STRUCT dtype. Errors in
- * vx_array_apply if the child expression doesn't have a specified field.
- *
- * Returns a DTYPE_STRUCT array with selected fields.
- *
- * Example:
- *
- * vx_expression* root = vx_expression_root();
- * const char* names[] = {"name", "age"};
- * vx_expression* select = vx_expression_select(names, 2, root);
- * vx_expression_free(select);
- * vx_expression_free(root);
- *
- */
-vx_expression *vx_expression_select(const char *const *names, size_t len, const vx_expression *child);
-
-/**
- * Create an AND expression for multiple child expressions.
- * If there are no input expressions, returns NULL
- */
-vx_expression *vx_expression_and(const vx_expression *const *expressions, size_t len);
-
-/**
- * Create an OR disjunction expression for multiple child expressions.
- * If there are no input expressions, returns NULL;
- */
-vx_expression *vx_expression_or(const vx_expression *const *expressions, size_t len);
-
-/**
- * Create a binary expression for two expressions of form lhs OP rhs.
- * If either input is NULL, returns NULL.
- *
- * Example for a binary sum:
- *
- * vx_expression* age = vx_expression_column("age");
- * vx_expression* height = vx_expression_column("height");
- * vx_expression* sum = vx_expression_binary(VX_OPERATOR_ADD, age, height);
- * vx_expression_free(sum);
- * vx_expression_free(height);
- * vx_expression_free(age);
- *
- * Example for a binary equality function:
- *
- * vx_expression* vx_expression_eq(
- *     const vx_expression* lhs,
- *     const vx_expression* rhs
- * ) {
- *     return vx_expression_binary(VX_OPERATOR_EQ, lhs, rhs);
- * }
- *
- */
-vx_expression *
-vx_expression_binary(vx_binary_operator operator_, const vx_expression *lhs, const vx_expression *rhs);
-
-/**
- * Create a logical NOT of the child expression.
- *
- * Returns the logical negation of the input boolean expression.
- */
-const vx_expression *vx_expression_not(const vx_expression *child);
-
-/**
- * Create an expression that checks for null values.
- *
- * Returns a boolean array indicating which positions contain null values.
- */
-vx_expression *vx_expression_is_null(const vx_expression *child);
-
-/**
- * Create an expression that extracts a named field from a struct expression.
- * Child expression must have a DTYPE_STRUCT dtype.
- * Errors in vx_array_apply if the root array doesn't have a specified field.
- *
- * Accesses the specified field from the result of the child expression.
- *
- * Example: if child is Struct { name=u8, age=u16 } and we do
- * vx_expression_get_item("name", child), output type will be DTYPE_U8
- */
-vx_expression *vx_expression_get_item(const char *item, const vx_expression *child);
-
-/**
- * Create an expression that checks if a value is contained in a list.
- *
- * Returns a boolean array indicating whether the value appears in each list.
- */
-vx_expression *vx_expression_list_contains(const vx_expression *list, const vx_expression *value);
 
 /**
  * Clone a borrowed [`vx_file`], returning an owned [`vx_file`].
@@ -1297,328 +734,6 @@ vx_array_iterator *vx_file_scan(const vx_session *session,
 void vx_set_log_level(vx_log_level level);
 
 /**
- * Free an owned [`vx_scalar`] object.
- */
-void vx_scalar_free(vx_scalar *ptr);
-
-/**
- * Clone a borrowed scalar handle.
- *
- * The input scalar handle is not consumed. The returned scalar handle must be
- * released with vx_scalar_free. Returns NULL when given a NULL scalar handle.
- */
-vx_scalar *vx_scalar_clone(const vx_scalar *scalar);
-
-/**
- * Return the data type of a scalar.
- *
- * The returned data type handle borrows storage from the scalar handle, so its
- * lifetime is bound to the scalar handle. It MUST NOT be freed separately.
- * Returns NULL when given a NULL scalar handle.
- */
-const vx_dtype *vx_scalar_dtype(const vx_scalar *scalar);
-
-/**
- * Return whether the scalar is a typed null value.
- *
- * Returns false when given a NULL scalar handle.
- */
-bool vx_scalar_is_null(const vx_scalar *scalar);
-
-/**
- * Create a boolean scalar.
- */
-vx_scalar *vx_scalar_new_bool(bool value, bool is_nullable);
-
-/**
- * Create an unsigned 8-bit integer scalar.
- */
-vx_scalar *vx_scalar_new_u8(uint8_t value, bool is_nullable);
-
-/**
- * Create an unsigned 16-bit integer scalar.
- */
-vx_scalar *vx_scalar_new_u16(uint16_t value, bool is_nullable);
-
-/**
- * Create an unsigned 32-bit integer scalar.
- */
-vx_scalar *vx_scalar_new_u32(uint32_t value, bool is_nullable);
-
-/**
- * Create an unsigned 64-bit integer scalar.
- */
-vx_scalar *vx_scalar_new_u64(uint64_t value, bool is_nullable);
-
-/**
- * Create a signed 8-bit integer scalar.
- */
-vx_scalar *vx_scalar_new_i8(int8_t value, bool is_nullable);
-
-/**
- * Create a signed 16-bit integer scalar.
- */
-vx_scalar *vx_scalar_new_i16(int16_t value, bool is_nullable);
-
-/**
- * Create a signed 32-bit integer scalar.
- */
-vx_scalar *vx_scalar_new_i32(int32_t value, bool is_nullable);
-
-/**
- * Create a signed 64-bit integer scalar.
- */
-vx_scalar *vx_scalar_new_i64(int64_t value, bool is_nullable);
-
-/**
- * Create a 32-bit floating point scalar.
- */
-vx_scalar *vx_scalar_new_f32(float value, bool is_nullable);
-
-/**
- * Create a 64-bit floating point scalar.
- */
-vx_scalar *vx_scalar_new_f64(double value, bool is_nullable);
-
-/**
- * Create a 16-bit floating point scalar.
- *
- * The value is read from raw half-precision bits because C has no portable
- * half-precision floating point ABI.
- */
-vx_scalar *vx_scalar_new_f16_bits(uint16_t bits, bool is_nullable);
-
-/**
- * Create a UTF-8 scalar.
- *
- * The byte range is copied into the scalar. A NULL data pointer is allowed only
- * for an empty byte range. Invalid UTF-8 returns NULL and writes the error
- * output.
- */
-vx_scalar *vx_scalar_new_utf8(const char *ptr, size_t len, bool is_nullable, vx_error **err);
-
-/**
- * Create a binary scalar.
- *
- * The byte range is copied into the scalar. A NULL data pointer is allowed only
- * for an empty byte range. Passing a NULL data pointer for a non-empty byte
- * range returns NULL and writes the error output.
- */
-vx_scalar *vx_scalar_new_binary(const uint8_t *ptr, size_t len, bool is_nullable, vx_error **err);
-
-/**
- * Create a typed null scalar.
- *
- * The data type handle is borrowed, not consumed. The returned scalar uses a
- * nullable copy of that logical type, regardless of the input type's top-level
- * nullability. A NULL data type handle returns NULL and writes the error output.
- */
-vx_scalar *vx_scalar_new_null(const vx_dtype *dtype, vx_error **err);
-
-/**
- * Create a decimal scalar.
- *
- * The unscaled value is provided as a signed 8-bit integer. Decimal precision
- * and scale define the logical decimal type. Invalid decimal metadata or value
- * overflow returns NULL and writes the error output.
- */
-vx_scalar *
-vx_scalar_new_decimal_i8(int8_t value, uint8_t precision, int8_t scale, bool is_nullable, vx_error **err);
-
-/**
- * Create a decimal scalar.
- *
- * The unscaled value is provided as a signed 16-bit integer. Decimal precision
- * and scale define the logical decimal type. Invalid decimal metadata or value
- * overflow returns NULL and writes the error output.
- */
-vx_scalar *
-vx_scalar_new_decimal_i16(int16_t value, uint8_t precision, int8_t scale, bool is_nullable, vx_error **err);
-
-/**
- * Create a decimal scalar.
- *
- * The unscaled value is provided as a signed 32-bit integer. Decimal precision
- * and scale define the logical decimal type. Invalid decimal metadata or value
- * overflow returns NULL and writes the error output.
- */
-vx_scalar *
-vx_scalar_new_decimal_i32(int32_t value, uint8_t precision, int8_t scale, bool is_nullable, vx_error **err);
-
-/**
- * Create a decimal scalar.
- *
- * The unscaled value is provided as a signed 64-bit integer. Decimal precision
- * and scale define the logical decimal type. Invalid decimal metadata or value
- * overflow returns NULL and writes the error output.
- */
-vx_scalar *
-vx_scalar_new_decimal_i64(int64_t value, uint8_t precision, int8_t scale, bool is_nullable, vx_error **err);
-
-/**
- * Create a decimal scalar.
- *
- * The unscaled value is read from a 16-byte little-endian signed integer
- * buffer. Decimal precision and scale define the logical decimal type.
- * Invalid decimal metadata or value overflow returns NULL and writes the error
- * output.
- */
-vx_scalar *vx_scalar_new_decimal_i128_le(const uint8_t *bytes16,
-                                         uint8_t precision,
-                                         int8_t scale,
-                                         bool is_nullable,
-                                         vx_error **err);
-
-/**
- * Create a decimal scalar.
- *
- * The unscaled value is read from a 32-byte little-endian signed integer
- * buffer. Decimal precision and scale define the logical decimal type.
- * Invalid decimal metadata or value overflow returns NULL and writes the error
- * output.
- */
-vx_scalar *vx_scalar_new_decimal_i256_le(const uint8_t *bytes32,
-                                         uint8_t precision,
-                                         int8_t scale,
-                                         bool is_nullable,
-                                         vx_error **err);
-
-/**
- * Create a list scalar.
- *
- * The element data type handle is borrowed, not consumed. Child scalar handles
- * are cloned into the list value, so the caller keeps ownership of the handle
- * array and each scalar in it. A NULL child handle array is allowed only for an
- * empty list. Child values are validated against the element logical type.
- */
-vx_scalar *vx_scalar_new_list(const vx_dtype *element_dtype,
-                              const vx_scalar *const *elements,
-                              size_t len,
-                              bool is_nullable,
-                              vx_error **err);
-
-/**
- * Create a fixed-size list scalar.
- *
- * The element data type handle is borrowed, not consumed. The number of child
- * scalars becomes the fixed-size list width and must fit in a 32-bit unsigned
- * integer. Child scalar handles are cloned into the list value, so the caller
- * keeps ownership of the handle array and each scalar in it. A NULL child
- * handle array is allowed only for an empty list. Child values are validated
- * against the element logical type.
- */
-vx_scalar *vx_scalar_new_fixed_size_list(const vx_dtype *element_dtype,
-                                         const vx_scalar *const *elements,
-                                         size_t len,
-                                         bool is_nullable,
-                                         vx_error **err);
-
-/**
- * Create a struct scalar.
- *
- * The struct data type handle is borrowed, not consumed. Field scalar handles
- * are cloned into the struct value, so the caller keeps ownership of the handle
- * array and each scalar in it. Field count and field logical types are validated
- * against the struct logical type. A NULL field handle array is allowed only for
- * an empty struct value.
- */
-vx_scalar *vx_scalar_new_struct(const vx_dtype *struct_dtype,
-                                const vx_scalar *const *fields,
-                                size_t len,
-                                vx_error **err);
-
-/**
- * Free an owned [`vx_scan`] object.
- */
-void vx_scan_free(vx_scan *ptr);
-
-/**
- * Free an owned [`vx_partition`] object.
- */
-void vx_partition_free(vx_partition *ptr);
-
-/**
- * Scan a data source.
- *
- * Return an owned scan that must be freed with vx_scan_free. A scan may be
- * consumed only once.
- *
- * "options" and "estimate" may be NULL.
- *
- * If "options" is NULL, all rows and columns are returned.
- * If "estimate" is not NULL, the estimated partition count is written to
- * *estimate before returning.
- *
- * Returns NULL and writes an error to "*err" on failure.
- */
-vx_scan *vx_data_source_scan(const vx_data_source *data_source,
-                             const vx_scan_options *options,
-                             vx_estimate *estimate,
-                             vx_error **err);
-
-/**
- * Return borrowed vx_scan's dtype.
- * This function will fail if called after vx_scan_next_partition.
- * Called must not free the returned pointer as its lifetime is bound to the
- * lifetime of the scan.
- * On error returns NULL and sets "err".
- */
-const vx_dtype *vx_scan_dtype(const vx_scan *scan, vx_error **err);
-
-/**
- * Return an owned partition from a scan.
- * The returned partition must be freed with vx_partition_free.
- *
- * On success returns a partition.
- * On exhaustion (no more partitions in scan) returns NULL but doesn't set
- * "err".
- * On error returns NULL and sets "err".
- *
- * This function is thread-unsafe. Callers running a multi-threaded pipeline
- * should synchronise on calls to this function and dispatch each produced
- * partition to a dedicated worker thread.
- */
-vx_partition *vx_scan_next_partition(vx_scan *scan, vx_error **err);
-
-/**
- * Get partition's estimated row count.
- * Must be called before the first call to vx_partition_next.
- *
- * On success, returns 0.
- * On error, return 1 and sets "error".
- */
-int vx_partition_row_count(const vx_partition *partition, vx_estimate *count, vx_error **err);
-
-/**
- * Scan partition to ArrowArrayStream.
- * Consumes partition fully: subsequent calls to vx_partition_scan_arrow or
- * vx_partition_next are undefined behaviour.
- * This call blocks current thread until underlying stream is fully consumed.
- *
- * Caller must not free partition after calling this function.
- *
- * On success, sets "stream" and returns 0.
- * On error, sets "err" and returns 1, freeing the partition.
- */
-int vx_partition_scan_arrow(const vx_session *session,
-                            vx_partition *partition,
-                            FFI_ArrowArrayStream *stream,
-                            vx_error **err);
-
-/**
- * Return an owned owned array from a partition.
- * The returned array must be freed with vx_array_free.
- *
- * On success returns an array.
- * On exhaustion (no more arrays in partition) returns NULL but doesn't set
- * "err".
- * On error return NULL and sets "err".
- *
- * This function is not thread-safe: call from one thread per partition.
- */
-const vx_array *vx_partition_next(vx_partition *partition, vx_error **err);
-
-/**
  * Free an owned [`vx_session`] object.
  */
 void vx_session_free(vx_session *ptr);
@@ -1631,13 +746,6 @@ void vx_session_free(vx_session *ptr);
 vx_session *vx_session_new(void);
 
 /**
- * Clone a Vortex session, returning an owned copy.
- *
- * The caller is responsible for freeing the session with [`vx_session_free`].
- */
-vx_session *vx_session_clone(const vx_session *session);
-
-/**
  * Opens a writable array stream, where sink is used to push values into the stream.
  * To close the stream close the sink with `vx_array_sink_close`.
  */
@@ -1647,8 +755,7 @@ vx_array_sink *vx_array_sink_open_file(const vx_session *session,
                                        vx_error **error_out);
 
 /**
- * Push an array into a file sink.
- * Does not take ownership of array
+ * Pushed a single array chunk into a file sink.
  */
 void vx_array_sink_push(vx_array_sink *sink, const vx_array *array, vx_error **error_out);
 
@@ -1692,61 +799,17 @@ size_t vx_string_len(const vx_string *ptr);
 const char *vx_string_ptr(const vx_string *ptr);
 
 /**
- * Free an owned [`vx_struct_column_builder`] object.
+ * Clone a borrowed [`vx_struct_fields`], returning an owned [`vx_struct_fields`].
+ *
+ *
+ * Must be released with [`vx_struct_fields_free`].
  */
-void vx_struct_column_builder_free(vx_struct_column_builder *ptr);
-
-/**
- * Create a new column-wise struct array builder with given validity and a
- * capacity hint. validity can't be NULL.
- * Capacity hint is for the number of columns.
- * If you don't know capacity, pass 0.
- * if validity is NULL, returns NULL.
- */
-vx_struct_column_builder *vx_struct_column_builder_new(const vx_validity *validity, size_t capacity);
-
-/**
- * Add a named field to a struct array builder.
- * All arguments must be non-NULL.
- * If field's length doesn't match lengths of previous fields, sets error.
- * If an error is returned, the builder is still valid, and caller must
- * deallocate it using vx_struct_column_builder_free.
- */
-void vx_struct_column_builder_add_field(vx_struct_column_builder *builder,
-                                        const char *name,
-                                        const vx_array *field,
-                                        vx_error **error);
-
-/**
- * Finalize a struct array builder, returning a struct array.
- * Consumes the builder. Caller doesn't need to free the builder after calling
- * this function.
- *
- * Example:
- *
- * vx_error* error = NULL;
- *
- * vx_validity validity = {};
- * validity.type = VX_VALIDITY_NON_NULLABLE;
- *
- * const vx_array* field_array = vx_array_new_null(5);
- * const vx_struct_column_builder* builder =
- *     vx_struct_column_builder_new(&validity, 1);
- *
- * vx_struct_column_builder_add_field(builder, "age", field_array, &error);
- *
- * vx_array* struct_array = vx_struct_column_builder_finalize(builder, &error);
- *
- * vx_array_free(struct_array);
- * vx_array_free(field_array);
- *
- */
-const vx_array *vx_struct_column_builder_finalize(vx_struct_column_builder *builder, vx_error **error);
+const vx_struct_fields *vx_struct_fields_clone(const vx_struct_fields *ptr);
 
 /**
  * Free an owned [`vx_struct_fields`] object.
  */
-void vx_struct_fields_free(vx_struct_fields *ptr);
+void vx_struct_fields_free(const vx_struct_fields *ptr);
 
 /**
  * Return the number of fields in the struct dtype.
@@ -1797,7 +860,7 @@ void vx_struct_fields_builder_add_field(vx_struct_fields_builder *builder,
  *
  * Takes ownership of the `builder`.
  */
-vx_struct_fields *vx_struct_fields_builder_finalize(vx_struct_fields_builder *builder);
+const vx_struct_fields *vx_struct_fields_builder_finalize(vx_struct_fields_builder *builder);
 
 #ifdef __cplusplus
 } // extern "C"

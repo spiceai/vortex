@@ -5,6 +5,8 @@ mod array;
 mod compute;
 mod rules;
 mod slice;
+#[cfg(test)]
+mod test;
 
 pub use array::*;
 
@@ -33,6 +35,3 @@ pub struct PcoMetadata {
     #[prost(message, repeated, tag = "2")]
     pub chunks: Vec<PcoChunkInfo>,
 }
-
-#[cfg(test)]
-mod tests;

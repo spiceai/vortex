@@ -2,7 +2,6 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::iter;
-use std::sync::Arc;
 
 use num_traits::AsPrimitive;
 use vortex_buffer::Buffer;
@@ -10,32 +9,30 @@ use vortex_error::VortexResult;
 use vortex_mask::AllOr;
 use vortex_mask::Mask;
 
+use crate::Array;
 use crate::ArrayRef;
 use crate::IntoArray;
-use crate::array::ArrayView;
-use crate::arrays::PrimitiveArray;
-use crate::arrays::VarBinView;
+use crate::ToCanonical;
+use crate::arrays::BinaryView;
+use crate::arrays::TakeExecute;
 use crate::arrays::VarBinViewArray;
-use crate::arrays::dict::TakeExecute;
-use crate::arrays::varbinview::BinaryView;
+use crate::arrays::VarBinViewVTable;
 use crate::buffer::BufferHandle;
 use crate::executor::ExecutionCtx;
 use crate::match_each_integer_ptype;
+use crate::vtable::ValidityHelper;
 
-impl TakeExecute for VarBinView {
+impl TakeExecute for VarBinViewVTable {
     /// Take involves creating a new array that references the old array, just with the given set of views.
     fn take(
-        array: ArrayView<'_, VarBinView>,
-        indices: &ArrayRef,
-        ctx: &mut ExecutionCtx,
+        array: &VarBinViewArray,
+        indices: &dyn Array,
+        _ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
-        let validity = array.validity()?.take(indices)?;
-        let indices = indices.clone().execute::<PrimitiveArray>(ctx)?;
+        let validity = array.validity().take(indices)?;
+        let indices = indices.to_primitive();
 
-        let indices_mask = indices
-            .as_ref()
-            .validity()?
-            .execute_mask(indices.as_ref().len(), ctx)?;
+        let indices_mask = indices.validity_mask()?;
         let views_buffer = match_each_integer_ptype!(indices.ptype(), |I| {
             take_views(array.views(), indices.as_slice::<I>(), &indices_mask)
         });
@@ -45,7 +42,7 @@ impl TakeExecute for VarBinView {
             Ok(Some(
                 VarBinViewArray::new_handle_unchecked(
                     BufferHandle::new_host(views_buffer.into_byte_buffer()),
-                    Arc::clone(array.data_buffers()),
+                    array.buffers().clone(),
                     array
                         .dtype()
                         .union_nullability(indices.dtype().nullability()),
@@ -93,10 +90,10 @@ mod tests {
 
     use crate::IntoArray;
     use crate::accessor::ArrayAccessor;
+    use crate::array::Array;
+    use crate::arrays::PrimitiveArray;
     use crate::arrays::VarBinViewArray;
-    use crate::arrays::varbinview::compute::take::PrimitiveArray;
-    #[expect(deprecated)]
-    use crate::canonical::ToCanonical as _;
+    use crate::canonical::ToCanonical;
     use crate::compute::conformance::take::test_take_conformance;
     use crate::dtype::DType;
     use crate::dtype::Nullability::NonNullable;
@@ -116,12 +113,12 @@ mod tests {
         let taken = arr.take(buffer![0, 3].into_array()).unwrap();
 
         assert!(taken.dtype().is_nullable());
-        #[expect(deprecated)]
-        let result = taken.to_varbinview().with_iterator(|it| {
-            it.map(|v| v.map(|b| unsafe { String::from_utf8_unchecked(b.to_vec()) }))
-                .collect::<Vec<_>>()
-        });
-        assert_eq!(result, [Some("one".to_string()), Some("four".to_string())]);
+        assert_eq!(
+            taken.to_varbinview().with_iterator(|it| it
+                .map(|v| v.map(|b| unsafe { String::from_utf8_unchecked(b.to_vec()) }))
+                .collect::<Vec<_>>()),
+            [Some("one".to_string()), Some("four".to_string())]
+        );
     }
 
     #[test]
@@ -134,15 +131,15 @@ mod tests {
             Validity::from(BitBuffer::from(vec![true, false])),
         );
 
-        let taken = arr.take(indices.into_array()).unwrap();
+        let taken = arr.take(indices.to_array()).unwrap();
 
         assert!(taken.dtype().is_nullable());
-        #[expect(deprecated)]
-        let result = taken.to_varbinview().with_iterator(|it| {
-            it.map(|v| v.map(|b| unsafe { String::from_utf8_unchecked(b.to_vec()) }))
-                .collect::<Vec<_>>()
-        });
-        assert_eq!(result, [Some("two".to_string()), None]);
+        assert_eq!(
+            taken.to_varbinview().with_iterator(|it| it
+                .map(|v| v.map(|b| unsafe { String::from_utf8_unchecked(b.to_vec()) }))
+                .collect::<Vec<_>>()),
+            [Some("two".to_string()), None]
+        );
     }
 
     #[rstest]
@@ -163,6 +160,6 @@ mod tests {
     ))]
     #[case(VarBinViewArray::from_iter(["single"].map(Some), DType::Utf8(NonNullable)))]
     fn test_take_varbinview_conformance(#[case] array: VarBinViewArray) {
-        test_take_conformance(&array.into_array());
+        test_take_conformance(array.as_ref());
     }
 }

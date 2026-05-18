@@ -43,7 +43,7 @@ pub(super) fn to_arrow_map(
 
     // Build the MapArray from the components.
     let map_array = ArrowMapArray::try_new(
-        Arc::clone(entries_field),
+        entries_field.clone(),
         offsets,
         entries_struct,
         nulls,

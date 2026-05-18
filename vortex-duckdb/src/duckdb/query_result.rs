@@ -3,13 +3,11 @@
 
 use std::ffi::CStr;
 
-use vortex::error::VortexExpect;
 use vortex::error::VortexResult;
 use vortex::error::vortex_bail;
 use vortex::error::vortex_err;
 
 use crate::cpp;
-use crate::cpp::DUCKDB_TYPE;
 use crate::duckdb::DataChunk;
 use crate::lifetime_wrapper;
 
@@ -73,15 +71,7 @@ impl QueryResultRef {
     /// Get the type of a column by index.
     pub fn column_type(&self, col_idx: usize) -> LogicalType {
         let dtype = unsafe { cpp::duckdb_column_type(self.as_ptr(), col_idx as u64) };
-        if dtype == DUCKDB_TYPE::DUCKDB_TYPE_DECIMAL {
-            let lt = unsafe { cpp::duckdb_column_logical_type(self.as_ptr(), col_idx as u64) };
-            let precision = unsafe { cpp::duckdb_decimal_width(lt) };
-            let scale = unsafe { cpp::duckdb_decimal_scale(lt) };
-
-            LogicalType::decimal_type(precision, scale).vortex_expect("valid decimal")
-        } else {
-            LogicalType::new(dtype)
-        }
+        LogicalType::new(dtype)
     }
 }
 

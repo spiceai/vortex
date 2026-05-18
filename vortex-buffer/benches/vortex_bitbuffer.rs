@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+#![allow(clippy::unwrap_used)]
+
 use std::iter::Iterator;
 
 use arrow_buffer::BooleanBuffer;
@@ -10,15 +12,6 @@ use vortex_buffer::BitBuffer;
 use vortex_buffer::BitBufferMut;
 
 fn main() {
-    // Pre-warm CPUID feature detection so the one-time probe cost is never
-    // included in any benchmark iteration.
-    #[cfg(target_arch = "x86_64")]
-    {
-        let _ = is_x86_feature_detected!("avx2");
-        let _ = is_x86_feature_detected!("avx512f");
-        let _ = is_x86_feature_detected!("avx512vpopcntdq");
-    }
-
     divan::main();
 }
 
@@ -32,11 +25,6 @@ impl FromIterator<bool> for Arrow<BooleanBuffer> {
 }
 
 const INPUT_SIZE: &[usize] = &[128, 1024, 2048, 16_384, 65_536];
-
-#[inline]
-fn true_count_pattern(i: usize) -> bool {
-    (i.is_multiple_of(3)) ^ (i.is_multiple_of(11))
-}
 
 #[cfg(not(codspeed))]
 #[divan::bench(args = INPUT_SIZE)]
@@ -172,8 +160,7 @@ fn slice_arrow_buffer(bencher: Bencher, length: usize) {
 
 #[divan::bench(args = INPUT_SIZE)]
 fn true_count_vortex_buffer(bencher: Bencher, length: usize) {
-    let buffer = BitBuffer::from_iter((0..length).map(true_count_pattern));
-
+    let buffer = BitBuffer::from_iter((0..length).map(|i| i % 2 == 0));
     bencher
         .with_inputs(|| &buffer)
         .bench_refs(|buffer| buffer.true_count())
@@ -181,12 +168,7 @@ fn true_count_vortex_buffer(bencher: Bencher, length: usize) {
 
 #[divan::bench(args = INPUT_SIZE)]
 fn true_count_arrow_buffer(bencher: Bencher, length: usize) {
-    let buffer = Arrow(BooleanBuffer::from_iter(
-        (0..length).map(true_count_pattern),
-    ));
-
-    buffer.0.count_set_bits();
-
+    let buffer = Arrow(BooleanBuffer::from_iter((0..length).map(|i| i % 2 == 0)));
     bencher
         .with_inputs(|| &buffer)
         .bench_refs(|buffer| buffer.0.count_set_bits());

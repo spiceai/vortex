@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-#![expect(clippy::cast_possible_truncation)]
+#![allow(clippy::cast_possible_truncation)]
 #![doc(html_logo_url = "/vortex/docs/_static/vortex_spiral_logo.svg")]
 //! Read and write Vortex layouts, a serialization of Vortex arrays.
 //!
@@ -109,16 +109,23 @@ pub use footer::*;
 pub use forever_constant::*;
 pub use open::*;
 pub use strategy::*;
-use vortex_array::arrays::Dict;
-use vortex_array::arrays::Patched;
-use vortex_array::arrays::patched::use_experimental_patches;
+use vortex_alp::ALPRDVTable;
+use vortex_alp::ALPVTable;
+use vortex_array::arrays::DictVTable;
 use vortex_array::session::ArraySessionExt;
-use vortex_bytebool::ByteBool;
-use vortex_fsst::FSST;
-use vortex_pco::Pco;
+use vortex_bytebool::ByteBoolVTable;
+use vortex_datetime_parts::DateTimePartsVTable;
+use vortex_decimal_byte_parts::DecimalBytePartsVTable;
+use vortex_fastlanes::BitPackedVTable;
+use vortex_fastlanes::DeltaVTable;
+use vortex_fastlanes::FoRVTable;
+use vortex_fastlanes::RLEVTable;
+use vortex_fsst::FSSTVTable;
+use vortex_pco::PcoVTable;
+use vortex_sequence::SequenceVTable;
 use vortex_session::VortexSession;
-use vortex_sparse::Sparse;
-use vortex_zigzag::ZigZag;
+use vortex_sparse::SparseVTable;
+use vortex_zigzag::ZigZagVTable;
 pub use writer::*;
 
 /// The current version of the Vortex file format
@@ -157,33 +164,34 @@ mod forever_constant {
 ///
 /// NOTE: this function will be changed in the future to encapsulate logic for using different
 /// Vortex "Editions" that may support different sets of encodings.
-pub fn register_default_encodings(session: &VortexSession) {
+pub fn register_default_encodings(session: &mut VortexSession) {
     {
         let arrays = session.arrays();
-        arrays.register(ByteBool);
-        arrays.register(Dict);
-        arrays.register(FSST);
-        arrays.register(Pco);
-        arrays.register(Sparse);
-        arrays.register(ZigZag);
+        arrays.register(ALPVTable::ID, ALPVTable);
+        arrays.register(ALPRDVTable::ID, ALPRDVTable);
+        arrays.register(BitPackedVTable::ID, BitPackedVTable);
+        arrays.register(ByteBoolVTable::ID, ByteBoolVTable);
+        arrays.register(DateTimePartsVTable::ID, DateTimePartsVTable);
+        arrays.register(DecimalBytePartsVTable::ID, DecimalBytePartsVTable);
+        arrays.register(DeltaVTable::ID, DeltaVTable);
+        arrays.register(DictVTable::ID, DictVTable);
+        arrays.register(FSSTVTable::ID, FSSTVTable);
+        arrays.register(FoRVTable::ID, FoRVTable);
+        arrays.register(PcoVTable::ID, PcoVTable);
+        arrays.register(RLEVTable::ID, RLEVTable);
+        arrays.register(SequenceVTable::ID, SequenceVTable);
+        arrays.register(SparseVTable::ID, SparseVTable);
+        arrays.register(ZigZagVTable::ID, ZigZagVTable);
         #[cfg(feature = "zstd")]
-        arrays.register(vortex_zstd::Zstd);
+        arrays.register(vortex_zstd::ZstdVTable::ID, vortex_zstd::ZstdVTable);
         #[cfg(all(feature = "zstd", feature = "unstable_encodings"))]
-        arrays.register(vortex_zstd::ZstdBuffers);
-        if use_experimental_patches() {
-            arrays.register(Patched);
-        }
+        arrays.register(
+            vortex_zstd::ZstdBuffersVTable::ID,
+            vortex_zstd::ZstdBuffersVTable,
+        );
     }
 
     // Eventually all encodings crates should expose an initialize function. For now it's only
     // a few of them.
-    vortex_alp::initialize(session);
-    vortex_datetime_parts::initialize(session);
-    vortex_decimal_byte_parts::initialize(session);
-    vortex_fastlanes::initialize(session);
-    vortex_runend::initialize(session);
-    vortex_sequence::initialize(session);
-
-    #[cfg(feature = "unstable_encodings")]
-    vortex_tensor::initialize(session);
+    vortex_runend::initialize(session)
 }

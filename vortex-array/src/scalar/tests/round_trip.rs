@@ -220,10 +220,7 @@ mod tests {
 
         // Test nested lists
         let inner_dtype = Arc::new(DType::Primitive(PType::I32, Nullability::NonNullable));
-        let outer_dtype = Arc::new(DType::List(
-            Arc::clone(&inner_dtype),
-            Nullability::NonNullable,
-        ));
+        let outer_dtype = Arc::new(DType::List(inner_dtype.clone(), Nullability::NonNullable));
 
         let inner_list1 = Scalar::list(
             inner_dtype,
@@ -320,14 +317,14 @@ mod tests {
     #[case::binary_short(Scalar::binary(vec![1u8, 2, 3], Nullability::NonNullable))]
     fn test_nbytes_approx_eq_to_proto_bytes(#[case] scalar: Scalar) {
         let proto_bytes: Vec<u8> = ScalarValue::to_proto_bytes(scalar.value());
-        let diff = (scalar.approx_nbytes() as isize - proto_bytes.len() as isize).abs();
+        let diff = (scalar.nbytes() as isize - proto_bytes.len() as isize).abs();
 
         // NOTE: THE 4 HERE IS COMPLETELY ARBITRARY!!!
         assert!(
             diff <= 4,
             "nbytes() should be within 4 of proto-serialized length for {:?}, got {} vs {}",
             scalar,
-            scalar.approx_nbytes(),
+            scalar.nbytes(),
             proto_bytes.len(),
         );
     }

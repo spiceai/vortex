@@ -2,16 +2,16 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use vortex_buffer::BitBuffer;
-use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 
+use crate::Array;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::IntoArray;
-use crate::array::ArrayView;
 use crate::arrays::BoolArray;
-use crate::arrays::Decimal;
+use crate::arrays::DecimalArray;
+use crate::arrays::DecimalVTable;
 use crate::dtype::NativeDecimalType;
 use crate::dtype::Nullability;
 use crate::match_each_decimal_value_type;
@@ -19,12 +19,13 @@ use crate::scalar::Scalar;
 use crate::scalar_fn::fns::between::BetweenKernel;
 use crate::scalar_fn::fns::between::BetweenOptions;
 use crate::scalar_fn::fns::between::StrictComparison;
+use crate::vtable::ValidityHelper;
 
-impl BetweenKernel for Decimal {
+impl BetweenKernel for DecimalVTable {
     fn between(
-        arr: ArrayView<'_, Decimal>,
-        lower: &ArrayRef,
-        upper: &ArrayRef,
+        arr: &DecimalArray,
+        lower: &dyn Array,
+        upper: &dyn Array,
         options: &BetweenOptions,
         _ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
@@ -37,7 +38,7 @@ impl BetweenKernel for Decimal {
 
         // NOTE: we know that have checked before that the lower and upper bounds are not all null.
         let nullability =
-            arr.dtype().nullability() | lower.dtype().nullability() | upper.dtype().nullability();
+            arr.dtype.nullability() | lower.dtype().nullability() | upper.dtype().nullability();
 
         match_each_decimal_value_type!(arr.values_type(), |D| {
             between_unpack::<D>(arr, lower, upper, nullability, options)
@@ -46,7 +47,7 @@ impl BetweenKernel for Decimal {
 }
 
 fn between_unpack<T: NativeDecimalType>(
-    arr: ArrayView<'_, Decimal>,
+    arr: &DecimalArray,
     lower: Scalar,
     upper: Scalar,
     nullability: Nullability,
@@ -94,7 +95,7 @@ fn between_unpack<T: NativeDecimalType>(
 }
 
 fn between_impl<T: NativeDecimalType>(
-    arr: ArrayView<'_, Decimal>,
+    arr: &DecimalArray,
     lower: T,
     upper: T,
     nullability: Nullability,
@@ -107,9 +108,7 @@ fn between_impl<T: NativeDecimalType>(
             let value = buffer[idx];
             lower_op(lower, value) & upper_op(value, upper)
         }),
-        arr.validity()
-            .vortex_expect("validity should be derivable")
-            .union_nullability(nullability),
+        arr.validity().clone().union_nullability(nullability),
     )
     .into_array()
 }

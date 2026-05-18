@@ -134,8 +134,8 @@ class GCSStore:
     [here](https://cloud.google.com/docs/authentication/application-default-credentials).
     """
 
-    def __new__(  # type: ignore[misc] # Overlap between argument names and ** TypedDict items: "bucket"
-        cls,
+    def __init__(  # type: ignore[misc] # Overlap between argument names and ** TypedDict items: "bucket"
+        self,
         bucket: str | None = None,
         *,
         prefix: str | None = None,
@@ -144,7 +144,7 @@ class GCSStore:
         retry_config: RetryConfig | None = None,
         credential_provider: GCSCredentialProvider | None = None,
         **kwargs: Unpack[GCSConfig],  # type: ignore # noqa: PGH003 (bucket key overlaps with positional arg)
-    ) -> Self:
+    ) -> None:
         """Construct a new GCSStore.
 
         Args:

@@ -9,7 +9,6 @@ use futures::TryStreamExt;
 use futures::stream::FuturesUnordered;
 use object_store::MultipartUpload;
 use object_store::ObjectStore;
-use object_store::ObjectStoreExt;
 use object_store::PutPayload;
 use object_store::PutResult;
 use object_store::path::Path;
@@ -129,7 +128,7 @@ mod tests {
         let location = Path::from("test.bin");
 
         for test_store in [memory_store, local_store] {
-            let mut writer = ObjectStoreWrite::new(Arc::clone(&test_store), &location).await?;
+            let mut writer = ObjectStoreWrite::new(test_store.clone(), &location).await?;
 
             #[expect(clippy::cast_possible_truncation)]
             let data = (0..3)

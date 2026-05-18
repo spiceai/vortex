@@ -7,13 +7,14 @@
 //! - Number of indices to take
 //! - Fixed size list length (elements per list)
 
-#![expect(clippy::cast_possible_truncation)]
-#![expect(clippy::unwrap_used)]
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::unwrap_used)]
 
 use divan::Bencher;
-use rand::RngExt;
+use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use vortex_array::Array;
 use vortex_array::IntoArray;
 use vortex_array::LEGACY_SESSION;
 use vortex_array::RecursiveCanonical;
@@ -27,7 +28,7 @@ fn main() {
 }
 
 /// Number of lists in the source array.
-const NUM_LISTS: usize = 500;
+const NUM_LISTS: usize = 10_000;
 
 /// Number of indices to take.
 const NUM_INDICES: &[usize] = &[100, 1_000];
@@ -65,8 +66,7 @@ fn take_fsl_random<const LIST_SIZE: usize>(bencher: Bencher, num_indices: usize)
         .with_inputs(|| (&fsl, &indices_array, LEGACY_SESSION.create_execution_ctx()))
         .bench_refs(|(array, indices, execution_ctx)| {
             array
-                .clone()
-                .take(indices.clone())
+                .take(indices.to_array())
                 .unwrap()
                 .execute::<RecursiveCanonical>(execution_ctx)
                 .unwrap()
@@ -91,8 +91,7 @@ fn take_fsl_nullable_random<const LIST_SIZE: usize>(bencher: Bencher, num_indice
         .with_inputs(|| (&fsl, &indices_array, LEGACY_SESSION.create_execution_ctx()))
         .bench_refs(|(array, indices, execution_ctx)| {
             array
-                .clone()
-                .take(indices.clone())
+                .take(indices.to_array())
                 .unwrap()
                 .execute::<RecursiveCanonical>(execution_ctx)
                 .unwrap()

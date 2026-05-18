@@ -1,24 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use vortex_array::Array;
 use vortex_array::ArrayRef;
-use vortex_array::ArrayView;
 use vortex_array::IntoArray;
 use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::DType;
 use vortex_array::scalar_fn::fns::cast::CastReduce;
 use vortex_error::VortexResult;
 
-use crate::DateTimeParts;
-use crate::array::DateTimePartsArraySlotsExt;
-impl CastReduce for DateTimeParts {
-    fn cast(array: ArrayView<'_, Self>, dtype: &DType) -> VortexResult<Option<ArrayRef>> {
+use crate::DateTimePartsArray;
+use crate::DateTimePartsVTable;
+
+impl CastReduce for DateTimePartsVTable {
+    fn cast(array: &DateTimePartsArray, dtype: &DType) -> VortexResult<Option<ArrayRef>> {
         if !array.dtype().eq_ignore_nullability(dtype) {
             return Ok(None);
         };
 
         Ok(Some(
-            DateTimeParts::try_new(
+            DateTimePartsArray::try_new(
                 dtype.clone(),
                 array
                     .days()
@@ -34,11 +35,9 @@ impl CastReduce for DateTimeParts {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use vortex_array::Array;
     use vortex_array::ArrayRef;
-    use vortex_array::Canonical;
     use vortex_array::IntoArray;
-    use vortex_array::LEGACY_SESSION;
-    use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::arrays::TemporalArray;
     use vortex_array::builtins::ArrayBuiltins;
@@ -48,26 +47,22 @@ mod tests {
     use vortex_array::validity::Validity;
     use vortex_buffer::buffer;
 
-    use crate::DateTimeParts;
     use crate::DateTimePartsArray;
 
     fn date_time_array(validity: Validity) -> ArrayRef {
-        DateTimeParts::try_from_temporal(
-            TemporalArray::new_timestamp(
-                PrimitiveArray::new(
-                    buffer![
-                        86_400i64,            // element with only day component
-                        86_400i64 + 1000,     // element with day + second components
-                        86_400i64 + 1000 + 1, // element with day + second + sub-second components
-                    ],
-                    validity,
-                )
-                .into_array(),
-                TimeUnit::Milliseconds,
-                Some("UTC".into()),
-            ),
-            &mut LEGACY_SESSION.create_execution_ctx(),
-        )
+        DateTimePartsArray::try_from(TemporalArray::new_timestamp(
+            PrimitiveArray::new(
+                buffer![
+                    86_400i64,            // element with only day component
+                    86_400i64 + 1000,     // element with day + second components
+                    86_400i64 + 1000 + 1, // element with day + second + sub-second components
+                ],
+                validity,
+            )
+            .into_array(),
+            TimeUnit::Milliseconds,
+            Some("UTC".into()),
+        ))
         .unwrap()
         .into_array()
     }
@@ -95,23 +90,22 @@ mod tests {
     #[case(Validity::AllInvalid)]
     #[case(Validity::from_iter([true, false, true]))]
     fn test_bad_cast_fails(#[case] validity: Validity) {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
         let array = date_time_array(validity);
-        // Cast to incompatible type - force evaluation via execute::<Canonical>
+        // Cast to incompatible type - force evaluation via to_canonical
         let result = array
             .cast(DType::Bool(Nullability::NonNullable))
-            .and_then(|a| a.execute::<Canonical>(&mut ctx).map(|c| c.into_array()));
+            .and_then(|a| a.to_canonical().map(|c| c.into_array()));
         assert!(result.is_err(), "Expected error, got: {result:?}");
 
-        // Cast nullable with nulls to non-nullable - force evaluation via execute::<Canonical>
+        // Cast nullable with nulls to non-nullable - force evaluation via to_canonical
         let result = array
             .cast(array.dtype().with_nullability(Nullability::NonNullable))
-            .and_then(|a| a.execute::<Canonical>(&mut ctx).map(|c| c.into_array()));
+            .and_then(|a| a.to_canonical().map(|c| c.into_array()));
         assert!(result.is_err(), "Expected error, got: {result:?}");
     }
 
     #[rstest]
-    #[case(DateTimeParts::try_from_temporal(TemporalArray::new_timestamp(
+    #[case(DateTimePartsArray::try_from(TemporalArray::new_timestamp(
         buffer![
             0i64,
             86_400_000,  // 1 day in ms
@@ -121,8 +115,8 @@ mod tests {
         ].into_array(),
         TimeUnit::Milliseconds,
         Some("UTC".into())
-    ), &mut LEGACY_SESSION.create_execution_ctx()).unwrap())]
-    #[case(DateTimeParts::try_from_temporal(TemporalArray::new_timestamp(
+    )).unwrap())]
+    #[case(DateTimePartsArray::try_from(TemporalArray::new_timestamp(
         PrimitiveArray::from_option_iter([
             Some(0i64),
             None,
@@ -132,14 +126,14 @@ mod tests {
         ]).into_array(),
         TimeUnit::Milliseconds,
         Some("UTC".into())
-    ), &mut LEGACY_SESSION.create_execution_ctx()).unwrap())]
-    #[case(DateTimeParts::try_from_temporal(TemporalArray::new_timestamp(
+    )).unwrap())]
+    #[case(DateTimePartsArray::try_from(TemporalArray::new_timestamp(
         buffer![86_400_000_000_000i64].into_array(), // 1 day in ns
         TimeUnit::Nanoseconds,
         Some("UTC".into())
-    ), &mut LEGACY_SESSION.create_execution_ctx()).unwrap())]
+    )).unwrap())]
     fn test_cast_datetime_parts_conformance(#[case] array: DateTimePartsArray) {
         use vortex_array::compute::conformance::cast::test_cast_conformance;
-        test_cast_conformance(&array.into_array());
+        test_cast_conformance(array.as_ref());
     }
 }

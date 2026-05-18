@@ -14,7 +14,6 @@ use futures::channel::mpsc;
 use futures::future;
 use vortex_array::buffer::BufferHandle;
 use vortex_buffer::Alignment;
-use vortex_buffer::ByteBuffer;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
@@ -137,7 +136,7 @@ impl SegmentSource for FileSegmentSource {
     fn request(&self, id: SegmentId) -> SegmentFuture {
         // We eagerly register the read request here assuming the behaviour of [`FileRead`], where
         // coalescing becomes effective prior to the future being polled.
-        let spec = *match self.segments.get(*id as usize) {
+        let spec = match self.segments.get(*id as usize).cloned() {
             Some(spec) => spec,
             None => {
                 return future::ready(Err(vortex_err!("Missing segment: {}", id))).boxed();
@@ -167,7 +166,7 @@ impl SegmentSource for FileSegmentSource {
 
         let fut = ReadFuture {
             id,
-            recv: recv.into_future(),
+            recv,
             polled: false,
             finished: false,
             events: self.events.clone(),
@@ -184,7 +183,7 @@ impl SegmentSource for FileSegmentSource {
 /// If dropped, the read request will be canceled where possible.
 struct ReadFuture {
     id: usize,
-    recv: oneshot::AsyncReceiver<VortexResult<BufferHandle>>,
+    recv: oneshot::Receiver<VortexResult<BufferHandle>>,
     polled: bool,
     finished: bool,
     events: mpsc::UnboundedSender<ReadEvent>,
@@ -250,48 +249,5 @@ impl RequestMetrics {
                 .add_labels(labels)
                 .histogram("io.requests.coalesced.num_coalesced"),
         }
-    }
-}
-
-/// A [`SegmentSource`] that resolves segments synchronously from an
-/// in-memory [`ByteBuffer`].
-///
-/// Resolves segments synchronously, bypassing the async I/O pipeline.
-pub(crate) struct BufferSegmentSource {
-    buffer: ByteBuffer,
-    segments: Arc<[SegmentSpec]>,
-}
-
-impl BufferSegmentSource {
-    /// Create a new `BufferSegmentSource` from a buffer and its segment map.
-    pub fn new(buffer: ByteBuffer, segments: Arc<[SegmentSpec]>) -> Self {
-        Self { buffer, segments }
-    }
-}
-
-impl SegmentSource for BufferSegmentSource {
-    fn request(&self, id: SegmentId) -> SegmentFuture {
-        let spec = match self.segments.get(*id as usize) {
-            Some(spec) => spec,
-            None => {
-                return future::ready(Err(vortex_err!("Missing segment: {}", id))).boxed();
-            }
-        };
-
-        let start = spec.offset as usize;
-        let end = start + spec.length as usize;
-        if end > self.buffer.len() {
-            return future::ready(Err(vortex_err!(
-                "Segment {} range {}..{} out of bounds for buffer of length {}",
-                *id,
-                start,
-                end,
-                self.buffer.len()
-            )))
-            .boxed();
-        }
-
-        let slice = self.buffer.slice(start..end).aligned(spec.alignment);
-        future::ready(Ok(BufferHandle::new_host(slice))).boxed()
     }
 }

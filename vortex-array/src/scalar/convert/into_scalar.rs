@@ -82,7 +82,7 @@ where
     Scalar: From<T>,
 {
     fn from(vec: Vec<T>) -> Self {
-        ScalarValue::Tuple(
+        ScalarValue::List(
             vec.into_iter()
                 .map(|elem| Scalar::from(elem).into_value())
                 .collect(),

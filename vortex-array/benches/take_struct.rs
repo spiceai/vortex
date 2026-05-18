@@ -1,17 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-#![expect(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used)]
 
 use divan::Bencher;
-use rand::RngExt;
+use rand::Rng;
 use rand::SeedableRng;
 use rand::distr::Uniform;
 use rand::rngs::StdRng;
+use vortex_array::Array;
 use vortex_array::IntoArray;
-use vortex_array::LEGACY_SESSION;
-use vortex_array::RecursiveCanonical;
-use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::StructArray;
 use vortex_array::dtype::FieldNames;
 use vortex_array::validity::Validity;
@@ -41,8 +39,7 @@ fn take_struct_simple(bencher: Bencher) {
         ARRAY_SIZE,
         Validity::NonNullable,
     )
-    .unwrap()
-    .into_array();
+    .unwrap();
 
     let indices: Buffer<u64> = (0..TAKE_SIZE)
         .map(|_| rng.random_range(0..ARRAY_SIZE) as u64)
@@ -50,19 +47,8 @@ fn take_struct_simple(bencher: Bencher) {
     let indices_array = indices.into_array();
 
     bencher
-        .with_inputs(|| {
-            (
-                &struct_array,
-                &indices_array,
-                LEGACY_SESSION.create_execution_ctx(),
-            )
-        })
-        .bench_refs(|(array, indices, ctx)| {
-            array
-                .take((*indices).clone())
-                .unwrap()
-                .execute::<RecursiveCanonical>(ctx)
-        });
+        .with_inputs(|| (&struct_array, &indices_array))
+        .bench_refs(|(array, indices)| array.take(indices.to_array()).unwrap());
 }
 
 #[divan::bench(args = [8])]
@@ -83,9 +69,8 @@ fn take_struct_wide(bencher: Bencher, width: usize) {
         "field1", "field2", "field3", "field4", "field5", "field6", "field7", "field8",
     ]);
 
-    let struct_array = StructArray::try_new(field_names, fields, ARRAY_SIZE, Validity::NonNullable)
-        .unwrap()
-        .into_array();
+    let struct_array =
+        StructArray::try_new(field_names, fields, ARRAY_SIZE, Validity::NonNullable).unwrap();
 
     let indices: Buffer<u64> = (0..TAKE_SIZE)
         .map(|_| rng.random_range(0..ARRAY_SIZE) as u64)
@@ -93,19 +78,8 @@ fn take_struct_wide(bencher: Bencher, width: usize) {
     let indices_array = indices.into_array();
 
     bencher
-        .with_inputs(|| {
-            (
-                &struct_array,
-                &indices_array,
-                LEGACY_SESSION.create_execution_ctx(),
-            )
-        })
-        .bench_refs(|(array, indices, ctx)| {
-            array
-                .take((*indices).clone())
-                .unwrap()
-                .execute::<RecursiveCanonical>(ctx)
-        });
+        .with_inputs(|| (&struct_array, &indices_array))
+        .bench_refs(|(array, indices)| array.take(indices.to_array()).unwrap());
 }
 
 #[divan::bench]
@@ -125,25 +99,13 @@ fn take_struct_sequential_indices(bencher: Bencher) {
         ARRAY_SIZE,
         Validity::NonNullable,
     )
-    .unwrap()
-    .into_array();
+    .unwrap();
 
     // Sequential indices for better cache performance
     let indices: Buffer<u64> = (0..TAKE_SIZE as u64).collect();
     let indices_array = indices.into_array();
 
     bencher
-        .with_inputs(|| {
-            (
-                &struct_array,
-                &indices_array,
-                LEGACY_SESSION.create_execution_ctx(),
-            )
-        })
-        .bench_refs(|(array, indices, ctx)| {
-            array
-                .take((*indices).clone())
-                .unwrap()
-                .execute::<RecursiveCanonical>(ctx)
-        });
+        .with_inputs(|| (&struct_array, &indices_array))
+        .bench_refs(|(array, indices)| array.take(indices.to_array()).unwrap());
 }

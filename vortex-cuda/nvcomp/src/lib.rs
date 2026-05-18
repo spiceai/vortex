@@ -22,10 +22,11 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 /// Raw FFI type definitions and dynamically-loaded function pointers from bindgen.
-#[expect(
+#[allow(
     non_upper_case_globals,
     non_camel_case_types,
     non_snake_case,
+    dead_code,
     clippy::all
 )]
 pub mod sys;
@@ -34,6 +35,7 @@ mod error;
 pub mod zstd;
 
 pub use error::NvcompError;
+use vortex_cuda_macros::cuda_tests;
 
 /// The loaded nvcomp library instance.
 static NVCOMP_LIB: OnceLock<Result<sys::NvcompLibrary, String>> = OnceLock::new();
@@ -64,12 +66,13 @@ pub fn nvcomp_library() -> Result<&'static sys::NvcompLibrary, NvcompError> {
         .as_ref()
         .map_err(|e| NvcompError::LibraryLoadError(e.clone()))
 }
-#[cfg(test)]
+
+#[cuda_tests]
 mod tests {
     use crate::zstd;
 
     /// Test that we can call nvcompBatchedZstdDecompressGetTempSizeAsync.
-    #[vortex_cuda_macros::test]
+    #[test]
     fn test_get_decompress_temp_size() {
         let num_chunks = 10;
         let max_uncompressed_chunk_bytes = 65536; // 64KB recommended chunk size

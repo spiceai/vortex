@@ -6,8 +6,8 @@ pub mod writer;
 
 use std::env;
 use std::sync::Arc;
-use std::sync::LazyLock;
 
+use vortex_array::ArrayContext;
 use vortex_array::DeserializeMetadata;
 use vortex_array::ProstMetadata;
 use vortex_array::dtype::DType;
@@ -16,7 +16,6 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
-use vortex_session::registry::ReadContext;
 
 use crate::LayoutChildType;
 use crate::LayoutEncodingRef;
@@ -31,21 +30,20 @@ use crate::segments::SegmentSource;
 use crate::vtable;
 
 /// Check if inline array node is enabled.
+/// This checks the env var each time to allow tests to toggle the behavior.
 pub(super) fn flat_layout_inline_array_node() -> bool {
-    static FLAT_LAYOUT_INLINE_ARRAY_NODE: LazyLock<bool> =
-        LazyLock::new(|| env::var("FLAT_LAYOUT_INLINE_ARRAY_NODE").is_ok_and(|v| v == "1"));
-    *FLAT_LAYOUT_INLINE_ARRAY_NODE
+    env::var("FLAT_LAYOUT_INLINE_ARRAY_NODE").is_ok()
 }
 
 vtable!(Flat);
 
-impl VTable for Flat {
+impl VTable for FlatVTable {
     type Layout = FlatLayout;
     type Encoding = FlatLayoutEncoding;
     type Metadata = ProstMetadata<FlatLayoutMetadata>;
 
     fn id(_encoding: &Self::Encoding) -> LayoutId {
-        LayoutId::new("vortex.flat")
+        LayoutId::new_ref("vortex.flat")
     }
 
     fn encoding(_layout: &Self::Layout) -> LayoutEncodingRef {
@@ -103,7 +101,7 @@ impl VTable for Flat {
         metadata: &<Self::Metadata as DeserializeMetadata>::Output,
         segment_ids: Vec<SegmentId>,
         _children: &dyn LayoutChildren,
-        ctx: &ReadContext,
+        ctx: &ArrayContext,
     ) -> VortexResult<Self::Layout> {
         if segment_ids.len() != 1 {
             vortex_bail!("Flat layout must have exactly one segment ID");
@@ -131,19 +129,17 @@ impl VTable for Flat {
 #[derive(Debug)]
 pub struct FlatLayoutEncoding;
 
-/// The terminal node of a layout tree. Stores a single chunk of array data as one serialized
-/// segment on disk.
 #[derive(Clone, Debug)]
 pub struct FlatLayout {
     row_count: u64,
     dtype: DType,
     segment_id: SegmentId,
-    ctx: ReadContext,
+    ctx: ArrayContext,
     array_tree: Option<ByteBuffer>,
 }
 
 impl FlatLayout {
-    pub fn new(row_count: u64, dtype: DType, segment_id: SegmentId, ctx: ReadContext) -> Self {
+    pub fn new(row_count: u64, dtype: DType, segment_id: SegmentId, ctx: ArrayContext) -> Self {
         Self {
             row_count,
             dtype,
@@ -157,7 +153,7 @@ impl FlatLayout {
         row_count: u64,
         dtype: DType,
         segment_id: SegmentId,
-        ctx: ReadContext,
+        ctx: ArrayContext,
         metadata: Option<ByteBuffer>,
     ) -> Self {
         Self {
@@ -175,7 +171,7 @@ impl FlatLayout {
     }
 
     #[inline]
-    pub fn array_ctx(&self) -> &ReadContext {
+    pub fn array_ctx(&self) -> &ArrayContext {
         &self.ctx
     }
 

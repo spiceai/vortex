@@ -3,18 +3,18 @@
 
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
+use vortex_mask::Mask;
 
+use crate::Array;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
-use crate::array::ArrayView;
-use crate::array::VTable;
-use crate::arrays::ScalarFn;
-use crate::arrays::scalar_fn::ExactScalarFn;
-use crate::arrays::scalar_fn::ScalarFnArrayExt;
-use crate::arrays::scalar_fn::ScalarFnArrayView;
+use crate::arrays::ExactScalarFn;
+use crate::arrays::ScalarFnArrayView;
+use crate::arrays::ScalarFnVTable;
 use crate::kernel::ExecuteParentKernel;
 use crate::optimizer::rules::ArrayParentReduceRule;
 use crate::scalar_fn::fns::zip::Zip as ZipExpr;
+use crate::vtable::VTable;
 
 /// Zip two arrays using a mask without reading buffers.
 ///
@@ -26,9 +26,9 @@ use crate::scalar_fn::fns::zip::Zip as ZipExpr;
 /// the parent `ScalarFnArray`.
 pub trait ZipReduce: VTable {
     fn zip(
-        array: ArrayView<'_, Self>,
-        if_false: &ArrayRef,
-        mask: &ArrayRef,
+        array: &Self::Array,
+        if_false: &dyn Array,
+        mask: &Mask,
     ) -> VortexResult<Option<ArrayRef>>;
 }
 
@@ -41,9 +41,9 @@ pub trait ZipReduce: VTable {
 /// the parent `ScalarFnArray`.
 pub trait ZipKernel: VTable {
     fn zip(
-        array: ArrayView<'_, Self>,
-        if_false: &ArrayRef,
-        mask: &ArrayRef,
+        array: &Self::Array,
+        if_false: &dyn Array,
+        mask: &Mask,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>>;
 }
@@ -60,7 +60,7 @@ where
 
     fn reduce_parent(
         &self,
-        array: ArrayView<'_, V>,
+        array: &V::Array,
         parent: ScalarFnArrayView<'_, ZipExpr>,
         child_idx: usize,
     ) -> VortexResult<Option<ArrayRef>> {
@@ -68,11 +68,13 @@ where
             return Ok(None);
         }
         let scalar_fn_array = parent
-            .as_opt::<ScalarFn>()
+            .as_opt::<ScalarFnVTable>()
             .vortex_expect("ExactScalarFn matcher confirmed ScalarFnArray");
-        let if_false = scalar_fn_array.get_child(1);
-        let mask_array = scalar_fn_array.get_child(2);
-        <V as ZipReduce>::zip(array, if_false, mask_array)
+        let children = scalar_fn_array.children();
+        let if_false = &*children[1];
+        let mask_array = &*children[2];
+        let mask = mask_array.try_to_mask_fill_null_false()?;
+        <V as ZipReduce>::zip(array, if_false, &mask)
     }
 }
 
@@ -88,7 +90,7 @@ where
 
     fn execute_parent(
         &self,
-        array: ArrayView<'_, V>,
+        array: &V::Array,
         parent: ScalarFnArrayView<'_, ZipExpr>,
         child_idx: usize,
         ctx: &mut ExecutionCtx,
@@ -97,10 +99,12 @@ where
             return Ok(None);
         }
         let scalar_fn_array = parent
-            .as_opt::<ScalarFn>()
+            .as_opt::<ScalarFnVTable>()
             .vortex_expect("ExactScalarFn matcher confirmed ScalarFnArray");
-        let if_false = scalar_fn_array.get_child(1);
-        let mask_array = scalar_fn_array.get_child(2);
-        <V as ZipKernel>::zip(array, if_false, mask_array, ctx)
+        let children = scalar_fn_array.children();
+        let if_false = &*children[1];
+        let mask_array = &*children[2];
+        let mask = mask_array.try_to_mask_fill_null_false()?;
+        <V as ZipKernel>::zip(array, if_false, &mask, ctx)
     }
 }

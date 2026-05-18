@@ -8,15 +8,34 @@ use std::hash::Hash;
 use std::hash::Hasher;
 
 use vortex_error::VortexResult;
+use vortex_error::vortex_ensure;
 use vortex_error::vortex_ensure_eq;
 use vortex_error::vortex_panic;
 
 use crate::dtype::DType;
 use crate::dtype::NativeDType;
 use crate::dtype::PType;
-use crate::dtype::StructFields;
+use crate::scalar::PValue;
 use crate::scalar::Scalar;
 use crate::scalar::ScalarValue;
+
+/// We implement `PartialEq` manually because we want to ignore nullability when comparing scalars.
+/// Two scalars with the same value but different nullability should be considered equal.
+impl PartialEq for Scalar {
+    fn eq(&self, other: &Self) -> bool {
+        self.dtype.eq_ignore_nullability(&other.dtype) && self.value == other.value
+    }
+}
+
+/// We implement `Hash` manually to be consistent with `PartialEq`. Since we ignore nullability
+/// in equality comparisons, we must also ignore it when hashing to maintain the invariant that
+/// equal values have equal hashes.
+impl Hash for Scalar {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.dtype.as_nonnullable().hash(state);
+        self.value.hash(state);
+    }
+}
 
 impl Scalar {
     // Constructors for null scalars.
@@ -69,7 +88,11 @@ impl Scalar {
     ///
     /// Returns an error if the given [`DType`] and [`ScalarValue`] are incompatible.
     pub fn try_new(dtype: DType, value: Option<ScalarValue>) -> VortexResult<Self> {
-        Self::validate(&dtype, value.as_ref())?;
+        vortex_ensure!(
+            Self::is_compatible(&dtype, value.as_ref()),
+            "Incompatible dtype {dtype} with value {}",
+            value.map(|v| format!("{}", v)).unwrap_or_default()
+        );
 
         Ok(Self { dtype, value })
     }
@@ -80,15 +103,13 @@ impl Scalar {
     /// # Safety
     ///
     /// The caller must ensure that the given [`DType`] and [`ScalarValue`] are compatible per the
-    /// rules defined in [`Self::validate`].
+    /// rules defined in [`Self::is_compatible`].
     pub unsafe fn new_unchecked(dtype: DType, value: Option<ScalarValue>) -> Self {
-        #[cfg(debug_assertions)]
-        {
-            use vortex_error::VortexExpect;
-
-            Self::validate(&dtype, value.as_ref())
-                .vortex_expect("Scalar::new_unchecked called with incompatible dtype and value");
-        }
+        debug_assert!(
+            Self::is_compatible(&dtype, value.as_ref()),
+            "Incompatible dtype {dtype} with value {}",
+            value.map(|v| format!("{}", v)).unwrap_or_default()
+        );
 
         Self { dtype, value }
     }
@@ -98,44 +119,103 @@ impl Scalar {
     /// For nullable types, this returns a null scalar. For non-nullable and non-nested types, this
     /// returns the zero value for the type.
     ///
-    /// See [`Scalar::zero_value`] for more details about "zero" values.
-    ///
     /// For non-nullable and nested types that may need null values in their children (as of right
     /// now, that is _only_ `FixedSizeList` and `Struct`), this function will provide null default
     /// children.
+    ///
+    /// See [`ScalarValue::zero_value`] for more details about "zero" values.
     pub fn default_value(dtype: &DType) -> Self {
         let value = ScalarValue::default_value(dtype);
-
         // SAFETY: We assume that `default_value` creates a valid `ScalarValue` for the `DType`.
         unsafe { Self::new_unchecked(dtype.clone(), value) }
     }
 
     /// Returns a non-null zero / identity value for the given [`DType`].
     ///
-    /// # Zero Values
-    ///
-    /// Here is the list of zero values for each [`DType`] (when the [`DType`] is non-nullable):
-    ///
-    /// - `Null`: Does not have a "zero" value
-    /// - `Bool`: `false`
-    /// - `Primitive`: `0`
-    /// - `Decimal`: `0`
-    /// - `Utf8`: `""`
-    /// - `Binary`: An empty buffer
-    /// - `List`: An empty list
-    /// - `FixedSizeList`: A list (with correct size) of zero values, which is determined by the
-    ///   element [`DType`]
-    /// - `Struct`: A struct where each field has a zero value, which is determined by the field
-    ///   [`DType`]
-    /// - `Extension`: The zero value of the storage [`DType`]
+    /// See [`ScalarValue::zero_value`] for more details about "zero" values.
     pub fn zero_value(dtype: &DType) -> Self {
         let value = ScalarValue::zero_value(dtype);
-
         // SAFETY: We assume that `zero_value` creates a valid `ScalarValue` for the `DType`.
         unsafe { Self::new_unchecked(dtype.clone(), Some(value)) }
     }
 
     // Other methods.
+
+    /// Check if the given [`ScalarValue`] is compatible with the given [`DType`].
+    pub fn is_compatible(dtype: &DType, value: Option<&ScalarValue>) -> bool {
+        let Some(value) = value else {
+            return dtype.is_nullable();
+        };
+        // From here on, we know that the value is not null.
+
+        match dtype {
+            DType::Null => false,
+            DType::Bool(_) => matches!(value, ScalarValue::Bool(_)),
+            DType::Primitive(ptype, _) => {
+                if let ScalarValue::Primitive(pvalue) = value {
+                    // Note that this is a backwards compatibility check for poor design in the
+                    // previous implementation. `f16` `ScalarValue`s used to be serialized as
+                    // `pb::ScalarValue::Uint64Value(v.to_bits() as u64)`, so we need to ensure that
+                    // we can still represent them as such.
+                    let f16_backcompat_still_works =
+                        matches!(ptype, &PType::F16) && matches!(pvalue, PValue::U64(_));
+
+                    f16_backcompat_still_works || pvalue.ptype() == *ptype
+                } else {
+                    false
+                }
+            }
+            DType::Decimal(dec_dtype, _) => {
+                if let ScalarValue::Decimal(dvalue) = value {
+                    dvalue.fits_in_precision(*dec_dtype)
+                } else {
+                    false
+                }
+            }
+            DType::Utf8(_) => matches!(value, ScalarValue::Utf8(_)),
+            DType::Binary(_) => matches!(value, ScalarValue::Binary(_)),
+            DType::List(elem_dtype, _) => {
+                if let ScalarValue::List(elements) = value {
+                    elements
+                        .iter()
+                        .all(|element| Self::is_compatible(elem_dtype.as_ref(), element.as_ref()))
+                } else {
+                    false
+                }
+            }
+            DType::FixedSizeList(elem_dtype, size, _) => {
+                if let ScalarValue::List(elements) = value {
+                    if elements.len() != *size as usize {
+                        return false;
+                    }
+                    elements
+                        .iter()
+                        .all(|element| Self::is_compatible(elem_dtype.as_ref(), element.as_ref()))
+                } else {
+                    false
+                }
+            }
+            DType::Struct(fields, _) => {
+                if let ScalarValue::List(values) = value {
+                    if values.len() != fields.nfields() {
+                        return false;
+                    }
+                    for (field, field_value) in fields.fields().zip(values.iter()) {
+                        if !Self::is_compatible(&field, field_value.as_ref()) {
+                            return false;
+                        }
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            DType::Extension(ext_dtype) => {
+                // TODO(connor): Fix this when adding the correct extension scalars!
+                Self::is_compatible(ext_dtype.storage_dtype(), Some(value))
+            }
+        }
+    }
 
     /// Check if two scalars are equal, ignoring nullability of the [`DType`].
     pub fn eq_ignore_nullability(&self, other: &Self) -> bool {
@@ -191,7 +271,6 @@ impl Scalar {
             DType::FixedSizeList(_, list_size, _) => value.as_list().len() == *list_size as usize,
             DType::Struct(struct_fields, _) => value.as_list().len() == struct_fields.nfields(),
             DType::Extension(_) => self.as_extension().to_storage_scalar().is_zero()?,
-            DType::Variant(_) => self.as_variant().is_zero()?,
         };
 
         Some(is_zero)
@@ -227,7 +306,7 @@ impl Scalar {
     ///
     /// Note that the protobuf serialization of scalars will likely have a different (but roughly
     /// similar) length.
-    pub fn approx_nbytes(&self) -> usize {
+    pub fn nbytes(&self) -> usize {
         use crate::dtype::NativeDecimalType;
         use crate::dtype::i256;
 
@@ -251,38 +330,15 @@ impl Scalar {
             DType::Struct(..) => self
                 .as_struct()
                 .fields_iter()
-                .map(|fields| fields.into_iter().map(|f| f.approx_nbytes()).sum::<usize>())
+                .map(|fields| fields.into_iter().map(|f| f.nbytes()).sum::<usize>())
                 .unwrap_or_default(),
             DType::List(..) | DType::FixedSizeList(..) => self
                 .as_list()
                 .elements()
-                .map(|fields| fields.into_iter().map(|f| f.approx_nbytes()).sum::<usize>())
+                .map(|fields| fields.into_iter().map(|f| f.nbytes()).sum::<usize>())
                 .unwrap_or_default(),
-            DType::Extension(_) => self.as_extension().to_storage_scalar().approx_nbytes(),
-            DType::Variant(_) => self.as_variant().value().map_or(0, Scalar::approx_nbytes),
+            DType::Extension(_) => self.as_extension().to_storage_scalar().nbytes(),
         }
-    }
-}
-
-/// We implement `Hash` manually to be consistent with `PartialEq`. Since we ignore nullability in
-/// equality comparisons, we must also ignore it when hashing to maintain the invariant that equal
-/// values have equal hashes.
-impl Hash for Scalar {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.dtype.as_nonnullable().hash(state);
-        self.value.hash(state);
-    }
-}
-
-/// We implement `PartialEq` manually because we want to ignore nullability when comparing scalars.
-/// Two scalars with the same value but different nullability should be considered equal.
-///
-/// Note that this has **different** behavior than the [`PartialOrd`] implementation since the
-/// [`PartialOrd`] returns `None` if the types are different, whereas this `PartialEq`
-/// implementation simply returns `false`.
-impl PartialEq for Scalar {
-    fn eq(&self, other: &Self) -> bool {
-        self.dtype.eq_ignore_nullability(&other.dtype) && self.value == other.value
     }
 }
 
@@ -299,14 +355,7 @@ impl PartialOrd for Scalar {
     /// - Non-null values are compared according to their natural ordering
     ///
     /// # Examples
-    ///
-    /// ```
-    /// use std::cmp::Ordering;
-    /// use vortex_array::dtype::DType;
-    /// use vortex_array::dtype::Nullability;
-    /// use vortex_array::dtype::PType;
-    /// use vortex_array::scalar::Scalar;
-    ///
+    /// ```ignore
     /// // Same types compare successfully
     /// let a = Scalar::primitive(10i32, Nullability::NonNullable);
     /// let b = Scalar::primitive(20i32, Nullability::NonNullable);
@@ -326,101 +375,6 @@ impl PartialOrd for Scalar {
         if !self.dtype().eq_ignore_nullability(other.dtype()) {
             return None;
         }
-
-        partial_cmp_scalar_values(self.dtype(), self.value(), other.value())
+        self.value().partial_cmp(&other.value())
     }
-}
-
-/// Compare two optional scalar values using `dtype` for nested tuple interpretation.
-fn partial_cmp_scalar_values(
-    dtype: &DType,
-    lhs: Option<&ScalarValue>,
-    rhs: Option<&ScalarValue>,
-) -> Option<Ordering> {
-    match (lhs, rhs) {
-        (None, None) => Some(Ordering::Equal),
-        (None, Some(_)) => Some(Ordering::Less),
-        (Some(_), None) => Some(Ordering::Greater),
-        (Some(lhs), Some(rhs)) => partial_cmp_non_null_scalar_values(dtype, lhs, rhs),
-    }
-}
-
-/// Compare two non-null scalar values, consulting `dtype` only for tuple-backed values.
-fn partial_cmp_non_null_scalar_values(
-    dtype: &DType,
-    lhs: &ScalarValue,
-    rhs: &ScalarValue,
-) -> Option<Ordering> {
-    // `Scalar::validate` guarantees that a scalar's value matches its dtype. Most of the scalar
-    // value variants have only 1 method of comparison, regardless of the dtype.
-    match (lhs, rhs) {
-        (ScalarValue::Bool(lhs), ScalarValue::Bool(rhs)) => lhs.partial_cmp(rhs),
-        (ScalarValue::Primitive(lhs), ScalarValue::Primitive(rhs)) => lhs.partial_cmp(rhs),
-        (ScalarValue::Decimal(lhs), ScalarValue::Decimal(rhs)) => lhs.partial_cmp(rhs),
-        (ScalarValue::Utf8(lhs), ScalarValue::Utf8(rhs)) => lhs.partial_cmp(rhs),
-        (ScalarValue::Binary(lhs), ScalarValue::Binary(rhs)) => lhs.partial_cmp(rhs),
-        // `Tuple` is the exception here. Since it backs lists, fixed-size lists, and structs, we
-        // need the dtype to know whether children share one element dtype or use per-field dtypes.
-        (ScalarValue::Tuple(lhs), ScalarValue::Tuple(rhs)) => {
-            partial_cmp_tuple_values(dtype, lhs, rhs)
-        }
-        // Variant values can have a different dtype in each row, so it doesn't make sense to
-        // compare them.
-        (ScalarValue::Variant(_), ScalarValue::Variant(_)) => None,
-        _ => None,
-    }
-}
-
-/// Compare tuple values according to the list, fixed-size list, or struct dtype layout.
-fn partial_cmp_tuple_values(
-    dtype: &DType,
-    lhs: &[Option<ScalarValue>],
-    rhs: &[Option<ScalarValue>],
-) -> Option<Ordering> {
-    match dtype {
-        DType::List(element_dtype, _) | DType::FixedSizeList(element_dtype, ..) => {
-            partial_cmp_list_values(element_dtype, lhs, rhs)
-        }
-        DType::Struct(fields, _) => partial_cmp_struct_values(fields, lhs, rhs),
-        DType::Extension(ext_dtype) => {
-            partial_cmp_tuple_values(ext_dtype.storage_dtype(), lhs, rhs)
-        }
-        _ => None,
-    }
-}
-
-/// Compare list tuple values using the shared element dtype for each element.
-fn partial_cmp_list_values(
-    element_dtype: &DType,
-    lhs: &[Option<ScalarValue>],
-    rhs: &[Option<ScalarValue>],
-) -> Option<Ordering> {
-    for (lhs, rhs) in lhs.iter().zip(rhs.iter()) {
-        match partial_cmp_scalar_values(element_dtype, lhs.as_ref(), rhs.as_ref())? {
-            Ordering::Equal => continue,
-            ordering => return Some(ordering),
-        }
-    }
-
-    Some(lhs.len().cmp(&rhs.len()))
-}
-
-/// Compare struct tuple values using each field's dtype in field order.
-fn partial_cmp_struct_values(
-    fields: &StructFields,
-    lhs: &[Option<ScalarValue>],
-    rhs: &[Option<ScalarValue>],
-) -> Option<Ordering> {
-    if lhs.len() != fields.nfields() || rhs.len() != fields.nfields() {
-        return None;
-    }
-
-    for ((field_dtype, lhs), rhs) in fields.fields().zip(lhs.iter()).zip(rhs.iter()) {
-        match partial_cmp_scalar_values(&field_dtype, lhs.as_ref(), rhs.as_ref())? {
-            Ordering::Equal => continue,
-            ordering => return Some(ordering),
-        }
-    }
-
-    Some(Ordering::Equal)
 }

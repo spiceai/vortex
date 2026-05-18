@@ -2,19 +2,20 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::ffi::CStr;
+use std::ffi::CString;
 use std::ffi::c_void;
 use std::ptr;
 
 use bitvec::macros::internal::funty::Fundamental;
 use bitvec::slice::BitSlice;
 use bitvec::view::BitView;
-use vortex::array::dtype::Nullability;
 use vortex::array::validity::Validity;
 use vortex::buffer::BitBuffer;
 use vortex::buffer::Buffer;
+use vortex::error::VortexExpect;
 use vortex::error::VortexResult;
 use vortex::error::vortex_bail;
-use vortex::mask::Mask;
+use vortex::error::vortex_err;
 
 use crate::cpp;
 use crate::cpp::duckdb_vx_error;
@@ -24,28 +25,10 @@ use crate::duckdb::LogicalTypeRef;
 use crate::duckdb::SelectionVectorRef;
 use crate::duckdb::Value;
 use crate::duckdb::ValueRef;
-use crate::duckdb::VectorBuffer;
 use crate::duckdb::VectorBufferRef;
 use crate::lifetime_wrapper;
 
-/// External validity data for zero-copy export of validity masks to DuckDB.
-///
-/// Holds a [`VectorBuffer`] as a keep-alive and a raw pointer to the validity bitmap.
-pub(crate) struct ValidityData {
-    /// VectorBuffer that keeps the underlying memory alive via DuckDB's ref-counting.
-    pub(crate) shared_buffer: VectorBuffer,
-    /// Pointer to the raw validity bitmap data within the buffer.
-    pub(crate) data_ptr: *const u8,
-}
-
-/// Returns the internal vector size used by DuckDB at runtime.
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "DuckDB vector size always fits in usize"
-)]
-pub fn duckdb_vector_size() -> usize {
-    unsafe { cpp::duckdb_vector_size() as usize }
-}
+pub const DUCKDB_STANDARD_VECTOR_SIZE: usize = 2048;
 
 lifetime_wrapper!(Vector, cpp::duckdb_vector, cpp::duckdb_destroy_vector);
 
@@ -108,6 +91,20 @@ impl VectorRef {
         unsafe { cpp::duckdb_vx_set_dictionary_vector_length(self.as_ptr(), len) }
     }
 
+    // A operator-scoped id to assert dictionary vector value uniqueness
+    pub fn set_dictionary_id(&mut self, dict_id: String) {
+        let dict_id = CString::new(dict_id)
+            .map_err(|e| vortex_err!("cstr creation error {e}"))
+            .vortex_expect("dictionary ID should be valid C string");
+        unsafe {
+            cpp::duckdb_vx_set_dictionary_vector_id(
+                self.as_ptr(),
+                dict_id.as_ptr(),
+                dict_id.as_bytes().len().as_u32(),
+            )
+        }
+    }
+
     pub fn to_sequence(&mut self, start: i64, stop: i64, capacity: u64) {
         unsafe { cpp::duckdb_vx_sequence_vector(self.as_ptr(), start, stop, capacity) }
     }
@@ -160,31 +157,6 @@ impl VectorRef {
     /// Sets the data pointer for the vector. This is the start of the values array in the vector.
     pub unsafe fn set_data_ptr<T>(&self, ptr: *mut T) {
         unsafe { cpp::duckdb_vx_vector_set_data_ptr(self.as_ptr(), ptr as *mut c_void) }
-    }
-
-    /// Sets the validity data for the vector from a [`ValidityData`]. The buffer is
-    /// attached purely as a keep-alive, and the data pointer is used as the validity data
-    /// at the given `u64_offset`.
-    ///
-    /// # Safety
-    ///
-    /// The data pointer must point to a valid `u64` array with at least
-    /// `u64_offset + capacity.div_ceil(64)` elements.
-    pub(crate) unsafe fn set_validity_data(
-        &self,
-        u64_offset: usize,
-        capacity: usize,
-        zero_copy: &ValidityData,
-    ) {
-        unsafe {
-            cpp::duckdb_vx_vector_set_validity_data(
-                self.as_ptr(),
-                u64_offset as idx_t,
-                capacity as idx_t,
-                zero_copy.shared_buffer.as_ptr(),
-                zero_copy.data_ptr as *mut c_void,
-            )
-        }
     }
 
     /// Assigns the element at the specified index with a string value.
@@ -243,11 +215,7 @@ impl VectorRef {
     ///
     /// The provided capacity *must* be the actual capacity of this vector.
     pub unsafe fn validity_bitslice_mut(&mut self, capacity: usize) -> Option<&mut BitSlice<u64>> {
-        // capacity is always less than BitSlice<u64>::MAX_ELTS
-        unsafe {
-            self.validity_slice_mut(capacity)
-                .map(|slice| BitSlice::from_slice_unchecked_mut(slice))
-        }
+        unsafe { self.validity_slice_mut(capacity) }.map(|slice| slice.view_bits_mut())
     }
 
     pub fn validity_ref(&self, len: usize) -> ValidityRef<'_> {
@@ -363,29 +331,23 @@ impl ValidityRef<'_> {
         (validity_entry & (1u64 << idx_in_entry)) != 0
     }
 
-    /// Creates a mask directly from the DuckDB validity mask for optimal performance.
-    pub fn execute_mask(&self) -> Mask {
+    /// Creates a Validity directly from the DuckDB validity mask for optimal performance.
+    pub fn to_validity(&self) -> Validity {
         let Some(validity) = self.validity else {
             // All values are valid
-            return Mask::AllTrue(self.len);
+            return Validity::AllValid;
         };
 
-        Mask::from_buffer(BitBuffer::new(
+        Validity::from(BitBuffer::new(
             Buffer::<u64>::copy_from(validity).into_byte_buffer(),
             self.len,
         ))
-    }
-
-    pub fn to_validity(&self) -> Validity {
-        Validity::from_mask(self.execute_mask(), Nullability::Nullable)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use vortex::array::LEGACY_SESSION;
     use vortex::mask::Mask;
-    use vortex_array::VortexSessionExecute;
 
     use super::*;
     use crate::cpp::DUCKDB_TYPE;
@@ -399,8 +361,9 @@ mod tests {
 
         let validity = vector.validity_ref(len);
         let validity = validity.to_validity();
-        assert!(
-            matches!(validity, Validity::AllValid),
+        assert_eq!(
+            validity,
+            Validity::AllValid,
             "Expected None for all-valid vector"
         );
     }
@@ -420,9 +383,8 @@ mod tests {
         let validity = validity.to_validity();
         assert_eq!(validity.maybe_len(), Some(len));
 
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
         assert_eq!(
-            validity.execute_mask(len, &mut ctx).unwrap(),
+            validity.to_mask(len),
             Mask::from_indices(len, vec![0, 2, 4, 5, 6, 8, 9])
         );
     }
@@ -462,7 +424,7 @@ mod tests {
 
         let validity = vector.validity_ref(len);
         let validity = validity.to_validity();
-        assert!(matches!(validity, Validity::AllValid));
+        assert_eq!(validity, Validity::AllValid);
     }
 
     #[test]
@@ -478,7 +440,7 @@ mod tests {
 
         let validity = vector.validity_ref(len);
         let validity = validity.to_validity();
-        assert!(matches!(validity, Validity::AllInvalid));
+        assert_eq!(validity, Validity::AllInvalid);
     }
 
     #[test]

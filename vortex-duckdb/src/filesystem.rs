@@ -53,7 +53,7 @@ pub(super) fn resolve_filesystem(
     let fs_config = fs_config.as_string();
 
     Ok(if fs_config.as_str() == "duckdb" {
-        tracing::debug!(
+        tracing::info!(
             "Using DuckDB's built-in filesystem for URL scheme '{}'",
             base_url.scheme()
         );
@@ -63,7 +63,7 @@ pub(super) fn resolve_filesystem(
             ctx.erase_lifetime()
         }))
     } else if fs_config.as_str() == "vortex" {
-        tracing::debug!(
+        tracing::info!(
             "Using Vortex's object store filesystem for URL scheme '{}'",
             base_url.scheme()
         );
@@ -127,13 +127,27 @@ impl FileSystem for DuckDbFileSystem {
             directory_url.set_path(prefix);
         }
 
-        let ctx = self.ctx;
+        // DuckDB's ListFiles expects bare paths for local files, but full URLs
+        // for remote schemes (s3://, etc.).
+        let directory = if directory_url.scheme() == "file" {
+            directory_url.path().to_string()
+        } else {
+            directory_url.to_string()
+        };
 
-        let base_url = self.base_url.clone();
+        tracing::debug!(
+            "Listing files from {} with prefix {}",
+            self.base_url,
+            directory
+        );
+
+        let ctx = self.ctx;
+        let base_path = self.base_url.path().to_string();
+
         stream::once(async move {
             RUNTIME
                 .handle()
-                .spawn_blocking(move || list_recursive(ctx, &directory_url, &base_url))
+                .spawn_blocking(move || list_recursive(ctx, &directory, &base_path))
                 .await
         })
         .flat_map(|result| match result {
@@ -149,73 +163,26 @@ impl FileSystem for DuckDbFileSystem {
         let reader = unsafe { DuckDbFsReader::open_url(self.ctx.as_ptr(), &url)? };
         Ok(Arc::new(reader))
     }
-
-    async fn delete(&self, path: &str) -> VortexResult<()> {
-        let mut url = self.base_url.clone();
-        url.set_path(path);
-        let c_path = CString::new(url.as_str()).map_err(|e| vortex_err!("Invalid URL: {e}"))?;
-        let ctx = self.ctx;
-
-        RUNTIME
-            .handle()
-            .spawn_blocking(move || {
-                let mut err: cpp::duckdb_vx_error = ptr::null_mut();
-                let status = unsafe {
-                    cpp::duckdb_vx_fs_remove(ctx.as_ptr(), c_path.as_ptr(), &raw mut err)
-                };
-                if status != cpp::duckdb_state::DuckDBSuccess {
-                    return Err(fs_error(err));
-                }
-                Ok::<_, VortexError>(())
-            })
-            .await
-    }
 }
 
 /// Recursively list all files under `directory`, stripping `base_path` from each
 /// returned URL to produce relative paths.
 fn list_recursive(
     ctx: &ClientContextRef,
-    directory_url: &Url,
-    base_url: &Url,
+    directory: &str,
+    base_path: &str,
 ) -> VortexResult<Vec<FileListing>> {
-    // DuckDB's ListFiles expects bare paths for local files, but full URLs
-    // for remote schemes (s3://, etc.).
-    let directory = if directory_url.scheme() == "file" {
-        directory_url.path().to_string()
-    } else {
-        directory_url.to_string()
-    };
-
-    let (base_path, is_remote_path) = if base_url.scheme() == "file" {
-        (base_url.path().to_string(), false)
-    } else {
-        // This is really ugly. As we operate on Strings and not on urls, we
-        // must produce a base path with / so as relative url would not have
-        // the / and thus match the glob
-        (format!("{base_url}/"), true)
-    };
-
     let mut results = Vec::new();
-    let mut stack = vec![directory];
+    let mut stack = vec![directory.to_string()];
 
     while let Some(dir) = stack.pop() {
-        // TODO(myrrc) this doesn't work with curl backend in v1.4, producing
-        // "URL using bad/illegal format or missing URL error", see
-        // https://github.com/duckdb/duckdb-httpfs/pull/265
         for entry in duckdb_fs_list_dir(ctx, &dir)? {
-            // duckdb_fs_list_dir returns relative paths for local files but full
-            // paths for s3 files.
-            let full_path = if is_remote_path {
-                entry.name
-            } else {
-                format!("{}/{}", dir.trim_end_matches('/'), entry.name)
-            };
+            let full_path = format!("{}/{}", dir.trim_end_matches('/'), entry.name);
             if entry.is_dir {
                 stack.push(full_path);
             } else {
                 let relative_path = full_path
-                    .strip_prefix(&base_path)
+                    .strip_prefix(base_path)
                     .unwrap_or_else(|| &full_path)
                     .to_string();
                 results.push(FileListing {
@@ -267,7 +234,7 @@ impl VortexReadAt for DuckDbFsReader {
 
     fn coalesce_config(&self) -> Option<CoalesceConfig> {
         Some(if self.is_local {
-            CoalesceConfig::file()
+            CoalesceConfig::local()
         } else {
             CoalesceConfig::object_storage()
         })
@@ -282,8 +249,8 @@ impl VortexReadAt for DuckDbFsReader {
     }
 
     fn size(&self) -> BoxFuture<'static, VortexResult<u64>> {
-        let handle = Arc::clone(&self.handle);
-        let size_cell = Arc::clone(&self.size);
+        let handle = self.handle.clone();
+        let size_cell = self.size.clone();
 
         async move {
             if let Some(size) = size_cell.get() {
@@ -317,7 +284,7 @@ impl VortexReadAt for DuckDbFsReader {
         length: usize,
         alignment: Alignment,
     ) -> BoxFuture<'static, VortexResult<BufferHandle>> {
-        let handle = Arc::clone(&self.handle);
+        let handle = self.handle.clone();
 
         async move {
             let runtime = RUNTIME.handle();

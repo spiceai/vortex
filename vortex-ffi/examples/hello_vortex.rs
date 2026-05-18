@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC-BY-4.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-#![expect(clippy::unwrap_used, clippy::use_debug)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::use_debug)]
 //! This example shows usage of the Vortex C FFI to read a Vortex file written by a Rust client.
 //!
 //! You can invoke this example from a checkout by running
@@ -18,6 +18,7 @@ use std::process::Command;
 use std::sync::LazyLock;
 
 use vortex::VortexSessionDefault;
+use vortex::array::Array;
 use vortex::array::ArrayRef;
 use vortex::array::IntoArray;
 use vortex::array::arrays::ChunkedArray;
@@ -155,7 +156,7 @@ async fn write_vortex_file(path: impl AsRef<Path>) -> VortexResult<()> {
 
     SESSION
         .write_options()
-        .write(&mut file, test_data.into_array().to_array_stream())
+        .write(&mut file, test_data.to_array_stream())
         .await?;
     file.shutdown().await?;
 

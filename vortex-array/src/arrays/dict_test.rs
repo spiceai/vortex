@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-#![expect(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used)]
 
-use rand::RngExt;
+use rand::Rng;
 use rand::SeedableRng;
 use rand::distr::Alphanumeric;
 use rand::distr::Distribution;
@@ -14,11 +14,11 @@ use vortex_buffer::Buffer;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 
+use super::ChunkedArray;
+use super::DictArray;
+use super::PrimitiveArray;
 use crate::ArrayRef;
 use crate::IntoArray;
-use crate::arrays::ChunkedArray;
-use crate::arrays::DictArray;
-use crate::arrays::PrimitiveArray;
 use crate::dtype::NativePType;
 use crate::validity::Validity;
 

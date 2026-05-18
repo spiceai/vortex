@@ -4,18 +4,17 @@
 use std::ops::Range;
 
 use vortex_array::ArrayRef;
-use vortex_array::ArrayView;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
-use vortex_array::arrays::slice::SliceKernel;
+use vortex_array::arrays::SliceKernel;
 use vortex_error::VortexResult;
 
-use crate::ALPRDArrayExt;
-use crate::alp_rd::ALPRD;
+use crate::alp_rd::ALPRDArray;
+use crate::alp_rd::ALPRDVTable;
 
-impl SliceKernel for ALPRD {
+impl SliceKernel for ALPRDVTable {
     fn slice(
-        array: ArrayView<'_, Self>,
+        array: &Self::Array,
         range: Range<usize>,
         _ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
@@ -27,7 +26,7 @@ impl SliceKernel for ALPRD {
 
         // SAFETY: slicing components does not change the encoded values
         Ok(Some(unsafe {
-            ALPRD::new_unchecked(
+            ALPRDArray::new_unchecked(
                 array.dtype().clone(),
                 array.left_parts().slice(range.clone())?,
                 array.left_parts_dictionary().clone(),

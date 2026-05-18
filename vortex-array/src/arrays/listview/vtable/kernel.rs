@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use crate::arrays::ListView;
+use crate::arrays::ListViewVTable;
+use crate::arrays::TakeExecuteAdaptor;
 use crate::kernel::ParentKernelSet;
-use crate::scalar_fn::fns::cast::CastExecuteAdaptor;
 
-pub(super) const PARENT_KERNELS: ParentKernelSet<ListView> =
-    ParentKernelSet::new(&[ParentKernelSet::lift(&CastExecuteAdaptor(ListView))]);
+pub(super) const PARENT_KERNELS: ParentKernelSet<ListViewVTable> =
+    ParentKernelSet::new(&[ParentKernelSet::lift(&TakeExecuteAdaptor(ListViewVTable))]);

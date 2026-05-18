@@ -10,16 +10,16 @@ use tracing::instrument;
 use vortex::array::ArrayRef;
 use vortex::array::Canonical;
 use vortex::array::arrays::PrimitiveArray;
-use vortex::array::arrays::primitive::PrimitiveDataParts;
+use vortex::array::arrays::PrimitiveArrayParts;
 use vortex::array::match_each_unsigned_integer_ptype;
 use vortex::dtype::NativePType;
 use vortex::dtype::PType;
-use vortex::encodings::zigzag::ZigZag;
 use vortex::encodings::zigzag::ZigZagArray;
-use vortex::encodings::zigzag::ZigZagArrayExt;
+use vortex::encodings::zigzag::ZigZagVTable;
 use vortex::error::VortexResult;
 use vortex::error::vortex_ensure;
 use vortex::error::vortex_err;
+use vortex_cuda_macros::cuda_tests;
 
 use crate::CudaBufferExt;
 use crate::executor::CudaArrayExt;
@@ -32,7 +32,7 @@ pub(crate) struct ZigZagExecutor;
 
 impl ZigZagExecutor {
     fn try_specialize(array: ArrayRef) -> Option<ZigZagArray> {
-        array.try_downcast::<ZigZag>().ok()
+        array.try_into::<ZigZagVTable>().ok()
     }
 }
 
@@ -71,9 +71,9 @@ where
     // Execute child and copy to device
     let canonical = array.encoded().clone().execute_cuda(ctx).await?;
     let primitive = canonical.into_primitive();
-    let PrimitiveDataParts {
+    let PrimitiveArrayParts {
         buffer, validity, ..
-    } = primitive.into_data_parts();
+    } = primitive.into_parts();
 
     let device_buffer = ctx.ensure_on_device(buffer).await?;
 
@@ -82,7 +82,7 @@ where
     let array_len_u64 = array_len as u64;
 
     // Load kernel function
-    let cuda_function = ctx.load_function("zigzag", &[U::PTYPE])?;
+    let cuda_function = ctx.load_function_ptype("zigzag", &[U::PTYPE])?;
 
     ctx.launch_kernel(&cuda_function, array_len, |args| {
         args.arg(&cuda_view).arg(&array_len_u64);
@@ -96,14 +96,14 @@ where
     )))
 }
 
-#[cfg(test)]
+#[cuda_tests]
 mod tests {
     use vortex::array::IntoArray;
     use vortex::array::arrays::PrimitiveArray;
     use vortex::array::assert_arrays_eq;
     use vortex::array::validity::Validity::NonNullable;
     use vortex::buffer::Buffer;
-    use vortex::encodings::zigzag::ZigZag;
+    use vortex::encodings::zigzag::ZigZagArray;
     use vortex::error::VortexExpect;
     use vortex::session::VortexSession;
 
@@ -111,7 +111,7 @@ mod tests {
     use crate::CanonicalCudaExt;
     use crate::session::CudaSession;
 
-    #[crate::test]
+    #[tokio::test]
     async fn test_cuda_zigzag_decompression_u32() -> VortexResult<()> {
         let mut cuda_ctx = CudaSession::create_execution_ctx(&VortexSession::empty())
             .vortex_expect("failed to create execution context");
@@ -120,14 +120,14 @@ mod tests {
         // So encoded [0, 2, 4, 1, 3] should decode to [0, 1, 2, -1, -2]
         let encoded_data: Vec<u32> = vec![0, 2, 4, 1, 3];
 
-        let zigzag_array = ZigZag::try_new(
+        let zigzag_array = ZigZagArray::try_new(
             PrimitiveArray::new(Buffer::from(encoded_data), NonNullable).into_array(),
         )?;
 
-        let cpu_result = crate::canonicalize_cpu(zigzag_array.clone())?;
+        let cpu_result = zigzag_array.to_canonical()?;
 
         let gpu_result = ZigZagExecutor
-            .execute(zigzag_array.into_array(), &mut cuda_ctx)
+            .execute(zigzag_array.to_array(), &mut cuda_ctx)
             .await
             .vortex_expect("GPU decompression failed")
             .into_host()

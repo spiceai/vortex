@@ -1,26 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::mem;
-use std::ptr;
-
 use async_trait::async_trait;
 use futures::future::BoxFuture;
 use vortex::array::ArrayRef;
 use vortex::array::Canonical;
-use vortex::array::arrays::PrimitiveArray;
+use vortex::array::ToCanonical;
+use vortex::array::arrays::BoolArrayParts;
+use vortex::array::arrays::DecimalArrayParts;
+use vortex::array::arrays::PrimitiveArrayParts;
 use vortex::array::arrays::StructArray;
-use vortex::array::arrays::bool::BoolDataParts;
-use vortex::array::arrays::decimal::DecimalDataParts;
-use vortex::array::arrays::extension::ExtensionArrayExt;
-use vortex::array::arrays::primitive::PrimitiveDataParts;
-use vortex::array::arrays::struct_::StructDataParts;
+use vortex::array::arrays::StructArrayParts;
 use vortex::array::buffer::BufferHandle;
+use vortex::array::vtable::ValidityHelper;
 use vortex::dtype::DecimalType;
 use vortex::error::VortexResult;
 use vortex::error::vortex_bail;
 use vortex::error::vortex_ensure;
 use vortex::extension::datetime::AnyTemporal;
+use vortex_cuda_macros::cuda_tests;
 
 use crate::CudaExecutionCtx;
 use crate::arrow::ArrowArray;
@@ -70,9 +68,9 @@ fn export_canonical(
             Canonical::Struct(struct_array) => export_struct(struct_array, ctx).await,
             Canonical::Primitive(primitive) => {
                 let len = primitive.len();
-                let PrimitiveDataParts {
+                let PrimitiveArrayParts {
                     buffer, validity, ..
-                } = primitive.into_data_parts();
+                } = primitive.into_parts();
 
                 check_validity_empty(&validity)?;
 
@@ -94,12 +92,12 @@ fn export_canonical(
             }
             Canonical::Decimal(decimal) => {
                 let len = decimal.len();
-                let DecimalDataParts {
+                let DecimalArrayParts {
                     values,
                     values_type,
                     validity,
                     ..
-                } = decimal.into_data_parts();
+                } = decimal.into_parts();
 
                 // verify that there is no null buffer
                 check_validity_empty(&validity)?;
@@ -119,15 +117,12 @@ fn export_canonical(
                     vortex_bail!("only support temporal extension types currently");
                 }
 
-                let values = extension
-                    .storage_array()
-                    .clone()
-                    .execute::<PrimitiveArray>(ctx.execution_ctx())?;
+                let values = extension.storage().to_primitive();
                 let len = extension.len();
 
-                let PrimitiveDataParts {
+                let PrimitiveArrayParts {
                     buffer, validity, ..
-                } = values.into_data_parts();
+                } = values.into_parts();
 
                 check_validity_empty(&validity)?;
 
@@ -135,11 +130,13 @@ fn export_canonical(
                 export_fixed_size(buffer, len, 0, ctx)
             }
             Canonical::Bool(bool_array) => {
-                let len = bool_array.len();
-                let validity = bool_array.validity()?;
-                let BoolDataParts {
-                    bits, offset, len, ..
-                } = bool_array.into_data().into_parts(len);
+                let BoolArrayParts {
+                    bits,
+                    offset,
+                    len,
+                    validity,
+                    ..
+                } = bool_array.into_parts();
 
                 check_validity_empty(&validity)?;
 
@@ -147,7 +144,7 @@ fn export_canonical(
             }
             Canonical::VarBinView(varbinview) => {
                 let len = varbinview.len();
-                check_validity_empty(&varbinview.validity()?)?;
+                check_validity_empty(varbinview.validity())?;
 
                 let BinaryParts { offsets, bytes } =
                     copy_varbinview_to_varbin(varbinview, ctx).await?;
@@ -167,9 +164,9 @@ fn export_canonical(
                     n_buffers: 2,
                     buffers: private_data.buffer_ptrs.as_mut_ptr(),
                     n_children: 0,
-                    children: ptr::null_mut(),
+                    children: std::ptr::null_mut(),
                     release: Some(release_array),
-                    dictionary: ptr::null_mut(),
+                    dictionary: std::ptr::null_mut(),
                     private_data: Box::into_raw(private_data).cast(),
                 };
 
@@ -187,9 +184,9 @@ async fn export_struct(
     ctx: &mut CudaExecutionCtx,
 ) -> VortexResult<(ArrowArray, SyncEvent)> {
     let len = array.len();
-    let StructDataParts {
+    let StructArrayParts {
         validity, fields, ..
-    } = array.into_data_parts();
+    } = array.into_parts();
 
     check_validity_empty(&validity)?;
 
@@ -247,9 +244,9 @@ fn export_fixed_size(
         n_buffers: 2,
         buffers: private_data.buffer_ptrs.as_mut_ptr(),
         n_children: 0,
-        children: ptr::null_mut(),
+        children: std::ptr::null_mut(),
         release: Some(release_array),
-        dictionary: ptr::null_mut(),
+        dictionary: std::ptr::null_mut(),
         private_data: Box::into_raw(private_data).cast(),
     };
 
@@ -261,14 +258,16 @@ unsafe extern "C" fn release_array(array: *mut ArrowArray) {
     //  code. This is necessary to ensure that the fields inside the CudaPrivateData
     //  get dropped to free native/GPU memory.
     unsafe {
-        let private_data_ptr = ptr::replace(&raw mut (*array).private_data, ptr::null_mut());
+        let private_data_ptr =
+            std::ptr::replace(&raw mut (*array).private_data, std::ptr::null_mut());
 
         if !private_data_ptr.is_null() {
             let mut private_data = Box::from_raw(private_data_ptr.cast::<PrivateData>());
-            let children = mem::take(&mut private_data.children);
+            let children = std::mem::take(&mut private_data.children);
             for child in children {
                 release_array(child);
             }
+            drop(private_data);
         }
 
         // update the release function to NULL to avoid any possibility of double-frees.
@@ -276,10 +275,10 @@ unsafe extern "C" fn release_array(array: *mut ArrowArray) {
     }
 }
 
-#[cfg(test)]
+#[cuda_tests]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use rstest::rstest;
-    use vortex::array::ArrayRef;
     use vortex::array::IntoArray;
     use vortex::array::arrays::DecimalArray;
     use vortex::array::arrays::NullArray;
@@ -309,9 +308,9 @@ mod tests {
     #[case::i64(PrimitiveArray::from_iter(0i64..10).into_array(), 10)]
     #[case::f32(PrimitiveArray::from_iter([1.0f32, 2.0, 3.0]).into_array(), 3)]
     #[case::f64(PrimitiveArray::from_iter([1.0f64, 2.0, 3.0]).into_array(), 3)]
-    #[crate::test]
+    #[tokio::test]
     async fn test_export_primitive(
-        #[case] array: ArrayRef,
+        #[case] array: vortex::array::ArrayRef,
         #[case] expected_len: i64,
     ) -> VortexResult<()> {
         let mut ctx = CudaSession::create_execution_ctx(&VortexSession::empty())
@@ -331,7 +330,7 @@ mod tests {
         Ok(())
     }
 
-    #[crate::test]
+    #[tokio::test]
     async fn test_export_null() -> VortexResult<()> {
         let mut ctx = CudaSession::create_execution_ctx(&VortexSession::empty())
             .vortex_expect("failed to create execution context");
@@ -347,7 +346,7 @@ mod tests {
         Ok(())
     }
 
-    #[crate::test]
+    #[tokio::test]
     async fn test_export_decimal() -> VortexResult<()> {
         let mut ctx = CudaSession::create_execution_ctx(&VortexSession::empty())
             .vortex_expect("failed to create execution context");
@@ -366,7 +365,7 @@ mod tests {
         Ok(())
     }
 
-    #[crate::test]
+    #[tokio::test]
     async fn test_export_temporal() -> VortexResult<()> {
         let mut ctx = CudaSession::create_execution_ctx(&VortexSession::empty())
             .vortex_expect("failed to create execution context");
@@ -389,7 +388,7 @@ mod tests {
         Ok(())
     }
 
-    #[crate::test]
+    #[tokio::test]
     async fn test_export_varbinview() -> VortexResult<()> {
         let mut ctx = CudaSession::create_execution_ctx(&VortexSession::empty())
             .vortex_expect("failed to create execution context");
@@ -414,7 +413,7 @@ mod tests {
         Ok(())
     }
 
-    #[crate::test]
+    #[tokio::test]
     async fn test_export_struct() -> VortexResult<()> {
         let mut ctx = CudaSession::create_execution_ctx(&VortexSession::empty())
             .vortex_expect("failed to create execution context");

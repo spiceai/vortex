@@ -17,11 +17,11 @@ use vortex_error::vortex_bail;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::IntoArray;
-use crate::arrays::Constant;
 use crate::arrays::ConstantArray;
-use crate::arrays::Dict;
+use crate::arrays::ConstantVTable;
 use crate::arrays::DictArray;
-use crate::arrays::dict::DictArraySlotsExt;
+use crate::arrays::DictArrayParts;
+use crate::arrays::DictVTable;
 use crate::arrow::ArrowArrayExecutor;
 
 pub(super) fn to_arrow_dictionary(
@@ -30,11 +30,11 @@ pub(super) fn to_arrow_dictionary(
     values_type: &DataType,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrowArrayRef> {
-    let array = match array.try_downcast::<Dict>() {
+    let array = match array.try_into::<DictVTable>() {
         Ok(dict) => return dict_to_dict(dict, codes_type, values_type, ctx),
         Err(array) => array,
     };
-    let array = match array.try_downcast::<Constant>() {
+    let array = match array.try_into::<ConstantVTable>() {
         Ok(constant) => return constant_to_dict(constant, codes_type, values_type, ctx),
         Err(array) => array,
     };
@@ -78,11 +78,9 @@ fn dict_to_dict(
     values_type: &DataType,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrowArrayRef> {
-    let codes = array.codes().clone().execute_arrow(Some(codes_type), ctx)?;
-    let values = array
-        .values()
-        .clone()
-        .execute_arrow(Some(values_type), ctx)?;
+    let DictArrayParts { codes, values, .. } = array.into_parts();
+    let codes = codes.execute_arrow(Some(codes_type), ctx)?;
+    let values = values.execute_arrow(Some(values_type), ctx)?;
     make_dict_array(codes_type, codes, values)
 }
 
@@ -150,11 +148,11 @@ mod tests {
 
     use crate::IntoArray;
     use crate::LEGACY_SESSION;
+    use crate::arrays::ConstantArray;
+    use crate::arrays::DictArray;
     use crate::arrays::PrimitiveArray;
     use crate::arrays::VarBinViewArray;
     use crate::arrow::ArrowArrayExecutor;
-    use crate::arrow::executor::dictionary::ConstantArray;
-    use crate::arrow::executor::dictionary::DictArray;
     use crate::dtype::DType;
     use crate::dtype::Nullability::Nullable;
     use crate::executor::VortexSessionExecute;
@@ -166,24 +164,6 @@ mod tests {
 
     fn execute(array: crate::ArrayRef, dt: &DataType) -> VortexResult<arrow_array::ArrayRef> {
         array.execute_arrow(Some(dt), &mut LEGACY_SESSION.create_execution_ctx())
-    }
-
-    fn dict_basic_input() -> crate::ArrayRef {
-        DictArray::try_new(
-            buffer![0u8, 1, 0].into_array(),
-            VarBinViewArray::from_iter_str(["a", "b"]).into_array(),
-        )
-        .expect("valid dictionary input")
-        .into_array()
-    }
-
-    fn dict_with_null_codes_input() -> crate::ArrayRef {
-        DictArray::try_new(
-            PrimitiveArray::from_option_iter(vec![Some(0u8), None, Some(1)]).into_array(),
-            VarBinViewArray::from_iter_str(["a", "b"]).into_array(),
-        )
-        .expect("valid dictionary input with null codes")
-        .into_array()
     }
 
     #[rstest]
@@ -198,12 +178,18 @@ mod tests {
         Arc::new(vec![Some("hello"); 5].into_iter().collect::<ArrowDictArray<UInt32Type>>()) as arrow_array::ArrayRef,
     )]
     #[case::dict_basic(
-        dict_basic_input(),
+        DictArray::try_new(
+            buffer![0u8, 1, 0].into_array(),
+            VarBinViewArray::from_iter_str(["a", "b"]).into_array(),
+        ).unwrap().into_array(),
         dict_type(DataType::UInt8, DataType::Utf8),
         Arc::new(vec![Some("a"), Some("b"), Some("a")].into_iter().collect::<ArrowDictArray<UInt8Type>>()) as arrow_array::ArrayRef,
     )]
     #[case::dict_with_null_codes(
-        dict_with_null_codes_input(),
+        DictArray::try_new(
+            PrimitiveArray::from_option_iter(vec![Some(0u8), None, Some(1)]).into_array(),
+            VarBinViewArray::from_iter_str(["a", "b"]).into_array(),
+        ).unwrap().into_array(),
         dict_type(DataType::UInt8, DataType::Utf8),
         Arc::new(vec![Some("a"), None, Some("b")].into_iter().collect::<ArrowDictArray<UInt8Type>>()) as arrow_array::ArrayRef,
     )]

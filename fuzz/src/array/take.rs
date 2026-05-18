@@ -1,17 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use vortex_array::Array;
 use vortex_array::ArrayRef;
-use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
+use vortex_array::ToCanonical;
 use vortex_array::accessor::ArrayAccessor;
 use vortex_array::arrays::BoolArray;
 use vortex_array::arrays::DecimalArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::StructArray;
 use vortex_array::arrays::VarBinViewArray;
-use vortex_array::arrays::bool::BoolArrayExt;
-use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::builders::builder_with_capacity;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::DecimalDType;
@@ -26,9 +25,8 @@ use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 
 pub fn take_canonical_array_non_nullable_indices(
-    array: &ArrayRef,
+    array: &dyn Array,
     indices: &[usize],
-    ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
     take_canonical_array(
         array,
@@ -37,22 +35,17 @@ pub fn take_canonical_array_non_nullable_indices(
             .map(|i| Some(*i))
             .collect::<Vec<_>>()
             .as_slice(),
-        ctx,
     )
 }
 
 pub fn take_canonical_array(
-    array: &ArrayRef,
+    array: &dyn Array,
     indices: &[Option<usize>],
-    ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
     let nullable: Nullability = indices.contains(&None).into();
 
     let validity = if array.dtype().is_nullable() || nullable == Nullability::Nullable {
-        let validity_idx = array
-            .validity()?
-            .execute_mask(array.len(), ctx)?
-            .to_bit_buffer();
+        let validity_idx = array.validity_mask()?.to_bit_buffer();
 
         Validity::from_iter(
             indices
@@ -68,7 +61,7 @@ pub fn take_canonical_array(
 
     match array.dtype() {
         DType::Bool(_) => {
-            let bool_array = array.clone().execute::<BoolArray>(ctx)?;
+            let bool_array = array.to_bool();
             let vec_values = bool_array.to_bit_buffer().iter().collect::<Vec<_>>();
             Ok(BoolArray::new(
                 indices_slice_non_opt
@@ -80,7 +73,7 @@ pub fn take_canonical_array(
             .into_array())
         }
         DType::Primitive(p, _) => {
-            let primitive_array = array.clone().execute::<PrimitiveArray>(ctx)?;
+            let primitive_array = array.to_primitive();
             match_each_native_ptype!(p, |P| {
                 Ok(take_primitive::<P>(
                     primitive_array,
@@ -90,7 +83,7 @@ pub fn take_canonical_array(
             })
         }
         DType::Decimal(d, _) => {
-            let decimal_array = array.clone().execute::<DecimalArray>(ctx)?;
+            let decimal_array = array.to_decimal();
 
             match_each_decimal_value_type!(decimal_array.values_type(), |D| {
                 Ok(take_decimal::<D>(
@@ -102,7 +95,7 @@ pub fn take_canonical_array(
             })
         }
         DType::Utf8(_) | DType::Binary(_) => {
-            let utf8 = array.clone().execute::<VarBinViewArray>(ctx)?;
+            let utf8 = array.to_varbinview();
             let values =
                 utf8.with_iterator(|iter| iter.map(|v| v.map(|u| u.to_vec())).collect::<Vec<_>>());
             Ok(VarBinViewArray::from_iter(
@@ -114,10 +107,11 @@ pub fn take_canonical_array(
             .into_array())
         }
         DType::Struct(..) => {
-            let struct_array = array.clone().execute::<StructArray>(ctx)?;
+            let struct_array = array.to_struct();
             let taken_children = struct_array
-                .iter_unmasked_fields()
-                .map(|c| take_canonical_array_non_nullable_indices(c, indices_slice_non_opt, ctx))
+                .unmasked_fields()
+                .iter()
+                .map(|c| take_canonical_array_non_nullable_indices(c, indices_slice_non_opt))
                 .collect::<VortexResult<Vec<_>>>()?;
 
             StructArray::try_new(
@@ -137,7 +131,7 @@ pub fn take_canonical_array(
                 if let Some(idx) = idx {
                     builder.append_scalar(
                         &array
-                            .execute_scalar(*idx, ctx)?
+                            .scalar_at(*idx)?
                             .cast(&array.dtype().union_nullability(nullable))
                             .vortex_expect("cannot cast scalar nullability"),
                     )?;
@@ -147,7 +141,7 @@ pub fn take_canonical_array(
             }
             Ok(builder.finish())
         }
-        d @ (DType::Null | DType::Extension(_) | DType::Variant(_)) => {
+        d @ (DType::Null | DType::Extension(_)) => {
             unreachable!("DType {d} not supported for fuzzing")
         }
     }

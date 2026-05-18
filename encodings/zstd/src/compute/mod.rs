@@ -6,64 +6,72 @@ mod cast;
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
-    use vortex_array::IntoArray;
-    use vortex_array::LEGACY_SESSION;
-    use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::compute::conformance::consistency::test_array_consistency;
-    use vortex_buffer::buffer;
+    use vortex_buffer::Buffer;
 
-    use crate::Zstd;
     use crate::ZstdArray;
 
     fn zstd_i32() -> ZstdArray {
-        let values = PrimitiveArray::from_iter([100i32, 200, 300, 400, 500]);
-        Zstd::from_primitive(&values, 0, 0, &mut LEGACY_SESSION.create_execution_ctx()).unwrap()
+        let values = PrimitiveArray::new(
+            Buffer::copy_from(vec![100i32, 200, 300, 400, 500]),
+            vortex_array::validity::Validity::NonNullable,
+        );
+        ZstdArray::from_primitive(&values, 0, 0).unwrap()
     }
 
     fn zstd_f64() -> ZstdArray {
-        let values = PrimitiveArray::from_iter([1.1f64, 2.2, 3.3, 4.4, 5.5]);
-        Zstd::from_primitive(&values, 0, 0, &mut LEGACY_SESSION.create_execution_ctx()).unwrap()
+        let values = PrimitiveArray::new(
+            Buffer::copy_from(vec![1.1f64, 2.2, 3.3, 4.4, 5.5]),
+            vortex_array::validity::Validity::NonNullable,
+        );
+        ZstdArray::from_primitive(&values, 0, 0).unwrap()
     }
 
     fn zstd_u32() -> ZstdArray {
-        let values = PrimitiveArray::from_iter([10u32, 20, 30, 40, 50]);
-        Zstd::from_primitive(&values, 0, 0, &mut LEGACY_SESSION.create_execution_ctx()).unwrap()
+        let values = PrimitiveArray::new(
+            Buffer::copy_from(vec![10u32, 20, 30, 40, 50]),
+            vortex_array::validity::Validity::NonNullable,
+        );
+        ZstdArray::from_primitive(&values, 0, 0).unwrap()
     }
 
     fn zstd_nullable_i64() -> ZstdArray {
         let values =
             PrimitiveArray::from_option_iter([Some(1000i64), None, Some(3000), Some(4000), None]);
-        Zstd::from_primitive(&values, 0, 0, &mut LEGACY_SESSION.create_execution_ctx()).unwrap()
+        ZstdArray::from_primitive(&values, 0, 0).unwrap()
     }
 
     fn zstd_single() -> ZstdArray {
         let values = PrimitiveArray::new(
-            buffer![42i64],
+            Buffer::copy_from(vec![42i64]),
             vortex_array::validity::Validity::NonNullable,
         );
-        Zstd::from_primitive(&values, 0, 0, &mut LEGACY_SESSION.create_execution_ctx()).unwrap()
+        ZstdArray::from_primitive(&values, 0, 0).unwrap()
     }
 
     fn zstd_large() -> ZstdArray {
         let values = PrimitiveArray::new(
-            buffer![0u32..1000],
+            Buffer::copy_from((0..1000).map(|i| i as u32).collect::<Vec<_>>()),
             vortex_array::validity::Validity::NonNullable,
         );
-        Zstd::from_primitive(&values, 3, 0, &mut LEGACY_SESSION.create_execution_ctx()).unwrap()
+        ZstdArray::from_primitive(&values, 3, 0).unwrap()
     }
 
     fn zstd_all_same() -> ZstdArray {
         let values = PrimitiveArray::new(
-            buffer![42i32; 100],
+            Buffer::copy_from(vec![42i32; 100]),
             vortex_array::validity::Validity::NonNullable,
         );
-        Zstd::from_primitive(&values, 0, 0, &mut LEGACY_SESSION.create_execution_ctx()).unwrap()
+        ZstdArray::from_primitive(&values, 0, 0).unwrap()
     }
 
     fn zstd_negative() -> ZstdArray {
-        let values = PrimitiveArray::from_iter([-100i32, -50, 0, 50, 100]);
-        Zstd::from_primitive(&values, 0, 0, &mut LEGACY_SESSION.create_execution_ctx()).unwrap()
+        let values = PrimitiveArray::new(
+            Buffer::copy_from(vec![-100i32, -50, 0, 50, 100]),
+            vortex_array::validity::Validity::NonNullable,
+        );
+        ZstdArray::from_primitive(&values, 0, 0).unwrap()
     }
 
     #[rstest]
@@ -76,6 +84,6 @@ mod tests {
     #[case::all_same(zstd_all_same())]
     #[case::negative(zstd_negative())]
     fn test_zstd_consistency(#[case] array: ZstdArray) {
-        test_array_consistency(&array.into_array());
+        test_array_consistency(array.as_ref());
     }
 }

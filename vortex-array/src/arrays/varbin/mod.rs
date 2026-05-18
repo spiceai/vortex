@@ -2,15 +2,13 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 mod array;
-pub use array::VarBinArrayExt;
-pub use array::VarBinData;
-pub use array::VarBinDataParts;
-pub use vtable::VarBinArray;
+pub use array::VarBinArray;
 
 pub(crate) mod compute;
+pub(crate) use compute::varbin_compute_min_max;
 
 mod vtable;
-pub use vtable::VarBin;
+pub use vtable::VarBinVTable;
 
 pub mod builder;
 

@@ -1,108 +1,42 @@
-# Vortex C interface
-## Usage from a CMake project
+# Foreign Function Interface
 
-```
-# in vortex folder
-cargo build --release -p vortex-ffi
+Vortex is a file format that can be used by any execution engine. Nearly every programming language supports
+the C ABI (Application Binary Interface), so by providing an FFI interface to work with Vortex objects we can
+make it easy to support a variety of languages.
 
-# in your CMakeLists.txt
-include_directory(vortex/vortex-ffi)
-target_link_libraries(my_target, vortex_ffi_shared)
-# or target_link_libraries(my_target, vortex_ffi)
-```
+Check out the [`examples`](./examples/) directory to see an example of how to use the API to build
+a real native application.
 
-## Running C examples:
+## Design
 
-```sh
-cmake -Bbuild -DBUILD_EXAMPLES=1
-cmake --build build
-./build/examples/dtype
-./build/examples/scan
-./build/examples/scan_to_arrow
-./build/examples/write_sample
-```
+The FFI is designed to be very simple and follows a very object-oriented approach:
+
+- **Constructors** are simple C functions that return opaque pointers
+- **Methods** are functions that receive an opaque pointer as the first argument, followed by subsequent arguments.
+  Methods may return a value or void.
+- **Destructors** free native resources (allocations, file handles, network sockets) and must be explicitly called by
+  the foreign language to avoid leaking resources.
+
+Constructors will generally allocate rust memory, and destructors free that memory.
+
+## Documentation
+
+The FFI API is documented in `docs/api/c` with explicit inclusion of types, enums, and functions, etc. Note that an
+item cannot be referenced in the documentation if it does not have a documentation comment.
 
 ## Updating Headers
 
-If you're developing FFI and want to rebuild `cinclude/vortex.h`, run
-`cargo +nightly build -p vortex-ffi`.
+To rebuild the header file (requires nightly toolchain):
 
-## Testing C part
-
-Build the test library:
-
-```sh
-cmake -Bbuild -DBUILD_TESTS=1
-cmake --build build
+```shell
+cargo +nightly build -p vortex-ffi
 ```
 
-Run the tests:
+The header generation uses cbindgen's macro expansion feature which requires nightly.
+Stable builds use the checked-in header file at `cinclude/vortex.h`.
 
-```sh
-ctest --test-dir build -j $(nproc)
-```
+### Development Workflow
 
-You will need C++ compiler toolchain to run the tests since they use Catch2.
-
-## Testing Rust part with sanitizers
-
-AddressSanitizer:
-
-```sh
-# inside vortex-ffi
-RUSTFLAGS="-Z sanitizer=address" \
-cargo +nightly test -Zbuild-std \
-    --no-default-features --target <target triple> \
-    -- --no-capture
-```
-
-MemorySanitizer:
-
-```sh
-RUSTFLAGS="-Z sanitizer=memory -Cunsafe-allow-abi-mismatch=sanitizer" \
-cargo +nightly test -Zbuild-std \
-    --no-default-features --target <target triple> \
-    -- --no-capture
-```
-
-ThreadSanitizer:
-
-```sh
-TSAN_OPTIONS="suppressions=$HOME/vortex/vortex-ffi/tsan_suppressions.txt" \
-RUSTFLAGS="-Z sanitizer=thread -Cunsafe-allow-abi-mismatch=sanitizer" \
-cargo +nightly test -Zbuild-std \
-    --no-default-features --target <target triple> \
-    -- --no-capture
-```
-
-- `-Zbuild-std` is needed as memory and thread sanitizers report std errors
-  otherwise.
-- `--no-default-features` is needed as we use Mimalloc otherwise which interferes
-with sanitizers.
-- `allow-abi-mismatch` is safe because in our dependency graph only crates like
-  `compiler_builtins` unset sanitization, and they do it on purpose.
-- Make sure to use `cargo test` and not `cargo nextest` as nextest reports less
-  leaks.
-- If you want stack trace symbolization, install `llvm-symbolizer`.
-
-## Testing Rust and C with sanitizers
-
-1. Build FFI library with external sanitizer runtime:
-
-```sh
-RUSTFLAGS="-Zsanitizer=address -Zexternal-clangrt" \
-cargo +nightly build -Zbuild-std --target=<target triple> \
-    --no-default-features -p vortex-ffi
-```
-
-2. Build tests with target triple:
-
-```sh
-cmake -Bbuild -DWITH_ASAN=1 -DTARGET_TRIPLE=<target triple>
-```
-
-3. Run the tests (ctest doesn't output failures in detail):
-
-```sh
-./build/test/vortex_ffi_test 2>& 1 | rustfilt -i-
-```
+- **For header changes**: Use nightly toolchain to regenerate headers after modifying FFI code
+- **For regular development**: Stable toolchain builds work with existing checked-in headers
+- **CI validation**: Automated checks verify header freshness using nightly toolchain

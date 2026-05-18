@@ -1,27 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use vortex_array::ArrayView;
-use vortex_array::ExecutionCtx;
 use vortex_array::scalar::Scalar;
 use vortex_array::vtable::OperationsVTable;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 
-use super::RLE;
+use super::RLEVTable;
 use crate::FL_CHUNK_SIZE;
-use crate::rle::RLEArrayExt;
+use crate::RLEArray;
 
-impl OperationsVTable<RLE> for RLE {
-    fn scalar_at(
-        array: ArrayView<'_, RLE>,
-        index: usize,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<Scalar> {
+impl OperationsVTable<RLEVTable> for RLEVTable {
+    fn scalar_at(array: &RLEArray, index: usize) -> VortexResult<Scalar> {
         let offset_in_chunk = array.offset();
-        let chunk_relative_idx = array
-            .indices()
-            .execute_scalar(offset_in_chunk + index, ctx)?;
+        let chunk_relative_idx = array.indices().scalar_at(offset_in_chunk + index)?;
 
         let chunk_relative_idx = chunk_relative_idx
             .as_primitive()
@@ -29,11 +21,11 @@ impl OperationsVTable<RLE> for RLE {
             .vortex_expect("Index must not be null");
 
         let chunk_id = (offset_in_chunk + index) / FL_CHUNK_SIZE;
-        let value_idx_offset = array.values_idx_offset(chunk_id, ctx);
+        let value_idx_offset = array.values_idx_offset(chunk_id);
 
         let scalar = array
             .values()
-            .execute_scalar(value_idx_offset + chunk_relative_idx, ctx)?;
+            .scalar_at(value_idx_offset + chunk_relative_idx)?;
 
         Scalar::try_new(array.dtype().clone(), scalar.into_value())
     }
@@ -41,9 +33,9 @@ impl OperationsVTable<RLE> for RLE {
 
 #[cfg(test)]
 mod tests {
+    use vortex_array::Array;
     use vortex_array::IntoArray;
-    use vortex_array::LEGACY_SESSION;
-    use vortex_array::VortexSessionExecute;
+    use vortex_array::ToCanonical;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::assert_arrays_eq;
     use vortex_array::validity::Validity;
@@ -51,9 +43,6 @@ mod tests {
     use vortex_buffer::buffer;
 
     use super::*;
-    use crate::RLE;
-    use crate::RLEArray;
-    use crate::RLEData;
 
     mod fixture {
         use super::*;
@@ -70,14 +59,14 @@ mod tests {
             .into_array();
             let values_idx_offsets = PrimitiveArray::from_iter([0u64]).into_array();
 
-            RLE::try_new(
+            RLEArray::try_new(
                 values,
                 indices.clone(),
                 values_idx_offsets,
                 0,
                 indices.len(),
             )
-            .vortex_expect("RLEData is always valid")
+            .unwrap()
         }
 
         pub(super) fn rle_array_with_nulls() -> RLEArray {
@@ -105,14 +94,14 @@ mod tests {
             )
             .into_array();
 
-            RLE::try_new(
+            RLEArray::try_new(
                 values,
                 indices.clone(),
                 values_idx_offsets,
                 0,
                 indices.len(),
             )
-            .vortex_expect("RLEData is always valid")
+            .unwrap()
         }
     }
 
@@ -168,21 +157,19 @@ mod tests {
 
     #[test]
     fn test_scalar_at_multiple_chunks() {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
         // Test accessing elements around chunk boundaries
         let values: Buffer<u16> = (0..3000).map(|i| (i / 50) as u16).collect();
         let expected: Vec<u16> = (0..3000).map(|i| (i / 50) as u16).collect();
         let array = values.into_array();
 
-        let primitive = array.execute::<PrimitiveArray>(&mut ctx).unwrap();
-        let encoded = RLEData::encode(primitive.as_view(), &mut ctx).unwrap();
+        let encoded = RLEArray::encode(&array.to_primitive()).unwrap();
 
         // Access scalars from multiple chunks.
         for &idx in &[1023, 1024, 1025, 2047, 2048, 2049] {
             if idx < encoded.len() {
                 let original_value = expected[idx];
                 let encoded_value = encoded
-                    .execute_scalar(idx, &mut ctx)
+                    .scalar_at(idx)
                     .unwrap()
                     .as_primitive()
                     .as_::<u16>()
@@ -196,18 +183,14 @@ mod tests {
     #[should_panic]
     fn test_scalar_at_out_of_bounds() {
         let array = fixture::rle_array();
-        array
-            .execute_scalar(1025, &mut LEGACY_SESSION.create_execution_ctx())
-            .unwrap();
+        array.scalar_at(1025).unwrap();
     }
 
     #[test]
     #[should_panic]
     fn test_scalar_at_slice_out_of_bounds() {
         let array = fixture::rle_array().slice(0..1).unwrap();
-        array
-            .execute_scalar(1, &mut LEGACY_SESSION.create_execution_ctx())
-            .unwrap();
+        array.scalar_at(1).unwrap();
     }
 
     #[test]
@@ -224,7 +207,7 @@ mod tests {
             Some(30),
             Some(10),
         ]);
-        assert_arrays_eq!(sliced.into_array(), expected.into_array());
+        assert_arrays_eq!(sliced.to_array(), expected.to_array());
     }
 
     #[test]
@@ -233,7 +216,7 @@ mod tests {
         let sliced = array.slice(4..6).unwrap(); // [20, 30]
 
         let expected = buffer![20u32, 30].into_array();
-        assert_arrays_eq!(sliced, expected);
+        assert_arrays_eq!(sliced.to_array(), expected);
     }
 
     #[test]
@@ -242,7 +225,7 @@ mod tests {
         let sliced = array.slice(5..6).unwrap(); // [30]
 
         let expected = buffer![30u32].into_array();
-        assert_arrays_eq!(sliced, expected);
+        assert_arrays_eq!(sliced.to_array(), expected);
     }
 
     #[test]
@@ -259,21 +242,16 @@ mod tests {
         let sliced = array.slice(1..4).unwrap(); // [null, 20, 20]
 
         let expected = PrimitiveArray::from_option_iter([Option::<u32>::None, Some(20), Some(20)]);
-        assert_arrays_eq!(sliced.into_array(), expected.into_array());
+        assert_arrays_eq!(sliced.to_array(), expected.to_array());
     }
 
     #[test]
     fn test_slice_decode_with_nulls() {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
         let array = fixture::rle_array_with_nulls();
-        let sliced = array
-            .slice(1..4)
-            .unwrap()
-            .execute::<PrimitiveArray>(&mut ctx)
-            .unwrap(); // [null, 20, 20]
+        let sliced = array.slice(1..4).unwrap().to_array().to_primitive(); // [null, 20, 20]
 
         let expected = PrimitiveArray::from_option_iter([Option::<u32>::None, Some(20), Some(20)]);
-        assert_arrays_eq!(sliced.into_array(), expected.into_array());
+        assert_arrays_eq!(sliced.to_array(), expected.to_array());
     }
 
     #[test]
@@ -286,13 +264,11 @@ mod tests {
 
     #[test]
     fn test_slice_across_chunk_boundaries() {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
         let values: Buffer<u32> = (0..2100).map(|i| (i / 100) as u32).collect();
         let expected: Vec<u32> = (0..2100).map(|i| (i / 100) as u32).collect();
         let array = values.into_array();
 
-        let primitive = array.execute::<PrimitiveArray>(&mut ctx).unwrap();
-        let encoded = RLEData::encode(primitive.as_view(), &mut ctx).unwrap();
+        let encoded = RLEArray::encode(&array.to_primitive()).unwrap();
 
         // Slice across first and second chunk.
         let slice = encoded.slice(500..1500).unwrap();

@@ -15,15 +15,12 @@ use arrow_schema::Schema;
 use arrow_schema::SchemaRef;
 use futures::stream::TryStreamExt;
 use vortex::array::ArrayRef;
-use vortex::array::LEGACY_SESSION;
-use vortex::array::VortexSessionExecute;
-use vortex::array::arrow::ArrowArrayExecutor;
+use vortex::array::arrow::IntoArrowArray;
 use vortex::buffer::Buffer;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::io::runtime::BlockingRuntime;
-use vortex::layout::scan::arrow::RecordBatchIteratorAdapter;
-use vortex::layout::scan::scan_builder::ScanBuilder;
-use vortex::scan::selection::Selection;
+use vortex::scan::ScanBuilder;
+use vortex::scan::arrow::RecordBatchIteratorAdapter;
 
 use crate::RUNTIME;
 use crate::SESSION;
@@ -92,7 +89,8 @@ impl VortexScanBuilder {
     }
 
     pub(crate) fn with_include_by_index(&mut self, include_by_index: &[u64]) {
-        let selection = Selection::IncludeByIndex(Buffer::copy_from(include_by_index));
+        let selection =
+            vortex::scan::Selection::IncludeByIndex(Buffer::copy_from(include_by_index));
         take_mut::take(&mut self.inner, |inner| inner.with_selection(selection));
     }
 
@@ -165,7 +163,7 @@ pub(crate) fn scan_builder_into_threadsafe_cloneable_reader(
     let stream = builder
         .inner
         .map(move |b| {
-            b.execute_arrow(Some(&data_type), &mut LEGACY_SESSION.create_execution_ctx())
+            b.into_arrow(&data_type)
                 .map(|struct_array| RecordBatch::from(struct_array.as_struct()))
         })
         .into_stream()?

@@ -10,11 +10,12 @@ pub use kernel::*;
 use prost::Message;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
+use vortex_error::vortex_err;
 use vortex_proto::expr as pb;
 use vortex_session::VortexSession;
 
+use crate::Array;
 use crate::ArrayRef;
-use crate::ExecutionCtx;
 use crate::arrow::Datum;
 use crate::arrow::from_arrow_array_with_len;
 use crate::dtype::DType;
@@ -62,7 +63,7 @@ impl ScalarFnVTable for Like {
     type Options = LikeOptions;
 
     fn id(&self) -> ScalarFnId {
-        ScalarFnId::new("vortex.like")
+        ScalarFnId::from("vortex.like")
     }
 
     fn serialize(&self, instance: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
@@ -136,16 +137,13 @@ impl ScalarFnVTable for Like {
         ))
     }
 
-    fn execute(
-        &self,
-        options: &Self::Options,
-        args: &dyn ExecutionArgs,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<ArrayRef> {
-        let child = args.get(0)?;
-        let pattern = args.get(1)?;
+    fn execute(&self, options: &Self::Options, args: ExecutionArgs) -> VortexResult<ArrayRef> {
+        let [child, pattern]: [ArrayRef; _] = args
+            .inputs
+            .try_into()
+            .map_err(|_| vortex_err!("Wrong argument count"))?;
 
-        arrow_like(&child, &pattern, *options, ctx)
+        arrow_like(&child, &pattern, *options)
     }
 
     fn validity(
@@ -203,10 +201,9 @@ impl ScalarFnVTable for Like {
 
 /// Implementation of LIKE using the Arrow crate.
 pub(crate) fn arrow_like(
-    array: &ArrayRef,
-    pattern: &ArrayRef,
+    array: &dyn Array,
+    pattern: &dyn Array,
     options: LikeOptions,
-    ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
     let nullable = array.dtype().is_nullable() | pattern.dtype().is_nullable();
     let len = array.len();
@@ -218,8 +215,8 @@ pub(crate) fn arrow_like(
     );
 
     // convert the pattern to the preferred array datatype
-    let lhs = Datum::try_new(array, ctx)?;
-    let rhs = Datum::try_new_with_target_datatype(pattern, lhs.data_type(), ctx)?;
+    let lhs = Datum::try_new(array)?;
+    let rhs = Datum::try_new_with_target_datatype(pattern, lhs.data_type())?;
 
     let result = match (options.negated, options.case_insensitive) {
         (false, false) => arrow_string::like::like(&lhs, &rhs)?,
@@ -257,7 +254,6 @@ impl<'a> LikeVariant<'a> {
 
 #[cfg(test)]
 mod tests {
-    use crate::IntoArray;
     use crate::arrays::BoolArray;
     use crate::assert_arrays_eq;
     use crate::dtype::DType;
@@ -279,7 +275,7 @@ mod tests {
         let not_expr = not(root());
         let bools = BoolArray::from_iter([false, true, false, false, true, true]);
         assert_arrays_eq!(
-            bools.into_array().apply(&not_expr).unwrap(),
+            bools.to_array().apply(&not_expr).unwrap(),
             BoolArray::from_iter([true, false, true, true, false, false])
         );
     }

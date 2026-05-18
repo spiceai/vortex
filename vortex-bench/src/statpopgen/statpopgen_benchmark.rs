@@ -52,7 +52,7 @@ impl StatPopGenBenchmark {
             )
         })?;
 
-        let data_path = "statpopgen".to_data_path().join(format!("{n_rows}/"));
+        let data_path = "statspopgen".to_data_path().join(format!("{n_rows}/"));
 
         let data_url =
             Url::from_directory_path(data_path).map_err(|_| anyhow::anyhow!("bad data path?"))?;
@@ -129,7 +129,7 @@ impl Benchmark for StatPopGenBenchmark {
         Ok(())
     }
 
-    #[expect(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation)]
     fn expected_row_counts(&self) -> Option<Vec<usize>> {
         let n_rows = self.n_rows as usize;
         match self.scale_factor {
@@ -168,7 +168,7 @@ impl Benchmark for StatPopGenBenchmark {
         vec![TableSpec::new("statpopgen", None)]
     }
 
-    #[expect(clippy::expect_used)]
+    #[expect(clippy::expect_used, clippy::unwrap_in_result)]
     fn pattern(&self, _table_name: &str, format: Format) -> Option<glob::Pattern> {
         Some(
             format!("{}.{}", Self::FILE_NAME, format.ext())

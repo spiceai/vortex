@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::any::Any;
 use std::collections::BTreeSet;
 use std::ops::Range;
 use std::sync::Arc;
@@ -31,8 +30,6 @@ pub type LayoutReaderRef = Arc<dyn LayoutReader>;
 pub trait LayoutReader: 'static + Send + Sync {
     /// Returns the name of the layout reader for debugging.
     fn name(&self) -> &Arc<str>;
-
-    fn as_any(&self) -> &dyn Any;
 
     /// Returns the un-projected dtype of the layout reader.
     fn dtype(&self) -> &DType;
@@ -148,7 +145,7 @@ impl LazyReaderChildren {
             let child = self.children.child(idx, dtype)?;
             child.new_reader(
                 Arc::clone(&self.names[idx]),
-                Arc::clone(&self.segment_source),
+                self.segment_source.clone(),
                 &self.session,
             )
         })

@@ -2,13 +2,12 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use divan::Bencher;
-use rand::RngExt;
+use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
-#[expect(deprecated)]
-use vortex_array::ToCanonical as _;
+use vortex_array::ToCanonical;
 use vortex_array::arrays::VarBinViewArray;
 use vortex_array::builders::VarBinViewBuilder;
 use vortex_array::dtype::DType;
@@ -43,10 +42,8 @@ fn compact_impl(bencher: Bencher, (output_size, utilization_pct): (usize, usize)
     let base_array = build_varbinview_fixture(base_size);
     let indices = random_indices(output_size, base_size);
     let taken = base_array
-        .into_array()
         .take(indices)
         .vortex_expect("operation should succeed in benchmark");
-    #[expect(deprecated)]
     let array = taken.to_varbinview();
 
     bencher.with_inputs(|| &array).bench_refs(|array| {
@@ -60,10 +57,9 @@ fn compact_sliced_impl(bencher: Bencher, (output_size, utilization_pct): (usize,
     let base_size = (output_size * 100) / utilization_pct;
     let base_array = build_varbinview_fixture(base_size);
     let sliced = base_array
-        .into_array()
+        .as_ref()
         .slice(0..output_size)
         .vortex_expect("slice should succeed");
-    #[expect(deprecated)]
     let array = sliced.to_varbinview();
 
     bencher.with_inputs(|| &array).bench_refs(|array| {

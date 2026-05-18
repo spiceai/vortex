@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use vortex_array::Array;
 use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
-use vortex_array::LEGACY_SESSION;
-use vortex_array::VortexSessionExecute;
-use vortex_array::arrays::VarBinViewArray;
-use vortex_array::arrays::varbin::builder::VarBinBuilder;
+use vortex_array::ToCanonical;
+use vortex_array::arrays::builder::VarBinBuilder;
 use vortex_array::assert_arrays_eq;
 use vortex_array::assert_nth_scalar;
 use vortex_array::dtype::DType;
@@ -14,7 +13,7 @@ use vortex_array::dtype::Nullability;
 use vortex_buffer::buffer;
 use vortex_mask::Mask;
 
-use crate::FSST;
+use crate::FSSTVTable;
 use crate::fsst_compress;
 use crate::fsst_train_compressor;
 
@@ -29,15 +28,11 @@ pub(crate) fn build_fsst_array() -> ArrayRef {
     let input_array = input_array.finish(DType::Utf8(Nullability::NonNullable));
 
     let compressor = fsst_train_compressor(&input_array);
-    let len = input_array.len();
-    let dtype = input_array.dtype().clone();
-    let mut ctx = LEGACY_SESSION.create_execution_ctx();
-    fsst_compress(input_array, len, &dtype, &compressor, &mut ctx).into_array()
+    fsst_compress(input_array, &compressor).into_array()
 }
 
 #[test]
 fn test_fsst_array_ops() {
-    let mut ctx = LEGACY_SESSION.create_execution_ctx();
     // first test the scalar_at values
     let fsst_array = build_fsst_array();
     assert_nth_scalar!(
@@ -58,7 +53,7 @@ fn test_fsst_array_ops() {
 
     // test slice
     let fsst_sliced = fsst_array.slice(1..3).unwrap();
-    assert!(fsst_sliced.is::<FSST>());
+    assert!(fsst_sliced.is::<FSSTVTable>());
     assert_eq!(fsst_sliced.len(), 2);
     assert_nth_scalar!(
         fsst_sliced,
@@ -99,11 +94,7 @@ fn test_fsst_array_ops() {
     );
 
     // test to_canonical
-    let canonical_array = fsst_array
-        .clone()
-        .execute::<VarBinViewArray>(&mut ctx)
-        .unwrap()
-        .into_array();
+    let canonical_array = fsst_array.to_varbinview().into_array();
 
-    assert_arrays_eq!(fsst_array, canonical_array);
+    assert_arrays_eq!(fsst_array.to_array(), canonical_array);
 }

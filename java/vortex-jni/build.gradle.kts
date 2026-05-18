@@ -8,31 +8,28 @@ plugins {
     `java-library`
     `jvm-test-suite`
     id("com.google.protobuf")
-    id("com.gradleup.shadow") version "9.4.1"
+    id("com.gradleup.shadow") version "9.2.2"
 }
 
 dependencies {
-    // Align Netty versions across Arrow and Spark
-    implementation(platform(libs.netty.bom))
+    implementation("org.apache.arrow:arrow-c-data")
+    implementation("org.apache.arrow:arrow-memory-core")
+    implementation("org.apache.arrow:arrow-memory-netty")
 
-    implementation(libs.arrow.c.data)
-    implementation(libs.arrow.memory.core)
-    implementation(libs.arrow.memory.netty)
+    compileOnly("org.immutables:value")
+    annotationProcessor("org.immutables:value")
 
-    compileOnly(libs.immutables.value)
-    annotationProcessor(libs.immutables.value)
+    errorprone("com.google.errorprone:error_prone_core")
+    errorprone("com.jakewharton.nopen:nopen-checker")
 
-    errorprone(libs.errorprone.core)
-    errorprone(libs.nopen.checker)
-
-    implementation(libs.guava)
-    implementation(libs.protobuf.java)
-    compileOnly(libs.errorprone.annotations)
-    compileOnly(libs.nopen.annotations)
+    implementation("com.google.guava:guava")
+    implementation("com.google.protobuf:protobuf-java")
+    compileOnly("com.google.errorprone:error_prone_annotations")
+    compileOnly("com.jakewharton.nopen:nopen-annotations")
 
     // Logging
-    implementation(libs.slf4j.api)
-    testRuntimeOnly(libs.logback.classic)
+    implementation("org.slf4j:slf4j-api:2.0.17")
+    testRuntimeOnly("ch.qos.logback:logback-classic:1.5.27")
 }
 
 testing {
@@ -40,7 +37,7 @@ testing {
         val test by getting(JvmTestSuite::class) {
             useJUnitJupiter()
             dependencies {
-                implementation(libs.junit.jupiter.params)
+                implementation("org.junit.jupiter:junit-jupiter-params")
             }
         }
     }
@@ -93,7 +90,7 @@ tasks.withType<Test>().all {
 
 protobuf {
     protoc {
-        artifact = "com.google.protobuf:protoc:${libs.versions.protobuf.get()}"
+        artifact = "com.google.protobuf:protoc:4.33.5"
     }
 }
 
@@ -110,7 +107,6 @@ tasks.withType<ShadowJar> {
         // Note this class is not used by us, but required when loading the native lib
         exclude("org.apache.arrow.c.ArrayStreamExporter\$ExportedArrayStreamPrivateData")
     }
-    relocate("com.fasterxml.jackson", "dev.vortex.relocated.com.fasterxml.jackson")
 }
 
 tasks.build {
@@ -139,13 +135,14 @@ tasks.register("makeTestFiles") {
         }
 
         copy {
-            from("${rootProject.projectDir.absoluteFile.parentFile}/target/debug/libvortex_jni.so")
-            into("$projectDir/src/main/resources/native/linux-aarch64")
-        }
-
-        copy {
             from("${rootProject.projectDir.absoluteFile.parentFile}/target/debug/libvortex_jni.dylib")
             into("$projectDir/src/main/resources/native/darwin-aarch64")
+        }
+
+        execOps.exec {
+            workingDir = rootProject.projectDir.absoluteFile.parentFile
+            executable = "cargo"
+            args("xtask", "java-test-files")
         }
     }
 }

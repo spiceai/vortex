@@ -16,15 +16,8 @@ mod tests {
     use vortex_error::VortexError;
 
     use crate::IntoArray;
-    use crate::arrays::ChunkedArray;
-    use crate::arrays::DecimalArray;
-    use crate::arrays::FixedSizeListArray;
-    use crate::arrays::ListArray;
-    use crate::arrays::PrimitiveArray;
-    use crate::arrays::StructArray;
-    use crate::arrays::VarBinArray;
-    use crate::arrays::VarBinViewArray;
-    use crate::arrays::varbinview::build_views::BinaryView;
+    use crate::arrays::BinaryView;
+    use crate::arrays::*;
     use crate::dtype::DType;
     use crate::dtype::Nullability;
     use crate::dtype::PType;

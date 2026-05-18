@@ -8,7 +8,6 @@ use vortex_error::vortex_bail;
 use vortex_session::VortexSession;
 
 use crate::ArrayRef;
-use crate::ExecutionCtx;
 use crate::dtype::DType;
 use crate::dtype::FieldPath;
 use crate::expr::StatsCatalog;
@@ -30,7 +29,7 @@ impl ScalarFnVTable for Root {
     type Options = EmptyOptions;
 
     fn id(&self) -> ScalarFnId {
-        ScalarFnId::new("vortex.root")
+        ScalarFnId::from("vortex.root")
     }
 
     fn serialize(&self, _instance: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
@@ -69,12 +68,7 @@ impl ScalarFnVTable for Root {
         vortex_bail!("Root expression does not support return_dtype")
     }
 
-    fn execute(
-        &self,
-        _data: &Self::Options,
-        _args: &dyn ExecutionArgs,
-        _ctx: &mut ExecutionCtx,
-    ) -> VortexResult<ArrayRef> {
+    fn execute(&self, _data: &Self::Options, _args: ExecutionArgs) -> VortexResult<ArrayRef> {
         vortex_bail!("Root expression is not executable")
     }
 

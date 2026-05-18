@@ -8,8 +8,6 @@ use async_trait::async_trait;
 use tokio::fs::File as TokioFile;
 use tokio::io::AsyncWriteExt;
 use vortex::array::ArrayRef;
-use vortex::array::ExecutionCtx;
-use vortex::array::IntoArray;
 use vortex::array::stream::ArrayStreamExt;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::file::WriteOptionsSessionExt;
@@ -38,7 +36,7 @@ impl Dataset for TaxiData {
         "taxi"
     }
 
-    async fn to_vortex_array(&self, _ctx: &mut ExecutionCtx) -> Result<ArrayRef> {
+    async fn to_vortex_array(&self) -> Result<ArrayRef> {
         fetch_taxi_data().await
     }
 
@@ -95,7 +93,7 @@ pub async fn taxi_data_vortex() -> Result<PathBuf> {
 
         SESSION
             .write_options()
-            .write(&mut output_file, data.into_array().to_array_stream())
+            .write(&mut output_file, data.to_array_stream())
             .await?;
         output_file.flush().await?;
         Ok(buf)
@@ -114,7 +112,7 @@ pub async fn taxi_data_vortex_compact() -> Result<PathBuf> {
         let data = parquet_to_vortex_chunks(taxi_data_parquet().await?).await?;
 
         write_options
-            .write(&mut output_file, data.into_array().to_array_stream())
+            .write(&mut output_file, data.to_array_stream())
             .await?;
 
         output_file.flush().await?;

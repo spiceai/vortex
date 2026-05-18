@@ -1,6 +1,11 @@
-_extends: .github-private
 images:
-  ubuntu24-full-arm64-pre:
+  vortex-ci-amd64:
+    platform: "linux"
+    arch: "x64"
+    name: "vortex-ci-*"
+    owner: "375504701696"
+  vortex-ci-arm64:
     platform: "linux"
     arch: "arm64"
-    ami: "ami-08f97c6362847dc5d"
+    name: "vortex-ci-*"
+    owner: "375504701696"

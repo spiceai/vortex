@@ -113,10 +113,7 @@ impl TryFrom<&Scalar> for bool {
     type Error = VortexError;
 
     fn try_from(value: &Scalar) -> VortexResult<Self> {
-        value
-            .as_bool_opt()
-            .ok_or_else(|| vortex_err!("Expected bool scalar, found {}", value.dtype()))?
-            .value()
+        <Option<bool>>::try_from(value)?
             .ok_or_else(|| vortex_err!("Can't extract present value from null scalar"))
     }
 }

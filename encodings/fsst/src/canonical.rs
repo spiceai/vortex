@@ -4,26 +4,24 @@
 use std::sync::Arc;
 
 use vortex_array::ArrayRef;
-use vortex_array::ArrayView;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::VarBinViewArray;
-use vortex_array::arrays::varbin::VarBinArrayExt;
-use vortex_array::arrays::varbinview::build_views::BinaryView;
-use vortex_array::arrays::varbinview::build_views::MAX_BUFFER_LEN;
-use vortex_array::arrays::varbinview::build_views::build_views;
+use vortex_array::arrays::build_views::BinaryView;
+use vortex_array::arrays::build_views::MAX_BUFFER_LEN;
+use vortex_array::arrays::build_views::build_views;
 use vortex_array::match_each_integer_ptype;
+use vortex_array::vtable::ValidityHelper;
 use vortex_buffer::Buffer;
 use vortex_buffer::ByteBuffer;
 use vortex_buffer::ByteBufferMut;
 use vortex_error::VortexResult;
 
-use crate::FSST;
-use crate::FSSTArrayExt;
+use crate::FSSTArray;
 
 pub(super) fn canonicalize_fsst(
-    array: ArrayView<'_, FSST>,
+    array: &FSSTArray,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
     let (buffers, views) = fsst_decode_views(array, 0, ctx)?;
@@ -34,14 +32,14 @@ pub(super) fn canonicalize_fsst(
             views,
             Arc::from(buffers),
             array.dtype().clone(),
-            array.codes().validity()?,
+            array.codes().validity().clone(),
         )
         .into_array()
     })
 }
 
 pub(crate) fn fsst_decode_views(
-    fsst_array: ArrayView<'_, FSST>,
+    fsst_array: &FSSTArray,
     start_buf_index: u32,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<(Vec<ByteBuffer>, Buffer<BinaryView>)> {
@@ -59,7 +57,7 @@ pub(crate) fn fsst_decode_views(
         .clone()
         .execute::<PrimitiveArray>(ctx)?;
 
-    #[expect(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation)]
     let total_size: usize = match_each_integer_ptype!(uncompressed_lens_array.ptype(), |P| {
         uncompressed_lens_array
             .as_slice::<P>()
@@ -90,16 +88,16 @@ pub(crate) fn fsst_decode_views(
 mod tests {
     use std::sync::LazyLock;
 
-    use rand::RngExt;
+    use rand::Rng;
     use rand::SeedableRng;
     use rand::prelude::StdRng;
     use vortex_array::ArrayRef;
     use vortex_array::IntoArray;
+    use vortex_array::ToCanonical;
     use vortex_array::VortexSessionExecute;
     use vortex_array::accessor::ArrayAccessor;
     use vortex_array::arrays::ChunkedArray;
     use vortex_array::arrays::VarBinArray;
-    use vortex_array::arrays::VarBinViewArray;
     use vortex_array::builders::ArrayBuilder;
     use vortex_array::builders::VarBinViewBuilder;
     use vortex_array::dtype::DType;
@@ -148,17 +146,12 @@ mod tests {
     }
 
     fn make_data_chunked() -> (ChunkedArray, Vec<Option<Vec<u8>>>) {
-        let mut ctx = SESSION.create_execution_ctx();
-        #[expect(clippy::type_complexity)]
+        #[allow(clippy::type_complexity)]
         let (arr_vec, data_vec): (Vec<ArrayRef>, Vec<Vec<Option<Vec<u8>>>>) = (0..10)
             .map(|_| {
                 let (array, data) = make_data();
                 let compressor = fsst_train_compressor(&array);
-                (
-                    fsst_compress(&array, array.len(), array.dtype(), &compressor, &mut ctx)
-                        .into_array(),
-                    data,
-                )
+                (fsst_compress(&array, &compressor).into_array(), data)
             })
             .unzip();
 
@@ -170,15 +163,11 @@ mod tests {
 
     #[test]
     fn test_to_canonical() -> VortexResult<()> {
-        let mut ctx = SESSION.create_execution_ctx();
         let (chunked_arr, data) = make_data_chunked();
 
         let mut builder =
             VarBinViewBuilder::with_capacity(chunked_arr.dtype().clone(), chunked_arr.len());
-        chunked_arr
-            .clone()
-            .into_array()
-            .append_to_builder(&mut builder, &mut ctx)?;
+        chunked_arr.append_to_builder(&mut builder, &mut SESSION.create_execution_ctx())?;
 
         {
             let arr = builder.finish_into_canonical().into_varbinview();
@@ -188,39 +177,11 @@ mod tests {
         };
 
         {
-            let arr2 = chunked_arr
-                .as_array()
-                .clone()
-                .execute::<VarBinViewArray>(&mut ctx)?;
+            let arr2 = chunked_arr.to_varbinview();
             let res2 =
                 arr2.with_iterator(|iter| iter.map(|b| b.map(|v| v.to_vec())).collect::<Vec<_>>());
             assert_eq!(data, res2)
         };
-        Ok(())
-    }
-
-    #[test]
-    fn test_append_after_in_progress_buffer() -> VortexResult<()> {
-        let dtype = DType::Binary(Nullability::NonNullable);
-        let mut builder = VarBinViewBuilder::with_capacity(dtype.clone(), 2);
-        builder.append_value(b"long enough!!!");
-
-        let varbin = VarBinArray::from_iter(
-            [Some(b"long enough too".to_vec().into_boxed_slice())],
-            dtype,
-        );
-        let mut ctx = SESSION.create_execution_ctx();
-        let fsst_array = fsst_compress(
-            &varbin,
-            varbin.len(),
-            varbin.dtype(),
-            &fsst_train_compressor(&varbin),
-            &mut ctx,
-        )
-        .into_array();
-        fsst_array.append_to_builder(&mut builder, &mut ctx)?;
-
-        let _result = builder.finish_into_varbinview();
         Ok(())
     }
 }

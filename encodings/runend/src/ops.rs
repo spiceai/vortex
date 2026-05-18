@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use vortex_array::ArrayRef;
-use vortex_array::ArrayView;
-use vortex_array::ExecutionCtx;
+use vortex_array::Array;
 use vortex_array::scalar::PValue;
 use vortex_array::scalar::Scalar;
 use vortex_array::search_sorted::SearchResult;
@@ -12,18 +10,12 @@ use vortex_array::search_sorted::SearchSortedSide;
 use vortex_array::vtable::OperationsVTable;
 use vortex_error::VortexResult;
 
-use crate::RunEnd;
-use crate::array::RunEndArrayExt;
+use crate::RunEndArray;
+use crate::RunEndVTable;
 
-impl OperationsVTable<RunEnd> for RunEnd {
-    fn scalar_at(
-        array: ArrayView<'_, RunEnd>,
-        index: usize,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<Scalar> {
-        array
-            .values()
-            .execute_scalar(array.find_physical_index(index)?, ctx)
+impl OperationsVTable<RunEndVTable> for RunEndVTable {
+    fn scalar_at(array: &RunEndArray, index: usize) -> VortexResult<Scalar> {
+        array.values().scalar_at(array.find_physical_index(index)?)
     }
 }
 
@@ -31,7 +23,7 @@ impl OperationsVTable<RunEnd> for RunEnd {
 ///
 /// If the index exists in the array we want to take that position (as we are searching from the right)
 /// otherwise we want to take the next one
-pub(crate) fn find_slice_end_index(array: &ArrayRef, index: usize) -> VortexResult<usize> {
+pub(crate) fn find_slice_end_index(array: &dyn Array, index: usize) -> VortexResult<usize> {
     let result = array
         .as_primitive_typed()
         .search_sorted(&PValue::from(index), SearchSortedSide::Right)?;
@@ -50,26 +42,25 @@ pub(crate) fn find_slice_end_index(array: &ArrayRef, index: usize) -> VortexResu
 #[cfg(test)]
 mod tests {
 
+    use vortex_array::Array;
     use vortex_array::IntoArray;
-    use vortex_array::LEGACY_SESSION;
-    use vortex_array::VortexSessionExecute;
-    use vortex_array::aggregate_fn::fns::is_constant::is_constant;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::assert_arrays_eq;
+    use vortex_array::compute::Cost;
+    use vortex_array::compute::IsConstantOpts;
+    use vortex_array::compute::is_constant_opts;
     use vortex_array::dtype::DType;
     use vortex_array::dtype::Nullability;
     use vortex_array::dtype::PType;
     use vortex_buffer::buffer;
 
-    use crate::RunEnd;
+    use crate::RunEndArray;
 
     #[test]
     fn slice_array() {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
-        let arr = RunEnd::try_new(
+        let arr = RunEndArray::try_new(
             buffer![2u32, 5, 10].into_array(),
             buffer![1i32, 2, 3].into_array(),
-            &mut ctx,
         )
         .unwrap()
         .slice(3..8)
@@ -86,11 +77,9 @@ mod tests {
 
     #[test]
     fn double_slice() {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
-        let arr = RunEnd::try_new(
+        let arr = RunEndArray::try_new(
             buffer![2u32, 5, 10].into_array(),
             buffer![1i32, 2, 3].into_array(),
-            &mut ctx,
         )
         .unwrap()
         .slice(3..8)
@@ -105,11 +94,9 @@ mod tests {
 
     #[test]
     fn slice_end_inclusive() {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
-        let arr = RunEnd::try_new(
+        let arr = RunEndArray::try_new(
             buffer![2u32, 5, 10].into_array(),
             buffer![1i32, 2, 3].into_array(),
-            &mut ctx,
         )
         .unwrap()
         .slice(4..10)
@@ -126,11 +113,9 @@ mod tests {
 
     #[test]
     fn slice_at_end() {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
-        let re_array = RunEnd::try_new(
+        let re_array = RunEndArray::try_new(
             buffer![7_u64, 10].into_array(),
             buffer![2_u64, 3].into_array(),
-            &mut ctx,
         )
         .unwrap();
 
@@ -142,11 +127,9 @@ mod tests {
 
     #[test]
     fn slice_single_end() {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
-        let re_array = RunEnd::try_new(
+        let re_array = RunEndArray::try_new(
             buffer![7_u64, 10].into_array(),
             buffer![2_u64, 3].into_array(),
-            &mut ctx,
         )
         .unwrap();
 
@@ -154,31 +137,35 @@ mod tests {
 
         let sliced_array = re_array.slice(2..5).unwrap();
 
-        assert!(is_constant(&sliced_array, &mut ctx).unwrap())
+        assert!(
+            is_constant_opts(
+                &sliced_array,
+                &IsConstantOpts {
+                    cost: Cost::Canonicalize
+                }
+            )
+            .unwrap()
+            .unwrap_or_default()
+        )
     }
 
     #[test]
     fn ree_scalar_at_end() {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
-        let scalar = RunEnd::encode(
-            buffer![1, 1, 1, 4, 4, 4, 2, 2, 5, 5, 5, 5].into_array(),
-            &mut ctx,
-        )
-        .unwrap()
-        .execute_scalar(11, &mut ctx)
-        .unwrap();
+        let scalar = RunEndArray::encode(buffer![1, 1, 1, 4, 4, 4, 2, 2, 5, 5, 5, 5].into_array())
+            .unwrap()
+            .scalar_at(11)
+            .unwrap();
         assert_eq!(scalar, 5.into());
     }
 
     #[test]
+    #[allow(clippy::cognitive_complexity)]
     fn slice_along_run_boundaries() {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
         // Create a runend array with runs: [1, 1, 1] [4, 4, 4] [2, 2] [5, 5, 5, 5]
         // Run ends at indices: 3, 6, 8, 12
-        let arr = RunEnd::try_new(
+        let arr = RunEndArray::try_new(
             buffer![3u32, 6, 8, 12].into_array(),
             buffer![1i32, 4, 2, 5].into_array(),
-            &mut ctx,
         )
         .unwrap();
 

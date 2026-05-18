@@ -3,11 +3,11 @@
 
 use std::fmt::Formatter;
 
+use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_session::VortexSession;
 
 use crate::ArrayRef;
-use crate::ExecutionCtx;
 use crate::IntoArray;
 use crate::arrays::ConstantArray;
 use crate::builtins::ArrayBuiltins;
@@ -34,7 +34,7 @@ impl ScalarFnVTable for IsNull {
     type Options = EmptyOptions;
 
     fn id(&self) -> ScalarFnId {
-        ScalarFnId::from("vortex.is_null")
+        ScalarFnId::new_ref("is_null")
     }
 
     fn serialize(&self, _instance: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
@@ -75,22 +75,17 @@ impl ScalarFnVTable for IsNull {
         Ok(DType::Bool(Nullability::NonNullable))
     }
 
-    fn execute(
-        &self,
-        _data: &Self::Options,
-        args: &dyn ExecutionArgs,
-        _ctx: &mut ExecutionCtx,
-    ) -> VortexResult<ArrayRef> {
-        let child = args.get(0)?;
+    fn execute(&self, _data: &Self::Options, mut args: ExecutionArgs) -> VortexResult<ArrayRef> {
+        let child = args.inputs.pop().vortex_expect("Missing input child");
         if let Some(scalar) = child.as_constant() {
-            return Ok(ConstantArray::new(scalar.is_null(), args.row_count()).into_array());
+            return Ok(ConstantArray::new(scalar.is_null(), args.row_count).into_array());
         }
 
         match child.validity()? {
             Validity::NonNullable | Validity::AllValid => {
-                Ok(ConstantArray::new(false, args.row_count()).into_array())
+                Ok(ConstantArray::new(false, args.row_count).into_array())
             }
-            Validity::AllInvalid => Ok(ConstantArray::new(true, args.row_count()).into_array()),
+            Validity::AllInvalid => Ok(ConstantArray::new(true, args.row_count).into_array()),
             Validity::Array(a) => a.not(),
         }
     }
@@ -122,8 +117,6 @@ mod tests {
     use vortex_utils::aliases::hash_set::HashSet;
 
     use crate::IntoArray;
-    use crate::LEGACY_SESSION;
-    use crate::VortexSessionExecute;
     use crate::arrays::PrimitiveArray;
     use crate::arrays::StructArray;
     use crate::dtype::DType;
@@ -172,9 +165,7 @@ mod tests {
 
         for (i, expected_value) in expected.iter().enumerate() {
             assert_eq!(
-                result
-                    .execute_scalar(i, &mut LEGACY_SESSION.create_execution_ctx())
-                    .unwrap(),
+                result.scalar_at(i).unwrap(),
                 Scalar::bool(*expected_value, Nullability::NonNullable)
             );
         }
@@ -190,9 +181,7 @@ mod tests {
         // All values should be false (non-nullable input)
         for i in 0..result.len() {
             assert_eq!(
-                result
-                    .execute_scalar(i, &mut LEGACY_SESSION.create_execution_ctx())
-                    .unwrap(),
+                result.scalar_at(i).unwrap(),
                 Scalar::bool(false, Nullability::NonNullable)
             );
         }
@@ -210,9 +199,7 @@ mod tests {
         // All values should be true (all nulls)
         for i in 0..result.len() {
             assert_eq!(
-                result
-                    .execute_scalar(i, &mut LEGACY_SESSION.create_execution_ctx())
-                    .unwrap(),
+                result.scalar_at(i).unwrap(),
                 Scalar::bool(true, Nullability::NonNullable)
             );
         }
@@ -239,9 +226,7 @@ mod tests {
 
         for (i, expected_value) in expected.iter().enumerate() {
             assert_eq!(
-                result
-                    .execute_scalar(i, &mut LEGACY_SESSION.create_execution_ctx())
-                    .unwrap(),
+                result.scalar_at(i).unwrap(),
                 Scalar::bool(*expected_value, Nullability::NonNullable)
             );
         }

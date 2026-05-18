@@ -10,11 +10,8 @@ use arbitrary::Arbitrary;
 use arbitrary::Result;
 use arbitrary::Unstructured;
 use vortex_array::ArrayRef;
-use vortex_array::Canonical;
 use vortex_array::IntoArray;
-use vortex_array::LEGACY_SESSION;
-use vortex_array::VortexSessionExecute;
-use vortex_array::arrays::dict::ArbitraryDictArray;
+use vortex_array::arrays::ArbitraryDictArray;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
 use vortex_error::vortex_err;
@@ -96,6 +93,7 @@ fn arbitrary_gpu_primitive_dtype(u: &mut Unstructured) -> Result<vortex_array::d
 /// - `Ok(true)` - test passed, keep in corpus
 /// - `Ok(false)` - test skipped (e.g., no CUDA), reject from corpus
 /// - `Err(_)` - a bug was found
+#[allow(clippy::result_large_err)]
 pub async fn run_compress_gpu(fuzz: FuzzCompressGpu) -> VortexFuzzResult<bool> {
     use vortex_cuda::CanonicalCudaExt;
     use vortex_cuda::CudaSession;
@@ -113,10 +111,7 @@ pub async fn run_compress_gpu(fuzz: FuzzCompressGpu) -> VortexFuzzResult<bool> {
 
     let original_len = array.len();
 
-    let cpu_canonical = match array
-        .clone()
-        .execute::<Canonical>(&mut LEGACY_SESSION.create_execution_ctx())
-    {
+    let cpu_canonical = match array.to_canonical() {
         Ok(c) => c,
         Err(e) => {
             return Err(VortexFuzzError::VortexError(e, Backtrace::capture()));
@@ -165,10 +160,10 @@ pub async fn run_compress_gpu(fuzz: FuzzCompressGpu) -> VortexFuzzResult<bool> {
 
     for i in 0..original_len {
         let cpu_scalar = cpu_array
-            .execute_scalar(i, &mut LEGACY_SESSION.create_execution_ctx())
+            .scalar_at(i)
             .map_err(|e| VortexFuzzError::VortexError(e, Backtrace::capture()))?;
         let gpu_scalar = gpu_array
-            .execute_scalar(i, &mut LEGACY_SESSION.create_execution_ctx())
+            .scalar_at(i)
             .map_err(|e| VortexFuzzError::VortexError(e, Backtrace::capture()))?;
 
         if cpu_scalar != gpu_scalar {

@@ -18,11 +18,8 @@ all-features = true
 
 [dependencies]
 arcref = { workspace = true }
-arrow-array = { workspace = true }
-arrow-schema = { workspace = true }
 async-stream = { workspace = true }
 async-trait = { workspace = true }
-bit-vec = { workspace = true }
 flatbuffers = { workspace = true }
 futures = { workspace = true, features = ["alloc", "async-await", "executor"] }
 itertools = { workspace = true }
@@ -35,10 +32,10 @@ paste = { workspace = true }
 pin-project-lite = { workspace = true }
 prost = { workspace = true }
 rustc-hash = { workspace = true }
-sketches-ddsketch = { workspace = true }
 termtree = { workspace = true }
 tokio = { workspace = true, features = ["rt"], optional = true }
 tracing = { workspace = true }
+uuid = { workspace = true }
 vortex-array = { workspace = true }
 vortex-btrblocks = { workspace = true }
 vortex-buffer = { workspace = true }
@@ -47,8 +44,6 @@ vortex-flatbuffers = { workspace = true, features = ["layout"] }
 vortex-io = { workspace = true }
 vortex-mask = { workspace = true }
 vortex-metrics = { workspace = true }
-vortex-runend = { workspace = true }
-vortex-scan = { workspace = true }
 vortex-sequence = { workspace = true }
 vortex-session = { workspace = true }
 vortex-utils = { workspace = true, features = ["dashmap"] }
@@ -56,10 +51,10 @@ vortex-utils = { workspace = true, features = ["dashmap"] }
 [dev-dependencies]
 futures = { workspace = true, features = ["executor"] }
 rstest = { workspace = true }
-temp-env = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros"] }
 vortex-array = { path = "../vortex-array", features = ["_test-harness"] }
 vortex-io = { path = "../vortex-io", features = ["tokio"] }
+vortex-utils = { workspace = true, features = ["_test-harness"] }
 
 [features]
 _test-harness = []

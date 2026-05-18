@@ -15,7 +15,7 @@ use arrow_schema::Fields;
 use arrow_schema::Schema;
 use async_trait::async_trait;
 use parquet::arrow::ArrowWriter;
-use rand::RngExt;
+use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 
@@ -92,7 +92,7 @@ pub async fn nested_structs_parquet() -> Result<PathBuf> {
             ]));
 
             let file = std::fs::File::create(&temp_path)?;
-            let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None)?;
+            let mut writer = ArrowWriter::try_new(file, schema.clone(), None)?;
             let mut rng = StdRng::seed_from_u64(42);
 
             for batch_start in (0..ROW_COUNT).step_by(BATCH_SIZE) {
@@ -124,10 +124,8 @@ pub async fn nested_structs_parquet() -> Result<PathBuf> {
                     None,
                 )?;
 
-                let batch = RecordBatch::try_new(
-                    Arc::clone(&schema),
-                    vec![Arc::new(ids), Arc::new(outer)],
-                )?;
+                let batch =
+                    RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(outer)])?;
                 writer.write(&batch)?;
             }
 

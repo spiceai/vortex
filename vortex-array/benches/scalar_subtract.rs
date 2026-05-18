@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-#![expect(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used)]
 
 use divan::Bencher;
-use rand::RngExt;
+use rand::Rng;
 use rand::SeedableRng;
 use rand::distr::Uniform;
 use rand::rngs::StdRng;
@@ -44,7 +44,7 @@ fn scalar_subtract(bencher: Bencher) {
         .with_inputs(|| (&chunked, LEGACY_SESSION.create_execution_ctx()))
         .bench_refs(|(chunked, ctx)| {
             chunked
-                .clone()
+                .to_array()
                 .binary(
                     ConstantArray::new(
                         vortex_array::scalar::Scalar::from(to_subtract),

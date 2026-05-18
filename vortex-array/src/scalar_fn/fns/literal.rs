@@ -10,7 +10,6 @@ use vortex_proto::expr as pb;
 use vortex_session::VortexSession;
 
 use crate::ArrayRef;
-use crate::ExecutionCtx;
 use crate::IntoArray;
 use crate::arrays::ConstantArray;
 use crate::dtype::DType;
@@ -38,7 +37,7 @@ impl ScalarFnVTable for Literal {
     type Options = Scalar;
 
     fn id(&self) -> ScalarFnId {
-        ScalarFnId::from("vortex.literal")
+        ScalarFnId::new_ref("vortex.literal")
     }
 
     fn serialize(&self, instance: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
@@ -85,13 +84,8 @@ impl ScalarFnVTable for Literal {
         Ok(options.dtype().clone())
     }
 
-    fn execute(
-        &self,
-        scalar: &Scalar,
-        args: &dyn ExecutionArgs,
-        _ctx: &mut ExecutionCtx,
-    ) -> VortexResult<ArrayRef> {
-        Ok(ConstantArray::new(scalar.clone(), args.row_count()).into_array())
+    fn execute(&self, scalar: &Scalar, args: ExecutionArgs) -> VortexResult<ArrayRef> {
+        Ok(ConstantArray::new(scalar.clone(), args.row_count).into_array())
     }
 
     fn stat_expression(

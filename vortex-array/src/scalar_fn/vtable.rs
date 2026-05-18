@@ -13,7 +13,6 @@ use arcref::ArcRef;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
-use vortex_error::vortex_err;
 use vortex_session::VortexSession;
 
 use crate::ArrayRef;
@@ -22,9 +21,9 @@ use crate::dtype::DType;
 use crate::expr::Expression;
 use crate::expr::StatsCatalog;
 use crate::expr::stats::Stat;
+use crate::scalar_fn::ScalarFn;
 use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::ScalarFnRef;
-use crate::scalar_fn::TypedScalarFnInstance;
 
 /// This trait defines the interface for scalar function vtables, including methods for
 /// serialization, deserialization, validation, child naming, return type computation,
@@ -68,7 +67,7 @@ pub trait ScalarFnVTable: 'static + Sized + Clone + Send + Sync {
     /// Returns the name of the nth child of the expr.
     fn child_name(&self, options: &Self::Options, child_idx: usize) -> ChildName;
 
-    /// Format this expression in a nice human-readable SQL-style format
+    /// Format this expression in nice human-readable SQL-style format
     ///
     /// The implementation should recursively format child expressions by calling
     /// `expr.child(i).fmt_sql(f)`.
@@ -79,30 +78,8 @@ pub trait ScalarFnVTable: 'static + Sized + Clone + Send + Sync {
         f: &mut Formatter<'_>,
     ) -> fmt::Result;
 
-    /// Coerce the arguments of this function.
-    ///
-    /// This is optionally used by Vortex users when performing type coercion over a Vortex
-    /// expression. Note that direct Vortex query engine integrations (e.g. DuckDB, DataFusion,
-    /// etc.) do not perform type coercion and rely on the engine's own logical planner.
-    ///
-    /// Note that the default implementation simply returns the arguments without coercion, and it
-    /// is expected that the [`ScalarFnVTable::return_dtype`] call may still fail.
-    fn coerce_args(&self, options: &Self::Options, args: &[DType]) -> VortexResult<Vec<DType>> {
-        let _ = options;
-        Ok(args.to_vec())
-    }
-
     /// Compute the return [`DType`] of the expression if evaluated over the given input types.
-    ///
-    /// # Preconditions
-    ///
-    /// The length of `args` must match the [`Arity`] of this function. Callers are responsible
-    /// for validating this (e.g., [`Expression::try_new`] checks arity at construction time).
-    /// Implementations may assume correct arity and will panic or return nonsensical results if
-    /// violated.
-    ///
-    /// [`Expression::try_new`]: crate::expr::Expression::try_new
-    fn return_dtype(&self, options: &Self::Options, args: &[DType]) -> VortexResult<DType>;
+    fn return_dtype(&self, options: &Self::Options, arg_dtypes: &[DType]) -> VortexResult<DType>;
 
     /// Execute the expression over the input arguments.
     ///
@@ -115,12 +92,7 @@ pub trait ScalarFnVTable: 'static + Sized + Clone + Send + Sync {
     ///
     /// This provides maximum opportunities for array-level optimizations using execute_parent
     /// kernels.
-    fn execute(
-        &self,
-        options: &Self::Options,
-        args: &dyn ExecutionArgs,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<ArrayRef>;
+    fn execute(&self, options: &Self::Options, args: ExecutionArgs) -> VortexResult<ArrayRef>;
 
     /// Implement an abstract reduction rule over a tree of scalar functions.
     ///
@@ -227,25 +199,12 @@ pub trait ScalarFnVTable: 'static + Sized + Clone + Send + Sync {
         true
     }
 
-    /// Returns whether this expression is semantically fallible. Conservatively defaults to
-    /// `true`.
+    /// Returns whether this expression itself is fallible. Conservatively default to *true*.
     ///
-    /// An expression is semantically fallible if there exists a set of well-typed inputs that
-    /// causes the expression to produce an error as part of its _defined behavior_. For example,
-    /// `checked_add` is fallible because integer overflow is a domain error, and division is
-    /// fallible because of division by zero.
+    /// An expression is runtime fallible is there is an input set that causes the expression to
+    /// panic or return an error, for example checked_add is fallible if there is overflow.
     ///
-    /// This does **not** include execution errors that are incidental to the implementation, such
-    /// as canonicalization failures, memory allocation errors, or encoding mismatches. Those can
-    /// happen to any expression and are not what this method captures.
-    ///
-    /// This property is used by optimizations that speculatively evaluate an expression over values
-    /// that may not appear in the actual input. For example, pushing a scalar function down to a
-    /// dictionary's values array is only safe when the function is infallible or all values are
-    /// referenced, since a fallible function might error on a value left unreferenced after
-    /// slicing that would never be encountered during normal evaluation.
-    ///
-    /// Note: this is only applicable to expressions that pass type-checking via
+    /// Note: this is only applicable to expressions that pass type-checking
     /// [`ScalarFnVTable::return_dtype`].
     fn is_fallible(&self, options: &Self::Options) -> bool {
         _ = options;
@@ -332,48 +291,13 @@ pub trait SimplifyCtx {
 }
 
 /// Arguments for expression execution.
-pub trait ExecutionArgs {
-    /// Returns the input array at the given index.
-    fn get(&self, index: usize) -> VortexResult<ArrayRef>;
-
-    /// Returns the number of inputs.
-    fn num_inputs(&self) -> usize;
-
-    /// Returns the row count of the execution scope.
-    fn row_count(&self) -> usize;
-}
-
-/// A concrete [`ExecutionArgs`] backed by a `Vec<ArrayRef>`.
-pub struct VecExecutionArgs {
-    inputs: Vec<ArrayRef>,
-    row_count: usize,
-}
-
-impl VecExecutionArgs {
-    /// Create a new `VecExecutionArgs`.
-    pub fn new(inputs: Vec<ArrayRef>, row_count: usize) -> Self {
-        Self { inputs, row_count }
-    }
-}
-
-impl ExecutionArgs for VecExecutionArgs {
-    fn get(&self, index: usize) -> VortexResult<ArrayRef> {
-        self.inputs.get(index).cloned().ok_or_else(|| {
-            vortex_err!(
-                "Input index {} out of bounds (num_inputs={})",
-                index,
-                self.inputs.len()
-            )
-        })
-    }
-
-    fn num_inputs(&self) -> usize {
-        self.inputs.len()
-    }
-
-    fn row_count(&self) -> usize {
-        self.row_count
-    }
+pub struct ExecutionArgs<'a> {
+    /// The inputs for the expression, one per child.
+    pub inputs: Vec<ArrayRef>,
+    /// The row count of the execution scope.
+    pub row_count: usize,
+    /// The execution context.
+    pub ctx: &'a mut ExecutionCtx,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -388,7 +312,7 @@ impl Display for EmptyOptions {
 pub trait ScalarFnVTableExt: ScalarFnVTable {
     /// Bind this vtable with the given options into a [`ScalarFnRef`].
     fn bind(&self, options: Self::Options) -> ScalarFnRef {
-        TypedScalarFnInstance::new(self.clone(), options).erased()
+        ScalarFn::new(self.clone(), options).erased()
     }
 
     /// Create a new expression with this vtable and the given options and children.

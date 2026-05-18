@@ -81,7 +81,9 @@ where
         // Attempt to acquire enough permits to begin working on a request that will occupy
         // `bytes` amount of memory when it completes.
         // Acquiring the permits is what creates backpressure for the producer.
-        let permits = Arc::clone(&self.bytes_available)
+        let permits = self
+            .bytes_available
+            .clone()
             .acquire_many_owned(bytes.try_into().vortex_expect("bytes must fit in u32"))
             .await
             .unwrap_or_else(|_| unreachable!("pushing to closed semaphore"));
@@ -100,7 +102,9 @@ where
     ///
     /// If there is not enough capacity, the original future is returned to the caller.
     pub fn try_push(&self, fut: Fut, bytes: usize) -> Result<(), Fut> {
-        match Arc::clone(&self.bytes_available)
+        match self
+            .bytes_available
+            .clone()
             .try_acquire_many_owned(bytes.try_into().vortex_expect("bytes must fit in u32"))
         {
             Ok(permits) => {
@@ -277,7 +281,7 @@ mod tests {
 
         // Push many small items
         for i in 0..10 {
-            #[expect(clippy::cast_possible_truncation)]
+            #[allow(clippy::cast_possible_truncation)]
             stream.push(async move { vec![i as u8; 5] }, 5).await;
         }
 

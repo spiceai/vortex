@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-#![expect(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used)]
 
 use std::sync::LazyLock;
 
 use divan::Bencher;
-use rand::RngExt;
+use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use vortex_array::Canonical;
 use vortex_array::IntoArray;
 use vortex_array::LEGACY_SESSION;
 use vortex_array::RecursiveCanonical;
@@ -20,6 +19,7 @@ use vortex_array::arrays::VarBinArray;
 use vortex_array::builders::ArrayBuilder;
 use vortex_array::builders::VarBinViewBuilder;
 use vortex_array::builtins::ArrayBuiltins;
+use vortex_array::compute::warm_up_vtables;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
 use vortex_array::scalar::Scalar;
@@ -30,6 +30,7 @@ use vortex_fsst::fsst_train_compressor;
 use vortex_session::VortexSession;
 
 fn main() {
+    warm_up_vtables();
     divan::main();
 }
 
@@ -57,29 +58,19 @@ fn compress_fsst(bencher: Bencher, (string_count, avg_len, unique_chars): (usize
     let array = generate_test_data(string_count, avg_len, unique_chars);
     let compressor = fsst_train_compressor(&array);
     bencher
-        .with_inputs(|| (&array, &compressor, LEGACY_SESSION.create_execution_ctx()))
-        .bench_refs(|(array, compressor, ctx)| {
-            fsst_compress(*array, array.len(), array.dtype(), compressor, ctx)
-        })
+        .with_inputs(|| (&array, &compressor))
+        .bench_refs(|(array, compressor)| fsst_compress(*array, compressor))
 }
 
 #[divan::bench(args = BENCH_ARGS)]
 fn decompress_fsst(bencher: Bencher, (string_count, avg_len, unique_chars): (usize, usize, u8)) {
     let array = generate_test_data(string_count, avg_len, unique_chars);
     let compressor = fsst_train_compressor(&array);
-    let len = array.len();
-    let dtype = array.dtype().clone();
-    let encoded = fsst_compress(
-        array,
-        len,
-        &dtype,
-        &compressor,
-        &mut LEGACY_SESSION.create_execution_ctx(),
-    );
+    let encoded = fsst_compress(array, &compressor);
 
     bencher
-        .with_inputs(|| (&encoded, LEGACY_SESSION.create_execution_ctx()))
-        .bench_refs(|(encoded, ctx)| (**encoded).clone().into_array().execute::<Canonical>(ctx))
+        .with_inputs(|| &encoded)
+        .bench_refs(|encoded| encoded.to_canonical())
 }
 
 #[divan::bench(args = BENCH_ARGS)]
@@ -94,13 +85,7 @@ fn train_compressor(bencher: Bencher, (string_count, avg_len, unique_chars): (us
 fn pushdown_compare(bencher: Bencher, (string_count, avg_len, unique_chars): (usize, usize, u8)) {
     let array = generate_test_data(string_count, avg_len, unique_chars);
     let compressor = fsst_train_compressor(&array);
-    let fsst_array = fsst_compress(
-        &array,
-        array.len(),
-        array.dtype(),
-        &compressor,
-        &mut LEGACY_SESSION.create_execution_ctx(),
-    );
+    let fsst_array = fsst_compress(&array, &compressor);
     let constant = ConstantArray::new(Scalar::from(&b"const"[..]), array.len());
 
     bencher
@@ -113,9 +98,8 @@ fn pushdown_compare(bencher: Bencher, (string_count, avg_len, unique_chars): (us
         })
         .bench_refs(|(fsst_array, constant, ctx)| {
             fsst_array
-                .clone()
-                .into_array()
-                .binary(constant.clone().into_array(), Operator::Eq)
+                .to_array()
+                .binary(constant.to_array(), Operator::Eq)
                 .unwrap()
                 .execute::<RecursiveCanonical>(ctx)
                 .unwrap();
@@ -129,13 +113,7 @@ fn canonicalize_compare(
 ) {
     let array = generate_test_data(string_count, avg_len, unique_chars);
     let compressor = fsst_train_compressor(&array);
-    let fsst_array = fsst_compress(
-        &array,
-        array.len(),
-        array.dtype(),
-        &compressor,
-        &mut LEGACY_SESSION.create_execution_ctx(),
-    );
+    let fsst_array = fsst_compress(&array, &compressor);
     let constant = ConstantArray::new(Scalar::from(&b"const"[..]), array.len());
 
     bencher
@@ -147,13 +125,12 @@ fn canonicalize_compare(
             )
         })
         .bench_refs(|(fsst_array, constant, ctx)| {
-            (*fsst_array)
-                .clone()
-                .into_array()
-                .execute::<Canonical>(ctx)
+            fsst_array
+                .to_canonical()
                 .unwrap()
-                .into_array()
-                .binary(constant.clone().into_array(), Operator::Eq)
+                .as_ref()
+                .to_array()
+                .binary(constant.to_array(), Operator::Eq)
                 .unwrap()
                 .execute::<RecursiveCanonical>(ctx)
                 .unwrap();
@@ -200,8 +177,8 @@ fn chunked_into_canonical(
     let array = generate_chunked_test_data(chunk_size, string_count, avg_len, unique_chars);
 
     bencher
-        .with_inputs(|| (&array, SESSION.create_execution_ctx()))
-        .bench_refs(|(array, ctx)| (**array).clone().into_array().execute::<Canonical>(ctx));
+        .with_inputs(|| &array)
+        .bench_refs(|array| array.to_canonical());
 }
 
 /// Helper function to generate random string data.
@@ -235,14 +212,11 @@ fn generate_chunked_test_data(
     avg_len: usize,
     unique_chars: u8,
 ) -> ChunkedArray {
-    let mut ctx = LEGACY_SESSION.create_execution_ctx();
     (0..chunk_size)
         .map(|_| {
             let array = generate_test_data(string_count, avg_len, unique_chars);
             let compressor = fsst_train_compressor(&array);
-            let len = array.len();
-            let dtype = array.dtype().clone();
-            fsst_compress(array, len, &dtype, &compressor, &mut ctx).into_array()
+            fsst_compress(array, &compressor).into_array()
         })
         .collect::<ChunkedArray>()
 }

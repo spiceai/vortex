@@ -11,8 +11,6 @@
 
 [Join the community on Slack!](https://vortex.dev/slack) | [Documentation](https://docs.vortex.dev/) | [Performance Benchmarks](https://bench.vortex.dev)
 
-If you are interested in closer collaboration, please email info@vortex.dev
-
 ## Overview
 
 Vortex is a next-generation columnar file format and toolkit designed for high-performance data processing.
@@ -88,14 +86,11 @@ uv add vortex-data
 For browsing the structure of Vortex files, you can use the `vx` command-line tool.
 
 ```bash
-# Install pre-built binary (fast, recommended)
-cargo binstall vortex-tui
-
-# Or build from source
+# Install latest release
 cargo install vortex-tui --locked
 
-# Or run via Python without installing
-uvx --from vortex-data vx --help
+# Or build from source
+cargo install --path vortex-tui --locked
 
 # Usage
 vx browse <file>

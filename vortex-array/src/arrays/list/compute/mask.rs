@@ -5,19 +5,21 @@ use vortex_error::VortexResult;
 
 use crate::ArrayRef;
 use crate::IntoArray;
-use crate::array::ArrayView;
-use crate::arrays::List;
 use crate::arrays::ListArray;
-use crate::arrays::list::ListArrayExt;
+use crate::arrays::ListVTable;
 use crate::scalar_fn::fns::mask::MaskReduce;
 use crate::validity::Validity;
+use crate::vtable::ValidityHelper;
 
-impl MaskReduce for List {
-    fn mask(array: ArrayView<'_, List>, mask: &ArrayRef) -> VortexResult<Option<ArrayRef>> {
+impl MaskReduce for ListVTable {
+    fn mask(array: &ListArray, mask: &ArrayRef) -> VortexResult<Option<ArrayRef>> {
         ListArray::try_new(
             array.elements().clone(),
             array.offsets().clone(),
-            array.validity()?.and(Validity::Array(mask.clone()))?,
+            array
+                .validity()
+                .clone()
+                .and(Validity::Array(mask.clone()))?,
         )
         .map(|a| Some(a.into_array()))
     }

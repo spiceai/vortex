@@ -1,75 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Use [`VortexDataSource`] to adapt an existing Vortex [`DataSourceRef`] into
-//! a DataFusion [`DataSource`] without going through file discovery.
-//!
-//! [`VortexDataSource`] is responsible for:
-//!
-//! - exposing an Arrow schema and output statistics to DataFusion,
-//! - translating DataFusion projection, filter, and limit pushdown into a
-//!   Vortex [`ScanRequest`],
-//! - executing the Vortex scan and converting the results into Arrow
-//!   `RecordBatch` values.
-//!
-//! # Example: Create a `DataSourceExec`
-//!
-//! ```no_run
-//! use std::sync::Arc;
-//!
-//! use arrow_schema::Schema;
-//! use datafusion_datasource::source::DataSourceExec;
-//! use vortex::VortexSessionDefault;
-//! use vortex::scan::DataSourceRef;
-//! use vortex::session::VortexSession;
-//! use vortex_datafusion::v2::VortexDataSource;
-//!
-//! # #[tokio::main]
-//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! # let data_source: DataSourceRef = todo!();
-//! let data_source = VortexDataSource::builder(data_source, VortexSession::default())
-//!     .with_arrow_schema(Arc::new(Schema::empty()))
-//!     .build()
-//!     .await?;
-//!
-//! let exec = DataSourceExec::from_data_source(data_source);
-//! # let _ = exec;
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! # Execution Flow
-//!
-//! ```text
-//!             ▲
-//!             │  RecordBatch stream
-//!             │
-//! ┌───────────────────────┐
-//! │     DataSourceExec    │
-//! └───────────────────────┘
-//!             ▲
-//!             │  DataFusion pushdown
-//!             │  (projection/filter/limit)
-//! ┌───────────────────────┐
-//! │   VortexDataSource    │
-//! └───────────────────────┘
-//!             ▲
-//!             │  final ScanRequest
-//! ┌───────────────────────┐
-//! │    DataSourceRef      │
-//! └───────────────────────┘
-//! ```
-//!
-//! Compared with [`crate::VortexSource`], this path starts from an existing
-//! Vortex source rather than from DataFusion-managed file discovery.
-//!
-//! [`DataSource`]: datafusion_datasource::source::DataSource
-//! [`DataSourceRef`]: vortex::scan::DataSourceRef
-//! [`ScanRequest`]: vortex::scan::ScanRequest
+//! [`VortexDataSource`] implements DataFusion's [`DataSource`] trait, deferring scan construction
+//! to [`DataSource::open`] so that pushed-down filters and limits are included in the
+//! [`ScanRequest`]. A single DataFusion partition is used; Vortex handles internal parallelism
+//! by driving splits concurrently via [`TryStreamExt::try_flatten_unordered`].
 
 use std::any::Any;
 use std::fmt;
 use std::fmt::Formatter;
+use std::num::NonZero;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use arrow_schema::DataType;
@@ -101,6 +42,7 @@ use vortex::array::arrow::ArrowArrayExecutor;
 use vortex::dtype::DType;
 use vortex::dtype::FieldPath;
 use vortex::dtype::Nullability;
+use vortex::error::VortexExpect;
 use vortex::error::VortexResult;
 use vortex::error::vortex_bail;
 use vortex::expr::Expression;
@@ -111,10 +53,9 @@ use vortex::expr::root;
 use vortex::expr::stats::Precision;
 use vortex::expr::transform::replace;
 use vortex::io::session::RuntimeSessionExt;
-use vortex::scan::DataSourceRef;
-use vortex::scan::ScanRequest;
+use vortex::scan::api::DataSourceRef;
+use vortex::scan::api::ScanRequest;
 use vortex::session::VortexSession;
-use vortex_utils::parallelism::get_available_parallelism;
 
 use crate::convert::exprs::DefaultExpressionConvertor;
 use crate::convert::exprs::ExpressionConvertor;
@@ -122,45 +63,7 @@ use crate::convert::exprs::ProcessedProjection;
 use crate::convert::exprs::make_vortex_predicate;
 use crate::convert::stats::stats_set_to_df;
 
-/// Builder for [`VortexDataSource`].
-///
-/// Use the builder to declare how an existing Vortex
-/// [`DataSourceRef`] should appear to DataFusion.
-/// In particular, it lets you choose:
-///
-/// - the Arrow schema DataFusion should see,
-/// - an initial top-level projection if the embedding system already knows
-///   which columns are needed.
-///
-/// The resulting [`VortexDataSource`] is ready to plug into
-/// [`DataSourceExec`] or other DataFusion physical planning code.
-///
-/// # Example
-///
-/// ```no_run
-/// use std::sync::Arc;
-///
-/// use arrow_schema::Schema;
-/// use vortex::VortexSessionDefault;
-/// use vortex::scan::DataSourceRef;
-/// use vortex::session::VortexSession;
-/// use vortex_datafusion::v2::VortexDataSource;
-///
-/// # #[tokio::main]
-/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// # let data_source: DataSourceRef = todo!();
-/// let data_source = VortexDataSource::builder(data_source, VortexSession::default())
-///     .with_arrow_schema(Arc::new(Schema::empty()))
-///     .with_projection(vec![0])
-///     .build()
-///     .await?;
-/// # let _ = data_source;
-/// # Ok(())
-/// # }
-/// ```
-///
-/// [`DataSourceRef`]: vortex::scan::DataSourceRef
-/// [`DataSourceExec`]: datafusion_datasource::source::DataSourceExec
+/// A builder for a [`VortexDataSource`].
 pub struct VortexDataSourceBuilder {
     data_source: DataSourceRef,
     session: VortexSession,
@@ -170,10 +73,8 @@ pub struct VortexDataSourceBuilder {
 }
 
 impl VortexDataSourceBuilder {
-    /// Sets the Arrow schema exposed to DataFusion.
-    ///
-    /// If not specified, the builder derives an Arrow schema from the Vortex
-    /// dtype.
+    /// Manually configure an Arrow schema to use when reading from the Vortex source.
+    /// If not specified, the data source will infer an Arrow schema from the Vortex DType.
     ///
     /// Note that this schema is not validated against the Vortex DType so any errors will be
     /// deferred until read time.
@@ -182,26 +83,24 @@ impl VortexDataSourceBuilder {
         self
     }
 
-    /// Configures an initial top-level projection.
-    ///
-    /// This is useful when the embedding system already knows which columns are
-    /// needed before DataFusion applies its own optimizer pushdown.
+    /// Configure an initial projection using top-level field indices.
     pub fn with_projection(mut self, indices: Vec<usize>) -> Self {
         self.projection = Some(indices);
         self
     }
 
-    /// Like [`Self::with_projection`], but accepts an optional projection.
+    /// Configure an initial projection using top-level field indices.
     pub fn with_some_projection(mut self, indices: Option<Vec<usize>>) -> Self {
         self.projection = indices;
         self
     }
 
-    /// Builds the [`VortexDataSource`].
+    /// Build the [`VortexDataSource`].
     ///
-    /// The builder eagerly resolves statistics for the initial projection
-    /// columns because DataFusion expects the `DataSource` to report output
-    /// statistics before execution begins.
+    /// FIXME(ngates): Note that due to the DataFusion API, this function eagerly resolves
+    ///   statistics for all projected columns. That said.. we only need to do this for aggregation
+    ///   reductions. Any stats used for pruning are handled internally. We could possibly look
+    ///   at the plan ourselves and decide whether there is any need for the stats?
     pub async fn build(self) -> VortexResult<VortexDataSource> {
         // The projection expression
         let mut projection = root();
@@ -263,11 +162,11 @@ impl VortexDataSourceBuilder {
         Ok(VortexDataSource {
             data_source: self.data_source,
             session: self.session,
-            initial_schema: Arc::clone(&arrow_schema),
+            initial_schema: arrow_schema.clone(),
             initial_projection: projection.clone(),
             initial_statistics: statistics.clone(),
             projected_projection: projection.clone(),
-            projected_schema: Arc::clone(&arrow_schema),
+            projected_schema: arrow_schema.clone(),
             projected_statistics: statistics.clone(),
             leftover_projection: None,
             leftover_schema: arrow_schema,
@@ -275,7 +174,9 @@ impl VortexDataSourceBuilder {
             filter: None,
             limit: None,
             ordered: false,
-            num_partitions: get_available_parallelism().unwrap_or(1),
+            num_partitions: std::thread::available_parallelism().unwrap_or_else(|_| {
+                NonZero::new(1).vortex_expect("available parallelism must be non-zero")
+            }),
         })
     }
 }
@@ -292,22 +193,12 @@ impl VortexDataSource {
     }
 }
 
-/// DataFusion [`DataSource`] backed by a Vortex [`DataSourceRef`].
+/// A DataFusion [`DataSource`] that defers Vortex scan construction to [`open`](DataSource::open).
 ///
-/// `VortexDataSource` is the core execution adapter for the `v2` integration.
-/// It presents DataFusion with a scanable Arrow data source while preserving the
-/// underlying Vortex source until execution time.
-///
-/// During planning, it reports the current output schema and column statistics.
-/// During execution, it builds the final Vortex [`ScanRequest`] from the
-/// current projection, pushed filters, ordering hints, and row limit.
-///
-/// This integration intentionally reports a single DataFusion output partition.
-/// Vortex then handles split-level concurrency internally by polling multiple
-/// split streams concurrently.
-///
-/// Use [`crate::VortexSource`] instead when DataFusion should discover and plan
-/// `.vortex` files on its own.
+/// Holds a [`DataSourceRef`] rather than pre-collected splits, so that filters and limits pushed
+/// down by DataFusion's optimizer are included in the [`ScanRequest`]. A single DataFusion
+/// partition is exposed; Vortex drives splits concurrently via
+/// [`TryStreamExt::try_flatten_unordered`].
 #[derive(Clone)]
 pub struct VortexDataSource {
     /// The Vortex data source.
@@ -321,7 +212,7 @@ pub struct VortexDataSource {
     /// The initial Vortex projection expression (e.g. column selection from the builder).
     initial_projection: Expression,
     /// Column statistics for the initial projection columns.
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     initial_statistics: Vec<ColumnStatistics>,
 
     // --- Phase 2: Projected (pushed into the Vortex scan) ---
@@ -356,7 +247,7 @@ pub struct VortexDataSource {
     /// We use this as a hint for how many splits to execute concurrently in `open()`, but we
     /// always declare to DataFusion that we only have a single partition so that we can
     /// internally manage concurrency and fix the problem of partition skew.
-    num_partitions: usize,
+    num_partitions: NonZeroUsize,
 }
 
 impl fmt::Debug for VortexDataSource {
@@ -394,8 +285,8 @@ impl DataSource for VortexDataSource {
             ..Default::default()
         };
 
-        let data_source = Arc::clone(&self.data_source);
-        let projected_schema = Arc::clone(&self.projected_schema);
+        let data_source = self.data_source.clone();
+        let projected_schema = self.projected_schema.clone();
         let session = self.session.clone();
         let num_partitions = self.num_partitions;
 
@@ -424,16 +315,16 @@ impl DataSource for VortexDataSource {
 
             let handle = session.handle();
             let stream = scan_streams
-                .try_flatten_unordered(Some(num_partitions * 2))
+                .try_flatten_unordered(Some(num_partitions.get() * 2))
                 .map(move |result| {
                     let session = session.clone();
-                    let schema = Arc::clone(&projected_schema);
+                    let schema = projected_schema.clone();
                     handle.spawn_cpu(move || {
                         let mut ctx = session.create_execution_ctx();
                         result.and_then(|chunk| chunk.execute_record_batch(&schema, &mut ctx))
                     })
                 })
-                .buffered(num_partitions)
+                .buffered(num_partitions.get())
                 .map(|result| result.map_err(|e| DataFusionError::External(Box::new(e))));
 
             // Apply leftover projection (expressions that couldn't be pushed into Vortex).
@@ -452,7 +343,7 @@ impl DataSource for VortexDataSource {
         .try_flatten();
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
-            Arc::clone(&self.leftover_schema),
+            self.leftover_schema.clone(),
             stream,
         )))
     }
@@ -467,7 +358,7 @@ impl DataSource for VortexDataSource {
             "VortexScanSource: projection={}",
             self.projected_projection
         )?;
-        if let Some(filter) = &self.filter {
+        if let Some(ref filter) = self.filter {
             write!(f, ", filter={filter}")?;
         }
         if let Some(limit) = self.limit {
@@ -484,7 +375,8 @@ impl DataSource for VortexDataSource {
     ) -> DFResult<Option<Arc<dyn DataSource>>> {
         // Vortex handles parallelism internally — always use a single partition.
         let mut this = self.clone();
-        this.num_partitions = target_partitions;
+        this.num_partitions = NonZero::new(target_partitions)
+            .ok_or_else(|| DataFusionError::Internal("non-zero partitions".to_string()))?;
         this.ordered |= output_ordering.is_some();
         Ok(Some(Arc::new(this)))
     }
@@ -494,16 +386,16 @@ impl DataSource for VortexDataSource {
     }
 
     fn eq_properties(&self) -> EquivalenceProperties {
-        EquivalenceProperties::new(Arc::clone(&self.leftover_schema))
+        EquivalenceProperties::new(self.leftover_schema.clone())
     }
 
     fn partition_statistics(&self, _partition: Option<usize>) -> DFResult<Statistics> {
         // FIXME(ngates): this should be adjusted based on filters. See DuckDB for heuristics,
         //  and in the future, store the selectivity stats in the session.
-        let num_rows = estimate_to_df_precision(self.data_source.row_count().as_ref());
+        let num_rows = estimate_to_df_precision(&self.data_source.row_count());
 
         // FIXME(ngates): byte size should be adjusted for the initial projection...
-        let total_byte_size = estimate_to_df_precision(self.data_source.byte_size().as_ref());
+        let total_byte_size = estimate_to_df_precision(&self.data_source.byte_size());
 
         // Column statistics must match the output schema (leftover_schema), which may differ
         // from the initial schema after try_swapping_with_projection adds computed columns.
@@ -575,11 +467,11 @@ impl DataSource for VortexDataSource {
 
         let mut this = self.clone();
         this.projected_projection = scan_projection;
-        this.projected_schema = Arc::clone(&scan_output_schema);
+        this.projected_schema = scan_output_schema.clone();
         this.projected_statistics =
             vec![ColumnStatistics::new_unknown(); scan_output_schema.fields().len()];
         this.leftover_projection = Some(leftover_projection);
-        this.leftover_schema = Arc::clone(&final_schema);
+        this.leftover_schema = final_schema.clone();
         this.leftover_statistics =
             vec![ColumnStatistics::new_unknown(); final_schema.fields().len()];
 
@@ -625,7 +517,7 @@ impl DataSource for VortexDataSource {
             .iter()
             .zip(pushdown_results.iter())
             .filter_map(|(expr, pushed)| match pushed {
-                PushedDown::Yes => Some(Arc::clone(expr)),
+                PushedDown::Yes => Some(expr.clone()),
                 PushedDown::No => None,
             })
             .collect();
@@ -650,11 +542,8 @@ impl DataSource for VortexDataSource {
     }
 }
 
-/// Convert a Vortex [`Option<Precision>`] to a DataFusion
-/// [`DataFusionPrecision`].
-///
-/// [`DataFusionPrecision`]: datafusion_common::stats::Precision
-fn estimate_to_df_precision(est: Option<&Precision<u64>>) -> DFPrecision<usize> {
+/// Convert a Vortex [`Option<Precision>`] to a DataFusion [`Precision`](DFPrecision).
+fn estimate_to_df_precision(est: &Option<Precision<u64>>) -> DFPrecision<usize> {
     match est {
         Some(Precision::Exact(v)) => DFPrecision::Exact(usize::try_from(*v).unwrap_or(usize::MAX)),
         Some(Precision::Inexact(v)) => {

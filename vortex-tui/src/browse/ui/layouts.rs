@@ -26,26 +26,30 @@ use ratatui::widgets::StatefulWidget;
 use ratatui::widgets::Table;
 use ratatui::widgets::Widget;
 use ratatui::widgets::Wrap;
+use tokio::runtime::Handle;
+use tokio::task::block_in_place;
+use vortex::array::Array;
 use vortex::array::ArrayRef;
-use vortex::array::VortexSessionExecute;
-use vortex::array::arrays::StructArray;
-use vortex::array::arrays::struct_::StructArrayExt;
+use vortex::array::MaskFuture;
+use vortex::array::ToCanonical;
 use vortex::error::VortexExpect;
-use vortex::layout::layouts::flat::Flat;
-use vortex::layout::layouts::zoned::Zoned;
+use vortex::expr::root;
+use vortex::layout::layouts::flat::FlatVTable;
+use vortex::layout::layouts::zoned::ZonedVTable;
 
 use crate::browse::app::AppState;
+use crate::browse::app::LayoutCursor;
 
 /// Render the Layouts tab.
-pub fn render_layouts(app_state: &mut AppState, area: Rect, buf: &mut Buffer) {
+pub fn render_layouts(app_state: &mut AppState<'_>, area: Rect, buf: &mut Buffer) {
     let [header_area, detail_area] =
         Layout::vertical([Constraint::Length(10), Constraint::Min(1)]).areas(area);
 
     // Render the header area.
-    render_layout_header(app_state, header_area, buf);
+    render_layout_header(&app_state.cursor, header_area, buf);
 
     // Render the list view if the layout has children
-    if app_state.cursor.layout().is::<Flat>() {
+    if app_state.cursor.layout().is::<FlatVTable>() {
         render_array(
             app_state,
             detail_area,
@@ -57,8 +61,7 @@ pub fn render_layouts(app_state: &mut AppState, area: Rect, buf: &mut Buffer) {
     }
 }
 
-fn render_layout_header(app: &AppState, area: Rect, buf: &mut Buffer) {
-    let cursor = &app.cursor;
+fn render_layout_header(cursor: &LayoutCursor, area: Rect, buf: &mut Buffer) {
     let layout_id = cursor.layout().encoding_id();
     let row_count = cursor.layout().row_count();
     let size_formatter = make_format(DECIMAL);
@@ -74,20 +77,18 @@ fn render_layout_header(app: &AppState, area: Rect, buf: &mut Buffer) {
         Text::from(format!("Segment data size: {size}")).bold(),
     ];
 
-    if cursor.layout().is::<Flat>() {
-        if let Some(fb_size) = app.cached_flatbuffer_size {
-            rows.push(Text::from(format!(
-                "FlatBuffer Size: {}",
-                size_formatter(fb_size)
-            )));
-        }
+    if cursor.layout().is::<FlatVTable>() {
+        rows.push(Text::from(format!(
+            "FlatBuffer Size: {}",
+            size_formatter(cursor.flatbuffer_size())
+        )));
 
         // Display metadata info about the flat layout
         let metadata_info = cursor.flat_layout_metadata_info();
         rows.push(Text::from(metadata_info));
     }
 
-    if let Some(layout) = cursor.layout().as_opt::<Zoned>() {
+    if let Some(layout) = cursor.layout().as_opt::<ZonedVTable>() {
         // Push any zone stats.
         let mut line = String::new();
         line.push_str("Statistics: ");
@@ -113,19 +114,29 @@ fn render_layout_header(app: &AppState, area: Rect, buf: &mut Buffer) {
 }
 
 /// Render the inner Array for a FlatLayout.
-fn render_array(app: &AppState, area: Rect, buf: &mut Buffer, is_stats_table: bool) {
-    // Array data is loaded eagerly when navigating to a FlatLayout (synchronously on
-    // native, asynchronously on WASM) and cached in AppState. The render loop never
-    // performs I/O.
-    let array = match app.cached_flat_array.as_ref() {
-        Some(arr) => arr.clone(),
-        None => {
-            let loading =
-                Paragraph::new("Loading array data...").style(Style::default().fg(Color::DarkGray));
-            Widget::render(loading, area, buf);
-            return;
-        }
-    };
+fn render_array(app: &AppState<'_>, area: Rect, buf: &mut Buffer, is_stats_table: bool) {
+    let row_count = app.cursor.layout().row_count();
+    let reader = app
+        .cursor
+        .layout()
+        .new_reader("".into(), app.vxf.segment_source(), app.session)
+        .vortex_expect("Failed to create reader");
+
+    // FIXME(ngates): our TUI app should never perform I/O in the render loop...
+    let array = block_in_place(|| {
+        Handle::current().block_on(
+            reader
+                .projection_evaluation(
+                    &(0..row_count),
+                    &root(),
+                    MaskFuture::new_true(
+                        usize::try_from(row_count).vortex_expect("row_count overflowed usize"),
+                    ),
+                )
+                .vortex_expect("Failed to construct projection"),
+        )
+    })
+    .vortex_expect("Failed to read flat array");
 
     // Show the metadata as JSON. (show count of encoded bytes as well)
     // let metadata_size = array.metadata_bytes().unwrap_or_default().len();
@@ -141,22 +152,14 @@ fn render_array(app: &AppState, area: Rect, buf: &mut Buffer, is_stats_table: bo
 
     if is_stats_table {
         // Render the stats table horizontally
-        let mut ctx = app.session.create_execution_ctx();
-        let struct_array = array
-            .clone()
-            .execute::<StructArray>(&mut ctx)
-            .vortex_expect("failed to canonicalize stats array to StructArray");
+        let struct_array = array.to_struct();
         // add 1 for the chunk column
         let field_count = struct_array.struct_fields().nfields() + 1;
         let header = std::iter::once("chunk")
             .chain(struct_array.names().iter().map(|x| x.as_ref()))
             .map(Cell::from)
             .collect::<Row>()
-            .style(
-                Style::default()
-                    .fg(Color::Rgb(206, 229, 98))
-                    .bg(Color::DarkGray),
-            )
+            .style(Style::default().fg(Color::Green).bg(Color::DarkGray))
             .height(1);
 
         assert_eq!(app.cursor.dtype(), array.dtype());
@@ -164,18 +167,17 @@ fn render_array(app: &AppState, area: Rect, buf: &mut Buffer, is_stats_table: bo
         let field_arrays: Vec<ArrayRef> = struct_array.unmasked_fields().to_vec();
 
         // TODO: trim the number of displayed rows and allow paging through column stats.
-        let mut rows = Vec::with_capacity(array.len());
-        for chunk_id in 0..array.len() {
-            let mut cells: Vec<Cell> = Vec::with_capacity(field_count);
-            cells.push(Cell::from(Text::from(format!("{chunk_id}"))));
-            for arr in &field_arrays {
-                let scalar = arr
-                    .execute_scalar(chunk_id, &mut ctx)
-                    .vortex_expect("scalar_at failed");
-                cells.push(Cell::from(Text::from(scalar.to_string())));
-            }
-            rows.push(cells.into_iter().collect::<Row>());
-        }
+        let rows = (0..array.len()).map(|chunk_id| {
+            std::iter::once(Cell::from(Text::from(format!("{chunk_id}"))))
+                .chain(field_arrays.iter().map(|arr| {
+                    Cell::from(Text::from(
+                        arr.scalar_at(chunk_id)
+                            .vortex_expect("scalar_at failed")
+                            .to_string(),
+                    ))
+                }))
+                .collect::<Row>()
+        });
 
         Widget::render(
             Table::new(rows, (0..field_count).map(|_| Constraint::Min(6))).header(header),
@@ -302,12 +304,7 @@ fn render_child_list_items(
 
     // Render the List view.
     StatefulWidget::render(
-        List::new(list_items).highlight_style(
-            Style::default()
-                .fg(Color::Rgb(16, 16, 16))
-                .bg(Color::Rgb(89, 113, 253))
-                .bold(),
-        ),
+        List::new(list_items).highlight_style(Style::default().black().on_white().bold()),
         inner_area,
         buf,
         &mut app.layouts_list_state,

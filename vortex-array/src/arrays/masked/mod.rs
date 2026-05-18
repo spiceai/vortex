@@ -2,11 +2,7 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 mod array;
-pub use array::MaskedArrayExt;
-pub use array::MaskedArraySlotsExt;
-pub use array::MaskedData;
-pub use array::MaskedSlots;
-pub use vtable::MaskedArray;
+pub use array::MaskedArray;
 
 pub(crate) mod compute;
 mod execute;
@@ -14,7 +10,7 @@ mod execute;
 pub use execute::mask_validity_canonical;
 
 mod vtable;
-pub use vtable::Masked;
+pub use vtable::MaskedVTable;
 
 #[cfg(test)]
 mod tests;

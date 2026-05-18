@@ -3,27 +3,24 @@
 
 use vortex_error::VortexResult;
 
-use super::Dict;
 use super::DictArray;
+use super::DictVTable;
+use crate::Array;
 use crate::ArrayRef;
-use crate::Canonical;
 use crate::ExecutionCtx;
 use crate::IntoArray;
-use crate::array::ArrayView;
 use crate::arrays::ConstantArray;
-use crate::arrays::dict::DictArrayExt;
-use crate::arrays::dict::DictArraySlotsExt;
 use crate::builtins::ArrayBuiltins;
 use crate::scalar_fn::fns::binary::CompareKernel;
 use crate::scalar_fn::fns::operators::CompareOperator;
 use crate::scalar_fn::fns::operators::Operator;
 
-impl CompareKernel for Dict {
+impl CompareKernel for DictVTable {
     fn compare(
-        lhs: ArrayView<'_, Dict>,
-        rhs: &ArrayRef,
+        lhs: &DictArray,
+        rhs: &dyn Array,
         operator: CompareOperator,
-        ctx: &mut ExecutionCtx,
+        _ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
         // if we have more values than codes, it is faster to canonicalise first.
         if lhs.values().len() > lhs.codes().len() {
@@ -32,8 +29,8 @@ impl CompareKernel for Dict {
 
         // If the RHS is constant, then we just need to compare against our encoded values.
         if let Some(rhs) = rhs.as_constant() {
-            let compare_result = lhs.values().clone().binary(
-                ConstantArray::new(rhs, lhs.values().len()).into_array(),
+            let compare_result = lhs.values().to_array().binary(
+                ConstantArray::new(rhs, lhs.values().len()).to_array(),
                 Operator::from(operator),
             )?;
 
@@ -45,7 +42,7 @@ impl CompareKernel for Dict {
             };
 
             // We canonicalize the result because dictionary-encoded bools is dumb.
-            return Ok(Some(result.execute::<Canonical>(ctx)?.into_array()));
+            return Ok(Some(result.to_canonical()?.into_array()));
         }
 
         // It's a little more complex, but we could perform a comparison against the dictionary

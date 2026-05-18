@@ -5,12 +5,13 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+use vortex::array::Array;
 use vortex::array::ExecutionCtx;
 use vortex::array::arrays::ListViewArray;
+use vortex::array::arrays::ListViewArrayParts;
 use vortex::array::arrays::PrimitiveArray;
-use vortex::array::arrays::listview::ListViewDataParts;
 use vortex::array::match_each_integer_ptype;
-use vortex::array::validity::Validity;
+use vortex::dtype::DType;
 use vortex::dtype::IntegerPType;
 use vortex::error::VortexResult;
 use vortex::error::vortex_err;
@@ -19,7 +20,6 @@ use vortex::mask::Mask;
 use super::ConversionCache;
 use super::all_invalid;
 use super::new_array_exporter_with_flatten;
-use super::validity;
 use crate::cpp;
 use crate::duckdb::LogicalType;
 use crate::duckdb::Vector;
@@ -27,6 +27,7 @@ use crate::duckdb::VectorRef;
 use crate::exporter::ColumnExporter;
 
 struct ListViewExporter<O, S> {
+    validity: Mask,
     /// We cache the child elements of our list array so that we don't have to export it every time,
     /// and we also share it across any other exporters who want to export this array.
     ///
@@ -47,27 +48,29 @@ pub(crate) fn new_exporter(
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<Box<dyn ColumnExporter>> {
     let len = array.len();
-    let ListViewDataParts {
+    let ListViewArrayParts {
         elements_dtype,
         elements,
         offsets,
         sizes,
         validity,
-    } = array.into_data_parts();
+    } = array.into_parts();
     // Cache an `elements` vector up front so that future exports can reference it.
     let num_elements = elements.len();
-
-    if matches!(validity, Validity::AllInvalid) {
-        return Ok(all_invalid::new_exporter());
-    }
+    let nullability = validity.nullability();
     let validity = validity.to_array(len).execute::<Mask>(ctx)?;
 
-    let values_key = elements.addr();
+    if validity.all_false() {
+        let ltype = LogicalType::try_from(DType::List(elements_dtype, nullability))?;
+        return Ok(all_invalid::new_exporter(len, &ltype));
+    }
+
+    let values_key = Arc::as_ptr(&elements).addr();
     // Check if we have a cached vector and extract it if we do.
     let cached_elements = cache
         .values_cache
         .get(&values_key)
-        .map(|entry| Arc::clone(&entry.value().1));
+        .map(|entry| entry.value().1.clone());
 
     let shared_elements = match cached_elements {
         Some(elements) => elements,
@@ -85,18 +88,19 @@ pub(crate) fn new_exporter(
             let shared_elements = Arc::new(Mutex::new(duckdb_elements));
             cache
                 .values_cache
-                .insert(values_key, (elements, Arc::clone(&shared_elements)));
+                .insert(values_key, (elements.clone(), shared_elements.clone()));
 
             shared_elements
         }
     };
 
     let offsets = offsets.execute::<PrimitiveArray>(ctx)?;
-    let sizes = sizes.execute::<PrimitiveArray>(ctx)?;
+    let sizes = sizes.clone().execute::<PrimitiveArray>(ctx)?;
 
     let boxed = match_each_integer_ptype!(offsets.ptype(), |O| {
         match_each_integer_ptype!(sizes.ptype(), |S| {
             Box::new(ListViewExporter {
+                validity,
                 duckdb_elements: shared_elements,
                 offsets,
                 sizes,
@@ -107,7 +111,7 @@ pub(crate) fn new_exporter(
         })
     });
 
-    Ok(validity::new_exporter(validity, boxed))
+    Ok(boxed)
 }
 
 impl<O: IntegerPType, S: IntegerPType> ColumnExporter for ListViewExporter<O, S> {
@@ -118,6 +122,21 @@ impl<O: IntegerPType, S: IntegerPType> ColumnExporter for ListViewExporter<O, S>
         vector: &mut VectorRef,
         _ctx: &mut ExecutionCtx,
     ) -> VortexResult<()> {
+        // Verify that offset + len doesn't exceed the validity mask length.
+        assert!(
+            offset + len <= self.validity.len(),
+            "Export range [{}, {}) exceeds validity mask length {}",
+            offset,
+            offset + len,
+            self.validity.len()
+        );
+
+        // Set validity if necessary.
+        if unsafe { vector.set_validity(&self.validity, offset, len) } {
+            // All values are null, so no point copying the data.
+            return Ok(());
+        }
+
         let offsets = &self.offsets.as_slice::<O>()[offset..offset + len];
         let sizes = &self.sizes.as_slice::<S>()[offset..offset + len];
         debug_assert_eq!(offsets.len(), len);
@@ -153,12 +172,12 @@ impl<O: IntegerPType, S: IntegerPType> ColumnExporter for ListViewExporter<O, S>
 #[cfg(test)]
 mod tests {
     use vortex::array::IntoArray as _;
-    use vortex::array::VortexSessionExecute;
     use vortex::array::arrays::VarBinArray;
     use vortex::array::validity::Validity;
     use vortex::buffer::Buffer;
     use vortex::buffer::buffer;
     use vortex::error::VortexExpect;
+    use vortex_array::VortexSessionExecute;
 
     use super::*;
     use crate::SESSION;

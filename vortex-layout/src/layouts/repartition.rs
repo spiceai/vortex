@@ -8,16 +8,15 @@ use async_stream::try_stream;
 use async_trait::async_trait;
 use futures::StreamExt as _;
 use futures::pin_mut;
+use vortex_array::Array;
 use vortex_array::ArrayContext;
 use vortex_array::ArrayRef;
-use vortex_array::Canonical;
 use vortex_array::IntoArray;
-use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::ChunkedArray;
 use vortex_array::dtype::DType;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
-use vortex_session::VortexSession;
+use vortex_io::runtime::Handle;
 
 use crate::LayoutRef;
 use crate::LayoutStrategy;
@@ -99,20 +98,17 @@ impl LayoutStrategy for RepartitionStrategy {
         segment_sink: SegmentSinkRef,
         stream: SendableSequentialStream,
         eof: SequencePointer,
-        session: &VortexSession,
+        handle: Handle,
     ) -> VortexResult<LayoutRef> {
         // TODO(os): spawn stream below like:
         // canon_stream = stream.map(async {to_canonical}).map(spawn).buffered(parallelism)
         let dtype = stream.dtype().clone();
         let stream = if self.options.canonicalize {
-            let canonicalize_session = session.clone();
             SequentialStreamAdapter::new(
                 dtype.clone(),
-                stream.map(move |chunk| {
+                stream.map(|chunk| {
                     let (sequence_id, chunk) = chunk?;
-                    let mut ctx = canonicalize_session.create_execution_ctx();
-                    let canonical = chunk.execute::<Canonical>(&mut ctx)?.into_array();
-                    VortexResult::Ok((sequence_id, canonical))
+                    VortexResult::Ok((sequence_id, chunk.to_canonical()?.into_array()))
                 }),
             )
             .sendable()
@@ -128,13 +124,11 @@ impl LayoutStrategy for RepartitionStrategy {
         // segments.
         let block_len = options.effective_block_len(&dtype);
         let block_size_minimum = options.block_size_minimum;
-        let repartition_session = session.clone();
 
         let repartitioned_stream = try_stream! {
             let canonical_stream = stream.peekable();
             pin_mut!(canonical_stream);
 
-            let mut ctx = repartition_session.create_execution_ctx();
             let mut chunks = ChunksBuffer::new(block_size_minimum, block_len);
             while let Some(chunk) = canonical_stream.as_mut().next().await {
                 let (sequence_id, chunk) = chunk?;
@@ -152,10 +146,9 @@ impl LayoutStrategy for RepartitionStrategy {
                         let chunked =
                             ChunkedArray::try_new(output_chunks, dtype_clone.clone())?;
                         if !chunked.is_empty() {
-                            let canonical = chunked.into_array().execute::<Canonical>(&mut ctx)?.into_array();
                             yield (
                                 sequence_pointer.advance(),
-                                canonical,
+                                chunked.to_canonical()?.into_array(),
                             )
                         }
                     }
@@ -166,10 +159,9 @@ impl LayoutStrategy for RepartitionStrategy {
                         dtype_clone.clone(),
                     )?;
                     if !to_flush.is_empty() {
-                        let canonical = to_flush.into_array().execute::<Canonical>(&mut ctx)?.into_array();
                         yield (
                             sequence_pointer.advance(),
-                            canonical,
+                            to_flush.to_canonical()?.into_array(),
                         )
                     }
                 }
@@ -182,7 +174,7 @@ impl LayoutStrategy for RepartitionStrategy {
                 segment_sink,
                 SequentialStreamAdapter::new(dtype, repartitioned_stream).sendable(),
                 eof,
-                session,
+                handle,
             )
             .await
     }
@@ -274,9 +266,9 @@ impl ChunksBuffer {
 mod tests {
     use std::sync::Arc;
 
+    use vortex_array::Array;
     use vortex_array::ArrayContext;
     use vortex_array::IntoArray;
-    use vortex_array::LEGACY_SESSION;
     use vortex_array::arrays::ConstantArray;
     use vortex_array::arrays::FixedSizeListArray;
     use vortex_array::arrays::PrimitiveArray;
@@ -287,7 +279,6 @@ mod tests {
     use vortex_array::validity::Validity;
     use vortex_error::VortexResult;
     use vortex_io::runtime::single::block_on;
-    use vortex_io::session::RuntimeSessionExt;
 
     use super::*;
     use crate::LayoutStrategy;
@@ -296,7 +287,6 @@ mod tests {
     use crate::segments::TestSegments;
     use crate::sequence::SequenceId;
     use crate::sequence::SequentialArrayStreamExt;
-    use crate::test::SESSION;
 
     const ONE_MEG: u64 = 1 << 20;
 
@@ -396,18 +386,8 @@ mod tests {
         );
 
         let stream = fsl.into_array().to_array_stream().sequenced(ptr);
-        let layout = block_on(|handle| async move {
-            let session = SESSION.clone().with_handle(handle);
-            strategy
-                .write_stream(
-                    ctx,
-                    Arc::<TestSegments>::clone(&segments),
-                    stream,
-                    eof,
-                    &session,
-                )
-                .await
-        })?;
+        let layout =
+            block_on(|handle| strategy.write_stream(ctx, segments.clone(), stream, eof, handle))?;
 
         // The layout should be a ChunkedLayout with multiple children.
         // With 1000 rows and effective block_len = 132:
@@ -461,18 +441,8 @@ mod tests {
         );
 
         let stream = elements.into_array().to_array_stream().sequenced(ptr);
-        let layout = block_on(|handle| async move {
-            let session = SESSION.clone().with_handle(handle);
-            strategy
-                .write_stream(
-                    ctx,
-                    Arc::<TestSegments>::clone(&segments),
-                    stream,
-                    eof,
-                    &session,
-                )
-                .await
-        })?;
+        let layout =
+            block_on(|handle| strategy.write_stream(ctx, segments.clone(), stream, eof, handle))?;
 
         assert_eq!(layout.row_count(), num_elements as u64);
         assert_eq!(layout.nchildren(), 2);
@@ -489,7 +459,6 @@ mod tests {
     /// `pop_front` subtracted the larger Cached-era values.
     #[test]
     fn chunks_buffer_pop_front_no_panic_after_shared_execution() -> VortexResult<()> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
         let n = 20_000usize;
         let block_len = 10_000usize;
 
@@ -508,9 +477,7 @@ mod tests {
         let _output = buf.pop_front().unwrap();
 
         // Transition SharedState from Source to Cached for ALL slices sharing this Arc.
-        use vortex_array::arrays::shared::SharedArrayExt;
-        let _canonical =
-            shared_handle.get_or_compute(|source| source.clone().execute::<Canonical>(&mut ctx))?;
+        shared_handle.get_or_compute(|source| source.to_canonical())?;
 
         // Before the fix this panicked with "attempt to subtract with overflow".
         let _s2 = buf.pop_front().unwrap();

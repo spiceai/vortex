@@ -4,15 +4,14 @@
 use vortex_buffer::BufferMut;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
+use vortex_mask::AllOr;
 
 use crate::ArrayRef;
 use crate::IntoArray;
 use crate::ToCanonical;
-use crate::array::ArrayView;
-use crate::arrays::Extension;
 use crate::arrays::ExtensionArray;
+use crate::arrays::ExtensionVTable;
 use crate::arrays::PrimitiveArray;
-use crate::arrays::extension::ExtensionArrayExt;
 use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
 use crate::dtype::PType;
@@ -20,19 +19,17 @@ use crate::extension::datetime::AnyTemporal;
 use crate::extension::datetime::TemporalMetadata;
 use crate::extension::datetime::TimeUnit;
 use crate::scalar_fn::fns::cast::CastReduce;
-use crate::validity::Validity;
+use crate::vtable::ValidityHelper;
 
-impl CastReduce for Extension {
-    fn cast(array: ArrayView<'_, Extension>, dtype: &DType) -> VortexResult<Option<ArrayRef>> {
+impl CastReduce for ExtensionVTable {
+    fn cast(array: &ExtensionArray, dtype: &DType) -> VortexResult<Option<ArrayRef>> {
         let DType::Extension(ext_dtype) = dtype else {
-            // Target is not an extension type.
-            // Delegate to the storage array's cast.
-            return Ok(Some(array.storage_array().cast(dtype.clone())?));
+            return Ok(None);
         };
 
         if array.ext_dtype().eq_ignore_nullability(ext_dtype) {
             let new_storage = match array
-                .storage_array()
+                .storage()
                 .cast(ext_dtype.storage_dtype().clone())
                 .and_then(|a| a.to_canonical().map(|c| c.into_array()))
             {
@@ -48,7 +45,7 @@ impl CastReduce for Extension {
             ));
         }
 
-        if let Some(new_storage) = cast_temporal_date_to_timestamp(&array, dtype)? {
+        if let Some(new_storage) = cast_temporal_date_to_timestamp(array, dtype)? {
             return Ok(Some(
                 ExtensionArray::new(ext_dtype.clone(), new_storage).into_array(),
             ));
@@ -59,7 +56,7 @@ impl CastReduce for Extension {
 }
 
 fn cast_temporal_date_to_timestamp(
-    array: &ArrayView<'_, Extension>,
+    array: &ExtensionArray,
     target_dtype: &DType,
 ) -> VortexResult<Option<ArrayRef>> {
     let DType::Extension(target_ext_dtype) = target_dtype else {
@@ -80,14 +77,14 @@ fn cast_temporal_date_to_timestamp(
     };
 
     let source_i64 = array
-        .storage_array()
+        .storage()
         .cast(DType::Primitive(PType::I64, array.dtype().nullability()))?;
     let source_i64 = source_i64.to_primitive();
 
     let converted = cast_date_values_to_timestamp(&source_i64, *source_unit, *target_unit)?;
 
     converted
-        .into_array()
+        .to_array()
         .cast(target_ext_dtype.storage_dtype().clone())
         .map(Some)
 }
@@ -100,30 +97,23 @@ fn cast_date_values_to_timestamp(
     let (multiply, divide) = date_to_timestamp_scale(source_unit, target_unit)?;
 
     let input = values.as_slice::<i64>();
-    let validity = values.validity()?;
     let mut output = BufferMut::with_capacity(input.len());
-
-    match &validity {
-        Validity::NonNullable | Validity::AllValid => {
+    match values.validity_mask()?.bit_buffer() {
+        AllOr::All => {
             for &value in input {
                 // SAFETY: output has sufficient capacity for all pushed values.
                 unsafe { output.push_unchecked(convert_temporal_value(value, multiply, divide)?) };
             }
         }
-        Validity::AllInvalid => {
+        AllOr::None => {
             for _ in 0..input.len() {
                 // SAFETY: output has sufficient capacity for all pushed values.
                 unsafe { output.push_unchecked(0i64) };
             }
         }
-        Validity::Array(validity_arr) => {
-            for (i, &value) in input.iter().enumerate() {
-                let is_valid = validity_arr
-                    .scalar_at(i)?
-                    .as_bool()
-                    .value()
-                    .unwrap_or(false);
-                if is_valid {
+        AllOr::Some(bits) => {
+            for (&value, valid) in input.iter().zip(bits.iter()) {
+                if valid {
                     // SAFETY: output has sufficient capacity for all pushed values.
                     unsafe {
                         output.push_unchecked(convert_temporal_value(value, multiply, divide)?)
@@ -136,7 +126,10 @@ fn cast_date_values_to_timestamp(
         }
     }
 
-    Ok(PrimitiveArray::new(output.freeze(), validity))
+    Ok(PrimitiveArray::new(
+        output.freeze(),
+        values.validity().clone(),
+    ))
 }
 
 fn date_to_timestamp_scale(
@@ -194,30 +187,21 @@ fn convert_temporal_value(value: i64, multiply: i64, divide: i64) -> VortexResul
 
 #[cfg(test)]
 mod tests {
-    use std::sync::LazyLock;
 
     use rstest::rstest;
     use vortex_buffer::Buffer;
     use vortex_buffer::buffer;
-    use vortex_session::VortexSession;
 
     use super::*;
+    use crate::Array;
     use crate::IntoArray;
     use crate::arrays::PrimitiveArray;
-    use crate::assert_arrays_eq;
     use crate::builtins::ArrayBuiltins;
     use crate::compute::conformance::cast::test_cast_conformance;
-    use crate::dtype::DType;
     use crate::dtype::Nullability;
-    use crate::dtype::PType;
-    use crate::executor::VortexSessionExecute;
     use crate::extension::datetime::Date;
     use crate::extension::datetime::TimeUnit;
     use crate::extension::datetime::Timestamp;
-    use crate::session::ArraySession;
-
-    static SESSION: LazyLock<VortexSession> =
-        LazyLock::new(|| VortexSession::empty().with::<ArraySession>());
 
     #[test]
     fn cast_same_ext_dtype() {
@@ -227,8 +211,7 @@ mod tests {
         let arr = ExtensionArray::new(ext_dtype.clone(), storage);
 
         let output = arr
-            .clone()
-            .into_array()
+            .to_array()
             .cast(DType::Extension(ext_dtype.clone()))
             .unwrap();
         assert_eq!(arr.len(), output.len());
@@ -242,11 +225,11 @@ mod tests {
         let storage = Buffer::<i64>::empty().into_array();
 
         let arr = ExtensionArray::new(ext_dtype.clone(), storage);
-        assert!(!arr.dtype().is_nullable());
+        assert!(!arr.dtype.is_nullable());
 
         let new_dtype = DType::Extension(ext_dtype).with_nullability(Nullability::Nullable);
 
-        let output = arr.clone().into_array().cast(new_dtype.clone()).unwrap();
+        let output = arr.to_array().cast(new_dtype.clone()).unwrap();
         assert_eq!(arr.len(), output.len());
         assert!(arr.dtype().eq_ignore_nullability(output.dtype()));
         assert_eq!(output.dtype(), &new_dtype);
@@ -259,14 +242,14 @@ mod tests {
 
         let arr = ExtensionArray::new(source_dtype, buffer![0i32, 1, -1].into_array());
         let output = arr
-            .into_array()
+            .to_array()
             .cast(DType::Extension(target_dtype.clone()))
             .unwrap()
             .to_extension();
 
         assert_eq!(output.dtype(), &DType::Extension(target_dtype));
 
-        let storage = output.storage_array().to_primitive();
+        let storage = output.storage().to_primitive();
         assert_eq!(
             storage.as_slice::<i64>(),
             &[0, 86_400_000_000_000, -86_400_000_000_000]
@@ -284,14 +267,14 @@ mod tests {
         );
 
         let output = arr
-            .into_array()
+            .to_array()
             .cast(DType::Extension(target_dtype.clone()))
             .unwrap()
             .to_extension();
 
         assert_eq!(output.dtype(), &DType::Extension(target_dtype));
 
-        let storage = output.storage_array().to_primitive();
+        let storage = output.storage().to_primitive();
         assert_eq!(
             storage.scalar_at(0).unwrap().as_primitive().as_::<i64>(),
             Some(0)
@@ -313,34 +296,12 @@ mod tests {
         let storage = buffer![1i64].into_array();
         let arr = ExtensionArray::new(original_dtype, storage);
 
-        let result = arr
-            .into_array()
-            .cast(DType::Extension(target_dtype))
-            .and_then(|a| {
-                a.execute::<ExtensionArray>(&mut SESSION.create_execution_ctx())
-                    .map(|c| c.into_array())
-            });
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn cast_timestamp_to_i64() -> VortexResult<()> {
-        let ext_dtype = Timestamp::new_with_tz(
-            TimeUnit::Nanoseconds,
-            Some("UTC".into()),
-            Nullability::NonNullable,
-        )
-        .erased();
-        let storage = buffer![1i64, 2, 3].into_array();
-        let arr = ExtensionArray::new(ext_dtype, storage).into_array();
-
-        let result = arr.cast(DType::Primitive(PType::I64, Nullability::NonNullable))?;
-        assert_eq!(
-            result.dtype(),
-            &DType::Primitive(PType::I64, Nullability::NonNullable)
+        assert!(
+            arr.to_array()
+                .cast(DType::Extension(target_dtype))
+                .and_then(|a| a.to_canonical().map(|c| c.into_array()))
+                .is_err()
         );
-        assert_arrays_eq!(result, buffer![1i64, 2, 3].into_array());
-        Ok(())
     }
 
     #[rstest]
@@ -349,7 +310,7 @@ mod tests {
     #[case(create_timestamp_array(TimeUnit::Nanoseconds, false))]
     #[case(create_timestamp_array(TimeUnit::Seconds, true))]
     fn test_cast_extension_conformance(#[case] array: ExtensionArray) {
-        test_cast_conformance(&array.into_array());
+        test_cast_conformance(array.as_ref());
     }
 
     fn create_timestamp_array(time_unit: TimeUnit, nullable: bool) -> ExtensionArray {

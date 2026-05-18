@@ -2,18 +2,18 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use vortex_array::ArrayRef;
-use vortex_array::ArrayView;
 use vortex_array::IntoArray;
-use vortex_array::arrays::filter::FilterReduce;
+use vortex_array::arrays::FilterReduce;
 use vortex_error::VortexResult;
 use vortex_mask::Mask;
 
-use crate::DateTimeParts;
-use crate::array::DateTimePartsArraySlotsExt;
-impl FilterReduce for DateTimeParts {
-    fn filter(array: ArrayView<'_, Self>, mask: &Mask) -> VortexResult<Option<ArrayRef>> {
+use crate::DateTimePartsArray;
+use crate::DateTimePartsVTable;
+
+impl FilterReduce for DateTimePartsVTable {
+    fn filter(array: &DateTimePartsArray, mask: &Mask) -> VortexResult<Option<ArrayRef>> {
         Ok(Some(
-            DateTimeParts::try_new(
+            DateTimePartsArray::try_new(
                 array.dtype().clone(),
                 array.days().filter(mask.clone())?,
                 array.seconds().filter(mask.clone())?,
@@ -27,19 +27,16 @@ impl FilterReduce for DateTimeParts {
 #[cfg(test)]
 mod test {
     use vortex_array::IntoArray;
-    use vortex_array::LEGACY_SESSION;
-    use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::arrays::TemporalArray;
     use vortex_array::compute::conformance::filter::test_filter_conformance;
     use vortex_array::extension::datetime::TimeUnit;
     use vortex_buffer::buffer;
 
-    use crate::DateTimeParts;
+    use crate::DateTimePartsArray;
 
     #[test]
     fn test_filter_datetime_parts() {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
         // Create temporal arrays and convert to DateTimePartsArray
         let timestamps = buffer![
             0i64,
@@ -53,8 +50,8 @@ mod test {
         let temporal =
             TemporalArray::new_timestamp(timestamps, TimeUnit::Milliseconds, Some("UTC".into()));
 
-        let array = DateTimeParts::try_from_temporal(temporal, &mut ctx).unwrap();
-        test_filter_conformance(&array.into_array());
+        let array = DateTimePartsArray::try_from(temporal).unwrap();
+        test_filter_conformance(array.as_ref());
 
         // Test with nullable values
         let timestamps = PrimitiveArray::from_option_iter([
@@ -69,7 +66,7 @@ mod test {
         let temporal =
             TemporalArray::new_timestamp(timestamps, TimeUnit::Milliseconds, Some("UTC".into()));
 
-        let array = DateTimeParts::try_from_temporal(temporal, &mut ctx).unwrap();
-        test_filter_conformance(&array.into_array());
+        let array = DateTimePartsArray::try_from(temporal).unwrap();
+        test_filter_conformance(array.as_ref());
     }
 }

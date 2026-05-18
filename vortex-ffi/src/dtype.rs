@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::ffi::c_int;
 use std::ptr;
 use std::sync::Arc;
 
-use arrow_array::ffi::FFI_ArrowSchema;
 use vortex::dtype::DType;
 use vortex::dtype::DecimalDType;
 use vortex::error::VortexExpect;
@@ -16,8 +14,6 @@ use vortex::extension::datetime::Time;
 use vortex::extension::datetime::Timestamp;
 
 use crate::arc_wrapper;
-use crate::error::try_or;
-use crate::error::vx_error;
 use crate::ptype::vx_ptype;
 use crate::string::vx_string;
 use crate::struct_fields::vx_struct_fields;
@@ -32,7 +28,7 @@ arc_wrapper!(
 );
 
 /// The variant tag for a Vortex data type.
-#[expect(non_camel_case_types)]
+#[allow(non_camel_case_types)]
 #[non_exhaustive]
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,7 +68,6 @@ impl From<&DType> for vx_dtype_variant {
             DType::List(..) => vx_dtype_variant::DTYPE_LIST,
             DType::FixedSizeList(..) => vx_dtype_variant::DTYPE_FIXED_SIZE_LIST,
             DType::Extension(_) => vx_dtype_variant::DTYPE_EXTENSION,
-            DType::Variant(_) => vortex_panic!("Variant DType is not supported in FFI yet"),
         }
     }
 }
@@ -144,11 +139,11 @@ pub unsafe extern "C-unwind" fn vx_dtype_new_fixed_size_list(
 /// Takes ownership of the `struct_dtype` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn vx_dtype_new_struct(
-    struct_dtype: *mut vx_struct_fields,
+    struct_dtype: *const vx_struct_fields,
     is_nullable: bool,
 ) -> *const vx_dtype {
-    let struct_dtype = vx_struct_fields::into_box(struct_dtype);
-    vx_dtype::new(Arc::new(DType::Struct(*struct_dtype, is_nullable.into())))
+    let struct_dtype = vx_struct_fields::as_ref(struct_dtype).clone();
+    vx_dtype::new(Arc::new(DType::Struct(struct_dtype, is_nullable.into())))
 }
 
 /// Create a new decimal data type.
@@ -210,9 +205,10 @@ pub unsafe extern "C-unwind" fn vx_dtype_decimal_scale(dtype: *const vx_dtype) -
 pub unsafe extern "C-unwind" fn vx_dtype_struct_dtype(
     dtype: *const vx_dtype,
 ) -> *const vx_struct_fields {
-    let Some(struct_dtype) = vx_dtype::as_ref(dtype).as_struct_fields_opt() else {
-        return ptr::null();
-    };
+    // TODO(joe): propagate this error up instead of expecting
+    let struct_dtype = vx_dtype::as_ref(dtype)
+        .as_struct_fields_opt()
+        .vortex_expect("not a struct dtype");
     vx_struct_fields::new_ref(struct_dtype)
 }
 
@@ -222,9 +218,10 @@ pub unsafe extern "C-unwind" fn vx_dtype_struct_dtype(
 /// Do NOT free the returned dtype pointer - it shares the lifetime of the list dtype.
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn vx_dtype_list_element(dtype: *const vx_dtype) -> *const vx_dtype {
-    let Some(element_dtype) = vx_dtype::as_ref(dtype).as_list_element_opt() else {
-        return ptr::null();
-    };
+    // TODO(joe): propagate this error up instead of expecting
+    let element_dtype = vx_dtype::as_ref(dtype)
+        .as_list_element_opt()
+        .vortex_expect("not a list dtype");
     vx_dtype::new_ref(element_dtype)
 }
 
@@ -322,31 +319,13 @@ pub unsafe extern "C-unwind" fn vx_dtype_time_zone(dtype: *const DType) -> *cons
     };
 
     match opts.tz.as_ref() {
-        Some(zone) => vx_string::new(Arc::clone(zone)),
+        Some(zone) => vx_string::new(zone.clone()),
         None => ptr::null(),
     }
 }
 
-/// Convert a dtype to ArrowSchema.
-/// You can use the dtype after conversion
-/// On success, returns 0. On error, sets err and returns 1.
-#[unsafe(no_mangle)]
-pub unsafe extern "C-unwind" fn vx_dtype_to_arrow_schema(
-    dtype: *const vx_dtype,
-    schema: *mut FFI_ArrowSchema,
-    err: *mut *mut vx_error,
-) -> c_int {
-    try_or(err, 1, || {
-        let dtype = vx_dtype::as_ref(dtype);
-        let arrow_schema = dtype.to_arrow_schema()?;
-        let arrow_schema = FFI_ArrowSchema::try_from(&arrow_schema)?;
-        unsafe { ptr::write(schema, arrow_schema) };
-        Ok(0)
-    })
-}
-
 #[cfg(test)]
-#[expect(clippy::cast_possible_truncation)]
+#[allow(clippy::cast_possible_truncation)]
 mod tests {
     use std::slice;
 
@@ -360,7 +339,6 @@ mod tests {
     use super::*;
     use crate::array::vx_array;
     use crate::array::vx_array_dtype;
-    use crate::array::vx_array_free;
     use crate::dtype::vx_dtype;
     use crate::dtype::vx_dtype_free;
     use crate::dtype::vx_dtype_get_variant;
@@ -666,7 +644,7 @@ mod tests {
     #[test]
     fn test_struct_introspection_simple() {
         let array = create_test_struct_array();
-        let vx_arr = vx_array::new(Arc::new(array));
+        let vx_arr = vx_array::new(array);
         let dtype_ptr = unsafe { vx_array_dtype(vx_arr) };
 
         let struct_fields_ptr = unsafe { vx_dtype_struct_dtype(dtype_ptr) };
@@ -675,14 +653,14 @@ mod tests {
 
         // Cleanup in reverse order - this is the safest order
         unsafe {
-            vx_array_free(vx_arr);
+            crate::array::vx_array_free(vx_arr);
         }
     }
 
     #[test]
     fn test_field_name_access() {
         let array = create_test_struct_array();
-        let vx_arr = vx_array::new(Arc::new(array));
+        let vx_arr = vx_array::new(array);
         let dtype_ptr = unsafe { vx_array_dtype(vx_arr) };
 
         let struct_fields_ptr = unsafe { vx_dtype_struct_dtype(dtype_ptr) };
@@ -700,14 +678,14 @@ mod tests {
         // Cleanup in careful order
         unsafe {
             // Field name is now a borrowed reference - do not free it
-            vx_array_free(vx_arr);
+            crate::array::vx_array_free(vx_arr);
         }
     }
 
     #[test]
     fn test_comprehensive_struct_introspection() {
         let array = create_test_struct_array();
-        let vx_arr = vx_array::new(Arc::new(array));
+        let vx_arr = vx_array::new(array);
         let dtype_ptr = unsafe { vx_array_dtype(vx_arr) };
 
         let struct_fields_ptr = unsafe { vx_dtype_struct_dtype(dtype_ptr) };
@@ -733,7 +711,7 @@ mod tests {
 
         // Cleanup
         unsafe {
-            vx_array_free(vx_arr);
+            crate::array::vx_array_free(vx_arr);
         }
     }
 }

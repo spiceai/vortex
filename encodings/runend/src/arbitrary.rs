@@ -5,12 +5,8 @@ use arbitrary::Arbitrary;
 use arbitrary::Result;
 use arbitrary::Unstructured;
 use vortex_array::IntoArray;
-use vortex_array::LEGACY_SESSION;
-use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::arbitrary::ArbitraryArray;
-use vortex_array::arrays::arbitrary::ArbitraryArrayConfig;
-use vortex_array::arrays::arbitrary::ArbitraryWith;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
@@ -18,7 +14,6 @@ use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
 use vortex_error::VortexExpect;
 
-use crate::RunEnd;
 use crate::RunEndArray;
 
 /// A wrapper type to implement `Arbitrary` for `RunEndArray`.
@@ -27,7 +22,8 @@ pub struct ArbitraryRunEndArray(pub RunEndArray);
 
 impl<'a> Arbitrary<'a> for ArbitraryRunEndArray {
     fn arbitrary(u: &mut Unstructured<'a>) -> Result<Self> {
-        // Pick a random primitive type for values.
+        // RunEnd supports Bool or Primitive types for values
+        // Pick a random primitive type for values
         let ptype: PType = u.arbitrary()?;
         let nullability: Nullability = u.arbitrary()?;
         let dtype = DType::Primitive(ptype, nullability);
@@ -43,39 +39,23 @@ impl ArbitraryRunEndArray {
         // Number of runs (values/ends pairs)
         let num_runs = u.int_in_range(0..=20)?;
 
-        // TODO(ctx): trait fixes - Arbitrary::arbitrary has a fixed signature.
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
         if num_runs == 0 {
             // Empty RunEndArray
             let ends = PrimitiveArray::from_iter(Vec::<u64>::new()).into_array();
-            let values = ArbitraryArray::arbitrary_with_config(
-                u,
-                &ArbitraryArrayConfig {
-                    dtype: Some(dtype.clone()),
-                    len: 0..=0,
-                },
-            )?
-            .0;
-            let runend_array = RunEnd::try_new(ends, values, &mut ctx)
+            let values = ArbitraryArray::arbitrary_with(u, Some(0), dtype)?.0;
+            let runend_array = RunEndArray::try_new(ends, values)
                 .vortex_expect("Empty RunEndArray creation should succeed");
             return Ok(ArbitraryRunEndArray(runend_array));
         }
 
         // Generate arbitrary values for each run
-        let values = ArbitraryArray::arbitrary_with_config(
-            u,
-            &ArbitraryArrayConfig {
-                dtype: Some(dtype.clone()),
-                len: num_runs..=num_runs,
-            },
-        )?
-        .0;
+        let values = ArbitraryArray::arbitrary_with(u, Some(num_runs), dtype)?.0;
 
         // Generate strictly increasing ends
         // Each end must be > previous end, and first end must be >= 1
         let ends = random_strictly_sorted_ends(u, num_runs, len)?;
 
-        let runend_array = RunEnd::try_new(ends, values, &mut ctx)
+        let runend_array = RunEndArray::try_new(ends, values)
             .vortex_expect("RunEndArray creation should succeed in arbitrary impl");
 
         Ok(ArbitraryRunEndArray(runend_array))

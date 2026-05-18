@@ -6,26 +6,27 @@
 use std::fmt::Debug;
 use std::ops::Range;
 
-use itertools::Itertools as _;
 use vortex_buffer::BitBuffer;
 use vortex_error::VortexExpect as _;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
+use vortex_error::vortex_panic;
+use vortex_mask::AllOr;
 use vortex_mask::Mask;
 use vortex_mask::MaskValues;
 
+use crate::Array;
 use crate::ArrayRef;
 use crate::Canonical;
 use crate::ExecutionCtx;
 use crate::IntoArray;
-use crate::LEGACY_SESSION;
-use crate::VortexSessionExecute;
+use crate::ToCanonical;
 use crate::arrays::BoolArray;
-use crate::arrays::ChunkedArray;
 use crate::arrays::ConstantArray;
-use crate::arrays::scalar_fn::ScalarFnFactoryExt;
+use crate::arrays::ScalarFnArrayExt;
 use crate::builtins::ArrayBuiltins;
+use crate::compute::sum;
 use crate::dtype::DType;
 use crate::dtype::Nullability;
 use crate::optimizer::ArrayOptimizer;
@@ -35,7 +36,7 @@ use crate::scalar_fn::fns::binary::Binary;
 use crate::scalar_fn::fns::operators::Operator;
 
 /// Validity information for an array
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum Validity {
     /// Items *can't* be null
     NonNullable,
@@ -47,17 +48,6 @@ pub enum Validity {
     ///
     /// True values are valid, false values are invalid ("null").
     Array(ArrayRef),
-}
-
-impl Debug for Validity {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NonNullable => write!(f, "NonNullable"),
-            Self::AllValid => write!(f, "AllValid"),
-            Self::AllInvalid => write!(f, "AllInvalid"),
-            Self::Array(arr) => write!(f, "SomeValid({})", arr.display_values()),
-        }
-    }
 }
 
 impl Validity {
@@ -112,13 +102,6 @@ impl Validity {
         }
     }
 
-    /// Returns `true` if this validity guarantees no null values, i.e. it is either
-    /// [`Validity::NonNullable`] or [`Validity::AllValid`].
-    #[inline]
-    pub fn no_nulls(&self) -> bool {
-        matches!(self, Self::NonNullable | Self::AllValid)
-    }
-
     /// The union nullability and validity.
     #[inline]
     pub fn union_nullability(self, nullability: Nullability) -> Self {
@@ -128,6 +111,34 @@ impl Validity {
         }
     }
 
+    #[inline]
+    pub fn all_valid(&self, len: usize) -> VortexResult<bool> {
+        Ok(match self {
+            _ if len == 0 => true,
+            Validity::NonNullable | Validity::AllValid => true,
+            Validity::AllInvalid => false,
+            Validity::Array(array) => {
+                usize::try_from(&sum(array).vortex_expect("must have sum for bool array"))
+                    .vortex_expect("sum must be a usize")
+                    == array.len()
+            }
+        })
+    }
+
+    #[inline]
+    pub fn all_invalid(&self, len: usize) -> VortexResult<bool> {
+        Ok(match self {
+            _ if len == 0 => true,
+            Validity::NonNullable | Validity::AllValid => false,
+            Validity::AllInvalid => true,
+            Validity::Array(array) => {
+                usize::try_from(&sum(array).vortex_expect("must have sum for bool array"))
+                    .vortex_expect("sum must be a usize")
+                    == 0
+            }
+        })
+    }
+
     /// Returns whether the `index` item is valid.
     #[inline]
     pub fn is_valid(&self, index: usize) -> VortexResult<bool> {
@@ -135,8 +146,8 @@ impl Validity {
             Self::NonNullable | Self::AllValid => true,
             Self::AllInvalid => false,
             Self::Array(a) => a
-                .execute_scalar(index, &mut LEGACY_SESSION.create_execution_ctx())
-                .vortex_expect("Validity array must support execute_scalar")
+                .scalar_at(index)
+                .vortex_expect("Validity array must support scalar_at")
                 .as_bool()
                 .value()
                 .vortex_expect("Validity must be non-nullable"),
@@ -156,16 +167,30 @@ impl Validity {
         }
     }
 
-    pub fn take(&self, indices: &ArrayRef) -> VortexResult<Self> {
+    pub fn take(&self, indices: &dyn Array) -> VortexResult<Self> {
         match self {
-            Self::NonNullable => indices.validity(),
-            Self::AllValid => Ok(match indices.validity()? {
-                Self::NonNullable => Self::AllValid,
-                v => v,
-            }),
+            Self::NonNullable => match indices.validity_mask()?.bit_buffer() {
+                AllOr::All => {
+                    if indices.dtype().is_nullable() {
+                        Ok(Self::AllValid)
+                    } else {
+                        Ok(Self::NonNullable)
+                    }
+                }
+                AllOr::None => Ok(Self::AllInvalid),
+                AllOr::Some(buf) => Ok(Validity::from(buf.clone())),
+            },
+            Self::AllValid => match indices.validity_mask()?.bit_buffer() {
+                AllOr::All => Ok(Self::AllValid),
+                AllOr::None => Ok(Self::AllInvalid),
+                AllOr::Some(buf) => Ok(Validity::from(buf.clone())),
+            },
             Self::AllInvalid => Ok(Self::AllInvalid),
             Self::Array(is_valid) => {
-                let maybe_is_valid = is_valid.take(indices.clone())?;
+                let maybe_is_valid = is_valid
+                    .take(indices.to_array())?
+                    .to_canonical()?
+                    .into_array();
                 // Null indices invalidate that position.
                 let is_valid = maybe_is_valid.fill_null(Scalar::from(false))?;
                 Ok(Self::Array(is_valid))
@@ -197,53 +222,31 @@ impl Validity {
             v @ (Validity::NonNullable | Validity::AllValid | Validity::AllInvalid) => {
                 Ok(v.clone())
             }
-            Validity::Array(arr) => Ok(Validity::Array(arr.filter(mask.clone())?)),
+            Validity::Array(arr) => Ok(Validity::Array(
+                arr.filter(mask.clone())?
+                    // TODO(connor): This is wrong!!! We should not be eagerly decompressing the
+                    // validity array.
+                    .to_canonical()?
+                    .into_array(),
+            )),
         }
     }
 
-    /// Converts this validity into a [`Mask`] of the given length.
-    ///
-    /// Valid elements are `true` and invalid elements are `false`.
-    #[deprecated(note = "Use execute_mask")]
-    pub fn to_mask(&self, length: usize, ctx: &mut ExecutionCtx) -> VortexResult<Mask> {
+    #[inline]
+    pub fn to_mask(&self, length: usize) -> Mask {
         match self {
-            Self::NonNullable | Self::AllValid => Ok(Mask::new_true(length)),
-            Self::AllInvalid => Ok(Mask::new_false(length)),
-            Self::Array(arr) => arr.clone().execute::<Mask>(ctx),
-        }
-    }
-
-    pub fn execute_mask(&self, length: usize, ctx: &mut ExecutionCtx) -> VortexResult<Mask> {
-        match self {
-            Self::NonNullable | Self::AllValid => Ok(Mask::AllTrue(length)),
-            Self::AllInvalid => Ok(Mask::AllFalse(length)),
-            Self::Array(arr) => {
+            Self::NonNullable | Self::AllValid => Mask::AllTrue(length),
+            Self::AllInvalid => Mask::AllFalse(length),
+            Self::Array(is_valid) => {
                 assert_eq!(
-                    arr.len(),
+                    is_valid.len(),
                     length,
                     "Validity::Array length must equal to_logical's argument: {}, {}.",
-                    arr.len(),
+                    is_valid.len(),
                     length,
                 );
-                // TODO(ngates): I'm not sure execution should take arrays by ownership.
-                //  If so we should fix call sites to clone and this function takes self.
-                arr.clone().execute::<Mask>(ctx)
+                is_valid.to_bool().to_mask()
             }
-        }
-    }
-
-    /// Compare two Validity values of the same length by executing them into masks if necessary.
-    pub fn mask_eq(&self, other: &Validity, ctx: &mut ExecutionCtx) -> VortexResult<bool> {
-        match (self, other) {
-            (Validity::NonNullable, Validity::NonNullable) => Ok(true),
-            (Validity::AllValid, Validity::AllValid) => Ok(true),
-            (Validity::AllInvalid, Validity::AllInvalid) => Ok(true),
-            (Validity::Array(a), Validity::Array(b)) => {
-                let a = a.clone().execute::<Mask>(ctx)?;
-                let b = b.clone().execute::<Mask>(ctx)?;
-                Ok(a == b)
-            }
-            _ => Ok(false),
         }
     }
 
@@ -277,9 +280,8 @@ impl Validity {
         self,
         len: usize,
         indices_offset: usize,
-        indices: &ArrayRef,
+        indices: &dyn Array,
         patches: &Validity,
-        ctx: &mut ExecutionCtx,
     ) -> VortexResult<Self> {
         match (&self, patches) {
             (Validity::NonNullable, Validity::NonNullable) => return Ok(Validity::NonNullable),
@@ -294,38 +296,42 @@ impl Validity {
             _ => {}
         };
 
-        if matches!(self, Validity::NonNullable) {
-            return Ok(Self::NonNullable);
-        }
+        let own_nullability = if self == Validity::NonNullable {
+            Nullability::NonNullable
+        } else {
+            Nullability::Nullable
+        };
 
-        // From here on we know that the validity is nullable
         let source = match self {
             Validity::NonNullable => BoolArray::from(BitBuffer::new_set(len)),
             Validity::AllValid => BoolArray::from(BitBuffer::new_set(len)),
             Validity::AllInvalid => BoolArray::from(BitBuffer::new_unset(len)),
-            Validity::Array(a) => a.execute::<BoolArray>(ctx)?,
+            Validity::Array(a) => a.to_bool(),
         };
 
         let patch_values = match patches {
             Validity::NonNullable => BoolArray::from(BitBuffer::new_set(indices.len())),
             Validity::AllValid => BoolArray::from(BitBuffer::new_set(indices.len())),
             Validity::AllInvalid => BoolArray::from(BitBuffer::new_unset(indices.len())),
-            Validity::Array(a) => a.clone().execute::<BoolArray>(ctx)?,
+            Validity::Array(a) => a.to_bool(),
         };
 
         let patches = Patches::new(
             len,
             indices_offset,
-            indices.clone(),
+            indices.to_array(),
             patch_values.into_array(),
             // TODO(0ax1): chunk offsets
             None,
         )?;
 
-        Ok(Self::Array(source.patch(&patches, ctx)?.into_array()))
+        Ok(Self::from_array(
+            source.patch(&patches)?.into_array(),
+            own_nullability,
+        ))
     }
 
-    /// Convert into a nullable variant.
+    /// Convert into a nullable variant
     #[inline]
     pub fn into_nullable(self) -> Validity {
         match self {
@@ -334,13 +340,9 @@ impl Validity {
         }
     }
 
-    /// Convert into a non-nullable variant, computing statistics if necessary.
-    ///
-    /// Returns `None` when the array contains invalid values (so the cast cannot be performed),
-    /// either because it is [`Validity::AllInvalid`] or because the validity array's minimum is
-    /// `false`.
+    /// Convert into a non-nullable variant
     #[inline]
-    pub fn into_non_nullable(self, len: usize, ctx: &mut ExecutionCtx) -> Option<Validity> {
+    pub fn into_non_nullable(self, len: usize) -> Option<Validity> {
         match self {
             _ if len == 0 => Some(Validity::NonNullable),
             Self::NonNullable => Some(Self::NonNullable),
@@ -349,7 +351,7 @@ impl Validity {
             Self::Array(is_valid) => {
                 is_valid
                     .statistics()
-                    .compute_min::<bool>(ctx)
+                    .compute_min::<bool>()
                     .vortex_expect("validity array must support min")
                     .then(|| {
                         // min true => all true
@@ -359,92 +361,38 @@ impl Validity {
         }
     }
 
-    /// Convert into a non-nullable variant without running execution.
-    ///
-    /// This is the cheap counterpart to [`Self::into_non_nullable`]: it inspects already-computed
-    /// statistics rather than triggering execution.
-    ///
-    /// Return values:
-    /// - `Ok(Some(NonNullable))` — the cast is provably safe.
-    /// - `Ok(None)` — We need to perform compute to determine whether cast is valid. Callers should fall back to [`Self::into_non_nullable`], typically by
-    ///   returning `Ok(None)` from a `CastReduce` rule so the corresponding `CastKernel` runs.
-    /// - `Err(_)` — we know the cast must fail (e.g. [`Validity::AllInvalid`]).
+    /// Convert into a variant compatible with the given nullability, if possible.
     #[inline]
-    pub fn trivial_into_non_nullable(self, len: usize) -> VortexResult<Option<Validity>> {
-        match self {
-            _ if len == 0 => Ok(Some(Validity::NonNullable)),
-            Self::NonNullable => Ok(Some(Self::NonNullable)),
-            Self::AllValid => Ok(Some(Self::NonNullable)),
-            Self::AllInvalid => {
-                Err(vortex_err!(InvalidArgument: "Cannot cast AllInvalid to NonNullable"))
-            }
-            Self::Array(_) => Ok(None),
-        }
-    }
-
-    /// Convert into a variant compatible with the given nullability.
-    ///
-    /// This is the execution-time half of the nullability-cast pair. It is paired with
-    /// [`Self::trivial_cast_nullability`], which is used by `CastReduce` rules. The pattern is:
-    ///
-    /// - **`CastReduce` rules** (metadata-only rewrites in the optimizer) call
-    ///   [`Self::trivial_cast_nullability`]. If it returns `Ok(None)`, the rule returns `Ok(None)`
-    ///   and the cast is deferred to execution.
-    /// - **`CastKernel` impls** (executed via [`ExecuteParentKernel`]) call this method, which
-    ///   may run the underlying validity array to compute statistics.
-    ///
-    /// Returns `Err` when nullability cannot be cast (for example, casting to non-nullable while
-    /// invalid values are present).
-    ///
-    /// [`ExecuteParentKernel`]: crate::kernel::ExecuteParentKernel
-    #[inline]
-    pub fn cast_nullability(
-        self,
-        nullability: Nullability,
-        len: usize,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<Validity> {
+    pub fn cast_nullability(self, nullability: Nullability, len: usize) -> VortexResult<Validity> {
         match nullability {
-            Nullability::NonNullable => self.into_non_nullable(len, ctx).ok_or_else(|| {
+            Nullability::NonNullable => self.into_non_nullable(len).ok_or_else(|| {
                 vortex_err!(InvalidArgument: "Cannot cast array with invalid values to non-nullable type.")
             }),
             Nullability::Nullable => Ok(self.into_nullable()),
         }
     }
 
-    /// Best-effort, non-executing variant of [`Self::cast_nullability`].
-    ///
-    /// Use this from `CastReduce` rules — they run inside the optimizer where execution is not
-    /// available. The pairing with [`Self::cast_nullability`] is symmetric: every encoding that
-    /// implements `CastReduce` and inspects validity should also implement `CastKernel` so that
-    /// the harder cases (where statistics are not yet cached) can still be handled at execution
-    /// time.
-    ///
-    /// Return values:
-    /// - `Ok(Some(_))` — the cast is provably safe and the new [`Validity`] is returned.
-    /// - `Ok(None)` — the cast cannot be reduced cheaply (the `CastKernel` should be tried via
-    ///   [`Self::cast_nullability`]).
-    /// - `Err(_)` — the cast is provably impossible.
-    ///
-    /// Typical usage inside a `CastReduce`:
-    ///
-    /// ```ignore
-    /// let Some(new_validity) = array
-    ///     .validity()?
-    ///     .trivial_cast_nullability(dtype.nullability(), array.len())?
-    /// else {
-    ///     return Ok(None);
-    /// };
-    /// ```
+    /// Create Validity by copying the given array's validity.
     #[inline]
-    pub fn trivial_cast_nullability(
-        self,
-        nullability: Nullability,
-        len: usize,
-    ) -> VortexResult<Option<Validity>> {
+    pub fn copy_from_array(array: &dyn Array) -> VortexResult<Self> {
+        Ok(Validity::from_mask(
+            array.validity_mask()?,
+            array.dtype().nullability(),
+        ))
+    }
+
+    /// Create Validity from boolean array with given nullability of the array.
+    ///
+    /// Note: You want to pass the nullability of parent array and not the nullability of the validity array itself
+    ///     as that is always nonnullable
+    #[inline]
+    fn from_array(value: ArrayRef, nullability: Nullability) -> Self {
+        if !matches!(value.dtype(), DType::Bool(Nullability::NonNullable)) {
+            vortex_panic!("Expected a non-nullable boolean array")
+        }
         match nullability {
-            Nullability::NonNullable => self.trivial_into_non_nullable(len),
-            Nullability::Nullable => Ok(Some(self.into_nullable())),
+            Nullability::NonNullable => Self::NonNullable,
+            Nullability::Nullable => Self::Array(value),
         }
     }
 
@@ -454,6 +402,32 @@ impl Validity {
         match self {
             Self::NonNullable | Self::AllValid | Self::AllInvalid => None,
             Self::Array(a) => Some(a.len()),
+        }
+    }
+
+    #[inline]
+    pub fn uncompressed_size(&self) -> usize {
+        if let Validity::Array(a) = self {
+            a.len().div_ceil(8)
+        } else {
+            0
+        }
+    }
+}
+
+impl PartialEq for Validity {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::NonNullable, Self::NonNullable) => true,
+            (Self::AllValid, Self::AllValid) => true,
+            (Self::AllInvalid, Self::AllInvalid) => true,
+            (Self::Array(a), Self::Array(b)) => {
+                let a = a.to_bool();
+                let b = b.to_bool();
+                a.to_bit_buffer() == b.to_bit_buffer()
+            }
+            _ => false,
         }
     }
 }
@@ -500,45 +474,6 @@ impl From<&Nullability> for Validity {
             Nullability::NonNullable => Validity::NonNullable,
             Nullability::Nullable => Validity::AllValid,
         }
-    }
-}
-
-impl Validity {
-    /// Concatenate one or more validities together.
-    ///
-    /// Returns None if the vector is empty.
-    pub fn concat(validities: Vec<(Validity, usize)>) -> Option<Self> {
-        let mut validity_kinds = validities
-            .iter()
-            .map(|(v, _)| std::mem::discriminant(v))
-            .unique();
-        let validity_kind = validity_kinds.next()?;
-        if validity_kinds.next().is_none() {
-            // If there is only one kind of validity and its not Validity::Array, avoid constructing
-            // a Validity::Array.
-            if validity_kind == std::mem::discriminant(&Validity::AllValid) {
-                return Some(Validity::AllValid);
-            }
-            if validity_kind == std::mem::discriminant(&Validity::AllInvalid) {
-                return Some(Validity::AllInvalid);
-            }
-            if validity_kind == std::mem::discriminant(&Validity::NonNullable) {
-                return Some(Validity::NonNullable);
-            }
-        }
-
-        Some(Validity::Array(
-            unsafe {
-                ChunkedArray::new_unchecked(
-                    validities
-                        .into_iter()
-                        .map(|(v, len)| v.to_array(len))
-                        .collect(),
-                    DType::Bool(Nullability::NonNullable),
-                )
-            }
-            .into_array(),
-        ))
     }
 }
 
@@ -596,11 +531,9 @@ mod tests {
 
     use crate::ArrayRef;
     use crate::IntoArray;
-    use crate::LEGACY_SESSION;
-    use crate::VortexSessionExecute;
+    use crate::arrays::BoolArray;
     use crate::arrays::PrimitiveArray;
     use crate::dtype::Nullability;
-    use crate::validity::BoolArray;
     use crate::validity::Validity;
 
     #[rstest]
@@ -665,30 +598,17 @@ mod tests {
     ) {
         let indices =
             PrimitiveArray::new(Buffer::copy_from(positions), Validity::NonNullable).into_array();
-
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
-
-        assert!(
-            validity
-                .patch(len, 0, &indices, &patches, &mut ctx,)
-                .unwrap()
-                .mask_eq(&expected, &mut ctx)
-                .unwrap()
+        assert_eq!(
+            validity.patch(len, 0, &indices, &patches).unwrap(),
+            expected
         );
     }
 
     #[test]
     #[should_panic]
     fn out_of_bounds_patch() {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
         Validity::NonNullable
-            .patch(
-                2,
-                0,
-                &buffer![4].into_array(),
-                &Validity::AllInvalid,
-                &mut ctx,
-            )
+            .patch(2, 0, &buffer![4].into_array(), &Validity::AllInvalid)
             .unwrap();
     }
 
@@ -732,13 +652,6 @@ mod tests {
         #[case] indices: ArrayRef,
         #[case] expected: Validity,
     ) {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
-        assert!(
-            validity
-                .take(&indices)
-                .unwrap()
-                .mask_eq(&expected, &mut ctx)
-                .unwrap()
-        );
+        assert_eq!(validity.take(&indices).unwrap(), expected);
     }
 }

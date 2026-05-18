@@ -1,17 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::any::Any;
 use std::fmt::Debug;
 use std::sync::Arc;
 
 use cudarc::driver::CudaContext;
-use vortex::array::ArrayId;
 use vortex::array::VortexSessionExecute;
+use vortex::array::vtable::ArrayId;
 use vortex::error::VortexResult;
 use vortex::session::Ref;
 use vortex::session::SessionExt;
-use vortex::session::SessionVar;
 use vortex::utils::aliases::dash_map::DashMap;
 
 use crate::ExportDeviceArray;
@@ -67,18 +65,18 @@ impl CudaSession {
     pub fn create_execution_ctx(
         vortex_session: &vortex::session::VortexSession,
     ) -> VortexResult<CudaExecutionCtx> {
-        let stream = vortex_session.cuda_session().stream()?;
+        let stream = vortex_session.cuda_session().new_stream()?;
         Ok(CudaExecutionCtx::new(
             stream,
             vortex_session.create_execution_ctx(),
         ))
     }
 
-    /// Returns a CUDA stream from the pool.
+    /// Gets a CUDA stream from the pool.
     ///
     /// The pool reuses existing streams in round-robin fashion.
-    pub fn stream(&self) -> VortexResult<VortexCudaStream> {
-        self.stream_pool.stream()
+    pub fn new_stream(&self) -> VortexResult<VortexCudaStream> {
+        self.stream_pool.get_stream()
     }
 
     /// Registers CUDA support for an array encoding.
@@ -87,12 +85,8 @@ impl CudaSession {
     ///
     /// * `array_id` - The encoding ID to register support for
     /// * `executor` - A static reference to the CUDA support implementation
-    pub fn register_kernel(
-        &self,
-        array_id: impl Into<ArrayId>,
-        executor: &'static dyn CudaExecute,
-    ) {
-        self.kernels.insert(array_id.into(), executor);
+    pub fn register_kernel(&self, array_id: ArrayId, executor: &'static dyn CudaExecute) {
+        self.kernels.insert(array_id, executor);
     }
 
     /// Retrieves the CUDA support implementation for an encoding, if registered.
@@ -146,16 +140,6 @@ impl Default for CudaSession {
         let this = Self::new(context);
         initialize_cuda(&this);
         this
-    }
-}
-
-impl SessionVar for CudaSession {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
     }
 }
 

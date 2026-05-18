@@ -10,26 +10,34 @@ use vortex_mask::Mask;
 use vortex_mask::MaskIter;
 
 use crate::ArrayRef;
+use crate::ExecutionCtx;
 use crate::IntoArray;
-use crate::array::ArrayView;
-use crate::arrays::Bool;
 use crate::arrays::BoolArray;
-use crate::arrays::bool::BoolArrayExt;
-use crate::arrays::filter::FilterReduce;
+use crate::arrays::BoolVTable;
+use crate::arrays::filter::FilterKernel;
+use crate::vtable::ValidityHelper;
 
 /// If the filter density is above 80%, we use slices to filter the array instead of indices.
 const FILTER_SLICES_DENSITY_THRESHOLD: f64 = 0.8;
 
-impl FilterReduce for Bool {
-    fn filter(array: ArrayView<'_, Bool>, mask: &Mask) -> VortexResult<Option<ArrayRef>> {
-        let validity = array.validity()?.filter(mask)?;
+impl FilterKernel for BoolVTable {
+    fn filter(
+        array: &BoolArray,
+        mask: &Mask,
+        _ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<ArrayRef>> {
+        let validity = array.validity().filter(mask)?;
 
         let mask_values = mask
             .values()
             .vortex_expect("AllTrue and AllFalse are handled by filter fn");
 
         let buffer = match mask_values.threshold_iter(FILTER_SLICES_DENSITY_THRESHOLD) {
-            MaskIter::Indices(indices) => filter_indices(&array.to_bit_buffer(), indices),
+            MaskIter::Indices(indices) => filter_indices(
+                &array.to_bit_buffer(),
+                mask.true_count(),
+                indices.iter().copied(),
+            ),
             MaskIter::Slices(slices) => filter_slices(
                 &array.to_bit_buffer(),
                 mask.true_count(),
@@ -41,18 +49,24 @@ impl FilterReduce for Bool {
     }
 }
 
-fn filter_indices(bools: &BitBuffer, indices: &[usize]) -> BitBuffer {
+/// Select indices from a boolean buffer.
+/// NOTE: it was benchmarked to be faster using collect_bool to index into a slice than to
+///  pass the indices as an iterator of usize. So we keep this alternate implementation.
+pub fn filter_indices(
+    bools: &BitBuffer,
+    indices_len: usize,
+    mut indices: impl Iterator<Item = usize>,
+) -> BitBuffer {
     let buffer = bools.inner().as_ref();
-    let offset = bools.offset();
-    BitBuffer::collect_bool(indices.len(), |idx| {
-        // Safety:
-        // We iterate over the slice's length.
-        let idx = unsafe { indices.get_unchecked(idx) } + offset;
-        get_bit(buffer, idx)
+    BitBuffer::collect_bool(indices_len, |_idx| {
+        let idx = indices
+            .next()
+            .vortex_expect("iterator is guaranteed to be within the length of the array.");
+        get_bit(buffer, bools.offset() + idx)
     })
 }
 
-fn filter_slices(
+pub fn filter_slices(
     buffer: &BitBuffer,
     indices_len: usize,
     slices: impl Iterator<Item = (usize, usize)>,
@@ -67,13 +81,12 @@ fn filter_slices(
 
 #[cfg(test)]
 mod test {
-
     use itertools::Itertools;
     use vortex_mask::Mask;
 
-    use super::*;
-    use crate::IntoArray;
     use crate::arrays::BoolArray;
+    use crate::arrays::bool::compute::filter::filter_indices;
+    use crate::arrays::bool::compute::filter::filter_slices;
     use crate::assert_arrays_eq;
     use crate::compute::conformance::filter::test_filter_conformance;
 
@@ -98,7 +111,7 @@ mod test {
     fn filter_bool_by_index_test() {
         let arr = BoolArray::from_iter([true, true, false]);
 
-        let filtered = filter_indices(&arr.to_bit_buffer(), &[0, 2]);
+        let filtered = filter_indices(&arr.to_bit_buffer(), 2, [0, 2].into_iter());
         assert_eq!(vec![true, false], filtered.iter().collect_vec())
     }
 
@@ -112,6 +125,6 @@ mod test {
     #[case(BoolArray::from_iter((0..100).map(|i| i % 2 == 0)))]
     #[case(BoolArray::from_iter((0..1024).map(|i| i % 3 != 0)))]
     fn test_filter_bool_conformance(#[case] array: BoolArray) {
-        test_filter_conformance(&array.into_array());
+        test_filter_conformance(array.as_ref());
     }
 }

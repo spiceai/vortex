@@ -3,26 +3,20 @@
 
 use std::iter;
 
-use vortex_error::VortexExpect;
-
-#[expect(deprecated)]
-use crate::ToCanonical as _;
+use crate::ToCanonical;
 use crate::accessor::ArrayAccessor;
-use crate::arrays::VarBinArray;
-use crate::arrays::varbin::VarBinArrayExt;
+use crate::arrays::varbin::VarBinArray;
 use crate::match_each_integer_ptype;
 use crate::validity::Validity;
+use crate::vtable::ValidityHelper;
 
 impl ArrayAccessor<[u8]> for VarBinArray {
     fn with_iterator<F, R>(&self, f: F) -> R
     where
         F: for<'a> FnOnce(&mut dyn Iterator<Item = Option<&'a [u8]>>) -> R,
     {
-        #[expect(deprecated)]
         let offsets = self.offsets().to_primitive();
-        let validity = self
-            .validity()
-            .vortex_expect("varbin validity should be derivable");
+        let validity = self.validity();
 
         let bytes = self.bytes();
         let bytes = bytes.as_slice();
@@ -40,7 +34,6 @@ impl ArrayAccessor<[u8]> for VarBinArray {
                 }
                 Validity::AllInvalid => f(&mut iter::repeat_n(None, self.len())),
                 Validity::Array(v) => {
-                    #[expect(deprecated)]
                     let validity = v.to_bool().into_bit_buffer();
                     let mut iter = offsets
                         .windows(2)

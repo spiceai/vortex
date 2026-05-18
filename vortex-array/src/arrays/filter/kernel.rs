@@ -1,13 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Reduce and execute adaptors for filter operations.
-//!
-//! Encodings that know how to filter themselves implement [`FilterReduce`] (metadata-only)
-//! or [`FilterKernel`] (buffer-reading). The adaptors [`FilterReduceAdaptor`] and
-//! [`FilterExecuteAdaptor`] bridge these into the execution model as
-//! [`ArrayParentReduceRule`] and [`ExecuteParentKernel`] respectively.
-
 use vortex_error::VortexResult;
 use vortex_mask::Mask;
 
@@ -15,12 +8,12 @@ use crate::ArrayRef;
 use crate::Canonical;
 use crate::ExecutionCtx;
 use crate::IntoArray;
-use crate::array::ArrayView;
-use crate::array::VTable;
-use crate::arrays::Filter;
+use crate::arrays::FilterArray;
+use crate::arrays::FilterVTable;
 use crate::kernel::ExecuteParentKernel;
 use crate::matcher::Matcher;
 use crate::optimizer::rules::ArrayParentReduceRule;
+use crate::vtable::VTable;
 
 pub trait FilterReduce: VTable {
     /// Filter an array with the provided mask without reading buffers.
@@ -35,7 +28,7 @@ pub trait FilterReduce: VTable {
     ///
     /// Additionally, the mask is guaranteed to be a `Mask::Values` variant (i.e., neither
     /// `Mask::AllTrue` nor `Mask::AllFalse`).
-    fn filter(array: ArrayView<'_, Self>, mask: &Mask) -> VortexResult<Option<ArrayRef>>;
+    fn filter(array: &Self::Array, mask: &Mask) -> VortexResult<Option<ArrayRef>>;
 }
 
 pub trait FilterKernel: VTable {
@@ -51,7 +44,7 @@ pub trait FilterKernel: VTable {
     /// Additionally, the mask is guaranteed to be a `Mask::Values` variant (i.e., neither
     /// `Mask::AllTrue` nor `Mask::AllFalse`).
     fn filter(
-        array: ArrayView<'_, Self>,
+        array: &Self::Array,
         mask: &Mask,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>>;
@@ -61,7 +54,7 @@ pub trait FilterKernel: VTable {
 ///
 /// Returns `Some(result)` if the precondition short-circuits the filter operation,
 /// or `None` if the filter should proceed normally.
-fn precondition<V: VTable>(array: ArrayView<'_, V>, mask: &Mask) -> Option<ArrayRef> {
+fn precondition<V: VTable>(array: &V::Array, mask: &Mask) -> Option<ArrayRef> {
     let true_count = mask.true_count();
 
     // Fast-path for empty mask (all false).
@@ -71,13 +64,12 @@ fn precondition<V: VTable>(array: ArrayView<'_, V>, mask: &Mask) -> Option<Array
 
     // Fast-path for full mask (all true).
     if true_count == mask.len() {
-        return Some(array.array().clone());
+        return Some(array.to_array());
     }
 
     None
 }
 
-/// Adaptor that wraps a [`FilterReduce`] impl as an [`ArrayParentReduceRule`].
 #[derive(Default, Debug)]
 pub struct FilterReduceAdaptor<V>(pub V);
 
@@ -85,12 +77,12 @@ impl<V> ArrayParentReduceRule<V> for FilterReduceAdaptor<V>
 where
     V: FilterReduce,
 {
-    type Parent = Filter;
+    type Parent = FilterVTable;
 
     fn reduce_parent(
         &self,
-        array: ArrayView<'_, V>,
-        parent: ArrayView<'_, Filter>,
+        array: &V::Array,
+        parent: &FilterArray,
         child_idx: usize,
     ) -> VortexResult<Option<ArrayRef>> {
         assert_eq!(child_idx, 0);
@@ -101,7 +93,6 @@ where
     }
 }
 
-/// Adaptor that wraps a [`FilterKernel`] impl as an [`ExecuteParentKernel`].
 #[derive(Default, Debug)]
 pub struct FilterExecuteAdaptor<V>(pub V);
 
@@ -109,11 +100,11 @@ impl<V> ExecuteParentKernel<V> for FilterExecuteAdaptor<V>
 where
     V: FilterKernel,
 {
-    type Parent = Filter;
+    type Parent = FilterVTable;
 
     fn execute_parent(
         &self,
-        array: ArrayView<'_, V>,
+        array: &V::Array,
         parent: <Self::Parent as Matcher>::Match<'_>,
         child_idx: usize,
         ctx: &mut ExecutionCtx,

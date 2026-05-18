@@ -5,23 +5,21 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::future::try_join_all;
+use vortex::array::Array;
 use vortex::array::Canonical;
 use vortex::array::IntoArray;
-use vortex::array::LEGACY_SESSION;
-use vortex::array::VortexSessionExecute;
+use vortex::array::arrays::BinaryView;
 use vortex::array::arrays::BoolArray;
+use vortex::array::arrays::BoolArrayParts;
 use vortex::array::arrays::DecimalArray;
+use vortex::array::arrays::DecimalArrayParts;
 use vortex::array::arrays::ExtensionArray;
 use vortex::array::arrays::PrimitiveArray;
+use vortex::array::arrays::PrimitiveArrayParts;
 use vortex::array::arrays::StructArray;
+use vortex::array::arrays::StructArrayParts;
 use vortex::array::arrays::VarBinViewArray;
-use vortex::array::arrays::bool::BoolDataParts;
-use vortex::array::arrays::decimal::DecimalDataParts;
-use vortex::array::arrays::extension::ExtensionArrayExt;
-use vortex::array::arrays::primitive::PrimitiveDataParts;
-use vortex::array::arrays::struct_::StructDataParts;
-use vortex::array::arrays::varbinview::BinaryView;
-use vortex::array::arrays::varbinview::VarBinViewDataParts;
+use vortex::array::arrays::VarBinViewArrayParts;
 use vortex::array::buffer::BufferHandle;
 use vortex::buffer::BitBuffer;
 use vortex::buffer::Buffer;
@@ -43,23 +41,16 @@ impl CanonicalCudaExt for Canonical {
             Canonical::Struct(struct_array) => {
                 // Children should all be canonical now
                 let len = struct_array.len();
-                let StructDataParts {
+                let StructArrayParts {
                     fields,
                     struct_fields,
                     validity,
                     ..
-                } = struct_array.into_data_parts();
+                } = struct_array.into_parts();
 
                 let mut host_fields = vec![];
                 for field in fields.iter() {
-                    host_fields.push(
-                        field
-                            .clone()
-                            .execute::<Canonical>(&mut LEGACY_SESSION.create_execution_ctx())?
-                            .into_host()
-                            .await?
-                            .into_array(),
-                    );
+                    host_fields.push(field.to_canonical()?.into_host().await?.into_array());
                 }
 
                 Ok(Canonical::Struct(StructArray::new(
@@ -73,22 +64,24 @@ impl CanonicalCudaExt for Canonical {
             Canonical::Bool(bool) => {
                 // NOTE: update to copy to host when adding buffer handle.
                 // Also update other method to copy validity to host.
-                let len = bool.len();
-                let validity = bool.validity()?;
-                let BoolDataParts {
-                    bits, offset, len, ..
-                } = bool.into_data().into_parts(len);
+                let BoolArrayParts {
+                    bits,
+                    validity,
+                    offset,
+                    len,
+                    ..
+                } = bool.into_parts();
 
                 let bits = BitBuffer::new_with_offset(bits.try_into_host()?.await?, offset, len);
                 Ok(Canonical::Bool(BoolArray::new(bits, validity)))
             }
             Canonical::Primitive(prim) => {
-                let PrimitiveDataParts {
+                let PrimitiveArrayParts {
                     ptype,
                     buffer,
                     validity,
                     ..
-                } = prim.into_data_parts();
+                } = prim.into_parts();
                 Ok(Canonical::Primitive(PrimitiveArray::from_byte_buffer(
                     buffer.try_into_host()?.await?,
                     ptype,
@@ -96,13 +89,13 @@ impl CanonicalCudaExt for Canonical {
                 )))
             }
             Canonical::Decimal(decimal) => {
-                let DecimalDataParts {
+                let DecimalArrayParts {
                     decimal_dtype,
                     values,
                     values_type,
                     validity,
                     ..
-                } = decimal.into_data_parts();
+                } = decimal.into_parts();
                 Ok(Canonical::Decimal(unsafe {
                     DecimalArray::new_unchecked_handle(
                         BufferHandle::new_host(values.try_into_host()?.await?),
@@ -113,12 +106,12 @@ impl CanonicalCudaExt for Canonical {
                 }))
             }
             Canonical::VarBinView(varbinview) => {
-                let VarBinViewDataParts {
+                let VarBinViewArrayParts {
                     views,
                     buffers,
                     validity,
                     dtype,
-                } = varbinview.into_data_parts();
+                } = varbinview.into_parts();
 
                 // Copy all device views to host
                 let host_views = views.try_into_host()?.await?;
@@ -140,9 +133,8 @@ impl CanonicalCudaExt for Canonical {
             Canonical::Extension(ext) => {
                 // Copy the storage array to host and rewrap in ExtensionArray.
                 let host_storage = ext
-                    .storage_array()
-                    .clone()
-                    .execute::<Canonical>(&mut LEGACY_SESSION.create_execution_ctx())?
+                    .storage()
+                    .to_canonical()?
                     .into_host()
                     .await?
                     .into_array();

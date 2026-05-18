@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-#![expect(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used)]
 
 use divan::Bencher;
-use rand::RngExt;
+use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use vortex_array::IntoArray;
@@ -13,10 +13,12 @@ use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::DictArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::builtins::ArrayBuiltins;
+use vortex_array::compute::warm_up_vtables;
 use vortex_mask::Mask;
 use vortex_session::VortexSession;
 
 fn main() {
+    warm_up_vtables();
     divan::main();
 }
 
@@ -62,13 +64,14 @@ fn bench_dict_mask(bencher: Bencher, (fraction_valid, fraction_masked): (f64, f6
     let filter_mask = filter_mask(len, fraction_masked, &mut rng);
     let session = VortexSession::empty();
     bencher
-        .with_inputs(|| (&array, &filter_mask, session.create_execution_ctx()))
-        .bench_refs(|(array, filter_mask, ctx)| {
+        .with_inputs(|| (&array, &filter_mask))
+        .bench_refs(|(array, filter_mask)| {
+            let mut ctx = session.create_execution_ctx();
             array
                 .clone()
                 .mask(filter_mask.clone().into_array())
                 .unwrap()
-                .execute::<RecursiveCanonical>(ctx)
+                .execute::<RecursiveCanonical>(&mut ctx)
                 .unwrap()
         });
 }

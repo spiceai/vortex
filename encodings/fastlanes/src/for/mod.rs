@@ -2,11 +2,9 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 mod array;
-pub use array::FoRArrayExt;
-pub use array::FoRData;
+pub use array::FoRArray;
 
-pub(crate) mod compute;
+mod compute;
 
 mod vtable;
-pub use vtable::FoR;
-pub use vtable::FoRArray;
+pub use vtable::FoRVTable;

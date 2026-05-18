@@ -7,7 +7,7 @@ pub(crate) mod flatbuffers;
 
 mod proto;
 
-#[expect(clippy::module_inception)]
+#[allow(clippy::module_inception)]
 #[cfg(feature = "serde")]
 mod serde;
 
@@ -65,22 +65,6 @@ mod test {
                 },
                 Token::Bool(false),
                 Token::TupleVariantEnd,
-            ],
-        );
-    }
-
-    #[test]
-    fn test_serde_variant_dtype() {
-        use serde_test::assert_ser_tokens;
-
-        assert_ser_tokens(
-            &DType::Variant(Nullability::NonNullable),
-            &[
-                Token::NewtypeVariant {
-                    name: "DType",
-                    variant: "Variant",
-                },
-                Token::Bool(false),
             ],
         );
     }
@@ -168,17 +152,5 @@ mod test {
             .deserialize(deserializer)
             .unwrap();
         assert_eq!(fields, from_value);
-    }
-
-    #[test]
-    fn test_serde_variant_dtype_json_roundtrip() {
-        let json = serde_json::to_string(&DType::Variant(Nullability::Nullable)).unwrap();
-        assert_eq!(json, "{\"Variant\":true}");
-
-        let mut deserializer = serde_json::Deserializer::from_str(&json);
-        let deserialized: DType = DTypeSerde::<DType>::new(&SESSION)
-            .deserialize(&mut deserializer)
-            .unwrap();
-        assert_eq!(DType::Variant(Nullability::Nullable), deserialized);
     }
 }

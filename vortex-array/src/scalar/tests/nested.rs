@@ -19,14 +19,14 @@ mod tests {
         // Create FixedSizeList[2] of FixedSizeList[3] of I32.
         let inner_element_dtype = Arc::new(DType::Primitive(PType::I32, Nullability::NonNullable));
         let inner_dtype = Arc::new(DType::FixedSizeList(
-            Arc::clone(&inner_element_dtype),
+            inner_element_dtype.clone(),
             3,
             Nullability::NonNullable,
         ));
 
         // Create inner FixedSizeLists.
         let inner_list1 = Scalar::fixed_size_list(
-            Arc::clone(&inner_element_dtype),
+            inner_element_dtype.clone(),
             vec![
                 Scalar::primitive(1i32, Nullability::NonNullable),
                 Scalar::primitive(2i32, Nullability::NonNullable),
@@ -87,12 +87,12 @@ mod tests {
         // Create FixedSizeList[2] of variable List of I32.
         let inner_element_dtype = Arc::new(DType::Primitive(PType::I32, Nullability::NonNullable));
         let inner_dtype = Arc::new(DType::List(
-            Arc::clone(&inner_element_dtype),
+            inner_element_dtype.clone(),
             Nullability::NonNullable,
         ));
 
         let inner_list1 = Scalar::list(
-            Arc::clone(&inner_element_dtype),
+            inner_element_dtype.clone(),
             vec![
                 Scalar::primitive(10i32, Nullability::NonNullable),
                 Scalar::primitive(20i32, Nullability::NonNullable),
@@ -133,13 +133,13 @@ mod tests {
         // Create variable List of FixedSizeList[3] of I32.
         let inner_element_dtype = Arc::new(DType::Primitive(PType::I32, Nullability::NonNullable));
         let inner_dtype = Arc::new(DType::FixedSizeList(
-            Arc::clone(&inner_element_dtype),
+            inner_element_dtype.clone(),
             3,
             Nullability::NonNullable,
         ));
 
         let fixed_list1 = Scalar::fixed_size_list(
-            Arc::clone(&inner_element_dtype),
+            inner_element_dtype.clone(),
             vec![
                 Scalar::primitive(1i32, Nullability::NonNullable),
                 Scalar::primitive(2i32, Nullability::NonNullable),
@@ -311,7 +311,7 @@ mod tests {
                 Arc::from(DType::Primitive(PType::U16, Nullability::Nullable)),
                 Nullability::Nullable,
             ),
-            Some(ScalarValue::Tuple(vec![
+            Some(ScalarValue::List(vec![
                 Some(ScalarValue::Primitive(PValue::U16(6))),
                 Some(ScalarValue::Primitive(PValue::U16(100))),
             ])),
@@ -350,7 +350,7 @@ mod tests {
                 Arc::from(DType::Primitive(PType::U16, Nullability::Nullable)),
                 Nullability::Nullable,
             ),
-            Some(ScalarValue::Tuple(vec![
+            Some(ScalarValue::List(vec![
                 Some(ScalarValue::Primitive(PValue::U16(100))),
                 Some(ScalarValue::Primitive(PValue::U16(256))), // Too large for U8
                 Some(ScalarValue::Primitive(PValue::U16(1000))), // Too large for U8
@@ -639,7 +639,7 @@ mod tests {
         ));
 
         let middle_fixed_list_dtype = Arc::new(DType::FixedSizeList(
-            Arc::clone(&struct_dtype),
+            struct_dtype.clone(),
             2,
             Nullability::NonNullable,
         ));
@@ -799,7 +799,7 @@ mod tests {
         ));
 
         let middle_dtype = Arc::new(DType::List(
-            Arc::clone(&innermost_dtype),
+            innermost_dtype.clone(),
             Nullability::NonNullable,
         ));
 
@@ -824,7 +824,7 @@ mod tests {
 
         // Create middle Lists.
         let middle_list1 = Scalar::list(
-            Arc::clone(&innermost_dtype),
+            innermost_dtype.clone(),
             vec![inner_fixed1.clone()],
             Nullability::NonNullable,
         );
@@ -886,7 +886,7 @@ mod tests {
         );
 
         // 2 outer elements * 2 inner elements * 4 bytes (i32) = 16 bytes.
-        assert_eq!(outer.approx_nbytes(), 16);
+        assert_eq!(outer.nbytes(), 16);
     }
 
     // Tests merged from fixed_size_list.rs
@@ -927,7 +927,7 @@ mod tests {
         // Test FixedSizeList[0] behavior.
         let element_dtype = Arc::new(DType::Primitive(PType::I32, Nullability::NonNullable));
         let empty_fixed_list =
-            Scalar::fixed_size_list(Arc::clone(&element_dtype), vec![], Nullability::NonNullable);
+            Scalar::fixed_size_list(element_dtype.clone(), vec![], Nullability::NonNullable);
 
         assert!(matches!(
             empty_fixed_list.dtype(),
@@ -949,7 +949,7 @@ mod tests {
     fn test_fixed_size_list_cast_to_list() {
         let element_dtype = Arc::new(DType::Primitive(PType::I32, Nullability::NonNullable));
         let fixed_list = Scalar::fixed_size_list(
-            Arc::clone(&element_dtype),
+            element_dtype.clone(),
             vec![
                 Scalar::primitive(1i32, Nullability::NonNullable),
                 Scalar::primitive(2i32, Nullability::NonNullable),
@@ -985,7 +985,7 @@ mod tests {
     fn test_list_cast_to_fixed_size_list() {
         let element_dtype = Arc::new(DType::Primitive(PType::I32, Nullability::NonNullable));
         let list = Scalar::list(
-            Arc::clone(&element_dtype),
+            element_dtype.clone(),
             vec![
                 Scalar::primitive(10i32, Nullability::NonNullable),
                 Scalar::primitive(20i32, Nullability::NonNullable),
@@ -1022,7 +1022,7 @@ mod tests {
     fn test_fixed_size_list_size_validation() {
         let element_dtype = Arc::new(DType::Primitive(PType::I32, Nullability::NonNullable));
         let list = Scalar::list(
-            Arc::clone(&element_dtype),
+            element_dtype.clone(),
             vec![
                 Scalar::primitive(1i32, Nullability::NonNullable),
                 Scalar::primitive(2i32, Nullability::NonNullable),
@@ -1032,7 +1032,7 @@ mod tests {
 
         // Try to cast to wrong size - should fail.
         let wrong_size_target =
-            DType::FixedSizeList(Arc::clone(&element_dtype), 3, Nullability::NonNullable);
+            DType::FixedSizeList(element_dtype.clone(), 3, Nullability::NonNullable);
         let result = list.cast(&wrong_size_target);
         assert!(result.is_err());
         assert!(
@@ -1072,7 +1072,7 @@ mod tests {
 
         // Create two equal fixed size lists.
         let list1 = Scalar::fixed_size_list(
-            Arc::clone(&element_dtype),
+            element_dtype.clone(),
             vec![
                 Scalar::primitive(1i32, Nullability::NonNullable),
                 Scalar::primitive(2i32, Nullability::NonNullable),
@@ -1081,7 +1081,7 @@ mod tests {
         );
 
         let list2 = Scalar::fixed_size_list(
-            Arc::clone(&element_dtype),
+            element_dtype.clone(),
             vec![
                 Scalar::primitive(1i32, Nullability::NonNullable),
                 Scalar::primitive(2i32, Nullability::NonNullable),
@@ -1113,7 +1113,7 @@ mod tests {
         // Test FixedSizeList[1].
         let element_dtype = Arc::new(DType::Primitive(PType::I64, Nullability::NonNullable));
         let single_element = Scalar::fixed_size_list(
-            Arc::clone(&element_dtype),
+            element_dtype.clone(),
             vec![Scalar::primitive(42i64, Nullability::NonNullable)],
             Nullability::NonNullable,
         );
@@ -1172,7 +1172,7 @@ mod tests {
 
         // FixedSizeList[3] of i32 = 3 * 4 bytes = 12 bytes.
         let fixed_list = Scalar::fixed_size_list(
-            Arc::clone(&element_dtype),
+            element_dtype.clone(),
             vec![
                 Scalar::primitive(1i32, Nullability::NonNullable),
                 Scalar::primitive(2i32, Nullability::NonNullable),
@@ -1180,11 +1180,11 @@ mod tests {
             ],
             Nullability::NonNullable,
         );
-        assert_eq!(fixed_list.approx_nbytes(), 12);
+        assert_eq!(fixed_list.nbytes(), 12);
 
         // Empty FixedSizeList[0] = 0 bytes.
         let empty_list = Scalar::fixed_size_list(element_dtype, vec![], Nullability::NonNullable);
-        assert_eq!(empty_list.approx_nbytes(), 0);
+        assert_eq!(empty_list.nbytes(), 0);
 
         // FixedSizeList with strings.
         let string_list = Scalar::fixed_size_list(
@@ -1195,7 +1195,7 @@ mod tests {
             ],
             Nullability::NonNullable,
         );
-        assert_eq!(string_list.approx_nbytes(), 5);
+        assert_eq!(string_list.nbytes(), 5);
     }
 
     #[test]

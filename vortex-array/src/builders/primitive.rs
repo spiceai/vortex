@@ -10,17 +10,15 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 use vortex_mask::Mask;
 
+use crate::Array;
 use crate::ArrayRef;
 use crate::IntoArray;
-use crate::LEGACY_SESSION;
-use crate::VortexSessionExecute;
 use crate::arrays::PrimitiveArray;
 use crate::builders::ArrayBuilder;
 use crate::builders::DEFAULT_BUILDER_CAPACITY;
 use crate::builders::LazyBitBufferBuilder;
 use crate::canonical::Canonical;
-#[expect(deprecated)]
-use crate::canonical::ToCanonical as _;
+use crate::canonical::ToCanonical;
 use crate::dtype::DType;
 use crate::dtype::NativePType;
 use crate::dtype::Nullability;
@@ -54,20 +52,9 @@ impl<T: NativePType> PrimitiveBuilder<T> {
         self.nulls.append_non_null();
     }
 
-    /// Appends `n` copies of `value` as non-null entries, directly writing into the buffer.
-    pub fn append_n_values(&mut self, value: T, n: usize) {
-        self.values.push_n(value, n);
-        self.nulls.append_n_non_nulls(n);
-    }
-
     /// Returns the raw primitive values in this builder as a slice.
     pub fn values(&self) -> &[T] {
         self.values.as_ref()
-    }
-
-    /// Returns the raw primitive values in this builder as a mutable slice.
-    pub fn values_mut(&mut self) -> &mut [T] {
-        self.values.as_mut()
     }
 
     /// Create a new handle to the next `len` uninitialized values in the builder.
@@ -177,8 +164,7 @@ impl<T: NativePType> ArrayBuilder for PrimitiveBuilder<T> {
         Ok(())
     }
 
-    unsafe fn extend_from_array_unchecked(&mut self, array: &ArrayRef) {
-        #[expect(deprecated)]
+    unsafe fn extend_from_array_unchecked(&mut self, array: &dyn Array) {
         let array = array.to_primitive();
 
         // This should be checked in `extend_from_array` but we can check it again.
@@ -191,14 +177,8 @@ impl<T: NativePType> ArrayBuilder for PrimitiveBuilder<T> {
         self.values.extend_from_slice(array.as_slice::<T>());
         self.nulls.append_validity_mask(
             array
-                .as_ref()
-                .validity()
-                .vortex_expect("validity_mask")
-                .execute_mask(
-                    array.as_ref().len(),
-                    &mut LEGACY_SESSION.create_execution_ctx(),
-                )
-                .vortex_expect("Failed to compute validity mask"),
+                .validity_mask()
+                .vortex_expect("validity_mask in extend_from_array_unchecked"),
         );
     }
 
@@ -368,8 +348,6 @@ impl<T> UninitRange<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use vortex_error::VortexExpect;
-
     use super::*;
     use crate::assert_arrays_eq;
 
@@ -440,24 +418,9 @@ mod tests {
         let array = builder.finish_into_primitive();
         assert_eq!(array.len(), 3);
         // Check validity using scalar_at - nulls will return is_null() = true.
-        assert!(
-            !array
-                .execute_scalar(0, &mut LEGACY_SESSION.create_execution_ctx())
-                .unwrap()
-                .is_null()
-        );
-        assert!(
-            array
-                .execute_scalar(1, &mut LEGACY_SESSION.create_execution_ctx())
-                .unwrap()
-                .is_null()
-        );
-        assert!(
-            !array
-                .execute_scalar(2, &mut LEGACY_SESSION.create_execution_ctx())
-                .unwrap()
-                .is_null()
-        );
+        assert!(!array.scalar_at(0).unwrap().is_null());
+        assert!(array.scalar_at(1).unwrap().is_null());
+        assert!(!array.scalar_at(2).unwrap().is_null());
     }
 
     /// REGRESSION TEST: This test verifies that `append_mask` validates the mask length.
@@ -545,38 +508,13 @@ mod tests {
         assert_eq!(array.as_slice::<i32>(), &[100, 200, 10, 20, 30]);
 
         // Check validity - the first two should be valid (from append_value).
-        assert!(
-            !array
-                .execute_scalar(0, &mut LEGACY_SESSION.create_execution_ctx())
-                .unwrap()
-                .is_null()
-        ); // initial value 100
-        assert!(
-            !array
-                .execute_scalar(1, &mut LEGACY_SESSION.create_execution_ctx())
-                .unwrap()
-                .is_null()
-        ); // initial value 200
+        assert!(!array.scalar_at(0).unwrap().is_null()); // initial value 100
+        assert!(!array.scalar_at(1).unwrap().is_null()); // initial value 200
 
         // Check the range items with modified validity.
-        assert!(
-            !array
-                .execute_scalar(2, &mut LEGACY_SESSION.create_execution_ctx())
-                .unwrap()
-                .is_null()
-        ); // range index 0 - set to valid
-        assert!(
-            array
-                .execute_scalar(3, &mut LEGACY_SESSION.create_execution_ctx())
-                .unwrap()
-                .is_null()
-        ); // range index 1 - left as null
-        assert!(
-            !array
-                .execute_scalar(4, &mut LEGACY_SESSION.create_execution_ctx())
-                .unwrap()
-                .is_null()
-        ); // range index 2 - set to valid
+        assert!(!array.scalar_at(2).unwrap().is_null()); // range index 0 - set to valid
+        assert!(array.scalar_at(3).unwrap().is_null()); // range index 1 - left as null
+        assert!(!array.scalar_at(4).unwrap().is_null()); // range index 2 - set to valid
     }
 
     /// Test that creating a zero-length uninit range panics.
@@ -671,27 +609,10 @@ mod tests {
         // values[2] might be any value since it's null.
 
         // Check validity - first two should be valid, third should be null.
-        assert!(
-            array
-                .validity()
-                .vortex_expect("primitive validity should be derivable")
-                .is_valid(0)
-                .unwrap()
-        );
-        assert!(
-            array
-                .validity()
-                .vortex_expect("primitive validity should be derivable")
-                .is_valid(1)
-                .unwrap()
-        );
-        assert!(
-            !array
-                .validity()
-                .vortex_expect("primitive validity should be derivable")
-                .is_valid(2)
-                .unwrap()
-        );
+        use crate::vtable::ValidityHelper;
+        assert!(array.validity().is_valid(0).unwrap());
+        assert!(array.validity().is_valid(1).unwrap());
+        assert!(!array.validity().is_valid(2).unwrap());
 
         // Test wrong dtype error.
         let mut builder = PrimitiveBuilder::<i32>::with_capacity(Nullability::NonNullable, 10);

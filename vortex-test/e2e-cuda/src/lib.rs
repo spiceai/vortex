@@ -11,7 +11,7 @@
 //! * run some operations on the loaded column view
 //! * call `array->release()` to drop the data allocated from the Rust side
 
-#![expect(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::mem;
 use std::sync::Arc;

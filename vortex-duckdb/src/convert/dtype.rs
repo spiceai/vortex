@@ -171,7 +171,6 @@ impl FromLogicalType for DType {
             DUCKDB_TYPE::DUCKDB_TYPE_BIGNUM => todo!(),
             DUCKDB_TYPE::DUCKDB_TYPE_STRING_LITERAL => todo!(),
             DUCKDB_TYPE::DUCKDB_TYPE_INTEGER_LITERAL => todo!(),
-            DUCKDB_TYPE::DUCKDB_TYPE_GEOMETRY => todo!(),
         })
     }
 }
@@ -236,9 +235,6 @@ impl TryFrom<&DType> for LogicalType {
             DType::FixedSizeList(element_dtype, list_size, _) => {
                 let element_logical_type = LogicalType::try_from(element_dtype.as_ref())?;
                 return LogicalType::array_type(element_logical_type, *list_size);
-            }
-            DType::Variant(_) => {
-                vortex_bail!("Vortex Variant array aren't supported in DuckDB")
             }
             DType::Extension(ext_dtype) => {
                 let Some(temporal) = ext_dtype.metadata_opt::<AnyTemporal>() else {
@@ -584,7 +580,7 @@ mod tests {
             type NativeValue<'a> = &'a str;
 
             fn id(&self) -> ExtId {
-                ExtId::new("unknown.extension")
+                ExtId::new_ref("unknown.extension")
             }
 
             fn serialize_metadata(&self, _metadata: &Self::Metadata) -> VortexResult<Vec<u8>> {
@@ -595,12 +591,18 @@ mod tests {
                 Ok(EmptyMetadata)
             }
 
-            fn validate_dtype(_ext_dtype: &ExtDType<Self>) -> VortexResult<()> {
+            fn validate_dtype(
+                &self,
+                _options: &Self::Metadata,
+                _storage_dtype: &DType,
+            ) -> VortexResult<()> {
                 Ok(())
             }
 
             fn unpack_native<'a>(
-                _ext_dtype: &'a ExtDType<Self>,
+                &self,
+                _metadata: &'a Self::Metadata,
+                _storage_dtype: &'a DType,
                 _storage_value: &'a ScalarValue,
             ) -> VortexResult<Self::NativeValue<'a>> {
                 Ok("")

@@ -13,33 +13,12 @@ use std::time::Instant;
 
 use indicatif::ProgressBar;
 use vortex::error::vortex_panic;
-use vortex::utils::aliases::hash_set::HashSet;
 
 use crate::Benchmark;
 use crate::BenchmarkDataset;
 use crate::Engine;
 use crate::Format;
 use crate::Target;
-use crate::datasets::DEFAULT_BENCHMARK_RUNNER_ID;
-use crate::datasets::normalize_benchmark_runner_id;
-
-/// Controls whether queries are benchmarked or explained.
-pub enum BenchmarkMode {
-    /// Run each query `iterations` times, collecting timing.
-    Run { iterations: usize },
-    /// Prepend `EXPLAIN` to each query, print the result, skip timing.
-    Explain,
-}
-
-/// Trait implemented by engine-specific query results so the runner can
-/// extract row counts (for validation in Run mode) and display text
-/// (for Explain mode).
-pub trait BenchmarkQueryResult {
-    /// Number of result rows (used for row-count validation).
-    fn row_count(&self) -> usize;
-    /// Human-readable representation of the result (used by Explain mode).
-    fn display(self) -> String;
-}
 use crate::display::DisplayFormat;
 use crate::display::print_measurements_json;
 use crate::display::render_table;
@@ -68,10 +47,8 @@ pub struct BenchmarkResults {
 pub struct SqlBenchmarkRunner {
     engine: Engine,
     benchmark_dataset: BenchmarkDataset,
-    benchmark_runner: String,
     storage: String,
     expected_row_counts: Option<Vec<usize>>,
-    /// Deduplicated, preserving insertion order.
     formats: Vec<Format>,
     memory_tracker: Option<BenchmarkMemoryTracker>,
     hide_progress_bar: bool,
@@ -84,23 +61,17 @@ impl SqlBenchmarkRunner {
     pub fn new<B: Benchmark + ?Sized>(
         benchmark: &B,
         engine: Engine,
-        benchmark_runner: String,
-        formats: impl IntoIterator<Item = Format>,
+        formats: Vec<Format>,
         track_memory: bool,
         hide_progress_bar: bool,
     ) -> anyhow::Result<Self> {
-        let mut seen = HashSet::new();
-        let formats: Vec<Format> = formats.into_iter().filter(|f| seen.insert(*f)).collect();
         let storage = url_scheme_to_storage(benchmark.data_url())?;
-        let benchmark_runner = normalize_benchmark_runner_id(&benchmark_runner);
-        validate_benchmark_runner_id(&benchmark_runner, is_ci())?;
 
         let memory_tracker = track_memory.then(BenchmarkMemoryTracker::new);
 
         Ok(Self {
             engine,
             benchmark_dataset: benchmark.dataset(),
-            benchmark_runner,
             storage,
             expected_row_counts: benchmark.expected_row_counts().map(|s| s.to_vec()),
             formats,
@@ -126,32 +97,38 @@ impl SqlBenchmarkRunner {
     /// Run a synchronous query benchmark.
     ///
     /// Executes the query function `iterations` times, collecting timing information.
-    /// The function should return `(Option<Duration>, R)` where:
-    /// - `Option<Duration>` can be `Some(Duration)` if the callback wants to report its own timing
+    /// The function should return `(row_count, optional_timing, result)` where:
+    /// - `row_count` is used for validation
+    /// - `optional_timing` can be `Some(Duration)` if the callback wants to report its own timing
     ///   (e.g., DuckDB's internal timing), or `None` to use external wall-clock measurement
-    /// - `R` implements `BenchmarkQueryResult` for row count and display
-    fn run_query<R, F>(&mut self, query_idx: usize, format: Format, iterations: usize, mut f: F)
+    ///
+    /// This handles:
+    /// - Memory tracking (start/end)
+    /// - Timing each iteration
+    /// - Recording measurements
+    /// - Row count validation
+    /// - Progress bar updates
+    fn run_query<F>(&mut self, query_idx: usize, format: Format, iterations: usize, mut f: F)
     where
-        R: BenchmarkQueryResult,
-        F: FnMut() -> (Option<Duration>, R),
+        F: FnMut() -> (usize, Option<Duration>),
     {
         self.start_query();
 
         let mut runs = Vec::with_capacity(iterations);
-        let mut row_count = None;
+        let mut result = None;
 
         for _ in 0..iterations {
             let start = Instant::now();
-            let (timing, result) = f();
+            let (row_count, timing) = f();
             let elapsed = timing.unwrap_or_else(|| start.elapsed());
             runs.push(elapsed);
 
-            if row_count.is_none() {
-                row_count = Some(result.row_count());
+            if result.is_none() {
+                result = Some(row_count);
             }
         }
 
-        let row_count = row_count.expect("iterations must be > 0");
+        let row_count = result.expect("iterations must be > 0");
         self.record_query(query_idx, format, runs, row_count);
     }
 
@@ -175,7 +152,6 @@ impl SqlBenchmarkRunner {
             query_idx,
             target,
             benchmark_dataset: self.benchmark_dataset.clone(),
-            benchmark_runner: self.benchmark_runner.clone(),
             storage: self.storage.clone(),
             runs,
         });
@@ -200,7 +176,6 @@ impl SqlBenchmarkRunner {
                 query_idx,
                 target,
                 self.benchmark_dataset.clone(),
-                self.benchmark_runner.clone(),
                 self.storage.clone(),
                 memory_result,
             ));
@@ -260,89 +235,74 @@ impl SqlBenchmarkRunner {
         }
     }
 
-    /// Run (or explain) all queries for all formats synchronously.
+    /// Run all queries for all formats synchronously.
     ///
-    /// In `Run` mode, executes each query `iterations` times, collecting timing.
-    /// In `Explain` mode, prepends `EXPLAIN` to each query, executes once, and
-    /// prints `R::display()`. No progress bar or timing in Explain mode.
+    /// For each format:
+    /// 1. Calls `setup` to create a context for that format
+    /// 2. Iterates over all queries, calling `execute` for each
     ///
-    /// The `execute` callback returns `(Option<Duration>, R)` where
-    /// `Option<Duration>` overrides wall-clock timing, and `R` implements
-    /// `BenchmarkQueryResult`.
-    pub fn run_all<Ctx, R, S, E>(
+    /// The `execute` callback receives the context, query index, and query string,
+    /// and should return `(row_count, optional_timing)` where `optional_timing` can be
+    /// `Some(Duration)` if the callback wants to report its own timing.
+    pub fn run_all<Ctx, S, E>(
         &mut self,
         queries: &[(usize, String)],
-        mode: BenchmarkMode,
+        iterations: usize,
         mut setup: S,
         mut execute: E,
     ) -> anyhow::Result<()>
     where
-        R: BenchmarkQueryResult,
         S: FnMut(Format) -> anyhow::Result<Ctx>,
-        E: FnMut(&mut Ctx, usize, Format, &str) -> anyhow::Result<(Option<Duration>, R)>,
+        E: FnMut(&mut Ctx, usize, Format, &str) -> anyhow::Result<(usize, Option<Duration>)>,
     {
-        match mode {
-            BenchmarkMode::Run { iterations } => {
-                let bar_length = queries.len() * self.formats.len();
-                let progress_bar = if self.hide_progress_bar || bar_length == 0 {
-                    ProgressBar::hidden()
-                } else {
-                    ProgressBar::new(bar_length as u64)
-                };
+        let bar_length = queries.len() * self.formats.len();
+        let progress_bar = if self.hide_progress_bar || bar_length == 0 {
+            ProgressBar::hidden()
+        } else {
+            ProgressBar::new(bar_length as u64)
+        };
 
-                for format in self.formats.clone() {
-                    let mut ctx = setup(format)?;
+        for format in self.formats.clone() {
+            let mut ctx = setup(format)?;
 
-                    for (query_idx, query) in queries.iter() {
-                        let query_idx = *query_idx;
-                        tracing::debug!(%format, query_idx, "Running query");
-                        self.run_query(query_idx, format, iterations, || {
-                            execute(&mut ctx, query_idx, format, query.as_str()).unwrap_or_else(
-                                |err| {
-                                    vortex_panic!("query {query_idx} failed: {err}");
-                                },
-                            )
+            for (query_idx, query) in queries.iter() {
+                let query_idx = *query_idx;
+                tracing::debug!(%format, query_idx, "Running query");
+                self.run_query(query_idx, format, iterations, || {
+                    let (row_count, timing) = execute(&mut ctx, query_idx, format, query.as_str())
+                        .unwrap_or_else(|err| {
+                            vortex_panic!("query {query_idx} failed: {err}");
                         });
+                    (row_count, timing)
+                });
 
-                        progress_bar.inc(1);
-                    }
-                }
-
-                progress_bar.finish();
-            }
-            BenchmarkMode::Explain => {
-                for format in self.formats.clone() {
-                    let mut ctx = setup(format)?;
-
-                    for (query_idx, query) in queries.iter() {
-                        let explain_query = format!("EXPLAIN {query}");
-                        let (_, result) = execute(&mut ctx, *query_idx, format, &explain_query)?;
-                        println!("=== Q{query_idx} [{format}] ===");
-                        println!("{query}");
-                        println!();
-                        println!("{}", result.display());
-                        println!();
-                    }
-                }
+                progress_bar.inc(1);
             }
         }
+
+        progress_bar.finish();
 
         Ok(())
     }
 
-    /// Run (or explain) all queries for all formats asynchronously.
+    /// Run all queries for all formats asynchronously.
     ///
-    /// Same semantics as `run_all` but for async execute callbacks.
+    /// For each format:
+    /// 1. Calls `setup` to create a context for that format
+    /// 2. Iterates over all queries, calling `execute` for each
+    ///
+    /// The `execute` callback receives the context, query index, and query string,
+    /// and should return `(row_count, optional_timing, result)` where `optional_timing` can be
+    /// `Some(Duration)` if the callback wants to report its own timing.
     /// Use `Box::pin(async move { ... })` in the closure.
-    pub async fn run_all_async<Ctx, R, S, SFut, E>(
+    pub async fn run_all_async<Ctx, S, SFut, E, T>(
         &mut self,
         queries: &[(usize, String)],
-        mode: BenchmarkMode,
+        iterations: usize,
         setup: S,
         mut execute: E,
     ) -> anyhow::Result<()>
     where
-        R: BenchmarkQueryResult,
         S: Fn(Format) -> SFut,
         SFut: Future<Output = anyhow::Result<Ctx>>,
         E: for<'c> FnMut(
@@ -350,86 +310,55 @@ impl SqlBenchmarkRunner {
             &'c Ctx,
             &'c str,
         ) -> Pin<
-            Box<dyn Future<Output = anyhow::Result<(Option<Duration>, R)>> + 'c>,
+            Box<dyn Future<Output = anyhow::Result<(usize, Option<Duration>, T)>> + 'c>,
         >,
     {
-        match mode {
-            BenchmarkMode::Run { iterations } => {
-                let bar_length = queries.len() * self.formats.len();
-                let progress_bar = if self.hide_progress_bar || bar_length == 0 {
-                    ProgressBar::hidden()
-                } else {
-                    ProgressBar::new(bar_length as u64)
-                };
+        let bar_length = queries.len() * self.formats.len();
+        let progress_bar = if self.hide_progress_bar || bar_length == 0 {
+            ProgressBar::hidden()
+        } else {
+            ProgressBar::new(bar_length as u64)
+        };
 
-                for format in self.formats.clone() {
-                    let ctx = setup(format).await?;
+        for format in self.formats.clone() {
+            let ctx = setup(format).await?;
 
-                    for (query_idx, query) in queries.iter() {
-                        let query_idx = *query_idx;
+            for (query_idx, query) in queries.iter() {
+                let query_idx = *query_idx;
 
-                        self.start_query();
+                self.start_query();
 
-                        let mut runs = Vec::with_capacity(iterations);
-                        let mut row_count = None;
+                let mut runs = Vec::with_capacity(iterations);
+                let mut result = None;
 
-                        tracing::debug!(%format, query_idx, "Running query");
+                tracing::debug!(%format, query_idx, "Running query");
 
-                        for _ in 0..iterations {
-                            let start = Instant::now();
-                            let (timing, result) = execute(query_idx, &ctx, query.as_str())
-                                .await
-                                .unwrap_or_else(|err| {
-                                    vortex_panic!("query {query_idx} failed: {err}");
-                                });
-                            let elapsed = timing.unwrap_or_else(|| start.elapsed());
-                            runs.push(elapsed);
+                for _ in 0..iterations {
+                    let start = Instant::now();
+                    let (row_count, timing, iter_result) = execute(query_idx, &ctx, query.as_str())
+                        .await
+                        .unwrap_or_else(|err| {
+                            vortex_panic!("query {query_idx} failed: {err}");
+                        });
+                    let elapsed = timing.unwrap_or_else(|| start.elapsed());
+                    runs.push(elapsed);
 
-                            if row_count.is_none() {
-                                row_count = Some(result.row_count());
-                            }
-                        }
-
-                        let row_count = row_count.expect("iterations must be > 0");
-                        self.record_query(query_idx, format, runs, row_count);
-
-                        progress_bar.inc(1);
+                    if result.is_none() {
+                        result = Some((row_count, iter_result));
                     }
                 }
 
-                progress_bar.finish();
-            }
-            BenchmarkMode::Explain => {
-                for format in self.formats.clone() {
-                    let ctx = setup(format).await?;
+                let (row_count, _) = result.expect("iterations must be > 0");
+                self.record_query(query_idx, format, runs, row_count);
 
-                    for (query_idx, query) in queries.iter() {
-                        let explain_query = format!("EXPLAIN {query}");
-                        let (_, result) = execute(*query_idx, &ctx, &explain_query).await?;
-                        println!("=== Q{query_idx} [{format}] ===");
-                        println!("{query}");
-                        println!();
-                        println!("{}", result.display());
-                        println!();
-                    }
-                }
+                progress_bar.inc(1);
             }
         }
 
+        progress_bar.finish();
+
         Ok(())
     }
-}
-
-fn is_ci() -> bool {
-    matches!(std::env::var("CI").as_deref(), Ok("true"))
-}
-
-fn validate_benchmark_runner_id(benchmark_runner: &str, is_ci: bool) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        !is_ci || benchmark_runner != DEFAULT_BENCHMARK_RUNNER_ID,
-        "benchmark runner must not be unknown in CI; pass --runner"
-    );
-    Ok(())
 }
 
 pub fn export_results<W: Write>(
@@ -480,24 +409,4 @@ pub fn filter_queries(
                     .is_none_or(|excluded| !excluded.contains(query_idx))
         })
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ci_rejects_unknown_benchmark_runner() {
-        assert!(validate_benchmark_runner_id("unknown", true).is_err());
-    }
-
-    #[test]
-    fn ci_accepts_explicit_benchmark_runner() {
-        assert!(validate_benchmark_runner_id("ec2_c6id.8xlarge", true).is_ok());
-    }
-
-    #[test]
-    fn local_accepts_unknown_benchmark_runner() {
-        assert!(validate_benchmark_runner_id("unknown", false).is_ok());
-    }
 }

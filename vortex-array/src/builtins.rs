@@ -10,11 +10,14 @@
 //! the equivalent Arrow compute function.
 
 use vortex_error::VortexResult;
+use vortex_session::VortexSession;
 
+use crate::Array;
 use crate::ArrayRef;
+use crate::ExecutionCtx;
 use crate::IntoArray;
 use crate::arrays::ConstantArray;
-use crate::arrays::scalar_fn::ScalarFnFactoryExt;
+use crate::arrays::ScalarFnArrayExt;
 use crate::dtype::DType;
 use crate::dtype::FieldName;
 use crate::expr::Expression;
@@ -28,7 +31,6 @@ use crate::scalar_fn::fns::binary::Binary;
 use crate::scalar_fn::fns::cast::Cast;
 use crate::scalar_fn::fns::fill_null::FillNull;
 use crate::scalar_fn::fns::get_item::GetItem;
-use crate::scalar_fn::fns::is_not_null::IsNotNull;
 use crate::scalar_fn::fns::is_null::IsNull;
 use crate::scalar_fn::fns::list_contains::ListContains;
 use crate::scalar_fn::fns::mask::Mask;
@@ -50,9 +52,6 @@ pub trait ExprBuiltins: Sized {
     /// Is null check.
     fn is_null(&self) -> VortexResult<Expression>;
 
-    /// Is not null check.
-    fn is_not_null(&self) -> VortexResult<Expression>;
-
     /// Mask the expression using the given boolean mask.
     /// The resulting expression's validity is the intersection of the original expression's
     /// validity.
@@ -64,8 +63,8 @@ pub trait ExprBuiltins: Sized {
     /// Check if a list contains a value.
     fn list_contains(&self, value: Expression) -> VortexResult<Expression>;
 
-    /// Conditional selection: `result[i] = if mask[i] then if_true[i] else if_false[i]`.
-    fn zip(&self, if_true: Expression, if_false: Expression) -> VortexResult<Expression>;
+    /// Conditional selection: `result[i] = if mask[i] then self[i] else if_false[i]`.
+    fn zip(&self, if_false: Expression, mask: Expression) -> VortexResult<Expression>;
 
     /// Apply a binary operator to this expression and another.
     fn binary(&self, rhs: Expression, op: Operator) -> VortexResult<Expression>;
@@ -88,10 +87,6 @@ impl ExprBuiltins for Expression {
         IsNull.try_new_expr(EmptyOptions, [self.clone()])
     }
 
-    fn is_not_null(&self) -> VortexResult<Expression> {
-        IsNotNull.try_new_expr(EmptyOptions, [self.clone()])
-    }
-
     fn mask(&self, mask: Expression) -> VortexResult<Expression> {
         Mask.try_new_expr(EmptyOptions, [self.clone(), mask])
     }
@@ -104,8 +99,8 @@ impl ExprBuiltins for Expression {
         ListContains.try_new_expr(EmptyOptions, [self.clone(), value])
     }
 
-    fn zip(&self, if_true: Expression, if_false: Expression) -> VortexResult<Expression> {
-        Zip.try_new_expr(EmptyOptions, [if_true, if_false, self.clone()])
+    fn zip(&self, if_false: Expression, mask: Expression) -> VortexResult<Expression> {
+        Zip.try_new_expr(EmptyOptions, [self.clone(), if_false, mask])
     }
 
     fn binary(&self, rhs: Expression, op: Operator) -> VortexResult<Expression> {
@@ -126,9 +121,6 @@ pub trait ArrayBuiltins: Sized {
     /// Is null check.
     fn is_null(&self) -> VortexResult<ArrayRef>;
 
-    /// Is not null check.
-    fn is_not_null(&self) -> VortexResult<ArrayRef>;
-
     /// Mask the array using the given boolean mask.
     /// The resulting array's validity is the intersection of the original array's validity
     /// and the mask's validity.
@@ -137,8 +129,8 @@ pub trait ArrayBuiltins: Sized {
     /// Boolean negation.
     fn not(&self) -> VortexResult<ArrayRef>;
 
-    /// Conditional selection: `result[i] = if mask[i] then if_true[i] else if_false[i]`.
-    fn zip(&self, if_true: ArrayRef, if_false: ArrayRef) -> VortexResult<ArrayRef>;
+    /// Conditional selection: `result[i] = if mask[i] then self[i] else if_false[i]`.
+    fn zip(&self, if_false: ArrayRef, mask: ArrayRef) -> VortexResult<ArrayRef>;
 
     /// Check if a list contains a value.
     fn list_contains(&self, value: ArrayRef) -> VortexResult<ArrayRef>;
@@ -165,17 +157,13 @@ impl ArrayBuiltins for ArrayRef {
     }
 
     fn fill_null(&self, fill_value: impl Into<Scalar>) -> VortexResult<ArrayRef> {
-        let fill_value = fill_value.into();
-        if !self.dtype().is_nullable() {
-            return self.cast(fill_value.dtype().clone());
-        }
         FillNull
             .try_new_array(
                 self.len(),
                 EmptyOptions,
                 [
                     self.clone(),
-                    ConstantArray::new(fill_value, self.len()).into_array(),
+                    ConstantArray::new(fill_value.into(), self.len()).into_array(),
                 ],
             )?
             .optimize()
@@ -193,12 +181,6 @@ impl ArrayBuiltins for ArrayRef {
             .optimize()
     }
 
-    fn is_not_null(&self) -> VortexResult<ArrayRef> {
-        IsNotNull
-            .try_new_array(self.len(), EmptyOptions, [self.clone()])?
-            .optimize()
-    }
-
     fn mask(self, mask: ArrayRef) -> VortexResult<ArrayRef> {
         Mask.try_new_array(self.len(), EmptyOptions, [self, mask])?
             .optimize()
@@ -209,8 +191,11 @@ impl ArrayBuiltins for ArrayRef {
             .optimize()
     }
 
-    fn zip(&self, if_true: ArrayRef, if_false: ArrayRef) -> VortexResult<ArrayRef> {
-        Zip.try_new_array(self.len(), EmptyOptions, [if_true, if_false, self.clone()])
+    fn zip(&self, if_false: ArrayRef, mask: ArrayRef) -> VortexResult<ArrayRef> {
+        let scalar_fn =
+            Zip.try_new_array(self.len(), EmptyOptions, [self.clone(), if_false, mask])?;
+        let mut ctx = ExecutionCtx::new(VortexSession::empty());
+        scalar_fn.execute::<ArrayRef>(&mut ctx)
     }
 
     fn list_contains(&self, value: ArrayRef) -> VortexResult<ArrayRef> {

@@ -3,35 +3,36 @@
 
 use num_traits::AsPrimitive;
 use num_traits::NumCast;
+use vortex_array::Array;
 use vortex_array::ArrayRef;
-use vortex_array::ArrayView;
 use vortex_array::ExecutionCtx;
-use vortex_array::IntoArray;
+use vortex_array::ToCanonical;
 use vortex_array::arrays::PrimitiveArray;
-use vortex_array::arrays::dict::TakeExecute;
+use vortex_array::arrays::TakeExecute;
 use vortex_array::match_each_integer_ptype;
 use vortex_array::search_sorted::SearchResult;
 use vortex_array::search_sorted::SearchSorted;
 use vortex_array::search_sorted::SearchSortedSide;
 use vortex_array::validity::Validity;
+use vortex_array::vtable::ValidityHelper;
 use vortex_buffer::Buffer;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 
-use crate::RunEnd;
-use crate::array::RunEndArrayExt;
+use crate::RunEndArray;
+use crate::RunEndVTable;
 
-impl TakeExecute for RunEnd {
+impl TakeExecute for RunEndVTable {
     #[expect(
         clippy::cast_possible_truncation,
         reason = "index cast to usize inside macro"
     )]
     fn take(
-        array: ArrayView<'_, Self>,
-        indices: &ArrayRef,
-        ctx: &mut ExecutionCtx,
+        array: &RunEndArray,
+        indices: &dyn Array,
+        _ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
-        let primitive_indices = indices.clone().execute::<PrimitiveArray>(ctx)?;
+        let primitive_indices = indices.to_primitive();
 
         let checked_indices = match_each_integer_ptype!(primitive_indices.ptype(), |P| {
             primitive_indices
@@ -48,19 +49,17 @@ impl TakeExecute for RunEnd {
                 .collect::<VortexResult<Vec<_>>>()?
         });
 
-        let indices_validity = primitive_indices.validity()?;
-        take_indices_unchecked(array, &checked_indices, &indices_validity, ctx).map(Some)
+        take_indices_unchecked(array, &checked_indices, primitive_indices.validity()).map(Some)
     }
 }
 
 /// Perform a take operation on a RunEndArray by binary searching for each of the indices.
 pub fn take_indices_unchecked<T: AsPrimitive<usize>>(
-    array: ArrayView<'_, RunEnd>,
+    array: &RunEndArray,
     indices: &[T],
     validity: &Validity,
-    ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
-    let ends = array.ends().clone().execute::<PrimitiveArray>(ctx)?;
+    let ends = array.ends().to_primitive();
     let ends_len = ends.len();
 
     // TODO(joe): use the validity mask to skip search sorted.
@@ -85,12 +84,13 @@ pub fn take_indices_unchecked<T: AsPrimitive<usize>>(
         PrimitiveArray::new(buffer, validity.clone())
     });
 
-    array.values().take(physical_indices.into_array())
+    array.values().take(physical_indices.to_array())
 }
 
 #[cfg(test)]
-mod tests {
+mod test {
     use rstest::rstest;
+    use vortex_array::Array;
     use vortex_array::ArrayRef;
     use vortex_array::Canonical;
     use vortex_array::IntoArray;
@@ -101,15 +101,10 @@ mod tests {
     use vortex_array::compute::conformance::take::test_take_conformance;
     use vortex_buffer::buffer;
 
-    use crate::RunEnd;
     use crate::RunEndArray;
 
     fn ree_array() -> RunEndArray {
-        RunEnd::encode(
-            buffer![1, 1, 1, 4, 4, 4, 2, 2, 5, 5, 5, 5].into_array(),
-            &mut LEGACY_SESSION.create_execution_ctx(),
-        )
-        .unwrap()
+        RunEndArray::encode(buffer![1, 1, 1, 4, 4, 4, 2, 2, 5, 5, 5, 5].into_array()).unwrap()
     }
 
     #[test]
@@ -148,20 +143,19 @@ mod tests {
     #[test]
     fn ree_take_nullable() {
         let taken = ree_array()
-            .take(PrimitiveArray::from_option_iter([Some(1), None]).into_array())
+            .take(PrimitiveArray::from_option_iter([Some(1), None]).to_array())
             .unwrap();
 
         let expected = PrimitiveArray::from_option_iter([Some(1i32), None]);
-        assert_arrays_eq!(taken, expected.into_array());
+        assert_arrays_eq!(taken, expected.to_array());
     }
 
     #[rstest]
     #[case(ree_array())]
-    #[case(RunEnd::encode(
+    #[case(RunEndArray::encode(
         buffer![1u8, 1, 2, 2, 2, 3, 3, 3, 3, 4].into_array(),
-        &mut LEGACY_SESSION.create_execution_ctx(),
     ).unwrap())]
-    #[case(RunEnd::encode(
+    #[case(RunEndArray::encode(
         PrimitiveArray::from_option_iter([
             Some(10),
             Some(10),
@@ -172,14 +166,11 @@ mod tests {
             Some(20),
         ])
         .into_array(),
-        &mut LEGACY_SESSION.create_execution_ctx(),
     ).unwrap())]
-    #[case(RunEnd::encode(buffer![42i32, 42, 42, 42, 42].into_array(),
-        &mut LEGACY_SESSION.create_execution_ctx())
+    #[case(RunEndArray::encode(buffer![42i32, 42, 42, 42, 42].into_array())
         .unwrap())]
-    #[case(RunEnd::encode(
+    #[case(RunEndArray::encode(
         buffer![1i32, 2, 3, 4, 5, 6, 7, 8, 9, 10].into_array(),
-        &mut LEGACY_SESSION.create_execution_ctx(),
     ).unwrap())]
     #[case({
         let mut values = Vec::new();
@@ -188,27 +179,22 @@ mod tests {
                 values.push(i);
             }
         }
-        RunEnd::encode(
-            PrimitiveArray::from_iter(values).into_array(),
-            &mut LEGACY_SESSION.create_execution_ctx(),
-        )
-        .unwrap()
+        RunEndArray::encode(PrimitiveArray::from_iter(values).into_array()).unwrap()
     })]
     fn test_take_runend_conformance(#[case] array: RunEndArray) {
-        test_take_conformance(&array.into_array());
+        test_take_conformance(array.as_ref());
     }
 
     #[rstest]
     #[case(ree_array().slice(3..6).unwrap())]
     #[case({
-        let array = RunEnd::encode(
+        let array = RunEndArray::encode(
             buffer![1i32, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3].into_array(),
-            &mut LEGACY_SESSION.create_execution_ctx(),
         )
         .unwrap();
         array.slice(2..8).unwrap()
     })]
     fn test_take_sliced_runend_conformance(#[case] sliced: ArrayRef) {
-        test_take_conformance(&sliced);
+        test_take_conformance(sliced.as_ref());
     }
 }

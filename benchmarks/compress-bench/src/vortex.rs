@@ -12,7 +12,6 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::pin_mut;
-use vortex::array::IntoArray;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::file::WriteOptionsSessionExt;
 use vortex_bench::Format;
@@ -38,7 +37,7 @@ impl Compressor for VortexCompressor {
         let mut cursor = Cursor::new(&mut buf);
         SESSION
             .write_options()
-            .write(&mut cursor, uncompressed.into_array().to_array_stream())
+            .write(&mut cursor, uncompressed.to_array_stream())
             .await?;
         let elapsed = start.elapsed();
 
@@ -52,7 +51,7 @@ impl Compressor for VortexCompressor {
         let mut cursor = Cursor::new(&mut buf);
         SESSION
             .write_options()
-            .write(&mut cursor, uncompressed.into_array().to_array_stream())
+            .write(&mut cursor, uncompressed.to_array_stream())
             .await?;
 
         // Now decompress

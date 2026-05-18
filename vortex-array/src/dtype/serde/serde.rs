@@ -30,7 +30,6 @@ use crate::dtype::StructFields;
 use crate::dtype::decimal::DecimalDType;
 use crate::dtype::extension::ExtDTypeRef;
 use crate::dtype::extension::ExtId;
-use crate::dtype::extension::ForeignExtDType;
 use crate::dtype::session::DTypeSessionExt;
 
 /// Serialize Nullability as a boolean
@@ -118,7 +117,6 @@ impl Serialize for DType {
             DType::Extension(ext) => {
                 serializer.serialize_newtype_variant("DType", 9, "Extension", ext)
             }
-            DType::Variant(n) => serializer.serialize_newtype_variant("DType", 10, "Variant", n),
         }
     }
 }
@@ -158,7 +156,6 @@ impl<'de> DeserializeSeed<'de> for DTypeSerde<'_, DType> {
             "FixedSizeList",
             "Struct",
             "Extension",
-            "Variant",
         ];
 
         struct DTypeVisitor<'a> {
@@ -219,10 +216,6 @@ impl<'de> DeserializeSeed<'de> for DTypeSerde<'_, DType> {
                         let ext = access
                             .newtype_variant_seed(DTypeSerde::<ExtDTypeRef>::new(self.session))?;
                         Ok(DType::Extension(ext))
-                    }
-                    "Variant" => {
-                        let n = access.newtype_variant()?;
-                        Ok(DType::Variant(n))
                     }
                     _ => Err(de::Error::unknown_variant(&variant, VARIANTS)),
                 }
@@ -571,31 +564,21 @@ impl<'de> DeserializeSeed<'de> for DTypeSerde<'_, ExtDTypeRef> {
                 }
 
                 let id = id.ok_or_else(|| de::Error::missing_field("id"))?;
-                let id = ExtId::new(&id);
+                let id = ExtId::new_arc(id);
+                let vtable = self.session.dtypes().registry().find(&id).ok_or_else(|| {
+                    de::Error::custom(format!("unknown extension dtype id: {}", id))
+                })?;
+
                 let storage_dtype =
                     storage_dtype.ok_or_else(|| de::Error::missing_field("storage_dtype"))?;
                 let metadata = metadata.ok_or_else(|| de::Error::missing_field("metadata"))?;
 
-                if let Some(vtable) = self.session.dtypes().registry().find(&id) {
-                    vtable.deserialize(&metadata, storage_dtype).map_err(|e| {
-                        de::Error::custom(format!(
-                            "failed to deserialize extension dtype {}: {}",
-                            id, e
-                        ))
-                    })
-                } else if self.session.allows_unknown() {
-                    ForeignExtDType::from_parts(id, metadata, storage_dtype).map_err(|e| {
-                        de::Error::custom(format!(
-                            "failed to deserialize unknown extension dtype: {}",
-                            e
-                        ))
-                    })
-                } else {
-                    Err(de::Error::custom(format!(
-                        "unknown extension dtype id: {}",
-                        id
-                    )))
-                }
+                vtable.deserialize(&metadata, storage_dtype).map_err(|e| {
+                    de::Error::custom(format!(
+                        "failed to deserialize extension dtype {}: {}",
+                        id, e
+                    ))
+                })
             }
         }
 

@@ -4,6 +4,9 @@
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 mod avx2;
 
+#[cfg(vortex_nightly)]
+mod portable;
+
 use std::sync::LazyLock;
 
 use vortex_buffer::Buffer;
@@ -11,12 +14,13 @@ use vortex_buffer::BufferMut;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 
+use crate::Array;
 use crate::ArrayRef;
 use crate::IntoArray;
-use crate::array::ArrayView;
-use crate::arrays::Primitive;
-use crate::arrays::PrimitiveArray;
-use crate::arrays::dict::TakeExecute;
+use crate::ToCanonical;
+use crate::arrays::PrimitiveVTable;
+use crate::arrays::TakeExecute;
+use crate::arrays::primitive::PrimitiveArray;
 use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
 use crate::dtype::IntegerPType;
@@ -25,41 +29,47 @@ use crate::executor::ExecutionCtx;
 use crate::match_each_integer_ptype;
 use crate::match_each_native_ptype;
 use crate::validity::Validity;
+use crate::vtable::ValidityHelper;
 
 // Kernel selection happens on the first call to `take` and uses a combination of compile-time
 // and runtime feature detection to infer the best kernel for the platform.
 static PRIMITIVE_TAKE_KERNEL: LazyLock<&'static dyn TakeImpl> = LazyLock::new(|| {
-    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-    {
-        if is_x86_feature_detected!("avx2") {
-            &avx2::TakeKernelAVX2
+    cfg_if::cfg_if! {
+        if #[cfg(vortex_nightly)] {
+            // nightly codepath: use portable_simd kernel
+            &portable::TakeKernelPortableSimd
+        } else if #[cfg(target_arch = "x86_64")] {
+            // stable x86_64 path: use the optimized AVX2 kernel when available, falling
+            // back to scalar when not.
+            if is_x86_feature_detected!("avx2") {
+                &avx2::TakeKernelAVX2
+            } else {
+                &TakeKernelScalar
+            }
         } else {
+            // stable all other platforms: scalar kernel
             &TakeKernelScalar
         }
-    }
-
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
-    {
-        &TakeKernelScalar
     }
 });
 
 trait TakeImpl: Send + Sync {
     fn take(
         &self,
-        array: ArrayView<'_, Primitive>,
-        indices: ArrayView<'_, Primitive>,
+        array: &PrimitiveArray,
+        indices: &PrimitiveArray,
         validity: Validity,
     ) -> VortexResult<ArrayRef>;
 }
 
+#[allow(unused)]
 struct TakeKernelScalar;
 
 impl TakeImpl for TakeKernelScalar {
     fn take(
         &self,
-        array: ArrayView<'_, Primitive>,
-        indices: ArrayView<'_, Primitive>,
+        array: &PrimitiveArray,
+        indices: &PrimitiveArray,
         validity: Validity,
     ) -> VortexResult<ArrayRef> {
         match_each_native_ptype!(array.ptype(), |T| {
@@ -71,40 +81,36 @@ impl TakeImpl for TakeKernelScalar {
     }
 }
 
-impl TakeExecute for Primitive {
+impl TakeExecute for PrimitiveVTable {
     fn take(
-        array: ArrayView<'_, Primitive>,
-        indices: &ArrayRef,
-        ctx: &mut ExecutionCtx,
+        array: &PrimitiveArray,
+        indices: &dyn Array,
+        _ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
         let DType::Primitive(ptype, null) = indices.dtype() else {
             vortex_bail!("Invalid indices dtype: {}", indices.dtype())
         };
 
         let unsigned_indices = if ptype.is_unsigned_int() {
-            indices.clone().execute::<PrimitiveArray>(ctx)?
+            indices.to_primitive()
         } else {
             // This will fail if all values cannot be converted to unsigned
             indices
-                .clone()
+                .to_array()
                 .cast(DType::Primitive(ptype.to_unsigned(), *null))?
-                .execute::<PrimitiveArray>(ctx)?
+                .to_primitive()
         };
 
-        let validity = array
-            .validity()?
-            .take(&unsigned_indices.clone().into_array())?;
+        let validity = array.validity().take(unsigned_indices.as_ref())?;
         // Delegate to the best kernel based on the target CPU
-        {
-            let unsigned_indices = unsigned_indices.as_view();
-            PRIMITIVE_TAKE_KERNEL
-                .take(array, unsigned_indices, validity)
-                .map(Some)
-        }
+        PRIMITIVE_TAKE_KERNEL
+            .take(array, &unsigned_indices, validity)
+            .map(Some)
     }
 }
 
 // Compiler may see this as unused based on enabled features
+#[allow(unused)]
 #[inline(always)]
 fn take_primitive_scalar<T: NativePType, I: IntegerPType>(
     buffer: &[T],
@@ -135,9 +141,8 @@ mod test {
     use vortex_buffer::buffer;
     use vortex_error::VortexExpect;
 
+    use crate::Array;
     use crate::IntoArray;
-    use crate::LEGACY_SESSION;
-    use crate::VortexSessionExecute;
     use crate::arrays::BoolArray;
     use crate::arrays::PrimitiveArray;
     use crate::arrays::primitive::compute::take::take_primitive_scalar;
@@ -162,25 +167,19 @@ mod test {
             buffer![0, 3, 4],
             Validity::Array(BoolArray::from_iter([true, true, false]).into_array()),
         );
-        let actual = values.take(indices.into_array()).unwrap();
+        let actual = values.take(indices.to_array()).unwrap();
         assert_eq!(
-            actual
-                .execute_scalar(0, &mut LEGACY_SESSION.create_execution_ctx())
-                .vortex_expect("no fail"),
+            actual.scalar_at(0).vortex_expect("no fail"),
             Scalar::from(Some(1))
         );
         // position 3 is null
         assert_eq!(
-            actual
-                .execute_scalar(1, &mut LEGACY_SESSION.create_execution_ctx())
-                .vortex_expect("no fail"),
+            actual.scalar_at(1).vortex_expect("no fail"),
             Scalar::null_native::<i32>()
         );
         // the third index is null
         assert_eq!(
-            actual
-                .execute_scalar(2, &mut LEGACY_SESSION.create_execution_ctx())
-                .vortex_expect("no fail"),
+            actual.scalar_at(2).vortex_expect("no fail"),
             Scalar::null_native::<i32>()
         );
     }
@@ -197,6 +196,6 @@ mod test {
     ))]
     #[case(PrimitiveArray::from_option_iter([Some(1), None, Some(3), Some(4), None]))]
     fn test_take_primitive_conformance(#[case] array: PrimitiveArray) {
-        test_take_conformance(&array.into_array());
+        test_take_conformance(array.as_ref());
     }
 }

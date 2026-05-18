@@ -7,14 +7,12 @@ use vortex_error::VortexResult;
 
 use crate::ArrayRef;
 use crate::IntoArray;
-use crate::array::ArrayView;
-use crate::arrays::ListView;
 use crate::arrays::ListViewArray;
-use crate::arrays::listview::ListViewArrayExt;
-use crate::arrays::slice::SliceReduce;
+use crate::arrays::ListViewVTable;
+use crate::arrays::SliceReduce;
 
-impl SliceReduce for ListView {
-    fn slice(array: ArrayView<'_, Self>, range: Range<usize>) -> VortexResult<Option<ArrayRef>> {
+impl SliceReduce for ListViewVTable {
+    fn slice(array: &Self::Array, range: Range<usize>) -> VortexResult<Option<ArrayRef>> {
         Ok(Some(
             unsafe {
                 ListViewArray::new_unchecked(

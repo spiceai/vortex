@@ -4,25 +4,19 @@
 use std::ops::Range;
 
 use vortex_array::ArrayRef;
-use vortex_array::ArrayView;
 use vortex_array::IntoArray;
-use vortex_array::arrays::slice::SliceReduce;
-use vortex_array::vtable::child_to_validity;
+use vortex_array::arrays::SliceReduce;
 use vortex_error::VortexResult;
 
-use crate::Zstd;
+use crate::ZstdArray;
+use crate::ZstdVTable;
 
-impl SliceReduce for Zstd {
-    fn slice(array: ArrayView<'_, Self>, range: Range<usize>) -> VortexResult<Option<ArrayRef>> {
-        let unsliced_validity =
-            child_to_validity(array.slots()[0].as_ref(), array.dtype().nullability());
-        Ok(Some(
-            Zstd::try_new(
-                array.dtype().clone(),
-                array.data().with_slice(range.start, range.end),
-                unsliced_validity,
-            )?
-            .into_array(),
-        ))
+impl SliceReduce for ZstdVTable {
+    fn slice(array: &Self::Array, range: Range<usize>) -> VortexResult<Option<ArrayRef>> {
+        Ok(Some(slice_zstd(array, range)))
     }
+}
+
+fn slice_zstd(array: &ZstdArray, range: Range<usize>) -> ArrayRef {
+    array._slice(range.start, range.end).into_array()
 }

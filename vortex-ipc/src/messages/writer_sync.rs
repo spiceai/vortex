@@ -4,7 +4,6 @@
 use std::io::Write;
 
 use vortex_error::VortexResult;
-use vortex_session::VortexSession;
 
 use crate::messages::EncoderMessage;
 use crate::messages::MessageEncoder;
@@ -15,10 +14,10 @@ pub struct SyncMessageWriter<W> {
 }
 
 impl<W: Write> SyncMessageWriter<W> {
-    pub fn new(write: W, session: &VortexSession) -> Self {
+    pub fn new(write: W) -> Self {
         Self {
             write,
-            encoder: MessageEncoder::new(session.clone()),
+            encoder: MessageEncoder::default(),
         }
     }
 

@@ -7,7 +7,11 @@
 mod bitops;
 mod eq;
 mod intersect_by_rank;
+mod iter_bools;
+mod mask_mut;
 
+#[cfg(feature = "arrow")]
+mod arrow;
 #[cfg(test)]
 mod tests;
 
@@ -20,8 +24,10 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 
 use itertools::Itertools;
+pub use mask_mut::*;
 use vortex_buffer::BitBuffer;
 use vortex_buffer::BitBufferMut;
+use vortex_buffer::set_bit_unchecked;
 use vortex_error::VortexResult;
 use vortex_error::vortex_panic;
 
@@ -96,11 +102,10 @@ where
 impl<T> Eq for AllOr<T> where T: Eq {}
 
 /// Represents a set of sorted unique positive integers.
-/// If a value is included in a Mask, it's valid.
 ///
 /// A [`Mask`] can be constructed from various representations, and converted to various
 /// others. Internally, these are cached.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(::serde::Serialize, ::serde::Deserialize))]
 pub enum Mask {
     /// All values are included.
@@ -111,16 +116,6 @@ pub enum Mask {
     Values(Arc<MaskValues>),
 }
 
-impl Debug for Mask {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::AllTrue(len) => write!(f, "All true({len})"),
-            Self::AllFalse(len) => write!(f, "All false({len})"),
-            Self::Values(mask) => write!(f, "{mask:?}"),
-        }
-    }
-}
-
 impl Default for Mask {
     fn default() -> Self {
         Self::new_true(0)
@@ -128,6 +123,7 @@ impl Default for Mask {
 }
 
 /// Represents the values of a [`Mask`] that contains some true and some false elements.
+#[derive(Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MaskValues {
     buffer: BitBuffer,
@@ -143,23 +139,6 @@ pub struct MaskValues {
     true_count: usize,
     // i.e., the fraction of values that are true
     density: f64,
-}
-
-impl Debug for MaskValues {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "true_count={}, ", self.true_count)?;
-        write!(f, "density={}, ", self.density)?;
-        if let Some(v) = self.indices.get() {
-            write!(f, "indices={v:?}, ")?;
-        }
-        if let Some(v) = self.slices.get() {
-            write!(f, "slices={v:?}, ")?;
-        }
-        if f.alternate() {
-            f.write_str("\n")?;
-        }
-        write!(f, "{}", self.buffer)
-    }
 }
 
 impl Mask {
@@ -444,23 +423,6 @@ impl Mask {
         }
     }
 
-    /// Returns the last true index in the mask.
-    pub fn last(&self) -> Option<usize> {
-        match &self {
-            Self::AllTrue(len) => (*len > 0).then_some(*len - 1),
-            Self::AllFalse(_) => None,
-            Self::Values(values) => {
-                if let Some(indices) = values.indices.get() {
-                    return indices.last().copied();
-                }
-                if let Some(slices) = values.slices.get() {
-                    return slices.last().map(|(_, end)| end - 1);
-                }
-                values.buffer.set_slices().last().map(|(_, end)| end - 1)
-            }
-        }
-    }
-
     /// Returns the position in the mask of the nth true value.
     pub fn rank(&self, n: usize) -> usize {
         if n >= self.true_count() {
@@ -614,12 +576,12 @@ impl Mask {
             return self;
         }
 
-        match &self {
+        match self {
             Mask::AllTrue(len) => {
                 Self::from_iter([Self::new_true(limit), Self::new_false(len - limit)])
             }
             Mask::AllFalse(_) => self,
-            Mask::Values(mask_values) => {
+            Mask::Values(ref mask_values) => {
                 if limit >= mask_values.true_count() {
                     return self;
                 }
@@ -629,10 +591,11 @@ impl Mask {
                 let mut new_buffer_builder = BitBufferMut::new_unset(mask_values.len());
                 debug_assert!(limit < mask_values.len());
 
+                let ptr = new_buffer_builder.as_mut_ptr();
                 for index in existing_buffer.set_indices().take(limit) {
                     // SAFETY: We checked that `limit` was less than the mask values length,
                     // therefore `index` must be within the bounds of the bit buffer.
-                    unsafe { new_buffer_builder.set_unchecked(index) }
+                    unsafe { set_bit_unchecked(ptr, index) }
                 }
 
                 Self::from(new_buffer_builder.freeze())
@@ -757,6 +720,11 @@ impl MaskValues {
         } else {
             MaskIter::Indices(self.indices())
         }
+    }
+
+    /// Extracts the internal [`BitBuffer`].
+    pub(crate) fn into_buffer(self) -> BitBuffer {
+        self.buffer
     }
 }
 

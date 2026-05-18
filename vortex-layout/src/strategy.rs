@@ -4,7 +4,7 @@
 use async_trait::async_trait;
 use vortex_array::ArrayContext;
 use vortex_error::VortexResult;
-use vortex_session::VortexSession;
+use vortex_io::runtime::Handle;
 
 use crate::LayoutRef;
 use crate::segments::SegmentSinkRef;
@@ -52,7 +52,7 @@ pub trait LayoutStrategy: 'static + Send + Sync {
         segment_sink: SegmentSinkRef,
         stream: SendableSequentialStream,
         eof: SequencePointer,
-        session: &VortexSession,
+        handle: Handle,
     ) -> VortexResult<LayoutRef>;
 
     /// Returns the number of bytes currently buffered by this strategy and any child strategies.
@@ -73,10 +73,10 @@ impl LayoutStrategy for std::sync::Arc<dyn LayoutStrategy> {
         segment_sink: SegmentSinkRef,
         stream: SendableSequentialStream,
         eof: SequencePointer,
-        session: &VortexSession,
+        handle: Handle,
     ) -> VortexResult<LayoutRef> {
         (**self)
-            .write_stream(ctx, segment_sink, stream, eof, session)
+            .write_stream(ctx, segment_sink, stream, eof, handle)
             .await
     }
 

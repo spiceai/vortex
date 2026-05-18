@@ -2,7 +2,10 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 mod cast;
+mod is_constant;
+mod is_sorted;
 mod mask;
+mod min_max;
 pub(crate) mod rules;
 mod slice;
 mod take;
@@ -14,9 +17,9 @@ mod tests {
 
     use crate::IntoArray;
     use crate::accessor::ArrayAccessor;
+    use crate::array::Array;
     use crate::arrays::VarBinViewArray;
-    #[expect(deprecated)]
-    use crate::canonical::ToCanonical as _;
+    use crate::canonical::ToCanonical;
     #[test]
     fn take_nullable() {
         let arr = VarBinViewArray::from_iter_nullable_str([
@@ -31,12 +34,12 @@ mod tests {
         let taken = arr.take(buffer![0, 3].into_array()).unwrap();
 
         assert!(taken.dtype().is_nullable());
-        #[expect(deprecated)]
-        let result = taken.to_varbinview().with_iterator(|it| {
-            it.map(|v| v.map(|b| unsafe { String::from_utf8_unchecked(b.to_vec()) }))
-                .collect::<Vec<_>>()
-        });
-        assert_eq!(result, [Some("one".to_string()), Some("four".to_string())]);
+        assert_eq!(
+            taken.to_varbinview().with_iterator(|it| it
+                .map(|v| v.map(|b| unsafe { String::from_utf8_unchecked(b.to_vec()) }))
+                .collect::<Vec<_>>()),
+            [Some("one".to_string()), Some("four".to_string())]
+        );
     }
     // Consistency tests
     use rstest::rstest;
@@ -79,6 +82,6 @@ mod tests {
         None::<&str>, None, None, None
     ]))]
     fn test_varbinview_consistency(#[case] array: VarBinViewArray) {
-        test_array_consistency(&array.into_array());
+        test_array_consistency(array.as_ref());
     }
 }

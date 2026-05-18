@@ -1,23 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::fmt::Display;
-use std::fmt::Formatter;
 use std::hash::Hash;
-use std::hash::Hasher;
 
 use num_traits::cast::FromPrimitive;
-use prost::Message;
-use vortex_array::Array;
-use vortex_array::ArrayEq;
-use vortex_array::ArrayHash;
-use vortex_array::ArrayId;
-use vortex_array::ArrayParts;
+use vortex_array::ArrayBufferVisitor;
+use vortex_array::ArrayChildVisitor;
 use vortex_array::ArrayRef;
-use vortex_array::ArrayView;
+use vortex_array::DeserializeMetadata;
 use vortex_array::ExecutionCtx;
-use vortex_array::ExecutionResult;
+use vortex_array::IntoArray;
 use vortex_array::Precision;
+use vortex_array::ProstMetadata;
+use vortex_array::SerializeMetadata;
+use vortex_array::arrays::PrimitiveArray;
 use vortex_array::buffer::BufferHandle;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::NativePType;
@@ -33,26 +29,29 @@ use vortex_array::scalar::PValue;
 use vortex_array::scalar::Scalar;
 use vortex_array::scalar::ScalarValue;
 use vortex_array::serde::ArrayChildren;
+use vortex_array::stats::ArrayStats;
 use vortex_array::stats::StatsSet;
+use vortex_array::stats::StatsSetRef;
 use vortex_array::validity::Validity;
+use vortex_array::vtable;
+use vortex_array::vtable::ArrayId;
+use vortex_array::vtable::BaseArrayVTable;
 use vortex_array::vtable::OperationsVTable;
 use vortex_array::vtable::VTable;
 use vortex_array::vtable::ValidityVTable;
+use vortex_array::vtable::VisitorVTable;
+use vortex_buffer::BufferMut;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
-use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
-use vortex_session::registry::CachedId;
 
-use crate::compress::sequence_decompress;
 use crate::kernel::PARENT_KERNELS;
 use crate::rules::RULES;
 
-/// A [`Sequence`]-encoded Vortex array.
-pub type SequenceArray = Array<Sequence>;
+vtable!(Sequence);
 
 #[derive(Clone, prost::Message)]
 pub struct SequenceMetadata {
@@ -62,35 +61,33 @@ pub struct SequenceMetadata {
     multiplier: Option<vortex_proto::scalar::ScalarValue>,
 }
 
-pub(super) const SLOT_NAMES: [&str; 0] = [];
+/// Components of [`SequenceArray`].
+pub struct SequenceArrayParts {
+    pub base: PValue,
+    pub multiplier: PValue,
+    pub len: usize,
+    pub ptype: PType,
+    pub nullability: Nullability,
+}
 
 #[derive(Clone, Debug)]
 /// An array representing the equation `A[i] = base + i * multiplier`.
-pub struct SequenceData {
+pub struct SequenceArray {
     base: PValue,
     multiplier: PValue,
+    dtype: DType,
+    pub(crate) len: usize,
+    stats_set: ArrayStats,
 }
 
-impl Display for SequenceData {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "base: {}, multiplier: {}", self.base, self.multiplier)
-    }
-}
-
-pub struct SequenceDataParts {
-    pub base: PValue,
-    pub multiplier: PValue,
-    pub ptype: PType,
-}
-
-impl SequenceData {
-    pub(crate) fn try_new_typed<T: NativePType + Into<PValue>>(
+impl SequenceArray {
+    pub fn typed_new<T: NativePType + Into<PValue>>(
         base: T,
         multiplier: T,
         nullability: Nullability,
         length: usize,
     ) -> VortexResult<Self> {
-        Self::try_new(
+        Self::new(
             base.into(),
             multiplier.into(),
             T::PTYPE,
@@ -100,66 +97,73 @@ impl SequenceData {
     }
 
     /// Constructs a sequence array using two integer values (with the same ptype).
-    pub(crate) fn try_new(
+    pub fn new(
         base: PValue,
         multiplier: PValue,
         ptype: PType,
         nullability: Nullability,
         length: usize,
     ) -> VortexResult<Self> {
-        let dtype = DType::Primitive(ptype, nullability);
-        Self::validate(base, multiplier, &dtype, length)?;
-        let (base, multiplier) = Self::normalize(base, multiplier, ptype)?;
-
-        Ok(unsafe { Self::new_unchecked(base, multiplier) })
-    }
-
-    pub fn validate(
-        base: PValue,
-        multiplier: PValue,
-        dtype: &DType,
-        length: usize,
-    ) -> VortexResult<()> {
-        let DType::Primitive(ptype, _) = dtype else {
-            vortex_bail!("only primitive dtypes are supported in SequenceArray currently");
-        };
-
         if !ptype.is_int() {
             vortex_bail!("only integer ptype are supported in SequenceArray currently")
         }
 
-        vortex_ensure!(length > 0, "SequenceArray length must be greater than zero");
-        Self::try_last(base, multiplier, *ptype, length).map_err(|e| {
+        Self::try_last(base, multiplier, ptype, length).map_err(|e| {
             e.with_context(format!(
                 "final value not expressible, base = {base:?}, multiplier = {multiplier:?}, len = {length} ",
             ))
         })?;
 
-        Ok(())
+        Ok(Self::unchecked_new(
+            base,
+            multiplier,
+            ptype,
+            nullability,
+            length,
+        ))
     }
 
-    fn normalize(base: PValue, multiplier: PValue, ptype: PType) -> VortexResult<(PValue, PValue)> {
-        match_each_integer_ptype!(ptype, |P| {
-            Ok((
-                PValue::from(base.cast::<P>()?),
-                PValue::from(multiplier.cast::<P>()?),
-            ))
-        })
-    }
+    pub(crate) fn unchecked_new(
+        base: PValue,
+        multiplier: PValue,
+        ptype: PType,
+        nullability: Nullability,
+        length: usize,
+    ) -> Self {
+        let dtype = DType::Primitive(ptype, nullability);
 
-    /// Constructs a [`SequenceArray`] payload without validation.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure that:
-    /// - `base` and `multiplier` are both normalized to the same integer `ptype`.
-    /// - they are logically compatible with the outer dtype and len.
-    pub(crate) unsafe fn new_unchecked(base: PValue, multiplier: PValue) -> Self {
-        Self { base, multiplier }
+        // A sequence A[i] = base + i * multiplier is sorted iff multiplier >= 0,
+        // and strictly sorted iff multiplier > 0.
+
+        let (is_sorted, is_strict_sorted) = match_each_pvalue!(
+            multiplier,
+            uint: |v| { (true, v> 0) },
+            int: |v| { (v >= 0, v > 0) },
+            float: |_v| { unreachable!("float multiplier not supported") }
+        );
+
+        // SAFETY: we don't have duplicate stats
+        let stats_set = unsafe {
+            StatsSet::new_unchecked(vec![
+                (Stat::IsSorted, StatPrecision::Exact(is_sorted.into())),
+                (
+                    Stat::IsStrictSorted,
+                    StatPrecision::Exact(is_strict_sorted.into()),
+                ),
+            ])
+        };
+
+        Self {
+            base,
+            multiplier,
+            dtype,
+            len: length,
+            stats_set: ArrayStats::from(stats_set),
+        }
     }
 
     pub fn ptype(&self) -> PType {
-        self.base.ptype()
+        self.dtype.as_ptype()
     }
 
     pub fn base(&self) -> PValue {
@@ -168,14 +172,6 @@ impl SequenceData {
 
     pub fn multiplier(&self) -> PValue {
         self.multiplier
-    }
-
-    pub fn into_parts(self) -> SequenceDataParts {
-        SequenceDataParts {
-            base: self.base,
-            multiplier: self.multiplier,
-            ptype: self.base.ptype(),
-        }
     }
 
     pub(crate) fn try_last(
@@ -199,6 +195,8 @@ impl SequenceData {
     }
 
     pub(crate) fn index_value(&self, idx: usize) -> PValue {
+        assert!(idx < self.len, "index_value({idx}): index out of bounds");
+
         match_each_native_ptype!(self.ptype(), |P| {
             let base = self.base.cast::<P>().vortex_expect("must be able to cast");
             let multiplier = self
@@ -210,128 +208,129 @@ impl SequenceData {
             PValue::from(value)
         })
     }
-}
 
-impl ArrayHash for SequenceData {
-    fn array_hash<H: Hasher>(&self, state: &mut H, _precision: Precision) {
-        self.base.hash(state);
-        self.multiplier.hash(state);
+    /// Returns the validated final value of a sequence array
+    pub fn last(&self) -> PValue {
+        Self::try_last(self.base, self.multiplier, self.ptype(), self.len)
+            .vortex_expect("validated array")
+    }
+
+    pub fn into_parts(self) -> SequenceArrayParts {
+        SequenceArrayParts {
+            base: self.base,
+            multiplier: self.multiplier,
+            len: self.len,
+            ptype: self.dtype.as_ptype(),
+            nullability: self.dtype.nullability(),
+        }
     }
 }
 
-impl ArrayEq for SequenceData {
-    fn array_eq(&self, other: &Self, _precision: Precision) -> bool {
-        self.base == other.base && self.multiplier == other.multiplier
-    }
-}
+impl VTable for SequenceVTable {
+    type Array = SequenceArray;
 
-impl VTable for Sequence {
-    type ArrayData = SequenceData;
+    type Metadata = ProstMetadata<SequenceMetadata>;
 
+    type ArrayVTable = Self;
     type OperationsVTable = Self;
     type ValidityVTable = Self;
+    type VisitorVTable = Self;
 
-    fn id(&self) -> ArrayId {
-        static ID: CachedId = CachedId::new("vortex.sequence");
-        *ID
+    fn id(_array: &Self::Array) -> ArrayId {
+        Self::ID
     }
 
-    fn validate(
-        &self,
-        data: &Self::ArrayData,
-        dtype: &DType,
-        len: usize,
-        _slots: &[Option<ArrayRef>],
-    ) -> VortexResult<()> {
-        SequenceData::validate(data.base, data.multiplier, dtype, len)
-    }
-
-    fn nbuffers(_array: ArrayView<'_, Self>) -> usize {
-        0
-    }
-
-    fn buffer(_array: ArrayView<'_, Self>, idx: usize) -> BufferHandle {
-        vortex_panic!("SequenceArray buffer index {idx} out of bounds")
-    }
-
-    fn buffer_name(_array: ArrayView<'_, Self>, idx: usize) -> Option<String> {
-        vortex_panic!("SequenceArray buffer_name index {idx} out of bounds")
-    }
-
-    fn serialize(
-        array: ArrayView<'_, Self>,
-        _session: &VortexSession,
-    ) -> VortexResult<Option<Vec<u8>>> {
-        let metadata = SequenceMetadata {
+    fn metadata(array: &SequenceArray) -> VortexResult<Self::Metadata> {
+        Ok(ProstMetadata(SequenceMetadata {
             base: Some((&array.base()).into()),
             multiplier: Some((&array.multiplier()).into()),
-        };
+        }))
+    }
 
-        Ok(Some(metadata.encode_to_vec()))
+    fn serialize(metadata: Self::Metadata) -> VortexResult<Option<Vec<u8>>> {
+        Ok(Some(metadata.serialize()))
     }
 
     fn deserialize(
-        &self,
+        bytes: &[u8],
+        _dtype: &DType,
+        _len: usize,
+        _buffers: &[BufferHandle],
+        _session: &VortexSession,
+    ) -> VortexResult<Self::Metadata> {
+        Ok(ProstMetadata(
+            <ProstMetadata<SequenceMetadata> as DeserializeMetadata>::deserialize(bytes)?,
+        ))
+    }
+
+    fn build(
         dtype: &DType,
         len: usize,
-        metadata: &[u8],
-        buffers: &[BufferHandle],
-        children: &dyn ArrayChildren,
-        session: &VortexSession,
-    ) -> VortexResult<ArrayParts<Self>> {
-        vortex_ensure!(
-            buffers.is_empty(),
-            "SequenceArray expects 0 buffers, got {}",
-            buffers.len()
-        );
+        metadata: &Self::Metadata,
+        _buffers: &[BufferHandle],
+        _children: &dyn ArrayChildren,
+    ) -> VortexResult<SequenceArray> {
+        let ptype = dtype.as_ptype();
+
+        // We go via scalar to cast the scalar values into the correct PType
+        let base = Scalar::from_proto_value(
+            metadata
+                .0
+                .base
+                .as_ref()
+                .ok_or_else(|| vortex_err!("base required"))?,
+            &DType::Primitive(ptype, NonNullable),
+        )?
+        .as_primitive()
+        .pvalue()
+        .vortex_expect("non-nullable primitive");
+
+        let multiplier = Scalar::from_proto_value(
+            metadata
+                .0
+                .multiplier
+                .as_ref()
+                .ok_or_else(|| vortex_err!("multiplier required"))?,
+            &DType::Primitive(ptype, NonNullable),
+        )?
+        .as_primitive()
+        .pvalue()
+        .vortex_expect("non-nullable primitive");
+
+        Ok(SequenceArray::unchecked_new(
+            base,
+            multiplier,
+            ptype,
+            dtype.nullability(),
+            len,
+        ))
+    }
+
+    fn with_children(_array: &mut Self::Array, children: Vec<ArrayRef>) -> VortexResult<()> {
         vortex_ensure!(
             children.is_empty(),
             "SequenceArray expects 0 children, got {}",
             children.len()
         );
-        let metadata = SequenceMetadata::decode(metadata)?;
-
-        let ptype = dtype.as_ptype();
-
-        // We go via Scalar to validate that the value is valid for the ptype.
-        let base = Scalar::from_proto_value(
-            metadata
-                .base
-                .as_ref()
-                .ok_or_else(|| vortex_err!("base required"))?,
-            &DType::Primitive(ptype, NonNullable),
-            session,
-        )?
-        .as_primitive()
-        .pvalue()
-        .vortex_expect("sequence array base should be a non-nullable primitive");
-
-        let multiplier = Scalar::from_proto_value(
-            metadata
-                .multiplier
-                .as_ref()
-                .ok_or_else(|| vortex_err!("multiplier required"))?,
-            &DType::Primitive(ptype, NonNullable),
-            session,
-        )?
-        .as_primitive()
-        .pvalue()
-        .vortex_expect("sequence array multiplier should be a non-nullable primitive");
-
-        let data = SequenceData::try_new(base, multiplier, ptype, dtype.nullability(), len)?;
-        Ok(ArrayParts::new(self.clone(), dtype.clone(), len, data))
+        Ok(())
     }
 
-    fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {
-        SLOT_NAMES[idx].to_string()
-    }
+    fn execute(array: &Self::Array, _ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
+        let prim = match_each_native_ptype!(array.ptype(), |P| {
+            let base = array.base().cast::<P>()?;
+            let multiplier = array.multiplier().cast::<P>()?;
+            let values = BufferMut::from_iter(
+                (0..array.len())
+                    .map(|i| base + <P>::from_usize(i).vortex_expect("must fit") * multiplier),
+            );
+            PrimitiveArray::new(values, array.dtype.nullability().into())
+        });
 
-    fn execute(array: Array<Self>, _ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
-        sequence_decompress(&array).map(ExecutionResult::done)
+        Ok(prim.into_array())
     }
 
     fn execute_parent(
-        array: ArrayView<'_, Self>,
+        array: &Self::Array,
         parent: &ArrayRef,
         child_idx: usize,
         ctx: &mut ExecutionCtx,
@@ -340,7 +339,7 @@ impl VTable for Sequence {
     }
 
     fn reduce_parent(
-        array: ArrayView<'_, Self>,
+        array: &SequenceArray,
         parent: &ArrayRef,
         child_idx: usize,
     ) -> VortexResult<Option<ArrayRef>> {
@@ -348,12 +347,40 @@ impl VTable for Sequence {
     }
 }
 
-impl OperationsVTable<Sequence> for Sequence {
-    fn scalar_at(
-        array: ArrayView<'_, Sequence>,
-        index: usize,
-        _ctx: &mut ExecutionCtx,
-    ) -> VortexResult<Scalar> {
+impl BaseArrayVTable<SequenceVTable> for SequenceVTable {
+    fn len(array: &SequenceArray) -> usize {
+        array.len
+    }
+
+    fn dtype(array: &SequenceArray) -> &DType {
+        &array.dtype
+    }
+
+    fn stats(array: &SequenceArray) -> StatsSetRef<'_> {
+        array.stats_set.to_ref(array.as_ref())
+    }
+
+    fn array_hash<H: std::hash::Hasher>(
+        array: &SequenceArray,
+        state: &mut H,
+        _precision: Precision,
+    ) {
+        array.base.hash(state);
+        array.multiplier.hash(state);
+        array.dtype.hash(state);
+        array.len.hash(state);
+    }
+
+    fn array_eq(array: &SequenceArray, other: &SequenceArray, _precision: Precision) -> bool {
+        array.base == other.base
+            && array.multiplier == other.multiplier
+            && array.dtype == other.dtype
+            && array.len == other.len
+    }
+}
+
+impl OperationsVTable<SequenceVTable> for SequenceVTable {
+    fn scalar_at(array: &SequenceArray, index: usize) -> VortexResult<Scalar> {
         Scalar::try_new(
             array.dtype().clone(),
             Some(ScalarValue::Primitive(array.index_value(index))),
@@ -361,98 +388,37 @@ impl OperationsVTable<Sequence> for Sequence {
     }
 }
 
-impl ValidityVTable<Sequence> for Sequence {
-    fn validity(_array: ArrayView<'_, Sequence>) -> VortexResult<Validity> {
+impl ValidityVTable<SequenceVTable> for SequenceVTable {
+    fn validity(_array: &SequenceArray) -> VortexResult<Validity> {
         Ok(Validity::AllValid)
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct Sequence;
-
-impl Sequence {
-    fn stats(multiplier: PValue) -> StatsSet {
-        // A sequence A[i] = base + i * multiplier is sorted iff multiplier >= 0,
-        // and strictly sorted iff multiplier > 0.
-        let (is_sorted, is_strict_sorted) = match_each_pvalue!(
-            multiplier,
-            uint: |v| { (true, v > 0) },
-            int: |v| { (v >= 0, v > 0) },
-            float: |_v| { unreachable!("float multiplier not supported") }
-        );
-
-        // SAFETY: we don't have duplicate stats.
-        unsafe {
-            StatsSet::new_unchecked(vec![
-                (Stat::IsSorted, StatPrecision::Exact(is_sorted.into())),
-                (
-                    Stat::IsStrictSorted,
-                    StatPrecision::Exact(is_strict_sorted.into()),
-                ),
-            ])
-        }
+impl VisitorVTable<SequenceVTable> for SequenceVTable {
+    fn visit_buffers(_array: &SequenceArray, _visitor: &mut dyn ArrayBufferVisitor) {
+        // TODO(joe): expose scalar values
     }
 
-    /// Construct a new [`SequenceArray`] from pre-validated parts.
-    ///
-    /// # Safety
-    ///
-    /// Caller must ensure the sequence is logically compatible with the provided dtype and len.
-    pub(crate) unsafe fn new_unchecked(
-        base: PValue,
-        multiplier: PValue,
-        ptype: PType,
-        nullability: Nullability,
-        length: usize,
-    ) -> SequenceArray {
-        let dtype = DType::Primitive(ptype, nullability);
-        let (base, multiplier) = SequenceData::normalize(base, multiplier, ptype)
-            .vortex_expect("SequenceArray parts must be normalized to the target ptype");
-        let stats = Self::stats(multiplier);
-        let data = unsafe { SequenceData::new_unchecked(base, multiplier) };
-        unsafe { Array::from_parts_unchecked(ArrayParts::new(Sequence, dtype, length, data)) }
-            .with_stats_set(stats)
+    fn nbuffers(_array: &SequenceArray) -> usize {
+        0
     }
 
-    /// Construct a new [`SequenceArray`] from its components.
-    pub fn try_new(
-        base: PValue,
-        multiplier: PValue,
-        ptype: PType,
-        nullability: Nullability,
-        length: usize,
-    ) -> VortexResult<SequenceArray> {
-        let dtype = DType::Primitive(ptype, nullability);
-        let data = SequenceData::try_new(base, multiplier, ptype, nullability, length)?;
-        let stats = Self::stats(data.multiplier());
-        Ok(
-            unsafe { Array::from_parts_unchecked(ArrayParts::new(Sequence, dtype, length, data)) }
-                .with_stats_set(stats),
-        )
-    }
+    fn visit_children(_array: &SequenceArray, _visitor: &mut dyn ArrayChildVisitor) {}
 
-    /// Construct a new typed [`SequenceArray`] from base/multiplier values.
-    pub fn try_new_typed<T: NativePType + Into<PValue>>(
-        base: T,
-        multiplier: T,
-        nullability: Nullability,
-        length: usize,
-    ) -> VortexResult<SequenceArray> {
-        let ptype = T::PTYPE;
-        let dtype = DType::Primitive(ptype, nullability);
-        let data = SequenceData::try_new_typed(base, multiplier, nullability, length)?;
-        let stats = Self::stats(data.multiplier());
-        Ok(
-            unsafe { Array::from_parts_unchecked(ArrayParts::new(Sequence, dtype, length, data)) }
-                .with_stats_set(stats),
-        )
+    fn nchildren(_array: &SequenceArray) -> usize {
+        0
     }
+}
+
+#[derive(Debug)]
+pub struct SequenceVTable;
+
+impl SequenceVTable {
+    pub const ID: ArrayId = ArrayId::new_ref("vortex.sequence");
 }
 
 #[cfg(test)]
 mod tests {
-    use vortex_array::LEGACY_SESSION;
-    use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::assert_arrays_eq;
     use vortex_array::dtype::Nullability;
@@ -463,11 +429,11 @@ mod tests {
     use vortex_array::scalar::ScalarValue;
     use vortex_error::VortexResult;
 
-    use crate::Sequence;
+    use crate::array::SequenceArray;
 
     #[test]
     fn test_sequence_canonical() {
-        let arr = Sequence::try_new_typed(2i64, 3, Nullability::NonNullable, 4).unwrap();
+        let arr = SequenceArray::typed_new(2i64, 3, Nullability::NonNullable, 4).unwrap();
 
         let canon = PrimitiveArray::from_iter((0..4).map(|i| 2i64 + i * 3));
 
@@ -476,7 +442,7 @@ mod tests {
 
     #[test]
     fn test_sequence_slice_canonical() {
-        let arr = Sequence::try_new_typed(2i64, 3, Nullability::NonNullable, 4)
+        let arr = SequenceArray::typed_new(2i64, 3, Nullability::NonNullable, 4)
             .unwrap()
             .slice(2..3)
             .unwrap();
@@ -488,9 +454,9 @@ mod tests {
 
     #[test]
     fn test_sequence_scalar_at() {
-        let scalar = Sequence::try_new_typed(2i64, 3, Nullability::NonNullable, 4)
+        let scalar = SequenceArray::typed_new(2i64, 3, Nullability::NonNullable, 4)
             .unwrap()
-            .execute_scalar(2, &mut LEGACY_SESSION.create_execution_ctx())
+            .scalar_at(2)
             .unwrap();
 
         assert_eq!(
@@ -501,19 +467,19 @@ mod tests {
 
     #[test]
     fn test_sequence_min_max() {
-        assert!(Sequence::try_new_typed(-127i8, -1i8, Nullability::NonNullable, 2).is_ok());
-        assert!(Sequence::try_new_typed(126i8, -1i8, Nullability::NonNullable, 2).is_ok());
+        assert!(SequenceArray::typed_new(-127i8, -1i8, Nullability::NonNullable, 2).is_ok());
+        assert!(SequenceArray::typed_new(126i8, -1i8, Nullability::NonNullable, 2).is_ok());
     }
 
     #[test]
     fn test_sequence_too_big() {
-        assert!(Sequence::try_new_typed(127i8, 1i8, Nullability::NonNullable, 2).is_err());
-        assert!(Sequence::try_new_typed(-128i8, -1i8, Nullability::NonNullable, 2).is_err());
+        assert!(SequenceArray::typed_new(127i8, 1i8, Nullability::NonNullable, 2).is_err());
+        assert!(SequenceArray::typed_new(-128i8, -1i8, Nullability::NonNullable, 2).is_err());
     }
 
     #[test]
     fn positive_multiplier_is_strict_sorted() -> VortexResult<()> {
-        let arr = Sequence::try_new_typed(0i64, 3, Nullability::NonNullable, 4)?;
+        let arr = SequenceArray::typed_new(0i64, 3, Nullability::NonNullable, 4)?;
 
         let is_sorted = arr
             .statistics()
@@ -529,7 +495,7 @@ mod tests {
 
     #[test]
     fn zero_multiplier_is_sorted_not_strict() -> VortexResult<()> {
-        let arr = Sequence::try_new_typed(5i64, 0, Nullability::NonNullable, 4)?;
+        let arr = SequenceArray::typed_new(5i64, 0, Nullability::NonNullable, 4)?;
 
         let is_sorted = arr
             .statistics()
@@ -545,7 +511,7 @@ mod tests {
 
     #[test]
     fn negative_multiplier_not_sorted() -> VortexResult<()> {
-        let arr = Sequence::try_new_typed(10i64, -1, Nullability::NonNullable, 4)?;
+        let arr = SequenceArray::typed_new(10i64, -1, Nullability::NonNullable, 4)?;
 
         let is_sorted = arr
             .statistics()
@@ -564,7 +530,7 @@ mod tests {
     #[test]
     fn test_large_multiplier_sorted() -> VortexResult<()> {
         let large_multiplier = (i64::MAX as u64) + 1;
-        let arr = Sequence::try_new_typed(0, large_multiplier, Nullability::NonNullable, 2)?;
+        let arr = SequenceArray::typed_new(0, large_multiplier, Nullability::NonNullable, 2)?;
 
         let is_sorted = arr
             .statistics()

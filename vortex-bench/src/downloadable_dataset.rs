@@ -4,8 +4,6 @@
 use async_trait::async_trait;
 use tokio::fs::File;
 use vortex::array::ArrayRef;
-use vortex::array::ExecutionCtx;
-use vortex::array::IntoArray;
 use vortex::array::stream::ArrayStreamExt;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::file::WriteOptionsSessionExt;
@@ -58,7 +56,7 @@ impl Dataset for DownloadableDataset {
         }
     }
 
-    async fn to_vortex_array(&self, _ctx: &mut ExecutionCtx) -> anyhow::Result<ArrayRef> {
+    async fn to_vortex_array(&self) -> anyhow::Result<ArrayRef> {
         let parquet = self.to_parquet_path().await?;
         let dir = format!("{}/", self.name()).to_data_path();
         let vortex = dir.join(format!("{}.vortex", self.name()));
@@ -71,7 +69,7 @@ impl Dataset for DownloadableDataset {
                     &mut File::create(path)
                         .await
                         .map_err(|e| anyhow::anyhow!("Failed to create file: {}", e))?,
-                    data.into_array().to_array_stream(),
+                    data.to_array_stream(),
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to write vortex file: {}", e))?;

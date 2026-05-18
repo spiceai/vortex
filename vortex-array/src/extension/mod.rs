@@ -6,7 +6,6 @@
 use std::fmt;
 
 pub mod datetime;
-pub mod uuid;
 
 #[cfg(test)]
 mod tests;

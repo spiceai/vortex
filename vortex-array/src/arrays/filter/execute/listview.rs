@@ -4,14 +4,25 @@
 use std::sync::Arc;
 
 use vortex_error::VortexExpect;
-use vortex_mask::Mask;
 use vortex_mask::MaskValues;
 
 use crate::arrays::ListViewArray;
+use crate::arrays::ListViewRebuildMode;
 use crate::arrays::filter::execute::filter_validity;
-use crate::arrays::listview;
-use crate::arrays::listview::ListViewArrayExt;
-use crate::arrays::listview::ListViewRebuildMode;
+use crate::arrays::filter::execute::values_to_mask;
+use crate::vtable::ValidityHelper;
+
+// TODO(connor)[ListView]: Make use of this threshold after we start migrating operators.
+/// The threshold for triggering a rebuild of the [`ListViewArray`].
+///
+/// By default, we will not touch the underlying `elements` array of the [`ListViewArray`] since it
+/// can be potentially expensive to reorganize the array based on what views we have into it.
+///
+/// However, we also do not want to carry around a large amount of garbage data. Below this
+/// threshold of the density of the selection mask, we will rebuild the [`ListViewArray`], removing
+/// any garbage data.
+#[allow(unused)]
+const REBUILD_DENSITY_THRESHOLD: f64 = 0.1;
 
 /// [`ListViewArray`] filter implementation.
 ///
@@ -30,12 +41,7 @@ pub fn filter_listview(array: &ListViewArray, selection_mask: &Arc<MaskValues>) 
     let offsets = array.offsets();
     let sizes = array.sizes();
 
-    let new_validity = filter_validity(
-        array
-            .validity()
-            .vortex_expect("listview validity should be derivable"),
-        selection_mask,
-    );
+    let new_validity = filter_validity(array.validity().clone(), selection_mask);
     debug_assert!(
         new_validity
             .maybe_len()
@@ -43,7 +49,7 @@ pub fn filter_listview(array: &ListViewArray, selection_mask: &Arc<MaskValues>) 
     );
 
     // Simply filter the offsets and sizes arrays.
-    let mask_for_filter = Mask::Values(Arc::clone(selection_mask));
+    let mask_for_filter = values_to_mask(selection_mask);
     let new_offsets = offsets
         .filter(mask_for_filter.clone())
         .vortex_expect("ListViewArray offsets are guaranteed to support filter");
@@ -59,14 +65,13 @@ pub fn filter_listview(array: &ListViewArray, selection_mask: &Arc<MaskValues>) 
         ListViewArray::new_unchecked(elements.clone(), new_offsets, new_sizes, new_validity)
     };
 
-    let kept_row_fraction = selection_mask.true_count() as f32 / array.sizes().len() as f32;
-    if kept_row_fraction < listview::compute::REBUILD_DENSITY_THRESHOLD {
-        new_array
-            .rebuild(ListViewRebuildMode::MakeZeroCopyToList)
-            .vortex_expect("ListViewArray rebuild to zero-copy List should always succeed")
-    } else {
-        new_array
-    }
+    // TODO(connor)[ListView]: Ideally, we would only rebuild after all `take`s and `filter`
+    // compute functions have run, at the "top" of the operator tree. However, we cannot do this
+    // right now, so we will just rebuild every time (similar to `ListArray`).
+
+    new_array
+        .rebuild(ListViewRebuildMode::MakeZeroCopyToList)
+        .vortex_expect("ListViewArray rebuild to zero-copy List should always succeed")
 }
 
 #[cfg(test)]
@@ -75,14 +80,10 @@ mod test {
     use vortex_mask::Mask;
 
     use crate::IntoArray;
-    use crate::LEGACY_SESSION;
-    #[expect(deprecated)]
-    use crate::ToCanonical as _;
-    use crate::VortexSessionExecute;
+    use crate::ToCanonical;
+    use crate::arrays::ConstantArray;
     use crate::arrays::ListViewArray;
     use crate::arrays::PrimitiveArray;
-    use crate::arrays::filter::execute::ConstantArray;
-    use crate::arrays::listview::ListViewArrayExt;
     use crate::assert_arrays_eq;
     use crate::compute::conformance::filter::test_filter_conformance;
     use crate::validity::Validity;
@@ -95,7 +96,7 @@ mod test {
         let sizes = buffer![2u32, 2, 2].into_array();
         let array =
             ListViewArray::new(elements.into_array(), offsets, sizes, Validity::NonNullable);
-        test_filter_conformance(&array.into_array());
+        test_filter_conformance(array.as_ref());
     }
 
     #[test]
@@ -106,7 +107,7 @@ mod test {
         let sizes = buffer![2u32, 2, 2].into_array();
         let validity = Validity::from_iter([true, false, true]);
         let array = ListViewArray::new(elements.into_array(), offsets, sizes, validity);
-        test_filter_conformance(&array.into_array());
+        test_filter_conformance(array.as_ref());
     }
 
     #[test]
@@ -119,7 +120,7 @@ mod test {
             ListViewArray::new_unchecked(elements, offsets, sizes, Validity::NonNullable)
                 .with_zero_copy_to_list(true)
         };
-        test_filter_conformance(&array.into_array());
+        test_filter_conformance(array.as_ref());
     }
 
     #[test]
@@ -130,7 +131,7 @@ mod test {
         let offsets = buffer![5u32, 2, 8, 0, 1].into_array();
         let sizes = buffer![3u32, 2, 2, 2, 4].into_array();
         let array = ListViewArray::new(elements, offsets, sizes, Validity::NonNullable);
-        test_filter_conformance(&array.into_array());
+        test_filter_conformance(array.as_ref());
     }
 
     #[test]
@@ -140,7 +141,7 @@ mod test {
         let offsets = buffer![0u32, 100, 200, 300, 400, 500, 600, 700, 800, 900].into_array();
         let sizes = buffer![50u32, 50, 50, 50, 50, 50, 50, 50, 50, 50].into_array();
         let array = ListViewArray::new(elements, offsets, sizes, Validity::NonNullable);
-        test_filter_conformance(&array.into_array());
+        test_filter_conformance(array.as_ref());
     }
 
     #[test]
@@ -182,12 +183,11 @@ mod test {
         let sizes = buffer![3u32, 2, 2, 2, 4].into_array();
 
         let listview =
-            ListViewArray::new(elements, offsets, sizes, Validity::NonNullable).into_array();
+            ListViewArray::new(elements.clone(), offsets, sizes, Validity::NonNullable).to_array();
 
         // Filter to keep only 2 lists.
         let mask = Mask::from_iter([true, false, false, true, false]);
         let result = listview.filter(mask).unwrap();
-        #[expect(deprecated)]
         let result_list = result.to_listview();
 
         assert_eq!(result_list.len(), 2, "Wrong number of filtered lists");
@@ -215,12 +215,11 @@ mod test {
         let sizes = buffer![3u32, 3, 2, 2, 2].into_array();
 
         let listview =
-            ListViewArray::new(elements, offsets, sizes, Validity::NonNullable).into_array();
+            ListViewArray::new(elements.clone(), offsets, sizes, Validity::NonNullable).to_array();
 
         // Filter to keep lists with gaps and overlaps.
         let mask = Mask::from_iter([false, true, true, true, false]);
         let result = listview.filter(mask).unwrap();
-        #[expect(deprecated)]
         let result_list = result.to_listview();
 
         assert_eq!(result_list.len(), 3, "Wrong filter result length");
@@ -260,11 +259,10 @@ mod test {
             varying_sizes,
             Validity::NonNullable,
         )
-        .into_array();
+        .to_array();
 
         let mask1 = Mask::from_iter([true, false, true, false]);
         let result1 = const_offset_list.filter(mask1).unwrap();
-        #[expect(deprecated)]
         let result1_list = result1.to_listview();
 
         assert_eq!(result1_list.len(), 2);
@@ -284,11 +282,10 @@ mod test {
             both_constant_sizes,
             Validity::NonNullable,
         )
-        .into_array();
+        .to_array();
 
         let mask2 = Mask::from_iter([true, false, true]);
         let result2 = both_const_list.filter(mask2).unwrap();
-        #[expect(deprecated)]
         let result2_list = result2.to_listview();
 
         assert_eq!(result2_list.len(), 2);
@@ -310,12 +307,11 @@ mod test {
         let sizes = buffer![5u32, 2, 5, 3, 4].into_array();
 
         let listview =
-            ListViewArray::new(elements, offsets, sizes, Validity::NonNullable).into_array();
+            ListViewArray::new(elements.clone(), offsets, sizes, Validity::NonNullable).to_array();
 
         // Filter to keep only 2 lists, demonstrating we keep all 10000 elements.
         let mask = Mask::from_iter([false, true, false, false, true]);
         let result = listview.filter(mask).unwrap();
-        #[expect(deprecated)]
         let result_list = result.to_listview();
 
         assert_eq!(result_list.len(), 2);
@@ -331,7 +327,7 @@ mod test {
         let list0 = result_list.list_elements_at(0).unwrap();
         assert_eq!(
             list0
-                .execute_scalar(0, &mut LEGACY_SESSION.create_execution_ctx())
+                .scalar_at(0)
                 .unwrap()
                 .as_primitive()
                 .as_::<i32>()
@@ -340,7 +336,7 @@ mod test {
         );
         assert_eq!(
             list0
-                .execute_scalar(1, &mut LEGACY_SESSION.create_execution_ctx())
+                .scalar_at(1)
                 .unwrap()
                 .as_primitive()
                 .as_::<i32>()
@@ -351,7 +347,6 @@ mod test {
         // Test sparse selection from large dataset.
         let sparse_mask = Mask::from_iter((0..5).map(|i| i == 0 || i == 4));
         let sparse_result = listview.filter(sparse_mask).unwrap();
-        #[expect(deprecated)]
         let sparse_list = sparse_result.to_listview();
 
         assert_eq!(sparse_list.len(), 2);

@@ -21,7 +21,6 @@ workspace = true
 
 [dependencies]
 arbitrary = { workspace = true, optional = true }
-arc-swap = { workspace = true }
 arcref = { workspace = true }
 arrow-arith = { workspace = true }
 arrow-array = { workspace = true, features = ["ffi"] }
@@ -39,6 +38,7 @@ cudarc = { workspace = true, optional = true }
 enum-iterator = { workspace = true }
 flatbuffers = { workspace = true }
 futures = { workspace = true, features = ["alloc", "async-await", "std"] }
+getrandom_v03 = { workspace = true }
 goldenfile = { workspace = true, optional = true }
 half = { workspace = true, features = ["num-traits"] }
 humansize = { workspace = true }
@@ -67,8 +67,6 @@ tabled = { workspace = true, optional = true, default-features = false, features
 ] }
 termtree = { workspace = true }
 tracing = { workspace = true }
-uuid = { workspace = true }
-vortex-array-macros = { workspace = true }
 vortex-buffer = { workspace = true, features = ["arrow"] }
 vortex-error = { workspace = true, features = ["flatbuffers"] }
 vortex-flatbuffers = { workspace = true, features = ["array", "dtype"] }
@@ -95,10 +93,6 @@ rstest = { workspace = true }
 serde_json = { workspace = true }
 serde_test = { workspace = true }
 vortex-array = { path = ".", features = ["_test-harness", "table-display"] }
-
-[[bench]]
-name = "cast_primitive"
-harness = false
 
 [[bench]]
 name = "search_sorted"
@@ -131,11 +125,6 @@ harness = false
 [[bench]]
 name = "expr_large_struct_pack"
 path = "benches/expr/large_struct_pack.rs"
-harness = false
-
-[[bench]]
-name = "expr_case_when"
-path = "benches/expr/case_when_bench.rs"
 harness = false
 
 [[bench]]
@@ -178,17 +167,8 @@ name = "take_fsl"
 harness = false
 
 [[bench]]
-name = "take_filter"
-harness = false
-
-[[bench]]
-name = "filter_bool"
-harness = false
-
-[[bench]]
 name = "listview_rebuild"
 harness = false
 
-[[bench]]
-name = "listview_builder_extend"
-harness = false
+[package.metadata.cargo-machete]
+ignored = ["getrandom_v03"]

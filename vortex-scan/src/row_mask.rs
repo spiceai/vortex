@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! A mask over a range of rows.
-
 use std::ops::Range;
 
 use vortex_mask::Mask;
@@ -12,13 +10,12 @@ use vortex_mask::Mask;
 /// The range itself can be [`u64`], but the length of the range must fit into a [`usize`], this
 /// allows us to use a `usize` filter mask within a much larger file.
 #[derive(Debug, Clone)]
-pub struct RowMask {
+pub(crate) struct RowMask {
     row_offset: u64,
     mask: Mask,
 }
 
 impl RowMask {
-    /// Create a new row range.
     #[inline]
     pub fn new(row_offset: u64, mask: Mask) -> Self {
         Self { row_offset, mask }

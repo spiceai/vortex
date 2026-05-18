@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-#![expect(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used)]
+#![allow(clippy::expect_used)]
 
 /// Adds a dynamic linker runtime path pointing to the DuckDB dylib dir.
 ///

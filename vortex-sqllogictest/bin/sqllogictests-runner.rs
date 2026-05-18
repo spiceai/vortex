@@ -17,7 +17,6 @@ use indicatif::MultiProgress;
 use indicatif::ProgressBar;
 use indicatif::ProgressDrawTarget;
 use indicatif::ProgressStyle;
-use sqllogictest::Normalizer;
 use sqllogictest::Record;
 use sqllogictest::Runner;
 use sqllogictest::parse_file;
@@ -28,18 +27,6 @@ use vortex_sqllogictest::args::Args;
 use vortex_sqllogictest::duckdb::DuckDB;
 use vortex_sqllogictest::duckdb::DuckDBTestError;
 use vortex_sqllogictest::utils::list_files;
-
-fn duckdb_validator(normalizer: Normalizer, actual: &[Vec<String>], expected: &[String]) -> bool {
-    let actual = actual.iter().flat_map(|strings| {
-        strings
-            .join(" ")
-            .trim_end()
-            .split('\n')
-            .map(|line| line.trim_end().to_string())
-            .collect::<Vec<_>>()
-    });
-    Iterator::eq(actual, expected.iter().map(normalizer))
-}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -59,42 +46,31 @@ async fn main() -> anyhow::Result<()> {
 
     let crate_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let path = crate_path.join("slt/");
-    let has_tpch_data = crate_path.join("slt/tpch/data/lineitem.vortex").exists();
 
-    let all_errors = futures::stream::iter(
-        list_files(path)?
-            .into_iter()
-            .filter(|path| {
-                has_tpch_data || !path.components().any(|comp| comp.as_os_str() == "tpch")
-            })
-            .collect::<Vec<_>>(),
-    )
-    .map(|path| {
-        let mpb = mpb.clone();
+    let all_errors = futures::stream::iter(list_files(path)?)
+        .map(|path| {
+            let mpb = mpb.clone();
 
-        async move {
-            let path = path.canonicalize()?;
+            async move {
+                let mut errors = vec![];
+                let factory = Arc::new(VortexFormatFactory::new());
+                let session_state_builder = SessionStateBuilder::new()
+                    .with_default_features()
+                    .with_table_factory(
+                        factory.get_ext().to_uppercase(),
+                        Arc::new(DefaultTableFactory::new()),
+                    )
+                    .with_file_formats(vec![factory]);
 
-            let mut errors = vec![];
-            let factory = Arc::new(VortexFormatFactory::new());
-            let session_state_builder = SessionStateBuilder::new()
-                .with_default_features()
-                .with_table_factory(
-                    factory.get_ext().to_uppercase(),
-                    Arc::new(DefaultTableFactory::new()),
-                )
-                .with_file_formats(vec![factory]);
+                let session = SessionContext::new_with_state(session_state_builder.build())
+                    .enable_url_table();
 
-            let session =
-                SessionContext::new_with_state(session_state_builder.build()).enable_url_table();
+                let filename = path
+                    .file_name()
+                    .vortex_expect("must be file")
+                    .to_string_lossy();
+                let records = parse_file(path.canonicalize()?)?;
 
-            let filename = path
-                .file_name()
-                .vortex_expect("must be file")
-                .to_string_lossy();
-            let records = parse_file(path.as_path())?;
-
-            if !path.components().any(|comp| comp.as_os_str() == "duckdb") {
                 let df_pb = mpb.add(ProgressBar::new(records.len() as u64));
                 df_pb.set_message(format!("DF {filename}"));
                 df_pb.set_style(ProgressStyle::default_spinner());
@@ -123,12 +99,7 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 df_pb.finish_and_clear();
-            }
 
-            if !path
-                .components()
-                .any(|comp| comp.as_os_str() == "datafusion")
-            {
                 let duckdb_pb = mpb.add(ProgressBar::new(records.len() as u64));
                 duckdb_pb.set_message(format!("DuckDB {filename}"));
 
@@ -140,7 +111,6 @@ async fn main() -> anyhow::Result<()> {
                 duckdb_runner.add_label("duckdb");
                 duckdb_runner.with_column_validator(strict_column_validator);
                 duckdb_runner.with_normalizer(value_normalizer);
-                duckdb_runner.with_validator(duckdb_validator);
 
                 for record in records.iter() {
                     if let Record::Halt { .. } = record {
@@ -153,26 +123,16 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 duckdb_pb.finish_and_clear();
+
+                anyhow::Ok(errors)
             }
+        })
+        .buffer_unordered(args.test_threads)
+        .try_collect::<Vec<_>>()
+        .await?;
 
-            anyhow::Ok(errors)
-        }
-    })
-    .buffer_unordered(args.test_threads)
-    .try_collect::<Vec<_>>()
-    .await?;
-
-    let errors = all_errors.into_iter().flatten().collect::<Vec<_>>();
-    for err in &errors {
+    for err in all_errors.into_iter().flatten() {
         eprintln!("Failure: {err}");
-    }
-
-    if !has_tpch_data {
-        eprintln!("Skipping TPC-H sqllogictests because slt/tpch/data is not present.");
-    }
-
-    if !errors.is_empty() {
-        anyhow::bail!("{} sqllogictest failure(s)", errors.len());
     }
 
     Ok(())

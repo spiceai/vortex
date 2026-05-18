@@ -9,15 +9,15 @@ use anyhow::Result;
 use clap::Parser;
 use clap::ValueEnum;
 use indicatif::ProgressBar;
-use rand::RngExt;
+use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::Distribution;
 use rand_distr::Exp;
+use vortex_bench::BenchmarkOutput;
 use vortex_bench::Engine;
 use vortex_bench::Format;
 use vortex_bench::Target;
-use vortex_bench::create_output_writer;
 use vortex_bench::datasets::feature_vectors::FeatureVectorsData;
 use vortex_bench::datasets::nested_lists::NestedListsData;
 use vortex_bench::datasets::nested_structs::NestedStructsData;
@@ -91,14 +91,14 @@ fn generate_indices(dataset: &dyn BenchDataset, pattern: AccessPattern) -> Vec<u
             // ~POISSON_EXPECTED_COUNT indices across the dataset.
             let rate = POISSON_EXPECTED_COUNT as f64 / row_count as f64;
             // SAFETY: rate is always positive (POISSON_EXPECTED_COUNT > 0, row_count > 0).
-            #[expect(clippy::unwrap_used)]
+            #[allow(clippy::unwrap_used)]
             let exp = Exp::new(rate).unwrap();
             let mut indices = Vec::with_capacity(POISSON_EXPECTED_COUNT);
             let mut pos = 0.0_f64;
             loop {
                 let gap: f64 = exp.sample(&mut rng);
                 pos += gap;
-                #[expect(clippy::cast_possible_truncation)]
+                #[allow(clippy::cast_possible_truncation)]
                 let idx = pos as u64;
                 if idx >= row_count {
                     break;
@@ -416,7 +416,8 @@ async fn run_random_access(
 
     progress.finish();
 
-    let mut writer = create_output_writer(&display_format, output_path, BENCHMARK_ID)?;
+    let output = BenchmarkOutput::with_path(BENCHMARK_ID, output_path);
+    let mut writer = output.create_writer()?;
 
     match display_format {
         DisplayFormat::Table => {

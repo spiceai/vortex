@@ -3,18 +3,14 @@
 
 use vortex_error::VortexResult;
 
-use super::Dict;
 use super::DictArray;
+use super::DictVTable;
+use crate::Array;
 use crate::ArrayRef;
-use crate::Canonical;
 use crate::ExecutionCtx;
 use crate::IntoArray;
-use crate::array::ArrayView;
-use crate::arrays::BoolArray;
+use crate::ToCanonical;
 use crate::arrays::ConstantArray;
-use crate::arrays::bool::BoolArrayExt;
-use crate::arrays::dict::DictArrayExt;
-use crate::arrays::dict::DictArraySlotsExt;
 use crate::builtins::ArrayBuiltins;
 use crate::match_each_integer_ptype;
 use crate::scalar::Scalar;
@@ -22,22 +18,22 @@ use crate::scalar::ScalarValue;
 use crate::scalar_fn::fns::fill_null::FillNullKernel;
 use crate::scalar_fn::fns::operators::Operator;
 
-impl FillNullKernel for Dict {
+impl FillNullKernel for DictVTable {
     fn fill_null(
-        array: ArrayView<'_, Dict>,
+        array: &DictArray,
         fill_value: &Scalar,
-        ctx: &mut ExecutionCtx,
+        _ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
         // If the fill value already exists in the dictionary, we can simply rewrite the null codes
         // to point to the value.
         let found_fill_values = array
             .values()
-            .clone()
+            .to_array()
             .binary(
-                ConstantArray::new(fill_value.clone(), array.values().len()).into_array(),
+                ConstantArray::new(fill_value.clone(), array.values().len()).to_array(),
                 Operator::Eq,
             )?
-            .execute::<BoolArray>(ctx)?;
+            .to_bool();
 
         // We found the fill value already in the values at this given index.
         let Some(existing_fill_value_index) =
@@ -46,9 +42,7 @@ impl FillNullKernel for Dict {
             // No fill values found, so we must canonicalize and fill_null.
             return Ok(Some(
                 array
-                    .array()
-                    .clone()
-                    .execute::<Canonical>(ctx)?
+                    .to_canonical()?
                     .into_array()
                     .fill_null(fill_value.clone())?,
             ));
@@ -70,11 +64,11 @@ impl FillNullKernel for Dict {
 
         // Fill nulls in both the codes and the values. Note that the precondition of this function
         // states that the fill value is non-null, so we do not have to worry about the nullability.
-        let codes = codes.clone().fill_null(Scalar::try_new(
+        let codes = codes.to_array().fill_null(Scalar::try_new(
             codes.dtype().as_nonnullable(),
             Some(fill_scalar_value),
         )?)?;
-        let values = array.values().clone().fill_null(fill_value.clone())?;
+        let values = array.values().to_array().fill_null(fill_value.clone())?;
 
         // SAFETY: invariants are still satisfied after patching nulls.
         unsafe {
@@ -94,12 +88,9 @@ mod tests {
     use vortex_error::VortexExpect;
 
     use crate::IntoArray;
-    use crate::LEGACY_SESSION;
-    #[expect(deprecated)]
-    use crate::ToCanonical as _;
-    use crate::VortexSessionExecute;
-    use crate::arrays::DictArray;
+    use crate::ToCanonical;
     use crate::arrays::PrimitiveArray;
+    use crate::arrays::dict::DictArray;
     use crate::assert_arrays_eq;
     use crate::builtins::ArrayBuiltins;
     use crate::dtype::Nullability;
@@ -119,16 +110,11 @@ mod tests {
         .vortex_expect("operation should succeed in test");
 
         let filled = dict
-            .into_array()
+            .to_array()
             .fill_null(Scalar::primitive(20, Nullability::NonNullable))
             .vortex_expect("operation should succeed in test");
-        #[expect(deprecated)]
         let filled_primitive = filled.to_primitive();
         assert_arrays_eq!(filled_primitive, PrimitiveArray::from_iter([10, 20, 20]));
-        assert!(
-            filled_primitive
-                .all_valid(&mut LEGACY_SESSION.create_execution_ctx())
-                .unwrap()
-        );
+        assert!(filled_primitive.all_valid().unwrap());
     }
 }

@@ -2,10 +2,9 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 mod array;
-pub use array::ExtensionArrayExt;
-pub use vtable::ExtensionArray;
+pub use array::ExtensionArray;
 
 pub(crate) mod compute;
 
 mod vtable;
-pub use vtable::Extension;
+pub use vtable::ExtensionVTable;

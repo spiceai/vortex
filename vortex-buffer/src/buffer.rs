@@ -208,31 +208,6 @@ impl<T> Buffer<T> {
         buffer.freeze()
     }
 
-    /// Map each element of the buffer with a closure.
-    pub fn map_each_in_place<R, F>(self, mut f: F) -> BufferMut<R>
-    where
-        T: Copy,
-        F: FnMut(T) -> R,
-    {
-        match self.try_into_mut() {
-            Ok(mut_buf) => mut_buf.map_each_in_place(f),
-            Err(buf) => {
-                let len = buf.len();
-                let mut out_buf = BufferMut::with_capacity(len);
-                out_buf
-                    .spare_capacity_mut()
-                    .iter_mut()
-                    .zip(buf)
-                    .for_each(|(out, in_)| {
-                        out.write(f(in_));
-                    });
-                // Safety: just assigned to each value
-                unsafe { out_buf.set_len(len) }
-                out_buf
-            }
-        }
-    }
-
     /// Clear the buffer, preserving existing capacity.
     pub fn clear(&mut self) {
         self.bytes.clear();
@@ -670,11 +645,9 @@ impl Buf for ByteBuffer {
 }
 
 /// Owned iterator over a [`Buffer`].
-pub struct BufferIterator<T: Copy> {
-    // Keep the buffer alive for the duration of the iteration.
-    _buffer: Buffer<T>,
-    ptr: *const T,
-    end: *const T,
+pub struct BufferIterator<T> {
+    buffer: Buffer<T>,
+    index: usize,
 }
 
 impl<T: Copy> Iterator for BufferIterator<T> {
@@ -682,24 +655,19 @@ impl<T: Copy> Iterator for BufferIterator<T> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        if self.ptr == self.end {
-            None
-        } else {
-            // SAFETY: ptr is within the buffer and has not reached end.
-            let value = unsafe { self.ptr.read() };
-            self.ptr = unsafe { self.ptr.add(1) };
-            Some(value)
-        }
+        (self.index < self.buffer.len()).then(move || {
+            let value = self.buffer[self.index];
+            self.index += 1;
+            value
+        })
     }
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = unsafe { self.end.offset_from(self.ptr) } as usize;
+        let remaining = self.buffer.len() - self.index;
         (remaining, Some(remaining))
     }
 }
-
-impl<T: Copy> ExactSizeIterator for BufferIterator<T> {}
 
 impl<T: Copy> IntoIterator for Buffer<T> {
     type Item = T;
@@ -707,12 +675,9 @@ impl<T: Copy> IntoIterator for Buffer<T> {
 
     #[inline]
     fn into_iter(self) -> Self::IntoIter {
-        let ptr = self.as_slice().as_ptr();
-        let end = unsafe { ptr.add(self.len()) };
         BufferIterator {
-            _buffer: self,
-            ptr,
-            end,
+            buffer: self,
+            index: 0,
         }
     }
 }

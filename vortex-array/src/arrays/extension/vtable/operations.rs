@@ -3,22 +3,17 @@
 
 use vortex_error::VortexResult;
 
-use crate::ExecutionCtx;
-use crate::array::ArrayView;
-use crate::array::OperationsVTable;
-use crate::arrays::Extension;
-use crate::arrays::extension::ExtensionArrayExt;
+use crate::Array;
+use crate::arrays::extension::ExtensionArray;
+use crate::arrays::extension::ExtensionVTable;
 use crate::scalar::Scalar;
+use crate::vtable::OperationsVTable;
 
-impl OperationsVTable<Extension> for Extension {
-    fn scalar_at(
-        array: ArrayView<'_, Extension>,
-        index: usize,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<Scalar> {
+impl OperationsVTable<ExtensionVTable> for ExtensionVTable {
+    fn scalar_at(array: &ExtensionArray, index: usize) -> VortexResult<Scalar> {
         Ok(Scalar::extension_ref(
             array.ext_dtype().clone(),
-            array.storage_array().execute_scalar(index, ctx)?,
+            array.storage().scalar_at(index)?,
         ))
     }
 }

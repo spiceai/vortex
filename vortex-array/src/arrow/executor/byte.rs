@@ -14,16 +14,16 @@ use vortex_error::VortexResult;
 use crate::ArrayRef;
 use crate::Canonical;
 use crate::ExecutionCtx;
-use crate::array::ArrayView;
-use crate::arrays::VarBin;
+use crate::arrays::VarBinArray;
+use crate::arrays::VarBinVTable;
 use crate::arrays::VarBinViewArray;
-use crate::arrays::varbin::VarBinArrayExt;
 use crate::arrow::byte_view::execute_varbinview_to_arrow;
 use crate::arrow::executor::validity::to_arrow_null_buffer;
 use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
 use crate::dtype::NativePType;
 use crate::dtype::Nullability;
+use crate::vtable::ValidityHelper;
 
 /// Convert a Vortex array into an Arrow GenericBinaryArray.
 pub(super) fn to_arrow_byte_array<T: ByteArrayType>(
@@ -34,7 +34,7 @@ where
     T::Offset: NativePType,
 {
     // If the Vortex array is already in VarBin format, we can directly convert it.
-    if let Some(array) = array.as_opt::<VarBin>() {
+    if let Some(array) = array.as_opt::<VarBinVTable>() {
         return varbin_to_byte_array::<T>(array, ctx);
     }
 
@@ -51,7 +51,7 @@ where
 
 /// Convert a Vortex VarBinArray into an Arrow GenericBinaryArray.
 fn varbin_to_byte_array<T: ByteArrayType>(
-    array: ArrayView<'_, VarBin>,
+    array: &VarBinArray,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrowArrayRef>
 where
@@ -68,7 +68,7 @@ where
 
     let data = array.bytes().clone().into_arrow_buffer();
 
-    let null_buffer = to_arrow_null_buffer(array.validity()?, array.len(), ctx)?;
+    let null_buffer = to_arrow_null_buffer(array.validity().clone(), array.len(), ctx)?;
     Ok(Arc::new(unsafe {
         GenericByteArray::<T>::new_unchecked(offsets, data, null_buffer)
     }))
@@ -84,8 +84,8 @@ mod tests {
     use crate::IntoArray;
     use crate::LEGACY_SESSION;
     use crate::VortexSessionExecute;
+    use crate::arrays::VarBinViewArray;
     use crate::arrow::ArrowArrayExecutor;
-    use crate::arrow::executor::byte::VarBinViewArray;
     use crate::dtype::DType;
     use crate::dtype::Nullability;
 

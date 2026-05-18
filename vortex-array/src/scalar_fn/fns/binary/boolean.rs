@@ -6,28 +6,27 @@ use arrow_schema::DataType;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
 
+use crate::Array;
 use crate::ArrayRef;
-use crate::IntoArray;
-use crate::arrays::Constant;
 use crate::arrays::ConstantArray;
-use crate::arrow::ArrowArrayExecutor;
+use crate::arrays::ConstantVTable;
 use crate::arrow::FromArrowArray;
+use crate::arrow::IntoArrowArray;
 use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
-use crate::executor::ExecutionCtx;
 use crate::scalar::Scalar;
 use crate::scalar_fn::fns::operators::Operator;
 
 /// Point-wise Kleene logical _and_ between two Boolean arrays.
 #[deprecated(note = "Use `ArrayBuiltins::binary` instead")]
-pub fn and_kleene(lhs: &ArrayRef, rhs: &ArrayRef) -> VortexResult<ArrayRef> {
-    lhs.clone().binary(rhs.clone(), Operator::And)
+pub fn and_kleene(lhs: &dyn Array, rhs: &dyn Array) -> VortexResult<ArrayRef> {
+    lhs.to_array().binary(rhs.to_array(), Operator::And)
 }
 
 /// Point-wise Kleene logical _or_ between two Boolean arrays.
 #[deprecated(note = "Use `ArrayBuiltins::binary` instead")]
-pub fn or_kleene(lhs: &ArrayRef, rhs: &ArrayRef) -> VortexResult<ArrayRef> {
-    lhs.clone().binary(rhs.clone(), Operator::Or)
+pub fn or_kleene(lhs: &dyn Array, rhs: &dyn Array) -> VortexResult<ArrayRef> {
+    lhs.to_array().binary(rhs.to_array(), Operator::Or)
 }
 
 /// Execute a Kleene boolean operation between two arrays.
@@ -35,34 +34,22 @@ pub fn or_kleene(lhs: &ArrayRef, rhs: &ArrayRef) -> VortexResult<ArrayRef> {
 /// This is the entry point for boolean operations from the binary expression.
 /// Handles constant-constant directly, otherwise falls back to Arrow.
 pub(crate) fn execute_boolean(
-    lhs: &ArrayRef,
-    rhs: &ArrayRef,
+    lhs: &dyn Array,
+    rhs: &dyn Array,
     op: Operator,
-    ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
     if let Some(result) = constant_boolean(lhs, rhs, op)? {
         return Ok(result);
     }
-    arrow_execute_boolean(lhs.clone(), rhs.clone(), op, ctx)
+    arrow_execute_boolean(lhs.to_array(), rhs.to_array(), op)
 }
 
 /// Arrow implementation for Kleene boolean operations using [`Operator`].
-fn arrow_execute_boolean(
-    lhs: ArrayRef,
-    rhs: ArrayRef,
-    op: Operator,
-    ctx: &mut ExecutionCtx,
-) -> VortexResult<ArrayRef> {
+fn arrow_execute_boolean(lhs: ArrayRef, rhs: ArrayRef, op: Operator) -> VortexResult<ArrayRef> {
     let nullable = lhs.dtype().is_nullable() || rhs.dtype().is_nullable();
 
-    let lhs = lhs
-        .execute_arrow(Some(&DataType::Boolean), ctx)?
-        .as_boolean()
-        .clone();
-    let rhs = rhs
-        .execute_arrow(Some(&DataType::Boolean), ctx)?
-        .as_boolean()
-        .clone();
+    let lhs = lhs.into_arrow(&DataType::Boolean)?.as_boolean().clone();
+    let rhs = rhs.into_arrow(&DataType::Boolean)?.as_boolean().clone();
 
     let array = match op {
         Operator::And => arrow_arith::boolean::and_kleene(&lhs, &rhs)?,
@@ -75,11 +62,14 @@ fn arrow_execute_boolean(
 
 /// Constant-folds a boolean operation between two constant arrays.
 fn constant_boolean(
-    lhs: &ArrayRef,
-    rhs: &ArrayRef,
+    lhs: &dyn Array,
+    rhs: &dyn Array,
     op: Operator,
 ) -> VortexResult<Option<ArrayRef>> {
-    let (Some(lhs), Some(rhs)) = (lhs.as_opt::<Constant>(), rhs.as_opt::<Constant>()) else {
+    let (Some(lhs), Some(rhs)) = (
+        lhs.as_opt::<ConstantVTable>(),
+        rhs.as_opt::<ConstantVTable>(),
+    ) else {
         return Ok(None);
     };
 
@@ -110,7 +100,7 @@ fn constant_boolean(
         .map(|b| Scalar::bool(b, nullable.into()))
         .unwrap_or_else(|| Scalar::null(DType::Bool(nullable.into())));
 
-    Ok(Some(ConstantArray::new(scalar, length).into_array()))
+    Ok(Some(ConstantArray::new(scalar, length).to_array()))
 }
 
 #[cfg(test)]
@@ -119,12 +109,9 @@ mod tests {
 
     use crate::ArrayRef;
     use crate::IntoArray;
-    use crate::LEGACY_SESSION;
-    use crate::VortexSessionExecute;
     use crate::arrays::BoolArray;
     use crate::builtins::ArrayBuiltins;
-    #[expect(deprecated)]
-    use crate::canonical::ToCanonical as _;
+    use crate::canonical::ToCanonical;
     use crate::scalar_fn::fns::operators::Operator;
 
     #[rstest]
@@ -138,29 +125,12 @@ mod tests {
     )]
     fn test_or(#[case] lhs: ArrayRef, #[case] rhs: ArrayRef) {
         let r = lhs.binary(rhs, Operator::Or).unwrap();
-        #[expect(deprecated)]
         let r = r.to_bool().into_array();
 
-        let v0 = r
-            .execute_scalar(0, &mut LEGACY_SESSION.create_execution_ctx())
-            .unwrap()
-            .as_bool()
-            .value();
-        let v1 = r
-            .execute_scalar(1, &mut LEGACY_SESSION.create_execution_ctx())
-            .unwrap()
-            .as_bool()
-            .value();
-        let v2 = r
-            .execute_scalar(2, &mut LEGACY_SESSION.create_execution_ctx())
-            .unwrap()
-            .as_bool()
-            .value();
-        let v3 = r
-            .execute_scalar(3, &mut LEGACY_SESSION.create_execution_ctx())
-            .unwrap()
-            .as_bool()
-            .value();
+        let v0 = r.scalar_at(0).unwrap().as_bool().value();
+        let v1 = r.scalar_at(1).unwrap().as_bool().value();
+        let v2 = r.scalar_at(2).unwrap().as_bool().value();
+        let v3 = r.scalar_at(3).unwrap().as_bool().value();
 
         assert!(v0.unwrap());
         assert!(v1.unwrap());
@@ -178,33 +148,16 @@ mod tests {
         BoolArray::from_iter([Some(true), Some(true), Some(false), Some(false)]).into_array(),
     )]
     fn test_and(#[case] lhs: ArrayRef, #[case] rhs: ArrayRef) {
-        #[expect(deprecated)]
         let r = lhs
             .binary(rhs, Operator::And)
             .unwrap()
             .to_bool()
             .into_array();
 
-        let v0 = r
-            .execute_scalar(0, &mut LEGACY_SESSION.create_execution_ctx())
-            .unwrap()
-            .as_bool()
-            .value();
-        let v1 = r
-            .execute_scalar(1, &mut LEGACY_SESSION.create_execution_ctx())
-            .unwrap()
-            .as_bool()
-            .value();
-        let v2 = r
-            .execute_scalar(2, &mut LEGACY_SESSION.create_execution_ctx())
-            .unwrap()
-            .as_bool()
-            .value();
-        let v3 = r
-            .execute_scalar(3, &mut LEGACY_SESSION.create_execution_ctx())
-            .unwrap()
-            .as_bool()
-            .value();
+        let v0 = r.scalar_at(0).unwrap().as_bool().value();
+        let v1 = r.scalar_at(1).unwrap().as_bool().value();
+        let v2 = r.scalar_at(2).unwrap().as_bool().value();
+        let v3 = r.scalar_at(3).unwrap().as_bool().value();
 
         assert!(v0.unwrap());
         assert!(!v1.unwrap());

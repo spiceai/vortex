@@ -18,8 +18,8 @@ use cudarc::driver::DeviceRepr;
 use tracing::instrument;
 use vortex::array::ArrayRef;
 use vortex::array::Canonical;
-use vortex::array::arrays::Filter;
-use vortex::array::arrays::filter::FilterArrayExt;
+use vortex::array::arrays::FilterArrayParts;
+use vortex::array::arrays::FilterVTable;
 use vortex::array::buffer::BufferHandle;
 use vortex::array::match_each_decimal_value_type;
 use vortex::array::match_each_native_simd_ptype;
@@ -50,11 +50,10 @@ impl CudaExecute for FilterExecutor {
         ctx: &mut CudaExecutionCtx,
     ) -> VortexResult<Canonical> {
         let filter_array = array
-            .try_downcast::<Filter>()
+            .try_into::<FilterVTable>()
             .map_err(|_| vortex_err!("Expected FilterArray"))?;
 
-        let child = filter_array.child().clone();
-        let mask = filter_array.data().filter_mask().clone();
+        let FilterArrayParts { child, mask } = filter_array.into_parts();
 
         // Early return for trivial cases.
         match mask {

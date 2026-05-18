@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use itertools::Itertools;
 use vortex::array::ExecutionCtx;
 use vortex::array::arrays::BoolArray;
-use vortex::array::arrays::bool::BoolArrayExt;
-use vortex::array::validity::Validity;
 use vortex::buffer::BitBuffer;
 use vortex::error::VortexResult;
 use vortex::mask::Mask;
 
+use crate::duckdb::LogicalType;
 use crate::duckdb::VectorRef;
 use crate::exporter::ColumnExporter;
 use crate::exporter::all_invalid;
@@ -24,12 +24,11 @@ pub(crate) fn new_exporter(
 ) -> VortexResult<Box<dyn ColumnExporter>> {
     let len = array.len();
     let bits = array.to_bit_buffer();
+    let validity = array.validity()?.to_array(len).execute::<Mask>(ctx)?;
 
-    let validity = array.validity()?;
-    if matches!(validity, Validity::AllInvalid) {
-        return Ok(all_invalid::new_exporter());
+    if validity.all_false() {
+        return Ok(all_invalid::new_exporter(len, &LogicalType::bool()));
     }
-    let validity = validity.to_array(len).execute::<Mask>(ctx)?;
 
     Ok(validity::new_exporter(
         validity,
@@ -52,7 +51,7 @@ impl ColumnExporter for BoolExporter {
                 .bit_buffer
                 .slice(offset..(offset + len))
                 .iter()
-                .collect::<Vec<bool>>(),
+                .collect_vec(),
         );
 
         Ok(())
@@ -110,7 +109,7 @@ mod tests {
                 r#"Chunk - [1 Columns]
 - FLAT BOOLEAN: 65 = [ {}]
 "#,
-                iter::repeat_n("true", 65).collect::<Vec<&str>>().join(", ")
+                iter::repeat_n("true", 65).join(", ")
             )
         );
     }

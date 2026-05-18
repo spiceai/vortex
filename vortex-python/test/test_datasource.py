@@ -14,15 +14,13 @@ from .test_file import record
 
 @pytest.fixture(scope="module")
 def ray_init():
-    # Ray's uv_runtime_env_hook would auto-upload the working directory to
-    # workers, but vortex-python's compiled _lib extension exceeds Ray's
-    # 512 MiB upload limit. Disable the hook for these local-mode tests.
-    # (Ray 2.55 added a string-type validation that broke the previous
-    # `working_dir: None` workaround from ray-project/ray#53848.)
-    import ray._private.ray_constants as ray_constants
-
-    ray_constants.RAY_ENABLE_UV_RUN_RUNTIME_ENV = False
-    _ = ray.init()  # pyright: ignore[reportUnknownMemberType]
+    # https://github.com/ray-project/ray/issues/53848#issuecomment-3056271943
+    ray.init(  # pyright: ignore[reportUnknownMemberType]
+        runtime_env={
+            "working_dir": None,
+            "excludes": [".git", ".venv"],
+        }
+    )
     yield None
     ray.shutdown()  # pyright: ignore[reportUnknownMemberType]
 
@@ -55,7 +53,7 @@ def test_vortex_datasource(ray_init, tmpdir_factory):  # pyright: ignore[reportU
     # Without an explicit sort, Ray may reorder rows *even within a single record batch*.
     ds = ds.sort("index")
 
-    tbl = pa.concat_tables(pa.Table.from_pydict(x) for x in ds.iter_batches())  # pyright: ignore[reportArgumentType, reportUnknownMemberType, reportUnknownVariableType]
+    tbl = pa.concat_tables(pa.Table.from_pydict(x) for x in ds.iter_batches())  # pyright: ignore[reportArgumentType]
     expected = pa.Table.from_pylist([record(x) for x in range(0, 10)], schema=tbl.schema)
 
     assert tbl == expected

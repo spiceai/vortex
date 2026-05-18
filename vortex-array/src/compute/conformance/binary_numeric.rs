@@ -18,8 +18,10 @@
 //!
 //! - Addition (`+`)
 //! - Subtraction (`-`)
+//! - Reverse Subtraction (scalar - array)
 //! - Multiplication (`*`)
 //! - Division (`/`)
+//! - Reverse Division (scalar / array)
 
 use itertools::Itertools;
 use num_traits::Num;
@@ -27,12 +29,12 @@ use vortex_error::VortexExpect;
 use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
 
+use crate::Array;
 use crate::ArrayRef;
 use crate::IntoArray;
 use crate::LEGACY_SESSION;
 use crate::RecursiveCanonical;
-#[expect(deprecated)]
-use crate::ToCanonical as _;
+use crate::ToCanonical;
 use crate::VortexSessionExecute;
 use crate::arrays::ConstantArray;
 use crate::builtins::ArrayBuiltins;
@@ -43,12 +45,12 @@ use crate::scalar::NumericOperator;
 use crate::scalar::PrimitiveScalar;
 use crate::scalar::Scalar;
 
-fn to_vec_of_scalar(array: &ArrayRef) -> Vec<Scalar> {
+fn to_vec_of_scalar(array: &dyn Array) -> Vec<Scalar> {
     // Not fast, but obviously correct
     (0..array.len())
         .map(|index| {
             array
-                .execute_scalar(index, &mut LEGACY_SESSION.create_execution_ctx())
+                .scalar_at(index)
                 .vortex_expect("scalar_at should succeed in conformance test")
         })
         .collect_vec()
@@ -93,7 +95,6 @@ fn test_standard_binary_numeric<T: NativePType + Num + Copy>(array: ArrayRef)
 where
     Scalar: From<T>,
 {
-    #[expect(deprecated)]
     let canonicalized_array = array.to_primitive();
     let original_values = to_vec_of_scalar(&canonicalized_array.into_array());
 
@@ -112,12 +113,12 @@ where
     ];
 
     for operator in operators {
-        let op = operator;
+        let op = operator.into();
         let rhs_const = ConstantArray::new(scalar_one.clone(), array.len()).into_array();
 
         // Test array operator scalar (e.g., array + 1)
         let result = array
-            .binary(rhs_const.clone(), op.into())
+            .binary(rhs_const.clone(), op)
             .vortex_expect("apply shouldn't fail")
             .execute::<RecursiveCanonical>(&mut LEGACY_SESSION.create_execution_ctx())
             .map(|c| c.0.into_array());
@@ -128,6 +129,9 @@ where
             continue;
         };
 
+        println!("result {}", result.display_tree());
+        println!("result {}", result.display_values());
+
         let actual_values = to_vec_of_scalar(&result);
 
         // Check each element for overflow/underflow
@@ -135,7 +139,7 @@ where
             .iter()
             .map(|x| {
                 x.as_primitive()
-                    .checked_binary_numeric(&scalar_one.as_primitive(), op)
+                    .checked_binary_numeric(&scalar_one.as_primitive(), operator)
                     .map(<Scalar as From<PrimitiveScalar<'_>>>::from)
             })
             .collect();
@@ -156,7 +160,7 @@ where
         }
 
         // Test scalar operator array (e.g., 1 + array)
-        let result = rhs_const.binary(array.clone(), op.into()).and_then(|a| {
+        let result = rhs_const.binary(array.clone(), op).and_then(|a| {
             a.execute::<RecursiveCanonical>(&mut LEGACY_SESSION.create_execution_ctx())
                 .map(|c| c.0.into_array())
         });
@@ -174,7 +178,7 @@ where
             .map(|x| {
                 scalar_one
                     .as_primitive()
-                    .checked_binary_numeric(&x.as_primitive(), op)
+                    .checked_binary_numeric(&x.as_primitive(), operator)
                     .map(<Scalar as From<PrimitiveScalar<'_>>>::from)
             })
             .collect();
@@ -330,7 +334,6 @@ where
     T: NativePType + Num + Copy + std::fmt::Debug,
     Scalar: From<T>,
 {
-    #[expect(deprecated)]
     let canonicalized_array = array.to_primitive();
     let original_values = to_vec_of_scalar(&canonicalized_array.into_array());
 
@@ -356,12 +359,12 @@ where
     };
 
     for operator in operators {
-        let op = operator;
+        let op = operator.into();
         let rhs_const = ConstantArray::new(scalar.clone(), array.len()).into_array();
 
         // Test array operator scalar
         let result = array
-            .binary(rhs_const, op.into())
+            .binary(rhs_const, op)
             .vortex_expect("apply failed")
             .execute::<RecursiveCanonical>(&mut LEGACY_SESSION.create_execution_ctx())
             .map(|x| x.0.into_array());
@@ -380,7 +383,7 @@ where
             .iter()
             .map(|x| {
                 x.as_primitive()
-                    .checked_binary_numeric(&scalar.as_primitive(), op)
+                    .checked_binary_numeric(&scalar.as_primitive(), operator)
                     .map(<Scalar as From<PrimitiveScalar<'_>>>::from)
             })
             .collect();

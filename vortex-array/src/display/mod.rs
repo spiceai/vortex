@@ -1,26 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-mod extractor;
-mod extractors;
-mod tree_display;
+mod tree;
 
 use std::fmt::Display;
 
-pub use extractor::IndentedFormatter;
-pub use extractor::TreeContext;
-pub use extractor::TreeExtractor;
-pub use extractors::BufferExtractor;
-pub use extractors::EncodingSummaryExtractor;
-pub use extractors::MetadataExtractor;
-pub use extractors::NbytesExtractor;
-pub use extractors::StatsExtractor;
 use itertools::Itertools as _;
-pub use tree_display::TreeDisplay;
+use tree::TreeDisplayWrapper;
 
-use crate::ArrayRef;
-use crate::LEGACY_SESSION;
-use crate::VortexSessionExecute;
+use crate::Array;
 
 /// Describe how to convert an array to a string.
 ///
@@ -68,7 +56,7 @@ pub enum DisplayOptions {
     /// # use vortex_buffer::buffer;
     /// let array = buffer![0_i16, 1, 2, 3, 4].into_array();
     /// let expected = "root: vortex.primitive(i16, len=5) nbytes=10 B (100.00%)
-    ///   metadata: ptype: i16
+    ///   metadata: EmptyMetadata
     ///   buffer: values host 10 B (align=2) (100.00%)
     /// ";
     /// assert_eq!(format!("{}", array.display_as(DisplayOptions::TreeDisplay { buffers: true, metadata: true, stats: true })), expected);
@@ -79,12 +67,12 @@ pub enum DisplayOptions {
     ///     ("y", buffer![3, 4].into_array()),
     /// ]).unwrap().into_array();
     /// let expected = "root: vortex.struct({x=i32, y=i32}, len=2) nbytes=16 B (100.00%)
-    ///   metadata:\x20
+    ///   metadata: EmptyMetadata
     ///   x: vortex.primitive(i32, len=2) nbytes=8 B (50.00%)
-    ///     metadata: ptype: i32
+    ///     metadata: EmptyMetadata
     ///     buffer: values host 8 B (align=4) (100.00%)
     ///   y: vortex.primitive(i32, len=2) nbytes=8 B (50.00%)
-    ///     metadata: ptype: i32
+    ///     metadata: EmptyMetadata
     ///     buffer: values host 8 B (align=4) (100.00%)
     /// ";
     /// assert_eq!(format!("{}", array.display_as(DisplayOptions::TreeDisplay { buffers: true, metadata: true, stats: true })), expected);
@@ -98,7 +86,7 @@ pub enum DisplayOptions {
     /// # use vortex_buffer::buffer;
     /// let array = buffer![0_i16, 1, 2, 3, 4].into_array();
     /// let expected = "root: vortex.primitive(i16, len=5) nbytes=10 B (100.00%)
-    ///   metadata: ptype: i16
+    ///   metadata: EmptyMetadata
     /// ";
     /// assert_eq!(format!("{}", array.display_as(DisplayOptions::TreeDisplay { buffers: false, metadata: true, stats: true })), expected);
     ///
@@ -108,11 +96,11 @@ pub enum DisplayOptions {
     ///     ("y", buffer![3, 4].into_array()),
     /// ]).unwrap().into_array();
     /// let expected = "root: vortex.struct({x=i32, y=i32}, len=2) nbytes=16 B (100.00%)
-    ///   metadata:\x20
+    ///   metadata: EmptyMetadata
     ///   x: vortex.primitive(i32, len=2) nbytes=8 B (50.00%)
-    ///     metadata: ptype: i32
+    ///     metadata: EmptyMetadata
     ///   y: vortex.primitive(i32, len=2) nbytes=8 B (50.00%)
-    ///     metadata: ptype: i32
+    ///     metadata: EmptyMetadata
     /// ";
     /// assert_eq!(format!("{}", array.display_as(DisplayOptions::TreeDisplay { buffers: false, metadata: true, stats: true })), expected);
     /// ```
@@ -125,7 +113,7 @@ pub enum DisplayOptions {
     /// # use vortex_buffer::buffer;
     /// let array = buffer![0_i16, 1, 2, 3, 4].into_array();
     /// let expected = "root: vortex.primitive(i16, len=5)
-    ///   metadata: ptype: i16
+    ///   metadata: EmptyMetadata
     ///   buffer: values host 10 B (align=2)
     /// ";
     /// assert_eq!(format!("{}", array.display_as(DisplayOptions::TreeDisplay { buffers: true, metadata: true, stats: false })), expected);
@@ -136,12 +124,12 @@ pub enum DisplayOptions {
     ///     ("y", buffer![3, 4].into_array()),
     /// ]).unwrap().into_array();
     /// let expected = "root: vortex.struct({x=i32, y=i32}, len=2)
-    ///   metadata:\x20
+    ///   metadata: EmptyMetadata
     ///   x: vortex.primitive(i32, len=2)
-    ///     metadata: ptype: i32
+    ///     metadata: EmptyMetadata
     ///     buffer: values host 8 B (align=4)
     ///   y: vortex.primitive(i32, len=2)
-    ///     metadata: ptype: i32
+    ///     metadata: EmptyMetadata
     ///     buffer: values host 8 B (align=4)
     /// ";
     /// assert_eq!(format!("{}", array.display_as(DisplayOptions::TreeDisplay { buffers: true, metadata: true, stats: false })), expected);
@@ -207,7 +195,7 @@ pub enum DisplayOptions {
     /// # use vortex_buffer::buffer;
     /// let array = buffer![0_i16, 1, 2, 3, 4].into_array();
     /// let expected = "root: vortex.primitive(i16, len=5)
-    ///   metadata: ptype: i16
+    ///   metadata: EmptyMetadata
     /// ";
     /// assert_eq!(format!("{}", array.display_as(DisplayOptions::TreeDisplay { buffers: false, metadata: true, stats: false })), expected);
     ///
@@ -217,11 +205,11 @@ pub enum DisplayOptions {
     ///     ("y", buffer![3, 4].into_array()),
     /// ]).unwrap().into_array();
     /// let expected = "root: vortex.struct({x=i32, y=i32}, len=2)
-    ///   metadata:\x20
+    ///   metadata: EmptyMetadata
     ///   x: vortex.primitive(i32, len=2)
-    ///     metadata: ptype: i32
+    ///     metadata: EmptyMetadata
     ///   y: vortex.primitive(i32, len=2)
-    ///     metadata: ptype: i32
+    ///     metadata: EmptyMetadata
     /// ";
     /// assert_eq!(format!("{}", array.display_as(DisplayOptions::TreeDisplay { buffers: false, metadata: true, stats: false })), expected);
     /// ```
@@ -316,7 +304,7 @@ impl Default for DisplayOptions {
 /// See also:
 /// [Array::display_as](../trait.Array.html#method.display_as)
 /// and [DisplayOptions].
-pub struct DisplayArrayAs<'a>(pub &'a ArrayRef, pub DisplayOptions);
+pub struct DisplayArrayAs<'a>(pub &'a dyn Array, pub DisplayOptions);
 
 impl Display for DisplayArrayAs<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -336,14 +324,13 @@ impl Display for DisplayArrayAs<'_> {
 ///     "vortex.primitive(i16, len=5)",
 /// );
 /// ```
-impl Display for ArrayRef {
+impl Display for dyn Array + '_ {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.fmt_as(f, &DisplayOptions::MetadataOnly)
     }
 }
 
-const DISPLAY_LIMIT: usize = 16;
-impl ArrayRef {
+impl dyn Array + '_ {
     /// Display logical values of the array
     ///
     /// For example, an `i16` typed array containing the first five non-negative integers is displayed
@@ -402,8 +389,15 @@ impl ArrayRef {
     /// ";
     /// assert_eq!(format!("{}", array.display_tree_encodings_only()), expected);
     /// ```
-    pub fn display_tree_encodings_only(&self) -> TreeDisplay {
-        self.tree_display_builder().with(EncodingSummaryExtractor)
+    pub fn display_tree_encodings_only(&self) -> impl Display {
+        DisplayArrayAs(
+            self,
+            DisplayOptions::TreeDisplay {
+                buffers: false,
+                metadata: false,
+                stats: false,
+            },
+        )
     }
 
     /// Display the tree of encodings of this array as an indented lists.
@@ -420,73 +414,20 @@ impl ArrayRef {
     /// # use vortex_buffer::buffer;
     /// let array = buffer![0_i16, 1, 2, 3, 4].into_array();
     /// let expected = "root: vortex.primitive(i16, len=5) nbytes=10 B (100.00%)
-    ///   metadata: ptype: i16
+    ///   metadata: EmptyMetadata
     ///   buffer: values host 10 B (align=2) (100.00%)
     /// ";
     /// assert_eq!(format!("{}", array.display_tree()), expected);
     /// ```
-    pub fn display_tree(&self) -> TreeDisplay {
-        TreeDisplay::default_display(self.clone())
-    }
-
-    /// Create a tree display with all built-in extractors (nbytes, stats, metadata, buffers).
-    ///
-    /// This is the default, fully-detailed tree display. Use
-    /// `tree_display_builder()` for a blank slate.
-    ///
-    /// # Examples
-    /// ```
-    /// # use vortex_array::IntoArray;
-    /// # use vortex_buffer::buffer;
-    /// let array = buffer![0_i16, 1, 2, 3, 4].into_array();
-    /// let expected = "root: vortex.primitive(i16, len=5) nbytes=10 B (100.00%)
-    ///   metadata: ptype: i16
-    ///   buffer: values host 10 B (align=2) (100.00%)
-    /// ";
-    /// assert_eq!(array.tree_display().to_string(), expected);
-    /// ```
-    pub fn tree_display(&self) -> TreeDisplay {
-        TreeDisplay::default_display(self.clone())
-    }
-
-    /// Create a composable tree display builder with no extractors.
-    ///
-    /// With no extractors, only the node names are shown.
-    /// Add extractors with [`.with()`][TreeDisplay::with] to include additional information.
-    /// Most builders should start with [`EncodingSummaryExtractor`] to include encoding headers.
-    ///
-    /// # Examples
-    /// ```
-    /// # use vortex_array::IntoArray;
-    /// # use vortex_buffer::buffer;
-    /// use vortex_array::display::{EncodingSummaryExtractor, NbytesExtractor, MetadataExtractor, BufferExtractor};
-    ///
-    /// let array = buffer![0_i16, 1, 2, 3, 4].into_array();
-    ///
-    /// // Encodings only
-    /// let encodings = array.tree_display_builder()
-    ///     .with(EncodingSummaryExtractor)
-    ///     .to_string();
-    /// assert_eq!(encodings, "root: vortex.primitive(i16, len=5)\n");
-    ///
-    /// // With encoding + nbytes
-    /// let with_nbytes = array.tree_display_builder()
-    ///     .with(EncodingSummaryExtractor)
-    ///     .with(NbytesExtractor)
-    ///     .to_string();
-    /// assert_eq!(with_nbytes, "root: vortex.primitive(i16, len=5) nbytes=10 B (100.00%)\n");
-    ///
-    /// // With encoding, metadata, and buffers
-    /// let detailed = array.tree_display_builder()
-    ///     .with(EncodingSummaryExtractor)
-    ///     .with(MetadataExtractor)
-    ///     .with(BufferExtractor { show_percent: false })
-    ///     .to_string();
-    /// let expected = "root: vortex.primitive(i16, len=5)\n  metadata: ptype: i16\n  buffer: values host 10 B (align=2)\n";
-    /// assert_eq!(detailed, expected);
-    /// ```
-    pub fn tree_display_builder(&self) -> TreeDisplay {
-        TreeDisplay::new(self.clone())
+    pub fn display_tree(&self) -> impl Display {
+        DisplayArrayAs(
+            self,
+            DisplayOptions::TreeDisplay {
+                buffers: true,
+                metadata: true,
+                stats: true,
+            },
+        )
     }
 
     /// Display the array as a formatted table.
@@ -523,64 +464,50 @@ impl ArrayRef {
 
     fn fmt_as(&self, f: &mut std::fmt::Formatter, options: &DisplayOptions) -> std::fmt::Result {
         match options {
-            DisplayOptions::MetadataOnly => EncodingSummaryExtractor::write(self, f),
+            DisplayOptions::MetadataOnly => {
+                write!(
+                    f,
+                    "{}({}, len={})",
+                    self.encoding_id(),
+                    self.dtype(),
+                    self.len()
+                )
+            }
             DisplayOptions::CommaSeparatedScalars {
                 omit_comma_after_space,
             } => {
-                let opening_brace = if f.alternate() { "[\n" } else { "[" };
-                let closing_brace = if f.alternate() { "\n]" } else { "]" };
-
+                write!(f, "[")?;
                 let sep = if *omit_comma_after_space { "," } else { ", " };
-                let sep = if f.alternate() { ",\n" } else { sep };
-                let limit = self.len().min(f.precision().unwrap_or(DISPLAY_LIMIT));
-                let is_truncated = self.len() > limit;
-
-                let fmt_scalar = |i| {
-                    self.execute_scalar(i, &mut LEGACY_SESSION.create_execution_ctx())
-                        .map_or_else(|e| format!("<error: {e}>"), |s| s.to_string())
-                };
                 write!(
                     f,
-                    "{opening_brace}{}{closing_brace}",
-                    (0..limit.saturating_sub(3))
-                        .map(fmt_scalar)
-                        .chain(std::iter::repeat_n(
-                            "...".to_string(),
-                            is_truncated as usize
-                        ))
-                        .chain((self.len().saturating_sub(3)..self.len()).map(fmt_scalar))
+                    "{}",
+                    (0..self.len())
+                        .map(|i| self
+                            .scalar_at(i)
+                            .map_or_else(|e| format!("<error: {e}>"), |s| s.to_string()))
                         .format(sep)
-                )
+                )?;
+                write!(f, "]")
             }
             DisplayOptions::TreeDisplay {
                 buffers,
                 metadata,
                 stats,
             } => {
-                let extractors: [(bool, Box<dyn TreeExtractor>); 5] = [
-                    (true, Box::new(EncodingSummaryExtractor)),
-                    (*stats, Box::new(NbytesExtractor)),
-                    (*stats, Box::new(StatsExtractor)),
-                    (*metadata, Box::new(MetadataExtractor)),
-                    (
-                        *buffers,
-                        Box::new(BufferExtractor {
-                            show_percent: *stats,
-                        }),
-                    ),
-                ];
-                let mut display = TreeDisplay::new(self.clone());
-                for (enabled, extractor) in extractors {
-                    if enabled {
-                        display = display.with_boxed(extractor);
+                write!(
+                    f,
+                    "{}",
+                    TreeDisplayWrapper {
+                        array: self.to_array(),
+                        buffers: *buffers,
+                        metadata: *metadata,
+                        stats: *stats
                     }
-                }
-                write!(f, "{display}")
+                )
             }
             #[cfg(feature = "table-display")]
             DisplayOptions::TableDisplay => {
-                #[expect(deprecated)]
-                use crate::canonical::ToCanonical as _;
+                use crate::canonical::ToCanonical;
                 use crate::dtype::DType;
 
                 let mut builder = tabled::builder::Builder::default();
@@ -590,7 +517,7 @@ impl ArrayRef {
                     // For non-struct arrays, simply display a single column table without header.
                     for row_idx in 0..self.len() {
                         let value = self
-                            .execute_scalar(row_idx, &mut LEGACY_SESSION.create_execution_ctx())
+                            .scalar_at(row_idx)
                             .map_or_else(|e| format!("<error: {e}>"), |s| s.to_string());
                         builder.push_record([value]);
                     }
@@ -601,24 +528,18 @@ impl ArrayRef {
                     return write!(f, "{table}");
                 };
 
-                #[expect(deprecated)]
                 let struct_ = self.to_struct();
                 builder.push_record(sf.names().iter().map(|name| name.to_string()));
 
                 for row_idx in 0..self.len() {
-                    if !self
-                        .is_valid(row_idx, &mut LEGACY_SESSION.create_execution_ctx())
-                        .unwrap_or(false)
-                    {
+                    if !self.is_valid(row_idx).unwrap_or(false) {
                         let null_row = vec!["null".to_string(); sf.names().len()];
                         builder.push_record(null_row);
                     } else {
                         let mut row = Vec::new();
-                        for field_array in
-                            crate::arrays::struct_::StructArrayExt::iter_unmasked_fields(&struct_)
-                        {
+                        for field_array in struct_.unmasked_fields().iter() {
                             let value = field_array
-                                .execute_scalar(row_idx, &mut LEGACY_SESSION.create_execution_ctx())
+                                .scalar_at(row_idx)
                                 .map_or_else(|e| format!("<error: {e}>"), |s| s.to_string());
                             row.push(value);
                         }
@@ -635,10 +556,7 @@ impl ArrayRef {
                 }
 
                 for row_idx in 0..self.len() {
-                    if !self
-                        .is_valid(row_idx, &mut LEGACY_SESSION.create_execution_ctx())
-                        .unwrap_or(false)
-                    {
+                    if !self.is_valid(row_idx).unwrap_or(false) {
                         table.modify(
                             (1 + row_idx, 0),
                             tabled::settings::Span::column(sf.names().len() as isize),
@@ -661,9 +579,7 @@ mod test {
     use crate::IntoArray as _;
     use crate::arrays::BoolArray;
     use crate::arrays::ListArray;
-    use crate::arrays::PrimitiveArray;
     use crate::arrays::StructArray;
-    use crate::display::DISPLAY_LIMIT;
     use crate::dtype::FieldNames;
     use crate::validity::Validity;
 
@@ -677,13 +593,6 @@ mod test {
 
         let x = buffer![1, 2, 3, 4].into_array();
         assert_eq!(x.display_values().to_string(), "[1i32, 2i32, 3i32, 4i32]");
-
-        let x =
-            PrimitiveArray::from_iter(0i32..i32::try_from(DISPLAY_LIMIT).unwrap() + 1).into_array();
-        assert_eq!(
-            x.display_values().to_string(),
-            "[0i32, 1i32, 2i32, 3i32, 4i32, 5i32, 6i32, 7i32, 8i32, 9i32, 10i32, 11i32, 12i32, ..., 14i32, 15i32, 16i32]"
-        );
     }
 
     #[test]
@@ -729,14 +638,6 @@ mod test {
     }
 
     #[test]
-    fn test_display_tree_nullable_primitive_validity_child() {
-        let array =
-            PrimitiveArray::from_option_iter([Some(1i64), Some(2), None, Some(3)]).into_array();
-        let expected = "root: vortex.primitive(i64?, len=4) nbytes=33 B (100.00%)\n  metadata: ptype: i64\n  buffer: values host 32 B (align=8) (96.97%)\n  validity: vortex.bool(bool, len=4) nbytes=1 B (3.03%)\n    metadata: offset: 0\n    buffer: bits host 1 B (align=1) (100.00%)\n";
-        assert_eq!(format!("{}", array.display_tree()), expected);
-    }
-
-    #[test]
     fn test_table_display_primitive() {
         use crate::display::DisplayOptions;
 
@@ -762,8 +663,13 @@ mod test {
     fn test_table_display() {
         use crate::display::DisplayOptions;
 
-        let array =
-            PrimitiveArray::from_option_iter(vec![Some(-1), Some(-2), Some(-3), None]).into_array();
+        let array = crate::arrays::PrimitiveArray::from_option_iter(vec![
+            Some(-1),
+            Some(-2),
+            Some(-3),
+            None,
+        ])
+        .into_array();
 
         let struct_ = StructArray::try_from_iter_with_validity(
             [("x", buffer![1, 2, 3, 4].into_array()), ("y", array)],

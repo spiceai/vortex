@@ -1,108 +1,91 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use vortex_array::Array;
 use vortex_array::ArrayRef;
-use vortex_array::ArrayView;
-use vortex_array::IntoArray;
 use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::DType;
-use vortex_array::dtype::Nullability;
 use vortex_array::scalar_fn::fns::cast::CastReduce;
 use vortex_error::VortexResult;
 
-use crate::rle::RLE;
-use crate::rle::RLEArrayExt;
+use crate::rle::RLEArray;
+use crate::rle::RLEVTable;
 
-impl CastReduce for RLE {
-    fn cast(array: ArrayView<'_, Self>, dtype: &DType) -> VortexResult<Option<ArrayRef>> {
+impl CastReduce for RLEVTable {
+    fn cast(array: &RLEArray, dtype: &DType) -> VortexResult<Option<ArrayRef>> {
         // Cast RLE values.
-        let casted_values = array
-            .values()
-            .cast(DType::Primitive(dtype.as_ptype(), Nullability::NonNullable))?;
+        let casted_values = array.values().cast(dtype.clone())?;
 
         // Cast RLE indices such that validity matches the target dtype.
-        let casted_indices = array.indices().cast(
-            array
-                .indices()
-                .dtype()
-                .with_nullability(dtype.nullability()),
-        )?;
+        let casted_indices = if array.indices().dtype().nullability() != dtype.nullability() {
+            array.indices().cast(DType::Primitive(
+                array.indices().dtype().as_ptype(),
+                dtype.nullability(),
+            ))?
+        } else {
+            array.indices().clone()
+        };
 
-        Ok(Some(
-            RLE::try_new(
+        Ok(Some(unsafe {
+            RLEArray::new_unchecked(
                 casted_values,
                 casted_indices,
                 array.values_idx_offsets().clone(),
+                dtype.clone(),
                 array.offset(),
                 array.len(),
-            )?
-            .into_array(),
-        ))
+            )
+            .into()
+        }))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::LazyLock;
-
     use rstest::rstest;
-    use vortex_array::Canonical;
-    use vortex_array::ExecutionCtx;
+    use vortex_array::Array;
     use vortex_array::IntoArray;
-    use vortex_array::LEGACY_SESSION;
-    use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::PrimitiveArray;
-    use vortex_array::assert_arrays_eq;
     use vortex_array::builtins::ArrayBuiltins;
     use vortex_array::compute::conformance::cast::test_cast_conformance;
     use vortex_array::dtype::DType;
     use vortex_array::dtype::Nullability;
     use vortex_array::dtype::PType;
-    use vortex_array::session::ArraySession;
     use vortex_array::validity::Validity;
     use vortex_buffer::Buffer;
-    use vortex_session::VortexSession;
 
-    use crate::RLEData;
     use crate::rle::RLEArray;
-
-    static SESSION: LazyLock<VortexSession> =
-        LazyLock::new(|| VortexSession::empty().with::<ArraySession>());
-
-    fn rle(primitive: &PrimitiveArray, ctx: &mut ExecutionCtx) -> RLEArray {
-        RLEData::encode(primitive.as_view(), ctx).unwrap()
-    }
 
     #[test]
     fn try_cast_rle_success() {
-        let mut ctx = SESSION.create_execution_ctx();
         let primitive = PrimitiveArray::new(
             Buffer::from_iter([10u8, 20, 30, 40, 50]),
             Validity::from_iter([true, true, true, true, true]),
         );
-        let encoded = rle(&primitive, &mut ctx);
+        let rle = RLEArray::encode(&primitive).unwrap();
 
-        let casted = encoded
-            .into_array()
-            .cast(DType::Primitive(PType::U16, Nullability::NonNullable))
-            .unwrap();
-        assert_arrays_eq!(casted, PrimitiveArray::from_iter([10u16, 20, 30, 40, 50]));
+        let res = rle
+            .to_array()
+            .cast(DType::Primitive(PType::U16, Nullability::NonNullable));
+        assert!(res.is_ok());
+        assert_eq!(
+            res.unwrap().dtype(),
+            &DType::Primitive(PType::U16, Nullability::NonNullable)
+        );
     }
 
     #[test]
     #[should_panic]
     fn try_cast_rle_fail() {
-        let mut ctx = SESSION.create_execution_ctx();
         let primitive = PrimitiveArray::new(
             Buffer::from_iter([10u8, 20, 30, 40, 50]),
             Validity::from_iter([true, false, true, true, false]),
         );
-        let encoded = rle(&primitive, &mut ctx);
-        let result = encoded
-            .into_array()
+        let rle = RLEArray::encode(&primitive).unwrap();
+        rle.to_array()
             .cast(DType::Primitive(PType::U8, Nullability::NonNullable))
-            .and_then(|a| a.execute::<Canonical>(&mut ctx).map(|c| c.into_array()));
-        result.unwrap();
+            .and_then(|a| a.to_canonical().map(|c| c.into_array()))
+            .unwrap();
     }
 
     #[rstest]
@@ -155,8 +138,7 @@ mod tests {
         )
     )]
     fn test_cast_rle_conformance(#[case] primitive: PrimitiveArray) {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
-        let rle_array = rle(&primitive, &mut ctx);
-        test_cast_conformance(&rle_array.into_array());
+        let rle_array = RLEArray::encode(&primitive).unwrap();
+        test_cast_conformance(rle_array.as_ref());
     }
 }

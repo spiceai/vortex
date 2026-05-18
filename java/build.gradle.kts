@@ -4,12 +4,12 @@
 import net.ltgt.gradle.errorprone.errorprone
 
 plugins {
-    id("com.diffplug.spotless") version "8.4.0"
-    id("com.palantir.git-version") version "5.0.0"
-    id("com.palantir.java-format") version "2.90.0"
-    id("net.ltgt.errorprone") version "5.1.0" apply false
-    id("com.google.protobuf") version "0.10.0" apply false
-    id("com.vanniktech.maven.publish") version "0.36.0" apply false
+    id("com.diffplug.spotless") version "8.1.0"
+    id("com.palantir.consistent-versions") version "3.7.0"
+    id("com.palantir.git-version") version "4.2.0"
+    id("net.ltgt.errorprone") version "4.3.0" apply false
+    id("com.google.protobuf") version "0.9.6" apply false
+    id("com.vanniktech.maven.publish") version "0.35.0" apply false
 }
 
 subprojects {
@@ -33,20 +33,15 @@ allprojects {
         apply(plugin = "net.ltgt.errorprone")
 
         dependencies {
-            "errorprone"("com.google.errorprone:error_prone_core:2.36.0")
-            "errorprone"("com.jakewharton.nopen:nopen-checker:1.0.1")
-            "compileOnly"("com.jakewharton.nopen:nopen-annotations:1.0.1")
+            "errorprone"("com.google.errorprone:error_prone_core")
+            "errorprone"("com.jakewharton.nopen:nopen-checker")
+            "compileOnly"("com.jakewharton.nopen:nopen-annotations")
         }
 
         spotless {
             java {
-                palantirJavaFormat().formatJavadoc(true)
+                palantirJavaFormat()
                 licenseHeaderFile("${rootProject.projectDir}/.spotless/java-license-header.txt")
-                removeUnusedImports()
-                forbidWildcardImports()
-                importOrder("")
-                trimTrailingWhitespace()
-                leadingTabsToSpaces(4)
                 targetExclude("**/generated/**")
                 targetExcludeIfContentContains("// spotless:disabled")
             }
@@ -58,7 +53,6 @@ allprojects {
             // ignore protobuf generated files
             options.errorprone.excludedPaths = ".*/build/generated/.*"
             options.release = 17
-            options.compilerArgs.add("-Werror")
 
             options.generatedSourceOutputDirectory = projectDir.resolve("generated_src")
         }

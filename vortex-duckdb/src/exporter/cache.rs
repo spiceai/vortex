@@ -8,7 +8,6 @@ use vortex::array::ArrayRef;
 use vortex::array::Canonical;
 use vortex_utils::aliases::dash_map::DashMap;
 
-use crate::duckdb::ReusableDict;
 use crate::duckdb::Vector;
 
 /// Cache for array conversions from Vortex to DuckDB.
@@ -18,8 +17,6 @@ use crate::duckdb::Vector;
 /// We hold on to the `ArrayRef` to ensure that the key (ptr addr) doesn't get reused.
 #[derive(Default)]
 pub struct ConversionCache {
-    pub dict_cache: DashMap<usize, (ArrayRef, ReusableDict)>,
     pub values_cache: DashMap<usize, (ArrayRef, Arc<Mutex<Vector>>)>,
     pub canonical_cache: DashMap<usize, (ArrayRef, Canonical)>,
-    pub file_index: usize,
 }

@@ -12,9 +12,7 @@ use std::sync::Arc;
 use itertools::Itertools;
 use vortex_array::ArrayRef;
 use vortex_array::Columnar;
-use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
-use vortex_array::arrays::ConstantArray;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Field;
 use vortex_array::dtype::FieldMask;
@@ -22,14 +20,13 @@ use vortex_array::dtype::FieldPath;
 use vortex_array::dtype::FieldPathSet;
 use vortex_array::expr::Expression;
 use vortex_array::expr::pruning::checked_pruning_expr;
-use vortex_array::scalar_fn::internal::row_count::substitute_row_count;
 use vortex_error::VortexResult;
 use vortex_layout::LayoutReader;
-use vortex_layout::scan::layout::LayoutReaderDataSource;
-use vortex_layout::scan::scan_builder::ScanBuilder;
-use vortex_layout::scan::split_by::SplitBy;
 use vortex_layout::segments::SegmentSource;
-use vortex_scan::DataSourceRef;
+use vortex_scan::ScanBuilder;
+use vortex_scan::SplitBy;
+use vortex_scan::api::DataSourceRef;
+use vortex_scan::layout::LayoutReaderDataSource;
 use vortex_session::VortexSession;
 use vortex_utils::aliases::hash_map::HashMap;
 
@@ -81,7 +78,7 @@ impl VortexFile {
     /// This may spawn a background I/O driver that will exit when the returned segment source
     /// is dropped.
     pub fn segment_source(&self) -> Arc<dyn SegmentSource> {
-        Arc::clone(&self.segment_source)
+        self.segment_source.clone()
     }
 
     /// Create a new layout reader for the file.
@@ -93,7 +90,7 @@ impl VortexFile {
             .new_reader("".into(), segment_source, &self.session)
     }
 
-    /// Create a [`DataSource`](vortex_scan::DataSource) from this file for scanning.
+    /// Create a [`DataSource`](vortex_scan::api::DataSource) from this file for scanning.
     ///
     /// Wraps the file's layout reader with [`FileStatsLayoutReader`] (when file-level
     /// statistics are available) and [`LayoutReaderDataSource`].
@@ -120,11 +117,7 @@ impl VortexFile {
         ))
     }
 
-    /// Returns `true` if file-level statistics prove the expression cannot
-    /// match any rows in this file.
-    ///
-    /// Row-count-aware pruning predicates are evaluated with the file's total
-    /// row count as their scope.
+    /// Returns true if the expression will never match any rows in the file.
     pub fn can_prune(&self, filter: &Expression) -> VortexResult<bool> {
         let Some((stats, fields)) = self
             .footer
@@ -169,18 +162,16 @@ impl VortexFile {
             return Ok(false);
         };
 
-        // Apply the predicate, then substitute any row_count placeholders in the resulting array
-        // tree with a ConstantArray carrying the file-level row count.
-        let applied = file_stats.apply(&predicate)?;
-        let row_count_replacement =
-            ConstantArray::new(self.footer.row_count(), applied.len()).into_array();
-        let applied = substitute_row_count(applied, &row_count_replacement)?;
-
         let mut ctx = self.session.create_execution_ctx();
-        Ok(match applied.execute::<Columnar>(&mut ctx)? {
-            Columnar::Constant(s) => s.scalar().as_bool().value() == Some(true),
-            Columnar::Canonical(_) => false,
-        })
+        Ok(
+            match file_stats
+                .apply(&predicate)?
+                .execute::<Columnar>(&mut ctx)?
+            {
+                Columnar::Constant(s) => s.scalar().as_bool().value() == Some(true),
+                Columnar::Canonical(_) => false,
+            },
+        )
     }
 
     pub fn splits(&self) -> VortexResult<Vec<Range<u64>>> {

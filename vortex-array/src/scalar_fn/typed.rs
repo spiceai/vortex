@@ -4,8 +4,10 @@
 //! Typed and inner representations of scalar functions.
 //!
 //! - [`ScalarFn<V>`]: The public typed wrapper, parameterized by a concrete [`ScalarFnVTable`].
-//! - [`ScalarFn<V>`]: The private inner struct that holds the vtable + options.
+//! - [`ScalarFnInner<V>`]: The private inner struct that holds the vtable + options.
 //! - [`DynScalarFn`]: The private sealed trait for type-erased dispatch (bound, options in self).
+//! - [`DynScalarFnVTable`]: The private trait for vtable-only dispatch (no options).
+//! - [`ScalarFnVTableAdapter<V>`]: The vtable-only adapter used by [`super::ScalarFnPlugin`].
 
 use std::any::Any;
 use std::fmt;
@@ -16,10 +18,11 @@ use std::hash::Hash;
 use std::hash::Hasher;
 use std::sync::Arc;
 
+use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
+use vortex_session::VortexSession;
 
 use crate::ArrayRef;
-use crate::ExecutionCtx;
 use crate::dtype::DType;
 use crate::expr::Expression;
 use crate::expr::StatsCatalog;
@@ -35,53 +38,76 @@ use crate::scalar_fn::ScalarFnRef;
 use crate::scalar_fn::ScalarFnVTable;
 use crate::scalar_fn::SimplifyCtx;
 
-/// A typed scalar function instance, parameterized by a concrete [`ScalarFnVTable`].
+// ============================================================================
+// DynScalarFnVTable — vtable-only trait (for ScalarFnPlugin)
+// ============================================================================
+
+/// An object-safe trait for vtable-only dispatch (no bound options).
 ///
-/// You can construct one via [`new()`], and erase the type with [`erased()`] to obtain a
-/// [`ScalarFnRef`].
-///
-/// [`new()`]: TypedScalarFnInstance::new
-/// [`erased()`]: TypedScalarFnInstance::erased
-pub struct TypedScalarFnInstance<V: ScalarFnVTable> {
-    vtable: V,
-    options: V::Options,
+/// Used by [`ScalarFnPlugin`] for registration, identity, and deserialization.
+/// Methods that require options take them as `&dyn Any` parameters.
+pub(crate) trait DynScalarFnVTable: 'static + Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+    fn id(&self) -> ScalarFnId;
+
+    fn options_deserialize(
+        &self,
+        metadata: &[u8],
+        session: &VortexSession,
+    ) -> VortexResult<Box<dyn Any + Send + Sync>>;
+
+    /// Bind deserialized options to create a [`ScalarFnRef`].
+    fn bind_deserialized(&self, options: Box<dyn Any + Send + Sync>) -> ScalarFnRef;
 }
 
-impl<V: ScalarFnVTable> TypedScalarFnInstance<V> {
-    /// Create a new typed scalar function instance.
-    pub fn new(vtable: V, options: V::Options) -> Self {
-        Self { vtable, options }
+/// Vtable-only adapter, wraps `V` for [`ScalarFnPlugin`].
+#[repr(transparent)]
+pub(super) struct ScalarFnVTableAdapter<V>(pub(super) V);
+
+impl<V: ScalarFnVTable> DynScalarFnVTable for ScalarFnVTableAdapter<V> {
+    #[inline(always)]
+    fn as_any(&self) -> &dyn Any {
+        &self.0
     }
 
-    /// Returns a reference to the vtable.
-    pub fn vtable(&self) -> &V {
-        &self.vtable
+    #[inline(always)]
+    fn id(&self) -> ScalarFnId {
+        V::id(&self.0)
     }
 
-    /// Returns a reference to the options.
-    pub fn options(&self) -> &V::Options {
-        &self.options
+    fn options_deserialize(
+        &self,
+        bytes: &[u8],
+        session: &VortexSession,
+    ) -> VortexResult<Box<dyn Any + Send + Sync>> {
+        Ok(Box::new(V::deserialize(&self.0, bytes, session)?))
     }
 
-    /// Erase the concrete type information, returning a type-erased [`ScalarFnRef`].
-    pub fn erased(self) -> ScalarFnRef {
-        ScalarFnRef(Arc::new(self))
+    fn bind_deserialized(&self, options: Box<dyn Any + Send + Sync>) -> ScalarFnRef {
+        let options = *options
+            .downcast::<V::Options>()
+            .ok()
+            .vortex_expect("Failed to downcast deserialized options to expected type");
+        ScalarFn::<V>::new(self.0.clone(), options).erased()
     }
 }
+
+// ============================================================================
+// DynScalarFn — bound trait (for ScalarFnRef), options stored in self
+// ============================================================================
 
 /// An object-safe, sealed trait for bound scalar function dispatch.
 ///
-/// Options are stored inside the implementing [`ScalarFn<V>`], not passed externally.
+/// Options are stored inside the implementing [`ScalarFnInner<V>`], not passed externally.
 /// This is the sole trait behind [`ScalarFnRef`]'s `Arc<dyn DynScalarFn>`.
-pub(super) trait DynScalarFn: 'static + Send + Sync + super::sealed::Sealed {
+pub(crate) trait DynScalarFn: 'static + Send + Sync + super::sealed::Sealed {
     fn as_any(&self) -> &dyn Any;
     fn id(&self) -> ScalarFnId;
     fn options_any(&self) -> &dyn Any;
 
     // Bound methods — options accessed from self
-    fn execute(&self, args: &dyn ExecutionArgs, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef>;
+    fn execute(&self, args: ExecutionArgs) -> VortexResult<ArrayRef>;
     fn return_dtype(&self, arg_types: &[DType]) -> VortexResult<DType>;
-    fn coerce_args(&self, arg_types: &[DType]) -> VortexResult<Vec<DType>>;
     fn reduce(
         &self,
         node: &dyn ReduceNode,
@@ -121,7 +147,20 @@ pub(super) trait DynScalarFn: 'static + Send + Sync + super::sealed::Sealed {
     fn options_debug(&self, f: &mut Formatter<'_>) -> fmt::Result;
 }
 
-impl<V: ScalarFnVTable> DynScalarFn for TypedScalarFnInstance<V> {
+// ============================================================================
+// ScalarFnInner<V> — bound adapter (vtable + options)
+// ============================================================================
+
+/// The private inner representation of a bound scalar function, pairing a vtable with its options.
+///
+/// This is the sole implementor of [`DynScalarFn`], enabling [`ScalarFnRef`] to safely downcast
+/// back to the concrete vtable type via [`Any`].
+pub(super) struct ScalarFnInner<V: ScalarFnVTable> {
+    pub(super) vtable: V,
+    pub(super) options: V::Options,
+}
+
+impl<V: ScalarFnVTable> DynScalarFn for ScalarFnInner<V> {
     #[inline(always)]
     fn as_any(&self) -> &dyn Any {
         self
@@ -136,17 +175,19 @@ impl<V: ScalarFnVTable> DynScalarFn for TypedScalarFnInstance<V> {
         &self.options
     }
 
-    fn execute(&self, args: &dyn ExecutionArgs, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
-        let expected_row_count = args.row_count();
+    fn execute(&self, args: ExecutionArgs) -> VortexResult<ArrayRef> {
+        let expected_row_count = args.row_count;
         #[cfg(debug_assertions)]
         let expected_dtype = {
-            let args_dtypes: Vec<DType> = (0..args.num_inputs())
-                .map(|i| args.get(i).map(|a| a.dtype().clone()))
-                .collect::<VortexResult<_>>()?;
+            let args_dtypes: Vec<DType> = args
+                .inputs
+                .iter()
+                .map(|array| array.dtype().clone())
+                .collect();
             V::return_dtype(&self.vtable, &self.options, &args_dtypes)
         }?;
 
-        let result = V::execute(&self.vtable, &self.options, args, ctx)?;
+        let result = V::execute(&self.vtable, &self.options, args)?;
 
         assert_eq!(
             result.len(),
@@ -173,10 +214,6 @@ impl<V: ScalarFnVTable> DynScalarFn for TypedScalarFnInstance<V> {
 
     fn return_dtype(&self, arg_dtypes: &[DType]) -> VortexResult<DType> {
         V::return_dtype(&self.vtable, &self.options, arg_dtypes)
-    }
-
-    fn coerce_args(&self, arg_types: &[DType]) -> VortexResult<Vec<DType>> {
-        V::coerce_args(&self.vtable, &self.options, arg_types)
     }
 
     fn reduce(
@@ -260,5 +297,40 @@ impl<V: ScalarFnVTable> DynScalarFn for TypedScalarFnInstance<V> {
 
     fn options_debug(&self, f: &mut Formatter<'_>) -> fmt::Result {
         Debug::fmt(&self.options, f)
+    }
+}
+
+// ============================================================================
+// ScalarFn<V> — typed wrapper
+// ============================================================================
+
+/// A typed scalar function instance, parameterized by a concrete [`ScalarFnVTable`].
+///
+/// You can construct one via [`new()`], and erase the type with [`erased()`] to obtain a
+/// [`ScalarFnRef`].
+///
+/// [`new()`]: ScalarFn::new
+/// [`erased()`]: ScalarFn::erased
+pub struct ScalarFn<V: ScalarFnVTable>(pub(super) Arc<ScalarFnInner<V>>);
+
+impl<V: ScalarFnVTable> ScalarFn<V> {
+    /// Create a new typed scalar function instance.
+    pub fn new(vtable: V, options: V::Options) -> Self {
+        Self(Arc::new(ScalarFnInner { vtable, options }))
+    }
+
+    /// Returns a reference to the vtable.
+    pub fn vtable(&self) -> &V {
+        &self.0.vtable
+    }
+
+    /// Returns a reference to the options.
+    pub fn options(&self) -> &V::Options {
+        &self.0.options
+    }
+
+    /// Erase the concrete type information, returning a type-erased [`ScalarFnRef`].
+    pub fn erased(self) -> ScalarFnRef {
+        ScalarFnRef(self.0)
     }
 }

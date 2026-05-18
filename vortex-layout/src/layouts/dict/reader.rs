@@ -11,6 +11,7 @@ use futures::FutureExt;
 use futures::TryFutureExt;
 use futures::future::BoxFuture;
 use futures::try_join;
+use vortex_array::Array;
 use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
 use vortex_array::MaskFuture;
@@ -61,7 +62,7 @@ impl DictReader {
         let values_len = usize::try_from(layout.values.row_count())?;
         let values = layout.values.new_reader(
             format!("{name}.values").into(),
-            Arc::clone(&segment_source),
+            segment_source.clone(),
             &session,
         )?;
         let codes =
@@ -105,25 +106,6 @@ impl DictReader {
             .clone()
     }
 
-    // This is the dict values array without canonicalization, if not already canonical
-    fn values_array_uncanonical(&self) -> SharedArrayFuture {
-        // We capture the name, so it may be wrong if we re-use the same reader within multiple
-        // different parent readers. But that's rare...
-        let values_len = self.values_len;
-        self.values_array.get().cloned().unwrap_or_else(|| {
-            self.values
-                .projection_evaluation(
-                    &(0..values_len as u64),
-                    &root(),
-                    MaskFuture::new_true(values_len),
-                )
-                .vortex_expect("must construct dict values array evaluation")
-                .map_err(Arc::new)
-                .boxed()
-                .shared()
-        })
-    }
-
     fn values_eval(&self, expr: Expression) -> SharedArrayFuture {
         // This is unsound since we cannot be sure that all the values are referenced in the query
         // after applying the filter, so if the expression is fallible this might fail when it
@@ -138,7 +120,7 @@ impl DictReader {
         self.values_evals
             .entry(expr.clone())
             .or_insert_with(|| {
-                self.values_array_uncanonical()
+                self.values_array()
                     .map(move |array| {
                         let array = array?.apply(&expr)?;
                         Ok(SharedArray::new(array).into_array())
@@ -224,7 +206,7 @@ impl LayoutReader for DictReader {
         mask: MaskFuture,
     ) -> VortexResult<BoxFuture<'static, VortexResult<ArrayRef>>> {
         // TODO: fix up expr partitioning with fallible & null sensitive annotations
-        let values_eval = self.values_array();
+        let values_eval = self.values_eval(root());
         let codes_eval = self
             .codes
             .projection_evaluation(row_range, &root(), mask)
@@ -244,16 +226,12 @@ impl LayoutReader for DictReader {
                 DictArray::new_unchecked(codes, values)
                     .set_all_values_referenced(all_values_referenced)
             }
-            .into_array()
+            .to_array()
             .optimize()?;
 
             array.apply(&expr)
         }
         .boxed())
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 }
 
@@ -263,11 +241,8 @@ mod tests {
 
     use rstest::rstest;
     use vortex_array::ArrayContext;
-    use vortex_array::Canonical;
     use vortex_array::IntoArray as _;
-    use vortex_array::LEGACY_SESSION;
     use vortex_array::MaskFuture;
-    use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::BoolArray;
     use vortex_array::arrays::StructArray;
     use vortex_array::arrays::VarBinArray;
@@ -277,19 +252,14 @@ mod tests {
     use vortex_array::dtype::FieldNames;
     use vortex_array::dtype::Nullability;
     use vortex_array::expr::eq;
-    use vortex_array::expr::is_not_null;
+    use vortex_array::expr::is_null;
     use vortex_array::expr::lit;
+    use vortex_array::expr::not;
     use vortex_array::expr::pack;
     use vortex_array::expr::root;
-    use vortex_array::scalar_fn::session::ScalarFnSession;
-    use vortex_array::session::ArraySession;
     use vortex_array::validity::Validity;
     use vortex_error::VortexExpect;
-    use vortex_io::runtime::Handle;
     use vortex_io::runtime::single::block_on;
-    use vortex_io::session::RuntimeSession;
-    use vortex_io::session::RuntimeSessionExt;
-    use vortex_session::VortexSession;
 
     use crate::LayoutId;
     use crate::LayoutRef;
@@ -302,23 +272,11 @@ mod tests {
     use crate::sequence::SequentialArrayStreamExt;
     use crate::sequence::SequentialStreamAdapter;
     use crate::sequence::SequentialStreamExt;
-    use crate::session::LayoutSession;
-
-    // FIXME(ngates): Deprecate the global `runtime::single::block_on` helper and require tests
-    // to call `block_on` on an explicit runtime instance.
-    fn session_with_handle(handle: Handle) -> VortexSession {
-        VortexSession::empty()
-            .with::<ArraySession>()
-            .with::<LayoutSession>()
-            .with::<ScalarFnSession>()
-            .with::<RuntimeSession>()
-            .with_handle(handle)
-    }
+    use crate::test::SESSION;
 
     #[test]
     fn reading_nested_packs_works() {
         block_on(|handle| async move {
-            let session = session_with_handle(handle);
             let strategy = DictStrategy::new(
                 FlatLayoutStrategy::default(),
                 FlatLayoutStrategy::default(),
@@ -340,7 +298,7 @@ mod tests {
                 ],
                 DType::Utf8(Nullability::Nullable),
             )
-            .into_array();
+            .to_array();
             let array_to_write = array.clone();
             let ctx = ArrayContext::empty();
             let segments = Arc::new(TestSegments::default());
@@ -348,14 +306,14 @@ mod tests {
             let layout: LayoutRef = strategy
                 .write_stream(
                     ctx,
-                    Arc::<TestSegments>::clone(&segments),
+                    segments.clone(),
                     SequentialStreamAdapter::new(
                         DType::Utf8(Nullability::Nullable),
                         array_to_write.to_array_stream().sequenced(ptr),
                     )
                     .sendable(),
                     eof,
-                    &session,
+                    handle,
                 )
                 .await
                 .unwrap();
@@ -367,9 +325,9 @@ mod tests {
                 )],
                 Nullability::NonNullable,
             );
-            assert!(layout.encoding_id() == LayoutId::new("vortex.dict"));
+            assert!(layout.encoding_id() == LayoutId::new_ref("vortex.dict"));
             let actual = layout
-                .new_reader("".into(), segments, &session)
+                .new_reader("".into(), segments, &SESSION)
                 .unwrap()
                 .projection_evaluation(
                     &(0..layout.row_count()),
@@ -417,7 +375,6 @@ mod tests {
         #[case] expected: Vec<bool>,
     ) {
         block_on(|handle| async move {
-            let session = session_with_handle(handle);
             let strategy = DictStrategy::new(
                 FlatLayoutStrategy::default(),
                 FlatLayoutStrategy::default(),
@@ -425,22 +382,21 @@ mod tests {
                 DictLayoutOptions::default(),
             );
 
-            let array =
-                VarBinArray::from_iter(data, DType::Utf8(Nullability::Nullable)).into_array();
+            let array = VarBinArray::from_iter(data, DType::Utf8(Nullability::Nullable)).to_array();
             let ctx = ArrayContext::empty();
             let segments = Arc::new(TestSegments::default());
             let (ptr, eof) = SequenceId::root().split();
             let layout: LayoutRef = strategy
                 .write_stream(
                     ctx,
-                    Arc::<TestSegments>::clone(&segments),
+                    segments.clone(),
                     SequentialStreamAdapter::new(
                         DType::Utf8(Nullability::Nullable),
                         array.to_array_stream().sequenced(ptr),
                     )
                     .sendable(),
                     eof,
-                    &session,
+                    handle,
                 )
                 .await
                 .unwrap();
@@ -453,7 +409,7 @@ mod tests {
                 )),
             );
             let mask = layout
-                .new_reader("".into(), segments, &session)
+                .new_reader("".into(), segments, &SESSION)
                 .unwrap()
                 .filter_evaluation(&(0..3), &filter, MaskFuture::new_true(3))
                 .unwrap()
@@ -467,8 +423,6 @@ mod tests {
     #[test]
     fn reading_is_null_works() {
         block_on(|handle| async move {
-            let mut ctx_exec = LEGACY_SESSION.create_execution_ctx();
-            let session = session_with_handle(handle);
             let strategy = DictStrategy::new(
                 FlatLayoutStrategy::default(),
                 FlatLayoutStrategy::default(),
@@ -490,7 +444,7 @@ mod tests {
                 ],
                 DType::Utf8(Nullability::Nullable),
             )
-            .into_array();
+            .to_array();
             let array_to_write = array.clone();
             let ctx = ArrayContext::empty();
 
@@ -499,22 +453,22 @@ mod tests {
             let layout: LayoutRef = strategy
                 .write_stream(
                     ctx,
-                    Arc::<TestSegments>::clone(&segments),
+                    segments.clone(),
                     SequentialStreamAdapter::new(
                         DType::Utf8(Nullability::Nullable),
                         array_to_write.to_array_stream().sequenced(ptr),
                     )
                     .sendable(),
                     eof,
-                    &session,
+                    handle,
                 )
                 .await
                 .unwrap();
 
-            let expression = is_not_null(root());
-            assert_eq!(layout.encoding_id(), LayoutId::new("vortex.dict"));
+            let expression = not(is_null(root())); // easier to test not_is_null b/c that's the validity array
+            assert_eq!(layout.encoding_id(), LayoutId::new_ref("vortex.dict"));
             let actual = layout
-                .new_reader("".into(), segments, &session)
+                .new_reader("".into(), segments, &SESSION)
                 .unwrap()
                 .projection_evaluation(
                     &(0..layout.row_count()),
@@ -524,17 +478,14 @@ mod tests {
                 .unwrap()
                 .await
                 .unwrap();
-            let expected = array
-                .validity()
-                .unwrap()
-                .execute_mask(array.len(), &mut ctx_exec)
-                .unwrap()
-                .into_array();
-            let actual_canonical = actual
-                .execute::<Canonical>(&mut ctx_exec)
-                .vortex_expect("to_canonical failed")
-                .into_array();
-            assert_arrays_eq!(actual_canonical, expected);
+            let expected = array.validity_mask().unwrap().into_array();
+            assert_arrays_eq!(
+                actual
+                    .to_canonical()
+                    .vortex_expect("to_canonical failed")
+                    .into_array(),
+                expected
+            );
         })
     }
 }

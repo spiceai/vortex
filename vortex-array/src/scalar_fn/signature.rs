@@ -7,7 +7,7 @@ use crate::scalar_fn::typed::DynScalarFn;
 
 /// Information about the signature of an expression.
 pub struct ScalarFnSignature<'a> {
-    pub(super) inner: &'a dyn DynScalarFn,
+    pub(crate) inner: &'a dyn DynScalarFn,
 }
 
 impl ScalarFnSignature<'_> {

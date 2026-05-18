@@ -23,7 +23,6 @@ use datafusion_physical_plan::metrics::MetricsSet;
 use futures::SinkExt;
 use futures::StreamExt;
 use object_store::ObjectStore;
-use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -262,7 +261,7 @@ async fn write_record_batch_stream_to_files(
                 );
                 active_writer = Some(start_file_writer(
                     &session,
-                    Arc::clone(&object_store),
+                    object_store.clone(),
                     file_path,
                     dtype.clone(),
                 ));
@@ -603,7 +602,7 @@ mod tests {
         let logical_plan = LogicalPlanBuilder::insert_into(
             LogicalPlan::Values(values.clone()),
             "my_tbl",
-            Arc::new(DefaultTableSource::new(Arc::clone(&tbl_provider))),
+            Arc::new(DefaultTableSource::new(tbl_provider.clone())),
             datafusion::logical_expr::dml::InsertOp::Append,
         )?
         .build()?;
@@ -1001,12 +1000,12 @@ mod tests {
         for i in 0..num_batches {
             let values = pseudo_random_i64s(batch_rows, (i * batch_rows) as i64);
             batches.push(RecordBatch::try_new(
-                Arc::clone(&schema),
+                schema.clone(),
                 vec![Arc::new(Int64Array::from(values))],
             )?);
         }
 
-        let table = MemTable::try_new(Arc::clone(&schema), vec![batches])?;
+        let table = MemTable::try_new(schema.clone(), vec![batches])?;
         ctx.session.register_table("source", Arc::new(table))?;
 
         let source = ctx.session.table("source").await?;
@@ -1109,12 +1108,12 @@ mod tests {
                 .map(|j| ((i * batch_rows + j) % 256) as i64)
                 .collect();
             batches.push(RecordBatch::try_new(
-                Arc::clone(&schema),
+                schema.clone(),
                 vec![Arc::new(Int64Array::from(values))],
             )?);
         }
 
-        let table = MemTable::try_new(Arc::clone(&schema), vec![batches])?;
+        let table = MemTable::try_new(schema.clone(), vec![batches])?;
         ctx.session.register_table("source", Arc::new(table))?;
 
         let source = ctx.session.table("source").await?;
@@ -1199,7 +1198,7 @@ mod tests {
         for p in 0..num_partitions {
             let values = pseudo_random_i64s(rows_per_partition, (p * rows_per_partition) as i64);
             partitions.push(vec![RecordBatch::try_new(
-                Arc::clone(&schema),
+                schema.clone(),
                 vec![Arc::new(Int64Array::from(values))],
             )?]);
         }
@@ -1302,7 +1301,7 @@ mod tests {
         for p in 0..num_partitions {
             let values = pseudo_random_i64s(rows_per_partition, (p * rows_per_partition) as i64);
             partitions.push(vec![RecordBatch::try_new(
-                Arc::clone(&schema),
+                schema.clone(),
                 vec![Arc::new(Int64Array::from(values))],
             )?]);
         }
@@ -1403,7 +1402,7 @@ mod tests {
         for p in 0..num_partitions {
             let values = pseudo_random_i64s(rows_per_partition, (p * rows_per_partition) as i64);
             partitions.push(vec![RecordBatch::try_new(
-                Arc::clone(&schema),
+                schema.clone(),
                 vec![Arc::new(Int64Array::from(values))],
             )?]);
         }
@@ -1514,13 +1513,11 @@ mod tests {
         let mut partitions: Vec<Arc<dyn PartitionStream>> = Vec::new();
         for p in 0..num_partitions {
             let values = pseudo_random_i64s(rows_per_partition, (p * rows_per_partition) as i64);
-            let batch = RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![Arc::new(Int64Array::from(values))],
-            )?;
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(values))])?;
 
             partitions.push(Arc::new(StaticPartitionStream {
-                schema: Arc::clone(&schema),
+                schema: schema.clone(),
                 batch,
             }));
         }
@@ -1633,13 +1630,11 @@ mod tests {
         let mut partitions: Vec<Arc<dyn PartitionStream>> = Vec::new();
         for p in 0..num_partitions {
             let values = pseudo_random_i64s(rows_per_partition, (p * rows_per_partition) as i64);
-            let batch = RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![Arc::new(Int64Array::from(values))],
-            )?;
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(values))])?;
 
             partitions.push(Arc::new(StaticPartitionStream {
-                schema: Arc::clone(&schema),
+                schema: schema.clone(),
                 batch,
             }));
         }
@@ -1756,13 +1751,11 @@ mod tests {
         let mut partitions: Vec<Arc<dyn PartitionStream>> = Vec::new();
         for p in 0..num_partitions {
             let values = pseudo_random_i64s(rows_per_partition, (p * rows_per_partition) as i64);
-            let batch = RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![Arc::new(Int64Array::from(values))],
-            )?;
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(values))])?;
 
             partitions.push(Arc::new(StaticPartitionStream {
-                schema: Arc::clone(&schema),
+                schema: schema.clone(),
                 batch,
             }));
         }

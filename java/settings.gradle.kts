@@ -19,8 +19,4 @@ rootProject.name = "vortex-root"
 
 // API bindings
 include("vortex-jni")
-include("vortex-spark_2.12")
-project(":vortex-spark_2.12").projectDir = file("vortex-spark")
-
-include("vortex-spark_2.13")
-project(":vortex-spark_2.13").projectDir = file("vortex-spark")
+include("vortex-spark")

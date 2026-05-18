@@ -3,7 +3,11 @@
 
 use std::ffi::CStr;
 
+use vortex::error::vortex_panic;
+
 use crate::cpp;
+use crate::duckdb::ObjectCache;
+use crate::duckdb::ObjectCacheRef;
 use crate::duckdb::Value;
 use crate::lifetime_wrapper;
 
@@ -30,6 +34,17 @@ impl ClientContextRef {
     /// and lives as long as the connection, so this is safe as long as the connection is kept alive.
     pub unsafe fn erase_lifetime(&self) -> &'static Self {
         unsafe { &*(self as *const Self) }
+    }
+
+    /// Get the object cache for this client context.
+    pub fn object_cache(&self) -> &ObjectCacheRef {
+        unsafe {
+            let cache = cpp::duckdb_client_context_get_object_cache(self.as_ptr());
+            if cache.is_null() {
+                vortex_panic!("Failed to get object cache from client context");
+            }
+            ObjectCache::borrow(cache)
+        }
     }
 
     /// Try to get the current value of a configuration setting.

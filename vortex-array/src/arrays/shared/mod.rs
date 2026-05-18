@@ -4,10 +4,8 @@
 mod array;
 mod vtable;
 
-pub use array::SharedArrayExt;
-pub use array::SharedData;
-pub use vtable::Shared;
-pub use vtable::SharedArray;
+pub use array::SharedArray;
+pub use vtable::SharedVTable;
 
 #[cfg(test)]
 mod tests;

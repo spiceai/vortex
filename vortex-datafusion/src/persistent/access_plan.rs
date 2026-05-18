@@ -1,49 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use vortex::layout::scan::scan_builder::ScanBuilder;
-use vortex::scan::selection::Selection;
+use vortex::scan::ScanBuilder;
+use vortex::scan::Selection;
 
-/// Additional Vortex-specific scan constraints attached to a
-/// [`PartitionedFile`].
+/// Custom Vortex-specific information that can be provided by external indexes or other sources.
 ///
-/// `VortexAccessPlan` is the hook to use when an external index or planner
-/// already knows that only part of a file needs to be scanned. The plan is
-/// attached as `extensions` on `PartitionedFile`, and the internal
-/// `VortexOpener` applies it before building the Vortex scan.
+/// This is intended as a low-level interface for users building their own data systems, see the [advance index] example from the DataFusion repo for a similar usage with Parquet.
 ///
-/// The current access plan surface is intentionally small: it lets callers
-/// provide a [`Selection`] that narrows the rows considered by the scan.
-///
-/// # Example
-///
-/// ```no_run
-/// # use std::sync::Arc;
-/// # use datafusion_datasource::PartitionedFile;
-/// # use vortex::scan::selection::Selection;
-/// use vortex_datafusion::VortexAccessPlan;
-///
-/// # let selection: Selection = todo!();
-/// let file = PartitionedFile::new("metrics.vortex", 1024).with_extensions(Arc::new(
-///     VortexAccessPlan::default().with_selection(selection),
-/// ));
-/// # let _ = file;
-/// ```
-///
-/// This is a low-level integration point for systems building their own access
-/// paths on top of DataFusion. For a conceptually similar Parquet example, see
-/// DataFusion's
-/// [`parquet_advanced_index`].
-///
-/// [`PartitionedFile`]: datafusion_datasource::PartitionedFile
-/// [`parquet_advanced_index`]: https://github.com/apache/datafusion/blob/47df535d2cd5aac5ad5a92bdc837f38e05ea0f0f/datafusion-examples/examples/data_io/parquet_advanced_index.rs
+/// [advance index]: https://github.com/apache/datafusion/blob/47df535d2cd5aac5ad5a92bdc837f38e05ea0f0f/datafusion-examples/examples/data_io/parquet_advanced_index.rs
 #[derive(Default)]
 pub struct VortexAccessPlan {
     selection: Option<Selection>,
 }
 
 impl VortexAccessPlan {
-    /// Sets the row [`Selection`] to apply when the file is opened.
+    /// Sets a [`Selection`] for this plan.
     pub fn with_selection(mut self, selection: Selection) -> Self {
         self.selection = Some(selection);
         self
@@ -56,10 +28,7 @@ impl VortexAccessPlan {
         self.selection.as_ref()
     }
 
-    /// Applies this access plan to a [`ScanBuilder`].
-    ///
-    /// This is used internally by the file opener after it has translated a
-    /// `PartitionedFile` into a Vortex scan.
+    /// Apply the plan to the scan's builder.
     pub fn apply_to_builder<A>(&self, mut scan_builder: ScanBuilder<A>) -> ScanBuilder<A>
     where
         A: 'static + Send,

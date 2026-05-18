@@ -33,14 +33,9 @@ impl CoalesceConfig {
         Self { distance, max_size }
     }
 
-    /// Configuration appropriate for in-memory / low-latency sources.
-    pub const fn in_memory() -> Self {
+    /// Configuration appropriate for fast local storage (memory, NVMe).
+    pub const fn local() -> Self {
         Self::new(8 * 1024, 8 * 1024) // 8KB
-    }
-
-    /// Configuration appropriate for local filesystem access.
-    pub const fn file() -> Self {
-        Self::new(1 << 20, 4 << 20) // 1MB distance, 4MB max
     }
 
     /// Configuration appropriate for object storage (S3, GCS, etc.).
@@ -229,8 +224,10 @@ impl<T: VortexReadAt + Clone> InstrumentedReadAt<T> {
     }
 }
 
-impl InnerMetrics {
-    fn log_sizes(&self) {
+// We implement drop for `InnerMetrics` so this will be logged only when we eventually drop the final instance of `InstrumentedRead`
+impl Drop for InnerMetrics {
+    #[allow(clippy::cognitive_complexity)]
+    fn drop(&mut self) {
         tracing::debug!("Reads: {}", self.sizes.count());
         if !self.sizes.is_empty() {
             tracing::debug!(
@@ -243,10 +240,10 @@ impl InnerMetrics {
                     .vortex_expect("must not be empty"),
             );
         }
-        tracing::debug!("Total read size: {}", self.total_size.value());
-    }
 
-    fn log_durations(&self) {
+        let total_size = self.total_size.value();
+        tracing::debug!("Total read size: {total_size}");
+
         if !self.durations.is_empty() {
             tracing::debug!(
                 "Read duration: p50={}ms p95={}ms p99={}ms p999={}ms",
@@ -268,14 +265,6 @@ impl InnerMetrics {
                     .as_millis(),
             );
         }
-    }
-}
-
-// We implement drop for `InnerMetrics` so this will be logged only when we eventually drop the final instance of `InstrumentedRead`
-impl Drop for InnerMetrics {
-    fn drop(&mut self) {
-        self.log_sizes();
-        self.log_durations();
     }
 }
 
@@ -328,17 +317,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_coalesce_config_in_memory() {
-        let config = CoalesceConfig::in_memory();
+    fn test_coalesce_config_local() {
+        let config = CoalesceConfig::local();
         assert_eq!(config.distance, 8 * 1024);
         assert_eq!(config.max_size, 8 * 1024);
-    }
-
-    #[test]
-    fn test_coalesce_config_file() {
-        let config = CoalesceConfig::file();
-        assert_eq!(config.distance, 1 << 20); // 1MB
-        assert_eq!(config.max_size, 4 << 20); // 4MB
     }
 
     #[test]

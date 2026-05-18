@@ -9,10 +9,14 @@ import org.apache.spark.sql.connector.write.WriterCommitMessage;
 /**
  * Commit message containing information about a successfully written Vortex file.
  *
- * <p>This message is passed from executors back to the driver to coordinate the commit phase of the write operation.
+ * This message is passed from executors back to the driver to coordinate
+ * the commit phase of the write operation.
  */
-public record VortexWriterCommitMessage(String filePath, long recordCount, long bytesWritten)
-        implements WriterCommitMessage, Serializable {
+public final class VortexWriterCommitMessage implements WriterCommitMessage, Serializable {
+
+    private final String filePath;
+    private final long recordCount;
+    private final long bytesWritten;
 
     /**
      * Creates a new commit message for a written Vortex file.
@@ -21,15 +25,18 @@ public record VortexWriterCommitMessage(String filePath, long recordCount, long 
      * @param recordCount the number of records written
      * @param bytesWritten the number of bytes written
      */
-    public VortexWriterCommitMessage {}
+    public VortexWriterCommitMessage(String filePath, long recordCount, long bytesWritten) {
+        this.filePath = filePath;
+        this.recordCount = recordCount;
+        this.bytesWritten = bytesWritten;
+    }
 
     /**
      * Gets the path to the written Vortex file.
      *
      * @return the file path
      */
-    @Override
-    public String filePath() {
+    public String getFilePath() {
         return filePath;
     }
 
@@ -38,8 +45,7 @@ public record VortexWriterCommitMessage(String filePath, long recordCount, long 
      *
      * @return the record count
      */
-    @Override
-    public long recordCount() {
+    public long getRecordCount() {
         return recordCount;
     }
 
@@ -48,8 +54,7 @@ public record VortexWriterCommitMessage(String filePath, long recordCount, long 
      *
      * @return the byte count
      */
-    @Override
-    public long bytesWritten() {
+    public long getBytesWritten() {
         return bytesWritten;
     }
 }

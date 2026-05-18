@@ -5,20 +5,23 @@ use vortex_error::VortexResult;
 
 use crate::ArrayRef;
 use crate::IntoArray;
-use crate::array::ArrayView;
-use crate::arrays::Primitive;
-use crate::arrays::PrimitiveArray;
+use crate::arrays::PrimitiveVTable;
+use crate::arrays::primitive::PrimitiveArray;
 use crate::scalar_fn::fns::mask::MaskReduce;
 use crate::validity::Validity;
+use crate::vtable::ValidityHelper;
 
-impl MaskReduce for Primitive {
-    fn mask(array: ArrayView<'_, Primitive>, mask: &ArrayRef) -> VortexResult<Option<ArrayRef>> {
+impl MaskReduce for PrimitiveVTable {
+    fn mask(array: &PrimitiveArray, mask: &ArrayRef) -> VortexResult<Option<ArrayRef>> {
         // SAFETY: validity and data buffer still have same length
         Ok(Some(unsafe {
             PrimitiveArray::new_unchecked_from_handle(
                 array.buffer_handle().clone(),
                 array.ptype(),
-                array.validity()?.and(Validity::Array(mask.clone()))?,
+                array
+                    .validity()
+                    .clone()
+                    .and(Validity::Array(mask.clone()))?,
             )
             .into_array()
         }))
@@ -29,7 +32,6 @@ impl MaskReduce for Primitive {
 mod test {
     use rstest::rstest;
 
-    use crate::IntoArray;
     use crate::arrays::PrimitiveArray;
     use crate::compute::conformance::mask::test_mask_conformance;
 
@@ -42,6 +44,6 @@ mod test {
     #[case(PrimitiveArray::from_iter([0.1f32, 0.2, 0.3, 0.4, 0.5]))]
     #[case(PrimitiveArray::from_option_iter([Some(1.1f64), None, Some(2.2), Some(3.3), None]))]
     fn test_mask_primitive_conformance(#[case] array: PrimitiveArray) {
-        test_mask_conformance(&array.into_array());
+        test_mask_conformance(array.as_ref());
     }
 }

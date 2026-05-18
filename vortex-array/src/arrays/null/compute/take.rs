@@ -4,22 +4,20 @@
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 
+use crate::Array;
 use crate::ArrayRef;
 use crate::IntoArray;
-#[expect(deprecated)]
-use crate::ToCanonical as _;
-use crate::array::ArrayView;
-use crate::arrays::Null;
+use crate::ToCanonical;
 use crate::arrays::NullArray;
-use crate::arrays::dict::TakeReduce;
-use crate::arrays::dict::TakeReduceAdaptor;
+use crate::arrays::NullVTable;
+use crate::arrays::TakeReduce;
+use crate::arrays::TakeReduceAdaptor;
 use crate::match_each_integer_ptype;
 use crate::optimizer::rules::ParentRuleSet;
 
-impl TakeReduce for Null {
-    #[expect(clippy::cast_possible_truncation)]
-    fn take(array: ArrayView<'_, Null>, indices: &ArrayRef) -> VortexResult<Option<ArrayRef>> {
-        #[expect(deprecated)]
+impl TakeReduce for NullVTable {
+    #[allow(clippy::cast_possible_truncation)]
+    fn take(array: &NullArray, indices: &dyn Array) -> VortexResult<Option<ArrayRef>> {
         let indices = indices.to_primitive();
 
         // Enforce all indices are valid
@@ -35,7 +33,7 @@ impl TakeReduce for Null {
     }
 }
 
-impl Null {
+impl NullVTable {
     pub const TAKE_RULES: ParentRuleSet<Self> =
         ParentRuleSet::new(&[ParentRuleSet::lift(&TakeReduceAdaptor::<Self>(Self))]);
 }

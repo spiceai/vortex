@@ -14,7 +14,7 @@ use crate::match_each_native_ptype;
 pub fn filter_primitive(array: &PrimitiveArray, mask: &Arc<MaskValues>) -> PrimitiveArray {
     let validity = array
         .validity()
-        .vortex_expect("primitive validity should be derivable");
+        .vortex_expect("missing PrimitiveArray validity");
     let filtered_validity = filter_validity(validity, mask);
 
     match_each_native_ptype!(array.ptype(), |T| {
@@ -27,16 +27,14 @@ pub fn filter_primitive(array: &PrimitiveArray, mask: &Arc<MaskValues>) -> Primi
 }
 
 #[cfg(test)]
-#[expect(clippy::cast_possible_truncation)]
+#[allow(clippy::cast_possible_truncation)]
 mod test {
     use itertools::Itertools;
     use rstest::rstest;
     use vortex_mask::Mask;
 
-    use crate::IntoArray;
-    use crate::arrays::PrimitiveArray;
-    #[expect(deprecated)]
-    use crate::canonical::ToCanonical as _;
+    use crate::arrays::primitive::PrimitiveArray;
+    use crate::canonical::ToCanonical;
     use crate::compute::conformance::filter::LARGE_SIZE;
     use crate::compute::conformance::filter::MEDIUM_SIZE;
     use crate::compute::conformance::filter::test_filter_conformance;
@@ -46,7 +44,6 @@ mod test {
         let mask = [true, true, false, true, true, true, false, true];
         let arr = PrimitiveArray::from_iter([1u32, 24, 54, 2, 3, 2, 3, 2]);
 
-        #[expect(deprecated)]
         let filtered = arr.filter(Mask::from_iter(mask)).unwrap().to_primitive();
         assert_eq!(
             filtered.len(),
@@ -76,6 +73,6 @@ mod test {
     #[case(PrimitiveArray::from_iter([0.1f32, 0.2, 0.3, 0.4, 0.5]))]
     #[case(PrimitiveArray::from_option_iter([Some(1.1f64), None, Some(2.2), Some(3.3), None]))]
     fn test_filter_primitive_conformance(#[case] array: PrimitiveArray) {
-        test_filter_conformance(&array.into_array());
+        test_filter_conformance(array.as_ref());
     }
 }

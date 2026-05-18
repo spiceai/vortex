@@ -18,13 +18,14 @@ use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
 
+use crate::Array;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::IntoArray;
-use crate::arrays::Constant;
+use crate::array::ArrayVisitor;
 use crate::arrays::ConstantArray;
+use crate::arrays::ConstantVTable;
 use crate::arrow::ArrowArrayExecutor;
-use crate::session::ArraySessionExt;
 
 /// The encoding ID used by `vortex-runend`. We match on this string to avoid a crate dependency.
 const VORTEX_RUNEND_ID: &str = "vortex.runend";
@@ -47,7 +48,7 @@ pub(super) fn to_arrow_run_end(
     values_type: &Field,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrowArrayRef> {
-    let array = match array.try_downcast::<Constant>() {
+    let array = match array.try_into::<ConstantVTable>() {
         Ok(constant) => {
             return constant_to_run_end(constant, ends_type, values_type, ctx);
         }
@@ -80,9 +81,8 @@ fn run_end_to_arrow(
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrowArrayRef> {
     let length = array.len();
-    let metadata_bytes = ctx
-        .session()
-        .array_serialize(&array)?
+    let metadata_bytes = array
+        .metadata()?
         .ok_or_else(|| vortex_err!("RunEndArray missing metadata"))?;
     let metadata = RunEndMetadata::decode(&*metadata_bytes)
         .map_err(|e| vortex_err!("Failed to decode RunEndMetadata: {e}"))?;
@@ -118,35 +118,22 @@ fn build_run_array<R: RunEndIndexType>(
 where
     R::Native: std::ops::Sub<Output = R::Native> + Ord,
 {
+    if offset == 0 {
+        return Ok(
+            Arc::new(RunArray::<R>::try_new(ends.as_primitive::<R>(), values)?) as ArrowArrayRef,
+        );
+    }
+
     let offset_native = R::Native::from_usize(offset)
         .ok_or_else(|| vortex_err!("Offset {offset} exceeds run-end index capacity"))?;
     let length_native = R::Native::from_usize(length)
         .ok_or_else(|| vortex_err!("Length {length} exceeds run-end index capacity"))?;
 
-    let ends_prim = ends.as_primitive::<R>();
-    if offset == 0 && ends_prim.values().last() == Some(&length_native) {
-        // Fast path: no trimming or adjustment needed.
-        return Ok(Arc::new(RunArray::<R>::try_new(ends_prim, values)?) as ArrowArrayRef);
-    }
-
-    // Trim to only include runs covering the [offset, offset+length) range.
-    // Runs beyond this would produce duplicate adjusted ends, violating
-    // Arrow's strict-ordering requirement for RunArray.
-    // Run ends are strictly increasing, so we can binary search.
-    let num_runs = (ends_prim
-        .values()
-        .partition_point(|&e| e - offset_native < length_native)
-        + 1)
-    .min(ends_prim.len());
-
-    let trimmed_ends = ends.slice(0, num_runs);
-    let trimmed_values = values.slice(0, num_runs);
-
-    let adjusted = trimmed_ends
+    let adjusted = ends
         .as_primitive::<R>()
         .unary(|end| (end - offset_native).min(length_native));
 
-    Ok(Arc::new(RunArray::<R>::try_new(&adjusted, &trimmed_values)?) as ArrowArrayRef)
+    Ok(Arc::new(RunArray::<R>::try_new(&adjusted, values)?) as ArrowArrayRef)
 }
 
 /// Convert a constant array to a run-end encoded array with a single run.
@@ -205,13 +192,12 @@ mod tests {
     use arrow_schema::Field;
     use rstest::rstest;
     use vortex_error::VortexResult;
-    use vortex_error::vortex_err;
     use vortex_session::VortexSession;
 
     use crate::IntoArray;
+    use crate::arrays::ConstantArray;
     use crate::arrays::PrimitiveArray;
     use crate::arrow::ArrowArrayExecutor;
-    use crate::arrow::executor::run_end::ConstantArray;
     use crate::dtype::DType;
     use crate::dtype::Nullability::Nullable;
     use crate::dtype::PType;
@@ -233,36 +219,22 @@ mod tests {
         array.execute_arrow(Some(dt), &mut SESSION.create_execution_ctx())
     }
 
-    fn constant_i32_with_i16_ends() -> arrow_array::ArrayRef {
-        Arc::new(
-            RunArray::<Int16Type>::try_new(
-                &Int16Array::from(vec![5i16]),
-                &Int32Array::from(vec![42]),
-            )
-            .expect("valid run-end test array"),
-        ) as arrow_array::ArrayRef
-    }
-
-    fn constant_f64_with_i64_ends() -> arrow_array::ArrayRef {
-        Arc::new(
-            RunArray::<Int64Type>::try_new(
-                &Int64Array::from(vec![7i64]),
-                &arrow_array::Float64Array::from(vec![1.5]),
-            )
-            .expect("valid run-end test array"),
-        ) as arrow_array::ArrayRef
-    }
-
     #[rstest]
     #[case::i32_with_i16_ends(
         ConstantArray::new(Scalar::from(42i32), 5).into_array(),
         ree_type(DataType::Int16, DataType::Int32),
-        constant_i32_with_i16_ends(),
+        Arc::new(RunArray::<Int16Type>::try_new(
+            &Int16Array::from(vec![5i16]),
+            &Int32Array::from(vec![42]),
+        ).unwrap()) as arrow_array::ArrayRef,
     )]
     #[case::f64_with_i64_ends(
         ConstantArray::new(Scalar::from(1.5f64), 7).into_array(),
         ree_type(DataType::Int64, DataType::Float64),
-        constant_f64_with_i64_ends(),
+        Arc::new(RunArray::<Int64Type>::try_new(
+            &Int64Array::from(vec![7i64]),
+            &arrow_array::Float64Array::from(vec![1.5]),
+        ).unwrap()) as arrow_array::ArrayRef,
     )]
     #[case::null(
         ConstantArray::new(Scalar::null(DType::Primitive(PType::I32, Nullable)), 4).into_array(),
@@ -301,40 +273,6 @@ mod tests {
             &Int32Array::from(vec![10, 20]),
         )?;
         assert_eq!(result.as_ref(), &expected);
-        Ok(())
-    }
-
-    /// Regression: build_run_array must trim excess trailing runs and
-    /// respect the `length` parameter. This happens when a vortex
-    /// RunEndArray is sliced to fewer rows than the physical run_ends cover.
-    #[rstest]
-    #[case::offset_zero(0, 5, &[3, 5], &[100, 200])]
-    #[case::nonzero_offset(2, 3, &[1, 3], &[100, 200])]
-    #[case::all_runs_needed_but_last_exceeds(0, 8, &[3, 5, 8], &[100, 200, 300])]
-    fn build_run_array_trims_excess_runs(
-        #[case] offset: usize,
-        #[case] length: usize,
-        #[case] expected_ends: &[i32],
-        #[case] expected_values: &[i64],
-    ) -> VortexResult<()> {
-        // 3 runs covering 10 rows: [0..3), [3..5), [5..10)
-        let ends: arrow_array::ArrayRef = Arc::new(Int32Array::from(vec![3i32, 5, 10]));
-        let values: arrow_array::ArrayRef = Arc::new(Int64Array::from(vec![100i64, 200, 300]));
-
-        let result = super::build_run_array::<Int32Type>(&ends, &values, offset, length)?;
-        assert_eq!(result.len(), length);
-
-        let ree = result
-            .as_any()
-            .downcast_ref::<RunArray<Int32Type>>()
-            .ok_or_else(|| vortex_err!("expected Int32 run-end array"))?;
-        assert_eq!(ree.run_ends().values(), expected_ends);
-        let values = ree
-            .values()
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| vortex_err!("expected Int64 values"))?;
-        assert_eq!(values.values(), expected_values);
         Ok(())
     }
 }

@@ -63,8 +63,7 @@ impl DType {
             | Binary(null)
             | Struct(_, null)
             | List(_, null)
-            | FixedSizeList(_, _, null)
-            | Variant(null) => matches!(null, Nullability::Nullable),
+            | FixedSizeList(_, _, null) => matches!(null, Nullability::Nullable),
         }
     }
 
@@ -88,10 +87,9 @@ impl DType {
             Utf8(_) => Utf8(nullability),
             Binary(_) => Binary(nullability),
             Struct(sf, _) => Struct(sf.clone(), nullability),
-            List(edt, _) => List(Arc::clone(edt), nullability),
-            FixedSizeList(edt, size, _) => FixedSizeList(Arc::clone(edt), *size, nullability),
+            List(edt, _) => List(edt.clone(), nullability),
+            FixedSizeList(edt, size, _) => FixedSizeList(edt.clone(), *size, nullability),
             Extension(ext) => Extension(ext.with_nullability(nullability)),
-            Variant(_) => Variant(nullability),
         }
     }
 
@@ -124,7 +122,6 @@ impl DType {
             (Extension(lhs_extdtype), Extension(rhs_extdtype)) => {
                 lhs_extdtype.eq_ignore_nullability(rhs_extdtype)
             }
-            (Variant(_), Variant(_)) => true,
             _ => false,
         }
     }
@@ -249,16 +246,11 @@ impl DType {
         matches!(self, Extension(_))
     }
 
-    /// Check if `self` is a [`DType::Variant`] type
-    pub fn is_variant(&self) -> bool {
-        matches!(self, Variant(_))
-    }
-
     /// Check if `self` is a nested type, i.e. list, fixed size list, struct, or extension of a
     /// recursive type.
     pub fn is_nested(&self) -> bool {
         match self {
-            List(..) | FixedSizeList(..) | Struct(..) | Variant(..) => true,
+            List(..) | FixedSizeList(..) | Struct(..) => true,
             Extension(ext) => ext.storage_dtype().is_nested(),
             _ => false,
         }
@@ -292,7 +284,6 @@ impl DType {
                 Some(sum)
             }
             Extension(ext) => ext.storage_dtype().element_size(),
-            Variant(_) => None,
         }
     }
 
@@ -468,7 +459,6 @@ impl Display for DType {
             List(edt, null) => write!(f, "list({edt}){null}"),
             FixedSizeList(edt, size, null) => write!(f, "fixed_size_list({edt})[{size}]{null}"),
             Extension(ext) => write!(f, "{}", ext),
-            Variant(null) => write!(f, "variant{null}"),
         }
     }
 }
@@ -539,7 +529,7 @@ mod tests {
     fn element_size_fixed_size_list() {
         let elem = Arc::new(DType::Primitive(PType::F64, NonNullable));
         assert_eq!(
-            DType::FixedSizeList(Arc::clone(&elem), 1000, NonNullable).element_size(),
+            DType::FixedSizeList(elem.clone(), 1000, NonNullable).element_size(),
             Some(8000)
         );
 

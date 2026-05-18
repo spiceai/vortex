@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-#![expect(clippy::unwrap_used)]
-#![expect(clippy::expect_used)]
-#![expect(clippy::use_debug)]
+#![allow(clippy::unwrap_used)]
+#![allow(clippy::expect_used)]
+#![allow(clippy::use_debug)]
 
 use std::env;
 use std::fs::File;
@@ -14,11 +14,10 @@ use std::process::Command;
 
 use fastlanes::FastLanes;
 
-use crate::bit_unpack_gen::generate_cuda_unpack_kernels;
-use crate::bit_unpack_gen::generate_cuda_unpack_lanes;
+use crate::cuda_kernel_generator::IndentedWriter;
+use crate::cuda_kernel_generator::generate_cuda_unpack_for_width;
 
-#[path = "src/bit_unpack_gen.rs"]
-pub mod bit_unpack_gen;
+pub mod cuda_kernel_generator;
 
 fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("Failed to get manifest dir");
@@ -44,12 +43,12 @@ fn main() {
     println!("cargo:rerun-if-env-changed=PROFILE");
 
     // Regenerate bit_unpack kernels only when the generator changes
-    println!(
-        "cargo:rerun-if-changed={}",
-        Path::new(&manifest_dir)
-            .join("src/bit_unpack_gen.rs")
-            .display()
-    );
+    for entry in std::fs::read_dir(Path::new(&manifest_dir).join("cuda_kernel_generator"))
+        .expect("Failed to read cuda_kernel_generator directory")
+        .flatten()
+    {
+        println!("cargo:rerun-if-changed={}", entry.path().display());
+    }
     generate_unpack::<u8>(&kernels_src, 32).expect("Failed to generate unpack for u8");
     generate_unpack::<u16>(&kernels_src, 32).expect("Failed to generate unpack for u16");
     generate_unpack::<u32>(&kernels_src, 32).expect("Failed to generate unpack for u32");
@@ -57,7 +56,6 @@ fn main() {
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
     generate_dynamic_dispatch_bindings(&kernels_src, &out_dir);
-    generate_patches_bindings(&kernels_src, &out_dir);
 
     if !is_cuda_available() {
         return;
@@ -73,11 +71,7 @@ fn main() {
 
             match path.extension().and_then(|e| e.to_str()) {
                 Some("cuh") | Some("h") => {
-                    // Only watch hand-written .cuh/.h files, not generated ones
-                    // (generated files are rebuilt when cuda_kernel_generator changes)
-                    if !is_generated {
-                        println!("cargo:rerun-if-changed={}", path.display());
-                    }
+                    println!("cargo:rerun-if-changed={}", path.display())
                 }
                 Some("cu") => {
                     // Only watch hand-written .cu files, not generated ones
@@ -99,19 +93,11 @@ fn main() {
 }
 
 fn generate_unpack<T: FastLanes>(output_dir: &Path, thread_count: usize) -> io::Result<PathBuf> {
-    // Generate the lanes header (.cuh) — device functions only, no __global__ kernels.
-    // This is what dynamic_dispatch.cu includes (via bit_unpack.cuh).
-    let cuh_path = output_dir.join(format!("bit_unpack_{}_lanes.cuh", T::T));
-    let mut cuh_file = File::create(&cuh_path)?;
-    generate_cuda_unpack_lanes::<T>(&mut cuh_file)?;
-
-    // Generate the standalone kernels (.cu) — includes the lanes header,
-    // adds _device template + __global__ wrappers. Compiled to its own PTX.
-    let cu_path = output_dir.join(format!("bit_unpack_{}.cu", T::T));
-    let mut cu_file = File::create(&cu_path)?;
-    generate_cuda_unpack_kernels::<T>(&mut cu_file, thread_count)?;
-
-    Ok(cu_path)
+    let path = output_dir.join(format!("bit_unpack_{}.cu", T::T));
+    let mut cu_file = File::create(&path)?;
+    let mut cu_writer = IndentedWriter::new(&mut cu_file);
+    generate_cuda_unpack_for_width::<T, _>(&mut cu_writer, thread_count)?;
+    Ok(path)
 }
 
 fn nvcc_compile_ptx(
@@ -152,7 +138,7 @@ fn nvcc_compile_ptx(
         .join(cu_path.file_name().unwrap())
         .with_extension("ptx");
 
-    cmd.arg("-std=c++20")
+    cmd.arg("-std=c++17")
         .arg("-arch=native")
         // Flags forwarded to Clang.
         .arg("--compiler-options=-Wall -Wextra -Wpedantic -Werror")
@@ -197,6 +183,9 @@ fn nvcc_compile_ptx(
 }
 
 /// Generate bindings for the dynamic dispatch shared header.
+///
+/// `DynamicDispatchPlan` and related types are shared between CUDA kernels
+/// and Rust host code.
 fn generate_dynamic_dispatch_bindings(kernels_src: &Path, out_dir: &Path) {
     let header = kernels_src.join("dynamic_dispatch.h");
     println!("cargo:rerun-if-changed={}", header.display());
@@ -211,23 +200,6 @@ fn generate_dynamic_dispatch_bindings(kernels_src: &Path, out_dir: &Path) {
     bindings
         .write_to_file(out_dir.join("dynamic_dispatch.rs"))
         .expect("Failed to write dynamic_dispatch.rs");
-}
-
-/// Generate bindings for patches shared header.
-fn generate_patches_bindings(kernels_src: &Path, out_dir: &Path) {
-    let header = kernels_src.join("patches.h");
-    println!("cargo:rerun-if-changed={}", header.display());
-
-    let bindings = bindgen::Builder::default()
-        .header(header.to_string_lossy())
-        .derive_copy(true)
-        .derive_debug(true)
-        .generate()
-        .expect("Failed to generate dynamic_dispatch bindings");
-
-    bindings
-        .write_to_file(out_dir.join("patches.rs"))
-        .expect("Failed to write patches.rs");
 }
 
 /// Check if CUDA is available based on nvcc.

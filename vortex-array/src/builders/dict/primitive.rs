@@ -13,13 +13,13 @@ use vortex_utils::aliases::hash_map::HashMap;
 
 use super::DictConstraints;
 use super::DictEncoder;
+use crate::Array;
 use crate::ArrayRef;
 use crate::IntoArray;
-#[expect(deprecated)]
-use crate::ToCanonical as _;
+use crate::ToCanonical;
 use crate::accessor::ArrayAccessor;
+use crate::arrays::NativeValue;
 use crate::arrays::PrimitiveArray;
-use crate::arrays::primitive::NativeValue;
 use crate::dtype::NativePType;
 use crate::dtype::Nullability;
 use crate::dtype::PType;
@@ -79,6 +79,7 @@ where
         }
     }
 
+    #[inline]
     fn encode_value(&mut self, v: Option<T>) -> Option<Code> {
         match self.lookup.entry(v.map(NativeValue)) {
             Entry::Occupied(o) => Some(*o.get()),
@@ -123,12 +124,10 @@ where
     NativeValue<T>: Hash + Eq,
     Code: UnsignedPType,
 {
-    fn encode(&mut self, array: &ArrayRef) -> ArrayRef {
+    fn encode(&mut self, array: &dyn Array) -> ArrayRef {
         let mut codes = BufferMut::<Code>::with_capacity(array.len());
 
-        #[expect(deprecated)]
-        let prim = array.to_primitive();
-        prim.with_iterator(|it| {
+        array.to_primitive().with_iterator(|it| {
             for value in it {
                 let Some(code) = self.encode_value(value.copied()) else {
                     break;
@@ -155,20 +154,20 @@ where
 
 #[cfg(test)]
 mod test {
-    #[expect(unused_imports)]
+    #[allow(unused_imports)]
     use itertools::Itertools;
     use vortex_buffer::buffer;
 
+    use crate::Array;
     use crate::IntoArray as _;
-    use crate::arrays::dict::DictArraySlotsExt;
+    use crate::arrays::PrimitiveArray;
     use crate::assert_arrays_eq;
     use crate::builders::dict::dict_encode;
-    use crate::builders::dict::primitive::PrimitiveArray;
 
     #[test]
     fn encode_primitive() {
         let arr = buffer![1, 1, 3, 3, 3].into_array();
-        let dict = dict_encode(&arr).unwrap();
+        let dict = dict_encode(arr.as_ref()).unwrap();
 
         let expected_codes = buffer![0u8, 0, 1, 1, 1].into_array();
         assert_arrays_eq!(dict.codes(), expected_codes);
@@ -189,7 +188,7 @@ mod test {
             Some(3),
             None,
         ]);
-        let dict = dict_encode(&arr.into_array()).unwrap();
+        let dict = dict_encode(arr.as_ref()).unwrap();
 
         let expected_codes = buffer![0u8, 0, 1, 2, 2, 1, 2, 1].into_array();
         assert_arrays_eq!(dict.codes(), expected_codes);

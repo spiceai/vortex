@@ -2,10 +2,8 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use pyo3::prelude::*;
-use vortex::array::VortexSessionExecute;
 use vortex::compressor::BtrBlocksCompressor;
 
-use crate::SESSION;
 use crate::arrays::PyArrayRef;
 use crate::error::PyVortexResult;
 use crate::install_module;
@@ -53,7 +51,6 @@ pub(crate) fn init(py: Python, parent: &Bound<PyModule>) -> PyResult<()> {
 ///    'vortex.alp(f64?, len=1000)'
 #[pyfunction]
 pub fn compress(array: PyArrayRef) -> PyVortexResult<PyArrayRef> {
-    let compressed = BtrBlocksCompressor::default()
-        .compress(array.inner(), &mut SESSION.create_execution_ctx())?;
+    let compressed = BtrBlocksCompressor::default().compress(array.inner())?;
     Ok(PyArrayRef::from(compressed))
 }

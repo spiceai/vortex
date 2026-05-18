@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::sync::Arc;
-
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
@@ -63,7 +61,7 @@ impl StatPopGenBenchmark {
                 let mut bgzf_reader = noodles_bgzf::r#async::io::Reader::new(buf_reader);
 
                 // Read and parse VCF header
-                let mut vcf_reader = noodles_vcf::r#async::io::Reader::new(&mut bgzf_reader);
+                let mut vcf_reader = noodles_vcf::AsyncReader::new(&mut bgzf_reader);
 
                 // Read and print the first 100,000 records
                 let header = vcf_reader.read_header().await?;
@@ -76,14 +74,14 @@ impl StatPopGenBenchmark {
                 );
                 let mut record = Record::default();
                 let schema = schema_from_vcf_header(&header);
-                let mut builder = GnomADBuilder::new(&header, Arc::clone(&schema));
+                let mut builder = GnomADBuilder::new(&header, schema.clone());
                 let file = File::create(parquet_output_path).await?;
-                let mut writer = AsyncArrowWriter::try_new(file, Arc::clone(&schema), None)
+                let mut writer = AsyncArrowWriter::try_new(file, schema.clone(), None)
                     .context("Failed to create parquet writer")?;
                 for i in progress.wrap_iter(0..self.n_rows) {
                     if i % ROW_GROUP_SIZE_IN_VARIANTS == 0 {
                         let rb = builder.finish()?;
-                        builder = GnomADBuilder::new(&header, Arc::clone(&schema));
+                        builder = GnomADBuilder::new(&header, schema.clone());
                         writer
                             .write(&rb)
                             .await

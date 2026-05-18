@@ -35,7 +35,6 @@ pub(crate) fn init(py: Python, parent: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(and_, &m)?)?;
     m.add_function(wrap_pyfunction!(cast, &m)?)?;
     m.add_function(wrap_pyfunction!(is_null, &m)?)?;
-    m.add_function(wrap_pyfunction!(is_not_null, &m)?)?;
     m.add_class::<PyExpr>()?;
 
     Ok(())
@@ -46,7 +45,7 @@ pub(crate) fn init(py: Python, parent: &Bound<PyModule>) -> PyResult<()> {
 /// .. seealso::
 ///    :func:`.column`
 ///
-#[pyclass(name = "Expr", module = "vortex", frozen, from_py_object)]
+#[pyclass(name = "Expr", module = "vortex", frozen)]
 #[derive(Clone)]
 pub struct PyExpr {
     inner: Expression,
@@ -421,21 +420,5 @@ pub fn cast(child: PyExpr, dtype: PyDType) -> PyResult<PyExpr> {
 pub fn is_null(child: PyExpr) -> PyResult<PyExpr> {
     Ok(PyExpr {
         inner: expr::is_null(child.into_inner()),
-    })
-}
-
-/// Creates an expression that checks for non-null values.
-///
-/// Parameters
-/// ----------
-/// child : :class:`vortex.Expr`
-///
-/// Returns
-/// -------
-/// :class:`vortex.Expr`
-#[pyfunction]
-pub fn is_not_null(child: PyExpr) -> PyResult<PyExpr> {
-    Ok(PyExpr {
-        inner: expr::is_not_null(child.into_inner()),
     })
 }

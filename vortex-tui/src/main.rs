@@ -8,6 +8,6 @@ use vortex_tui::launch;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let session = VortexSession::default().with_tokio().allow_unknown();
+    let session = VortexSession::default().with_tokio();
     launch(&session).await
 }

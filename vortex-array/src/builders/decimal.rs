@@ -11,12 +11,10 @@ use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
 use vortex_mask::Mask;
 
+use crate::Array;
 use crate::ArrayRef;
 use crate::IntoArray;
-use crate::LEGACY_SESSION;
-#[expect(deprecated)]
-use crate::ToCanonical as _;
-use crate::VortexSessionExecute;
+use crate::ToCanonical;
 use crate::arrays::DecimalArray;
 use crate::builders::ArrayBuilder;
 use crate::builders::DEFAULT_BUILDER_CAPACITY;
@@ -123,12 +121,6 @@ impl DecimalBuilder {
         self.nulls.append_non_null();
     }
 
-    /// Appends `n` copies of `value` as non-null entries, directly writing into the buffer.
-    pub fn append_n_values<V: NativeDecimalType>(&mut self, value: V, n: usize) {
-        self.values.push_n(value, n);
-        self.nulls.append_n_non_nulls(n);
-    }
-
     /// Finishes the builder directly into a [`DecimalArray`].
     pub fn finish_into_decimal(&mut self) -> DecimalArray {
         let validity = self.nulls.finish_with_nullability(self.dtype.nullability());
@@ -195,8 +187,7 @@ impl ArrayBuilder for DecimalBuilder {
         Ok(())
     }
 
-    unsafe fn extend_from_array_unchecked(&mut self, array: &ArrayRef) {
-        #[expect(deprecated)]
+    unsafe fn extend_from_array_unchecked(&mut self, array: &dyn Array) {
         let decimal_array = array.to_decimal();
 
         match_each_decimal_value_type!(decimal_array.values_type(), |D| {
@@ -208,14 +199,8 @@ impl ArrayBuilder for DecimalBuilder {
 
         self.nulls.append_validity_mask(
             decimal_array
-                .as_ref()
-                .validity()
-                .vortex_expect("validity_mask")
-                .execute_mask(
-                    decimal_array.as_ref().len(),
-                    &mut LEGACY_SESSION.create_execution_ctx(),
-                )
-                .vortex_expect("Failed to compute validity mask"),
+                .validity_mask()
+                .vortex_expect("validity_mask in extend_from_array_unchecked"),
         );
     }
 
@@ -310,12 +295,10 @@ impl Default for DecimalBuffer {
 
 #[cfg(test)]
 mod tests {
-    use crate::LEGACY_SESSION;
-    use crate::VortexSessionExecute;
+    use crate::arrays::DecimalArray;
     use crate::assert_arrays_eq;
     use crate::builders::ArrayBuilder;
     use crate::builders::DecimalBuilder;
-    use crate::builders::decimal::DecimalArray;
     use crate::dtype::DecimalDType;
 
     #[test]
@@ -333,13 +316,7 @@ mod tests {
         let i128s = i128s.finish();
 
         for i in 0..i8s.len() {
-            assert_eq!(
-                i8s.execute_scalar(i, &mut LEGACY_SESSION.create_execution_ctx())
-                    .unwrap(),
-                i128s
-                    .execute_scalar(i, &mut LEGACY_SESSION.create_execution_ctx())
-                    .unwrap()
-            );
+            assert_eq!(i8s.scalar_at(i).unwrap(), i128s.scalar_at(i).unwrap());
         }
     }
 
@@ -363,9 +340,7 @@ mod tests {
         // Test by taking a scalar from the array and appending it to a new builder.
         let mut builder2 = DecimalBuilder::new::<i64>(DecimalDType::new(10, 2), true.into());
         for i in 0..array.len() {
-            let scalar = array
-                .execute_scalar(i, &mut LEGACY_SESSION.create_execution_ctx())
-                .unwrap();
+            let scalar = array.scalar_at(i).unwrap();
             builder2.append_scalar(&scalar).unwrap();
         }
 

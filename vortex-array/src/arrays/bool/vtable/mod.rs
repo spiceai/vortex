@@ -1,47 +1,38 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::hash::Hash;
-use std::hash::Hasher;
-
 use kernel::PARENT_KERNELS;
-use prost::Message;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
-use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
 
 use crate::ArrayRef;
+use crate::DeserializeMetadata;
 use crate::ExecutionCtx;
-use crate::ExecutionResult;
-use crate::array::Array;
-use crate::array::ArrayParts;
-use crate::array::ArrayView;
-use crate::array::VTable;
-use crate::array::child_to_validity;
-use crate::arrays::bool::BoolData;
-use crate::arrays::bool::array::SLOT_NAMES;
+use crate::ProstMetadata;
+use crate::SerializeMetadata;
+use crate::arrays::BoolArray;
 use crate::buffer::BufferHandle;
 use crate::dtype::DType;
 use crate::serde::ArrayChildren;
 use crate::validity::Validity;
+use crate::vtable;
+use crate::vtable::VTable;
+use crate::vtable::ValidityVTableFromValidityHelper;
+
+mod array;
 mod canonical;
 mod kernel;
 mod operations;
 mod validity;
+mod visitor;
 
-use vortex_session::registry::CachedId;
-
-use crate::Precision;
-use crate::array::ArrayId;
 use crate::arrays::bool::compute::rules::RULES;
-use crate::hash::ArrayEq;
-use crate::hash::ArrayHash;
+use crate::vtable::ArrayId;
 
-/// A [`Bool`]-encoded Vortex array.
-pub type BoolArray = Array<Bool>;
+vtable!(Bool);
 
 #[derive(prost::Message)]
 pub struct BoolMetadata {
@@ -50,102 +41,49 @@ pub struct BoolMetadata {
     pub offset: u32,
 }
 
-impl ArrayHash for BoolData {
-    fn array_hash<H: Hasher>(&self, state: &mut H, precision: Precision) {
-        self.bits.array_hash(state, precision);
-        self.offset.hash(state);
-    }
-}
+impl VTable for BoolVTable {
+    type Array = BoolArray;
 
-impl ArrayEq for BoolData {
-    fn array_eq(&self, other: &Self, precision: Precision) -> bool {
-        self.offset == other.offset && self.bits.array_eq(&other.bits, precision)
-    }
-}
+    type Metadata = ProstMetadata<BoolMetadata>;
 
-impl VTable for Bool {
-    type ArrayData = BoolData;
-
+    type ArrayVTable = Self;
     type OperationsVTable = Self;
-    type ValidityVTable = Self;
+    type ValidityVTable = ValidityVTableFromValidityHelper;
+    type VisitorVTable = Self;
 
-    fn id(&self) -> ArrayId {
-        static ID: CachedId = CachedId::new("vortex.bool");
-        *ID
+    fn id(_array: &Self::Array) -> ArrayId {
+        Self::ID
     }
 
-    fn nbuffers(_array: ArrayView<'_, Self>) -> usize {
-        1
-    }
-
-    fn buffer(array: ArrayView<'_, Self>, idx: usize) -> BufferHandle {
-        match idx {
-            0 => array.bits.clone(),
-            _ => vortex_panic!("BoolArray buffer index {idx} out of bounds"),
-        }
-    }
-
-    fn buffer_name(_array: ArrayView<'_, Self>, idx: usize) -> Option<String> {
-        match idx {
-            0 => Some("bits".to_string()),
-            _ => None,
-        }
-    }
-
-    fn serialize(
-        array: ArrayView<'_, Self>,
-        _session: &VortexSession,
-    ) -> VortexResult<Option<Vec<u8>>> {
+    fn metadata(array: &BoolArray) -> VortexResult<Self::Metadata> {
         assert!(array.offset < 8, "Offset must be <8, got {}", array.offset);
-        Ok(Some(
-            BoolMetadata {
-                offset: u32::try_from(array.offset).vortex_expect("checked"),
-            }
-            .encode_to_vec(),
-        ))
+        Ok(ProstMetadata(BoolMetadata {
+            offset: u32::try_from(array.offset).vortex_expect("checked"),
+        }))
     }
 
-    fn validate(
-        &self,
-        data: &BoolData,
-        dtype: &DType,
-        len: usize,
-        slots: &[Option<ArrayRef>],
-    ) -> VortexResult<()> {
-        let DType::Bool(nullability) = dtype else {
-            vortex_bail!("Expected bool dtype, got {dtype:?}");
-        };
-        vortex_ensure!(
-            data.bits.len() * 8 >= data.offset + len,
-            "BoolArray buffer with offset {} cannot back outer length {} (buffer bits = {})",
-            data.offset,
-            len,
-            data.bits.len() * 8
-        );
-
-        let validity = child_to_validity(slots[0].as_ref(), *nullability);
-        if let Some(validity_len) = validity.maybe_len() {
-            vortex_ensure!(
-                validity_len == len,
-                "BoolArray validity len {} does not match outer length {}",
-                validity_len,
-                len
-            );
-        }
-
-        Ok(())
+    fn serialize(metadata: Self::Metadata) -> VortexResult<Option<Vec<u8>>> {
+        Ok(Some(metadata.serialize()))
     }
 
     fn deserialize(
-        &self,
+        bytes: &[u8],
+        _dtype: &DType,
+        _len: usize,
+        _buffers: &[BufferHandle],
+        _session: &VortexSession,
+    ) -> VortexResult<Self::Metadata> {
+        let metadata = <Self::Metadata as DeserializeMetadata>::deserialize(bytes)?;
+        Ok(ProstMetadata(metadata))
+    }
+
+    fn build(
         dtype: &DType,
         len: usize,
-        metadata: &[u8],
+        metadata: &Self::Metadata,
         buffers: &[BufferHandle],
         children: &dyn ArrayChildren,
-        _session: &VortexSession,
-    ) -> VortexResult<ArrayParts<Self>> {
-        let metadata = BoolMetadata::decode(metadata)?;
+    ) -> VortexResult<BoolArray> {
         if buffers.len() != 1 {
             vortex_bail!("Expected 1 buffer, got {}", buffers.len());
         }
@@ -160,80 +98,51 @@ impl VTable for Bool {
         };
 
         let buffer = buffers[0].clone();
-        let slots = BoolData::make_slots(&validity, len);
-        let data = BoolData::try_new_from_handle(buffer, metadata.offset as usize, len, validity)?;
-        Ok(ArrayParts::new(self.clone(), dtype.clone(), len, data).with_slots(slots))
+
+        BoolArray::try_new_from_handle(buffer, metadata.offset as usize, len, validity)
     }
 
-    fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {
-        SLOT_NAMES[idx].to_string()
+    fn with_children(array: &mut Self::Array, children: Vec<ArrayRef>) -> VortexResult<()> {
+        vortex_ensure!(
+            children.len() <= 1,
+            "BoolArray can have at most 1 child (validity), got {}",
+            children.len()
+        );
+
+        array.validity = if children.is_empty() {
+            Validity::from(array.dtype().nullability())
+        } else {
+            Validity::Array(children.into_iter().next().vortex_expect("checked"))
+        };
+
+        Ok(())
     }
 
-    fn execute(array: Array<Self>, _ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
-        Ok(ExecutionResult::done(array))
+    fn execute(array: &Self::Array, _ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
+        Ok(array.to_array())
+    }
+
+    fn reduce_parent(
+        array: &Self::Array,
+        parent: &ArrayRef,
+        child_idx: usize,
+    ) -> VortexResult<Option<ArrayRef>> {
+        RULES.evaluate(array, parent, child_idx)
     }
 
     fn execute_parent(
-        array: ArrayView<'_, Self>,
+        array: &Self::Array,
         parent: &ArrayRef,
         child_idx: usize,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
         PARENT_KERNELS.execute(array, parent, child_idx, ctx)
     }
-
-    fn reduce_parent(
-        array: ArrayView<'_, Self>,
-        parent: &ArrayRef,
-        child_idx: usize,
-    ) -> VortexResult<Option<ArrayRef>> {
-        RULES.evaluate(array, parent, child_idx)
-    }
 }
 
-#[derive(Clone, Debug)]
-pub struct Bool;
+#[derive(Debug)]
+pub struct BoolVTable;
 
-#[cfg(test)]
-mod tests {
-    use vortex_buffer::ByteBufferMut;
-    use vortex_session::registry::ReadContext;
-
-    use crate::ArrayContext;
-    use crate::IntoArray;
-    use crate::LEGACY_SESSION;
-    use crate::arrays::BoolArray;
-    use crate::assert_arrays_eq;
-    use crate::serde::SerializeOptions;
-    use crate::serde::SerializedArray;
-
-    #[test]
-    fn test_nullable_bool_serde_roundtrip() {
-        let array = BoolArray::from_iter([Some(true), None, Some(false), None]);
-        let dtype = array.dtype().clone();
-        let len = array.len();
-
-        let ctx = ArrayContext::empty();
-        let serialized = array
-            .clone()
-            .into_array()
-            .serialize(&ctx, &LEGACY_SESSION, &SerializeOptions::default())
-            .unwrap();
-
-        let mut concat = ByteBufferMut::empty();
-        for buf in serialized {
-            concat.extend_from_slice(buf.as_ref());
-        }
-        let parts = SerializedArray::try_from(concat.freeze()).unwrap();
-        let decoded = parts
-            .decode(
-                &dtype,
-                len,
-                &ReadContext::new(ctx.to_ids()),
-                &LEGACY_SESSION,
-            )
-            .unwrap();
-
-        assert_arrays_eq!(decoded, array);
-    }
+impl BoolVTable {
+    pub const ID: ArrayId = ArrayId::new_ref("vortex.bool");
 }

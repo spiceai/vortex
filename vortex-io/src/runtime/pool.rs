@@ -9,7 +9,6 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use smol::block_on;
 use vortex_error::VortexExpect;
-use vortex_utils::parallelism::get_available_parallelism;
 
 #[derive(Clone)]
 pub struct CurrentThreadWorkerPool {
@@ -26,10 +25,10 @@ impl CurrentThreadWorkerPool {
     }
 
     /// Set the number of worker threads to the available system parallelism as reported by
-    /// [`get_available_parallelism()`] minus 1, to leave a slot open for the calling thread.
+    /// `std::thread::available_parallelism()` minus 1, to leave a slot open for the calling thread.
     pub fn set_workers_to_available_parallelism(&self) {
-        let n = get_available_parallelism()
-            .map(|n| n.saturating_sub(1).max(1))
+        let n = std::thread::available_parallelism()
+            .map(|n| n.get().saturating_sub(1).max(1))
             .unwrap_or(1);
         self.set_workers(n);
     }
@@ -45,8 +44,8 @@ impl CurrentThreadWorkerPool {
             // Spawn new workers
             for _ in current..n {
                 let shutdown = Arc::new(AtomicBool::new(false));
-                let executor = Arc::clone(&self.executor);
-                let shutdown_clone = Arc::clone(&shutdown);
+                let executor = self.executor.clone();
+                let shutdown_clone = shutdown.clone();
 
                 std::thread::Builder::new()
                     .name("vortex-current-thread-worker".to_string())

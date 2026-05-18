@@ -3,14 +3,12 @@
 
 use vortex_buffer::buffer;
 
+use crate::Array;
 use crate::IntoArray;
-use crate::LEGACY_SESSION;
-use crate::VortexSessionExecute;
-use crate::arrays::ListView;
 use crate::arrays::ListViewArray;
+use crate::arrays::ListViewVTable;
 use crate::arrays::PrimitiveArray;
 use crate::arrays::StructArray;
-use crate::arrays::listview::ListViewArrayExt;
 use crate::dtype::DType;
 use crate::dtype::FieldNames;
 use crate::dtype::Nullability;
@@ -63,7 +61,7 @@ fn test_listview_of_listview_with_overlapping() {
 
     // Verify the outer structure.
     let first_outer = outer_listview.list_elements_at(0).unwrap();
-    let first_outer_lv = first_outer.as_::<ListView>();
+    let first_outer_lv = first_outer.as_::<ListViewVTable>();
     assert_eq!(first_outer_lv.len(), 3);
 
     // Verify overlapping data is preserved correctly.
@@ -74,7 +72,7 @@ fn test_listview_of_listview_with_overlapping() {
     // inner[0] should be [1, 2, 3].
     assert_eq!(
         inner0
-            .execute_scalar(0, &mut LEGACY_SESSION.create_execution_ctx())
+            .scalar_at(0)
             .unwrap()
             .as_primitive()
             .as_::<i32>()
@@ -83,7 +81,7 @@ fn test_listview_of_listview_with_overlapping() {
     );
     assert_eq!(
         inner0
-            .execute_scalar(2, &mut LEGACY_SESSION.create_execution_ctx())
+            .scalar_at(2)
             .unwrap()
             .as_primitive()
             .as_::<i32>()
@@ -94,7 +92,7 @@ fn test_listview_of_listview_with_overlapping() {
     // inner[1] should be [3, 4, 5] - shares element 3 with inner[0].
     assert_eq!(
         inner1
-            .execute_scalar(0, &mut LEGACY_SESSION.create_execution_ctx())
+            .scalar_at(0)
             .unwrap()
             .as_primitive()
             .as_::<i32>()
@@ -103,7 +101,7 @@ fn test_listview_of_listview_with_overlapping() {
     );
     assert_eq!(
         inner1
-            .execute_scalar(1, &mut LEGACY_SESSION.create_execution_ctx())
+            .scalar_at(1)
             .unwrap()
             .as_primitive()
             .as_::<i32>()
@@ -114,7 +112,7 @@ fn test_listview_of_listview_with_overlapping() {
     // Test slicing the outer ListView.
     let sliced = outer_listview.slice(1..2).unwrap();
     assert_eq!(sliced.len(), 1);
-    let sliced_lv = sliced.as_::<ListView>();
+    let sliced_lv = sliced.as_::<ListViewVTable>();
     let inner_after_slice = sliced_lv.list_elements_at(0).unwrap();
     assert_eq!(inner_after_slice.len(), 3);
 }
@@ -166,12 +164,12 @@ fn test_deeply_nested_out_of_order() {
 
     // Navigate through the scrambled structure.
     let top0 = level3.list_elements_at(0).unwrap();
-    let top0_lv = top0.as_::<ListView>();
+    let top0_lv = top0.as_::<ListViewVTable>();
     assert_eq!(top0_lv.len(), 2);
 
     // Due to out-of-order at level3, top0 actually contains level2[2] and level2[3].
     let mid0 = top0_lv.list_elements_at(0).unwrap();
-    let mid0_lv = mid0.as_::<ListView>();
+    let mid0_lv = mid0.as_::<ListViewVTable>();
     assert_eq!(mid0_lv.len(), 2);
 
     // Verify data integrity through the scrambled offsets.
@@ -202,8 +200,12 @@ fn test_mixed_offset_size_types() {
     let inner_offsets = buffer![0u32, 10, 20, 30, 40, 50, 100, 150, 200].into_array();
     let inner_sizes = buffer![5u16, 8, 10, 7, 15, 20, 25, 30, 50].into_array();
 
-    let inner_listview =
-        ListViewArray::new(elements, inner_offsets, inner_sizes, Validity::NonNullable);
+    let inner_listview = ListViewArray::new(
+        elements,
+        inner_offsets.clone(),
+        inner_sizes.clone(),
+        Validity::NonNullable,
+    );
 
     // Outer ListView with u64 offsets and u8 sizes.
     // Using small sizes that fit in u8 to test the type difference.
@@ -227,7 +229,7 @@ fn test_mixed_offset_size_types() {
     // Test slicing with mixed types.
     let sliced = outer_listview.slice(1..3).unwrap();
     assert_eq!(sliced.len(), 2);
-    let sliced_lv = sliced.as_::<ListView>();
+    let sliced_lv = sliced.as_::<ListViewVTable>();
 
     // Verify the sliced data maintains correct offsets despite type differences.
     let sliced_first = sliced_lv.list_elements_at(0).unwrap();
@@ -278,7 +280,7 @@ fn test_listview_zero_and_overlapping() {
 
     // Test first outer list with mixed empty/non-empty.
     let first_outer = outer_listview.list_elements_at(0).unwrap();
-    let first_outer_lv = first_outer.as_::<ListView>();
+    let first_outer_lv = first_outer.as_::<ListViewVTable>();
 
     let inner0 = first_outer_lv.list_elements_at(0).unwrap();
     assert_eq!(inner0.len(), 0); // Empty
@@ -287,7 +289,7 @@ fn test_listview_zero_and_overlapping() {
     assert_eq!(inner1.len(), 3); // [1, 2, 3]
     assert_eq!(
         inner1
-            .execute_scalar(0, &mut LEGACY_SESSION.create_execution_ctx())
+            .scalar_at(0)
             .unwrap()
             .as_primitive()
             .as_::<i32>()
@@ -300,13 +302,13 @@ fn test_listview_zero_and_overlapping() {
 
     // Test second outer list with overlapping data.
     let second_outer = outer_listview.list_elements_at(1).unwrap();
-    let second_outer_lv = second_outer.as_::<ListView>();
+    let second_outer_lv = second_outer.as_::<ListViewVTable>();
 
     let inner3 = second_outer_lv.list_elements_at(0).unwrap();
     assert_eq!(inner3.len(), 3); // [2, 3, 4]
     assert_eq!(
         inner3
-            .execute_scalar(0, &mut LEGACY_SESSION.create_execution_ctx())
+            .scalar_at(0)
             .unwrap()
             .as_primitive()
             .as_::<i32>()
@@ -383,12 +385,7 @@ fn test_listview_of_struct_with_nulls() {
     assert_eq!(list1.len(), 3);
 
     // The middle element (struct[2]) should be null.
-    assert!(
-        list1
-            .execute_scalar(1, &mut LEGACY_SESSION.create_execution_ctx())
-            .unwrap()
-            .is_null()
-    );
+    assert!(list1.scalar_at(1).unwrap().is_null());
 
     // Test slicing preserves null handling.
     let sliced = listview.slice(1..3).unwrap();

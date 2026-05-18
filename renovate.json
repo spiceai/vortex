@@ -2,7 +2,8 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "config:recommended",
-    ":automergeStableNonMajor",
+    ":automergePatch",
+    ":automergeMinor",
     ":automergePr",
     ":automergeRequireAllStatusChecks",
     ":combinePatchMinorReleases",
@@ -10,7 +11,6 @@
     ":separateMultipleMajorReleases",
     ":configMigration",
     "group:rust-futuresMonorepo",
-    "helpers:pinGitHubActionDigests",
     "schedule:earlyMondays",
     "docker:disable"
   ],
@@ -19,8 +19,6 @@
   },
   "autoApprove": true,
   "automergeStrategy": "squash",
-  "prHourlyLimit": 0,
-  "prConcurrentLimit": 20,
   "rebaseWhen": "conflicted",
   "cloneSubmodules": true,
   "platformAutomerge": true,
@@ -59,36 +57,6 @@
       "groupName": "tonic",
       "matchSourceUrls": [
         "https://github.com/hyperium/tonic"
-      ]
-    },
-    {
-      "groupName": "Rust lock file maintenance",
-      "groupSlug": "rust-lock-file-maintenance",
-      "matchManagers": [
-        "cargo"
-      ],
-      "matchUpdateTypes": [
-        "lockFileMaintenance"
-      ]
-    },
-    {
-      "groupName": "Python lock file maintenance",
-      "groupSlug": "python-lock-file-maintenance",
-      "matchManagers": [
-        "pep621"
-      ],
-      "matchUpdateTypes": [
-        "lockFileMaintenance"
-      ]
-    },
-    {
-      "groupName": "JS lock file maintenance",
-      "groupSlug": "js-lock-file-maintenance",
-      "matchManagers": [
-        "npm"
-      ],
-      "matchUpdateTypes": [
-        "lockFileMaintenance"
       ]
     }
   ],

@@ -24,7 +24,7 @@ impl<W: VortexWrite> CountingVortexWrite<W> {
     }
 
     pub fn counter(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.bytes_written)
+        self.bytes_written.clone()
     }
 }
 

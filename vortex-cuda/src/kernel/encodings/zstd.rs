@@ -15,26 +15,23 @@ use tracing::debug;
 use tracing::instrument;
 use vortex::array::ArrayRef;
 use vortex::array::Canonical;
+use vortex::array::arrays::BinaryView;
 use vortex::array::arrays::VarBinViewArray;
-use vortex::array::arrays::varbinview::BinaryView;
-use vortex::array::arrays::varbinview::build_views::MAX_BUFFER_LEN;
 use vortex::array::buffer::BufferHandle;
 use vortex::array::buffer::DeviceBuffer;
-use vortex::array::vtable::child_to_validity;
 use vortex::buffer::Alignment;
 use vortex::buffer::Buffer;
 use vortex::buffer::ByteBuffer;
 use vortex::dtype::DType;
-use vortex::encodings::zstd::Zstd;
 use vortex::encodings::zstd::ZstdArray;
-use vortex::encodings::zstd::ZstdDataParts;
+use vortex::encodings::zstd::ZstdArrayParts;
 use vortex::encodings::zstd::ZstdMetadata;
-use vortex::encodings::zstd::reconstruct_views;
+use vortex::encodings::zstd::ZstdVTable;
 use vortex::error::VortexExpect;
 use vortex::error::VortexResult;
-use vortex::error::vortex_bail;
 use vortex::error::vortex_err;
 use vortex::mask::AllOr;
+use vortex_cuda_macros::cuda_tests;
 use vortex_nvcomp::sys::nvcompStatus_t;
 use vortex_nvcomp::zstd as nvcomp_zstd;
 
@@ -188,7 +185,7 @@ pub(crate) struct ZstdExecutor;
 
 impl ZstdExecutor {
     fn try_specialize(array: ArrayRef) -> Option<ZstdArray> {
-        array.try_downcast::<Zstd>().ok()
+        array.as_opt::<ZstdVTable>().cloned()
     }
 }
 
@@ -202,32 +199,30 @@ impl CudaExecute for ZstdExecutor {
     ) -> VortexResult<Canonical> {
         let zstd = Self::try_specialize(array).ok_or_else(|| vortex_err!("Expected ZstdArray"))?;
 
-        match zstd.dtype() {
+        match zstd.as_ref().dtype() {
             DType::Binary(_) | DType::Utf8(_) => decode_zstd(zstd, ctx).await,
             _other => {
                 debug!(
                     dtype = %_other,
                     "Only Binary/Utf8 ZSTD arrays supported on GPU, falling back to CPU"
                 );
-                Zstd::decompress(&zstd, ctx.execution_ctx())?
-                    .execute::<Canonical>(ctx.execution_ctx())
+                zstd.decompress()?.to_canonical()
             }
         }
     }
 }
 
 async fn decode_zstd(array: ZstdArray, ctx: &mut CudaExecutionCtx) -> VortexResult<Canonical> {
-    let dtype = array.dtype().clone();
-    let validity = child_to_validity(array.as_ref().slots()[0].as_ref(), dtype.nullability());
-    let ZstdDataParts {
+    let ZstdArrayParts {
         frames,
         metadata,
+        dtype,
         validity,
         n_rows,
         dictionary,
         slice_start,
         slice_stop,
-    } = array.into_data().into_parts(validity);
+    } = array.into_parts();
 
     // nvCOMP doesn't support ZSTD dictionaries.
     if dictionary.is_some() {
@@ -319,51 +314,46 @@ async fn decode_zstd(array: ZstdArray, ctx: &mut CudaExecutionCtx) -> VortexResu
         .await?;
 
     let slice_value_indices = validity
-        .execute_mask(n_rows, ctx.execution_ctx())?
+        .to_mask(n_rows)
         .valid_counts_for_indices(&[slice_start, slice_stop]);
     let slice_value_idx_start = slice_value_indices[0];
     let slice_value_idx_stop = slice_value_indices[1];
 
     let sliced_validity = validity.slice(slice_start..slice_stop)?;
 
-    match sliced_validity
-        .execute_mask(slice_stop - slice_start, ctx.execution_ctx())?
-        .indices()
-    {
+    match sliced_validity.to_mask(slice_stop - slice_start).indices() {
         AllOr::All => {
-            let (buffers, all_views) = reconstruct_views(&host_buffer, MAX_BUFFER_LEN);
+            let all_views = vortex::encodings::zstd::reconstruct_views(&host_buffer);
             let sliced_views = all_views.slice(slice_value_idx_start..slice_value_idx_stop);
 
             Ok(Canonical::VarBinView(unsafe {
                 VarBinViewArray::new_unchecked(
                     sliced_views,
-                    Arc::from(buffers),
+                    Arc::from([host_buffer]),
                     dtype,
                     sliced_validity,
                 )
             }))
         }
         _ => {
-            vortex_bail!("CUDA ZSTD decompression does not yet support arrays with nulls")
+            unimplemented!("CUDA ZSTD decompression does not yet support arrays with nulls")
         }
     }
 }
 
-#[cfg(test)]
+#[cuda_tests]
 mod tests {
     use vortex::array::IntoArray;
     use vortex::array::arrays::VarBinViewArray;
     use vortex::array::assert_arrays_eq;
-    use vortex::encodings::zstd::Zstd;
+    use vortex::encodings::zstd::ZstdArray;
     use vortex::error::VortexResult;
     use vortex::session::VortexSession;
 
     use super::*;
-    use crate::CanonicalCudaExt;
-    use crate::executor::CudaArrayExt;
     use crate::session::CudaSession;
 
-    #[crate::test]
+    #[tokio::test]
     async fn test_cuda_zstd_decompression_utf8() -> VortexResult<()> {
         let mut cuda_ctx = CudaSession::create_execution_ctx(&VortexSession::empty())
             .vortex_expect("failed to create execution context");
@@ -377,10 +367,9 @@ mod tests {
             "baz",
         ]);
 
-        let zstd_array = Zstd::from_var_bin_view(&strings, 3, 0, cuda_ctx.execution_ctx())?;
+        let zstd_array = ZstdArray::from_var_bin_view(&strings, 3, 0)?;
 
-        let cpu_result = Zstd::decompress(&zstd_array, cuda_ctx.execution_ctx())?
-            .execute::<Canonical>(cuda_ctx.execution_ctx())?;
+        let cpu_result = zstd_array.decompress()?.to_canonical()?;
         let gpu_result = ZstdExecutor
             .execute(zstd_array.into_array(), &mut cuda_ctx)
             .await?;
@@ -389,7 +378,7 @@ mod tests {
         Ok(())
     }
 
-    #[crate::test]
+    #[tokio::test]
     async fn test_cuda_zstd_decompression_multiple_frames() -> VortexResult<()> {
         let mut cuda_ctx = CudaSession::create_execution_ctx(&VortexSession::empty())
             .vortex_expect("failed to create execution context");
@@ -413,10 +402,9 @@ mod tests {
 
         // Compress with ZSTD using values_per_frame=3 to create multiple frames.
         // 14 strings and 3 values per frame = ceil(14/3) = 5 frames.
-        let zstd_array = Zstd::from_var_bin_view(&strings, 3, 3, cuda_ctx.execution_ctx())?;
+        let zstd_array = ZstdArray::from_var_bin_view(&strings, 3, 3)?;
 
-        let cpu_result = Zstd::decompress(&zstd_array, cuda_ctx.execution_ctx())?
-            .execute::<Canonical>(cuda_ctx.execution_ctx())?;
+        let cpu_result = zstd_array.decompress()?.to_canonical()?;
         let gpu_result = ZstdExecutor
             .execute(zstd_array.into_array(), &mut cuda_ctx)
             .await?;
@@ -425,7 +413,7 @@ mod tests {
         Ok(())
     }
 
-    #[crate::test]
+    #[tokio::test]
     async fn test_cuda_zstd_decompression_sliced() -> VortexResult<()> {
         let mut cuda_ctx = CudaSession::create_execution_ctx(&VortexSession::empty())
             .vortex_expect("failed to create execution context");
@@ -443,51 +431,17 @@ mod tests {
             "final test string",
         ]);
 
-        let zstd_array = Zstd::from_var_bin_view(&strings, 3, 0, cuda_ctx.execution_ctx())?;
+        let zstd_array = ZstdArray::from_var_bin_view(&strings, 3, 0)?;
 
         // Slice the array to get a subset (indices 2..7)
         let sliced_zstd = zstd_array.slice(2..7)?;
 
-        let cpu_result = crate::canonicalize_cpu(sliced_zstd.clone())?;
+        let cpu_result = sliced_zstd.to_canonical()?;
         let gpu_result = ZstdExecutor
             .execute(sliced_zstd.clone(), &mut cuda_ctx)
             .await?;
 
         assert_arrays_eq!(cpu_result.into_array(), gpu_result.into_array());
-        Ok(())
-    }
-
-    /// Zstd with nullable data — the GPU kernel does not yet support nulls,
-    /// so `execute_cuda` should gracefully fall back to CPU and produce
-    /// correct results instead of panicking.
-    #[crate::test]
-    async fn test_cuda_zstd_nullable_falls_back_to_cpu() -> VortexResult<()> {
-        let mut cuda_ctx = CudaSession::create_execution_ctx(&VortexSession::empty())
-            .vortex_expect("failed to create execution context");
-
-        let strings = VarBinViewArray::from_iter_nullable_str([
-            Some("hello"),
-            None,
-            Some("world"),
-            None,
-            Some("testing nullable zstd"),
-            Some("another string"),
-        ]);
-
-        let zstd_array = Zstd::from_var_bin_view(&strings, 3, 0, cuda_ctx.execution_ctx())?;
-
-        let cpu_result = crate::canonicalize_cpu(zstd_array.clone())?.into_array();
-
-        // execute_cuda should fall back to CPU and still produce the correct result.
-        let gpu_result = zstd_array
-            .into_array()
-            .execute_cuda(&mut cuda_ctx)
-            .await?
-            .into_host()
-            .await?
-            .into_array();
-
-        assert_arrays_eq!(cpu_result, gpu_result);
         Ok(())
     }
 }

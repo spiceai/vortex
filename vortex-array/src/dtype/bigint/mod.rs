@@ -330,7 +330,7 @@ define_as_primitive!(i64);
 define_as_primitive!(i128);
 
 #[cfg(test)]
-#[expect(clippy::many_single_char_names)]
+#[allow(clippy::many_single_char_names)]
 mod tests {
     use num_traits::ToPrimitive;
 

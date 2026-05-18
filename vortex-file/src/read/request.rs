@@ -140,7 +140,7 @@ impl CoalescedRequest {
                     Err(e) => {
                         let e = Arc::new(e);
                         for req in self.requests.into_iter() {
-                            req.resolve(Err(VortexError::from(Arc::clone(&e))));
+                            req.resolve(Err(VortexError::from(e.clone())));
                         }
                         return;
                     }
@@ -163,7 +163,7 @@ impl CoalescedRequest {
             Err(e) => {
                 let e = Arc::new(e);
                 for req in self.requests.into_iter() {
-                    req.resolve(Err(VortexError::from(Arc::clone(&e))));
+                    req.resolve(Err(VortexError::from(e.clone())));
                 }
             }
         }

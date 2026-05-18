@@ -12,15 +12,16 @@ use itertools::Itertools;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 
+use crate::Array;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::IntoArray;
-use crate::arrays::Chunked;
-use crate::arrays::ScalarFn;
-use crate::arrays::Struct;
+use crate::ToCanonical;
+use crate::arrays::ChunkedVTable;
+use crate::arrays::ScalarFnVTable;
 use crate::arrays::StructArray;
-use crate::arrays::scalar_fn::ScalarFnArrayExt;
-use crate::arrays::struct_::StructDataParts;
+use crate::arrays::StructArrayParts;
+use crate::arrays::StructVTable;
 use crate::arrow::ArrowArrayExecutor;
 use crate::arrow::executor::validity::to_arrow_null_buffer;
 use crate::builtins::ArrayBuiltins;
@@ -38,24 +39,25 @@ pub(super) fn to_arrow_struct(
     let len = array.len();
 
     // If the array is chunked, then we invert the chunk-of-struct to struct-of-chunk.
-    let array = match array.try_downcast::<Chunked>() {
+    let array = match array.try_into::<ChunkedVTable>() {
         Ok(array) => {
             // NOTE(ngates): this currently uses the old into_canonical code path, but we should
             //  just call directly into the swizzle-chunks function.
-            array.into_array().execute::<StructArray>(ctx)?.into_array()
+            array.to_struct().into_array()
         }
         Err(array) => array,
     };
 
-    // Attempt to short-circuit if the array is already a Struct:
-    let array = match array.try_downcast::<Struct>() {
+    // Attempt to short-circuit if the array is already a StructVTable:
+    let array = match array.try_into::<StructVTable>() {
         Ok(array) => {
-            let StructDataParts {
+            let len = array.len();
+            let StructArrayParts {
                 validity,
                 fields,
                 struct_fields,
                 ..
-            } = array.into_data_parts();
+            } = array.into_parts();
             let validity = to_arrow_null_buffer(validity, len, ctx)?;
             return create_from_fields(
                 target_fields.ok_or_else(|| struct_fields.names().clone()),
@@ -69,7 +71,7 @@ pub(super) fn to_arrow_struct(
     };
 
     // We can also short-circuit if the array is a `pack` scalar function:
-    if let Some(array) = array.as_opt::<ScalarFn>()
+    if let Some(array) = array.as_opt::<ScalarFnVTable>()
         && let Some(_pack_options) = array.scalar_fn().as_opt::<Pack>()
     {
         let DType::Struct(struct_fields, _) = array.dtype() else {
@@ -77,7 +79,7 @@ pub(super) fn to_arrow_struct(
         };
         return create_from_fields(
             target_fields.ok_or_else(|| struct_fields.names().clone()),
-            &array.children(),
+            array.children(),
             None, // Pack is never null,
             len,
             ctx,
@@ -97,12 +99,13 @@ pub(super) fn to_arrow_struct(
     };
 
     let struct_array = array.execute::<StructArray>(ctx)?;
-    let StructDataParts {
+    let len = struct_array.len();
+    let StructArrayParts {
         validity,
         fields,
         struct_fields,
         ..
-    } = struct_array.into_data_parts();
+    } = struct_array.into_parts();
 
     let validity = to_arrow_null_buffer(validity, len, ctx)?;
     create_from_fields(
@@ -190,7 +193,6 @@ fn create_from_fields(
 mod tests {
     use std::sync::Arc;
 
-    use arrays::varbinview::VarBinViewArray;
     use arrow_array::ArrayRef;
     use arrow_array::PrimitiveArray as ArrowPrimitiveArray;
     use arrow_array::StringViewArray;
@@ -211,12 +213,12 @@ mod tests {
     use crate::arrays::StructArray;
     use crate::arrow::ArrowArrayExecutor;
     use crate::arrow::FromArrowArray;
+    use crate::arrow::IntoArrowArray;
     use crate::dtype::FieldNames;
     use crate::validity::Validity;
 
     #[test]
     fn struct_nullable_non_null_to_arrow() -> VortexResult<()> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
         let xs = PrimitiveArray::new(buffer![0i64, 1, 2, 3, 4], Validity::AllValid);
 
         let struct_a = StructArray::try_new(
@@ -229,15 +231,12 @@ mod tests {
         let fields = vec![Field::new("xs", DataType::Int64, false)];
         let arrow_dt = DataType::Struct(fields.into());
 
-        struct_a
-            .into_array()
-            .execute_arrow(Some(&arrow_dt), &mut ctx)?;
+        struct_a.into_array().into_arrow(&arrow_dt)?;
         Ok(())
     }
 
     #[test]
     fn struct_nullable_with_nulls_to_arrow() -> VortexResult<()> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
         let xs =
             PrimitiveArray::from_option_iter(vec![Some(0_i64), Some(1), Some(2), None, Some(3)]);
 
@@ -251,18 +250,12 @@ mod tests {
         let fields = vec![Field::new("xs", DataType::Int64, false)];
         let arrow_dt = DataType::Struct(fields.into());
 
-        assert!(
-            struct_a
-                .into_array()
-                .execute_arrow(Some(&arrow_dt), &mut ctx)
-                .is_err()
-        );
+        assert!(struct_a.into_array().into_arrow(&arrow_dt).is_err());
         Ok(())
     }
 
     #[test]
     fn struct_to_arrow_with_schema_mismatch() -> VortexResult<()> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
         let xs = PrimitiveArray::new(buffer![0i64, 1, 2, 3, 4], Validity::AllValid);
 
         let struct_a = StructArray::try_new(
@@ -278,11 +271,7 @@ mod tests {
         ];
         let arrow_dt = DataType::Struct(fields.into());
 
-        let err = struct_a
-            .into_array()
-            .execute_arrow(Some(&arrow_dt), &mut ctx)
-            .err()
-            .unwrap();
+        let err = struct_a.into_array().into_arrow(&arrow_dt).err().unwrap();
         assert!(
             err.to_string()
                 .contains("StructArray has 1 fields, but target Arrow type has 2 fields")
@@ -292,7 +281,6 @@ mod tests {
 
     #[test]
     fn test_to_arrow() -> VortexResult<()> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
         let array = StructArray::from_fields(
             vec![
                 (
@@ -301,7 +289,7 @@ mod tests {
                 ),
                 (
                     "b",
-                    VarBinViewArray::from_iter_str(vec!["a", "b", "c"]).into_array(),
+                    arrays::VarBinViewArray::from_iter_str(vec!["a", "b", "c"]).into_array(),
                 ),
             ]
             .as_slice(),
@@ -325,9 +313,10 @@ mod tests {
 
         let arrow_dtype = array.dtype().to_arrow_dtype()?;
         assert_eq!(
-            &array
-                .into_array()
-                .execute_arrow(Some(&arrow_dtype), &mut ctx)?,
+            &array.into_array().execute_arrow(
+                Some(&arrow_dtype),
+                &mut LEGACY_SESSION.create_execution_ctx()
+            )?,
             &arrow_array
         );
         Ok(())
@@ -335,7 +324,6 @@ mod tests {
 
     #[test]
     fn to_arrow_with_non_nullable_fields() -> VortexResult<()> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
         let array = StructArray::from_fields(
             vec![
                 (
@@ -344,13 +332,13 @@ mod tests {
                 ),
                 (
                     "b",
-                    VarBinViewArray::from_iter_str(vec!["a", "b", "c"]).into_array(),
+                    arrays::VarBinViewArray::from_iter_str(vec!["a", "b", "c"]).into_array(),
                 ),
             ]
             .as_slice(),
         )?;
         let orig_dtype = array.dtype().clone();
-        let arrow_array = array.into_array().execute_arrow(None, &mut ctx)?;
+        let arrow_array = array.into_array().into_arrow_preferred()?;
         let from_arrow = array::ArrayRef::from_arrow(arrow_array.as_ref(), false)?;
         assert_eq!(&orig_dtype, from_arrow.dtype());
         Ok(())

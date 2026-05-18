@@ -15,7 +15,6 @@ pub mod compressed;
 pub mod dict;
 pub mod file_stats;
 pub mod flat;
-pub(crate) mod foreign;
 pub(crate) mod partitioned;
 pub mod repartition;
 pub mod row_idx;

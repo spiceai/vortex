@@ -1,17 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use vortex_array::Array;
 use vortex_array::ArrayRef;
-use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
+use vortex_array::ToCanonical;
 use vortex_array::accessor::ArrayAccessor;
 use vortex_array::arrays::BoolArray;
 use vortex_array::arrays::DecimalArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::StructArray;
 use vortex_array::arrays::VarBinViewArray;
-use vortex_array::arrays::bool::BoolArrayExt;
-use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::dtype::DType;
 use vortex_array::match_each_decimal_value_type;
 use vortex_array::match_each_native_ptype;
@@ -22,16 +21,9 @@ use vortex_error::VortexResult;
 
 use crate::array::take_canonical_array_non_nullable_indices;
 
-pub fn filter_canonical_array(
-    array: &ArrayRef,
-    filter: &[bool],
-    ctx: &mut ExecutionCtx,
-) -> VortexResult<ArrayRef> {
+pub fn filter_canonical_array(array: &dyn Array, filter: &[bool]) -> VortexResult<ArrayRef> {
     let validity = if array.dtype().is_nullable() {
-        let validity_buff = array
-            .validity()?
-            .execute_mask(array.len(), ctx)?
-            .to_bit_buffer();
+        let validity_buff = array.validity_mask()?.to_bit_buffer();
         Validity::from_iter(
             filter
                 .iter()
@@ -45,7 +37,7 @@ pub fn filter_canonical_array(
 
     match array.dtype() {
         DType::Bool(_) => {
-            let bool_array = array.clone().execute::<BoolArray>(ctx)?;
+            let bool_array = array.to_bool();
             Ok(BoolArray::new(
                 BitBuffer::from_iter(
                     filter
@@ -59,7 +51,7 @@ pub fn filter_canonical_array(
             .into_array())
         }
         DType::Primitive(p, _) => match_each_native_ptype!(p, |P| {
-            let primitive_array = array.clone().execute::<PrimitiveArray>(ctx)?;
+            let primitive_array = array.to_primitive();
             Ok(PrimitiveArray::new(
                 filter
                     .iter()
@@ -72,7 +64,7 @@ pub fn filter_canonical_array(
             .into_array())
         }),
         DType::Decimal(d, _) => {
-            let decimal_array = array.clone().execute::<DecimalArray>(ctx)?;
+            let decimal_array = array.to_decimal();
             match_each_decimal_value_type!(decimal_array.values_type(), |D| {
                 let buf = decimal_array.buffer::<D>();
                 Ok(DecimalArray::new(
@@ -89,7 +81,7 @@ pub fn filter_canonical_array(
             })
         }
         DType::Utf8(_) | DType::Binary(_) => {
-            let utf8 = array.clone().execute::<VarBinViewArray>(ctx)?;
+            let utf8 = array.to_varbinview();
             let values = utf8.with_iterator(|iter| {
                 iter.zip(filter.iter())
                     .filter(|(_, f)| **f)
@@ -99,10 +91,11 @@ pub fn filter_canonical_array(
             Ok(VarBinViewArray::from_iter(values, array.dtype().clone()).into_array())
         }
         DType::Struct(..) => {
-            let struct_array = array.clone().execute::<StructArray>(ctx)?;
+            let struct_array = array.to_struct();
             let filtered_children = struct_array
-                .iter_unmasked_fields()
-                .map(|c| filter_canonical_array(c, filter, ctx))
+                .unmasked_fields()
+                .iter()
+                .map(|c| filter_canonical_array(c, filter))
                 .collect::<VortexResult<Vec<_>>>()?;
 
             StructArray::try_new_with_dtype(
@@ -120,9 +113,9 @@ pub fn filter_canonical_array(
                     indices.push(idx);
                 }
             }
-            take_canonical_array_non_nullable_indices(array, indices.as_slice(), ctx)
+            take_canonical_array_non_nullable_indices(array, indices.as_slice())
         }
-        d @ (DType::Null | DType::Extension(_) | DType::Variant(_)) => {
+        d @ (DType::Null | DType::Extension(_)) => {
             unreachable!("DType {d} not supported for fuzzing")
         }
     }

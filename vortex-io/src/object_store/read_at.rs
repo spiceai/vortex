@@ -11,12 +11,10 @@ use object_store::GetOptions;
 use object_store::GetRange;
 use object_store::GetResultPayload;
 use object_store::ObjectStore;
-use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjectPath;
 use vortex_array::buffer::BufferHandle;
-use vortex_array::memory::DefaultHostAllocator;
-use vortex_array::memory::HostAllocatorRef;
 use vortex_buffer::Alignment;
+use vortex_buffer::ByteBufferMut;
 use vortex_error::VortexError;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
@@ -36,7 +34,6 @@ pub struct ObjectStoreReadAt {
     path: ObjectPath,
     uri: Arc<str>,
     handle: Handle,
-    allocator: HostAllocatorRef,
     concurrency: usize,
     coalesce_config: Option<CoalesceConfig>,
 }
@@ -44,23 +41,12 @@ pub struct ObjectStoreReadAt {
 impl ObjectStoreReadAt {
     /// Create a new object store source.
     pub fn new(store: Arc<dyn ObjectStore>, path: ObjectPath, handle: Handle) -> Self {
-        Self::new_with_allocator(store, path, handle, Arc::new(DefaultHostAllocator))
-    }
-
-    /// Create a new object store source with a custom writable buffer allocator.
-    pub fn new_with_allocator(
-        store: Arc<dyn ObjectStore>,
-        path: ObjectPath,
-        handle: Handle,
-        allocator: HostAllocatorRef,
-    ) -> Self {
         let uri = Arc::from(path.to_string());
         Self {
             store,
             path,
             uri,
             handle,
-            allocator,
             concurrency: DEFAULT_CONCURRENCY,
             coalesce_config: Some(CoalesceConfig::object_storage()),
         }
@@ -75,6 +61,12 @@ impl ObjectStoreReadAt {
     /// Set the coalesce config for this source.
     pub fn with_coalesce_config(mut self, config: CoalesceConfig) -> Self {
         self.coalesce_config = Some(config);
+        self
+    }
+
+    /// Set an optional coalesce config for this source.
+    pub fn with_some_coalesce_config(mut self, config: Option<CoalesceConfig>) -> Self {
+        self.coalesce_config = config;
         self
     }
 }
@@ -93,7 +85,7 @@ impl VortexReadAt for ObjectStoreReadAt {
     }
 
     fn size(&self) -> BoxFuture<'static, VortexResult<u64>> {
-        let store = Arc::clone(&self.store);
+        let store = self.store.clone();
         let path = self.path.clone();
         async move {
             store
@@ -111,14 +103,13 @@ impl VortexReadAt for ObjectStoreReadAt {
         length: usize,
         alignment: Alignment,
     ) -> BoxFuture<'static, VortexResult<BufferHandle>> {
-        let store = Arc::clone(&self.store);
+        let store = self.store.clone();
         let path = self.path.clone();
         let handle = self.handle.clone();
-        let allocator = Arc::clone(&self.allocator);
         let range = offset..(offset + length as u64);
 
         async move {
-            let mut buffer = allocator.allocate(length, alignment)?;
+            let mut buffer = ByteBufferMut::with_capacity_aligned(length, alignment);
 
             let response = store
                 .get_opts(
@@ -133,9 +124,11 @@ impl VortexReadAt for ObjectStoreReadAt {
             let buffer = match response.payload {
                 #[cfg(not(target_arch = "wasm32"))]
                 GetResultPayload::File(file, _) => {
+                    unsafe { buffer.set_len(length) };
+
                     handle
                         .spawn_blocking(move || {
-                            read_exact_at(&file, buffer.as_mut_slice(), range.start)?;
+                            read_exact_at(&file, &mut buffer, range.start)?;
                             Ok::<_, io::Error>(buffer)
                         })
                         .await
@@ -146,25 +139,14 @@ impl VortexReadAt for ObjectStoreReadAt {
                     unreachable!("File payload not supported on wasm32")
                 }
                 GetResultPayload::Stream(mut byte_stream) => {
-                    let mut written = 0usize;
                     while let Some(bytes) = byte_stream.next().await {
-                        let bytes = bytes?;
-                        let end = written + bytes.len();
-                        vortex_ensure!(
-                            end <= length,
-                            "Object store stream returned too many bytes: {} > expected {} (range: {:?})",
-                            end,
-                            length,
-                            range
-                        );
-                        buffer.as_mut_slice()[written..end].copy_from_slice(&bytes);
-                        written = end;
+                        buffer.extend_from_slice(&bytes?);
                     }
 
                     vortex_ensure!(
-                        written == length,
+                        buffer.len() == length,
                         "Object store stream returned {} bytes but expected {} bytes (range: {:?})",
-                        written,
+                        buffer.len(),
                         length,
                         range
                     );

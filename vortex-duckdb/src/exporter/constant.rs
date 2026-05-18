@@ -65,13 +65,14 @@ impl ColumnExporter for ConstantExporter {
     fn export(
         &self,
         _offset: usize,
-        _len: usize,
+        len: usize,
         vector: &mut VectorRef,
         _ctx: &mut ExecutionCtx,
     ) -> VortexResult<()> {
         match self.value.as_ref() {
             None => {
-                vector.set_all_false_validity();
+                // TODO(ngates): would be good if DuckDB supported constant null vectors.
+                unsafe { vector.set_validity(&Mask::AllFalse(len), 0, len) };
             }
             Some(value) => {
                 vector.reference_value(value);

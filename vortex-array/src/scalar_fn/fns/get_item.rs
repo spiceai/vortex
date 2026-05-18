@@ -4,15 +4,14 @@
 use std::fmt::Formatter;
 
 use prost::Message;
+use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
 use vortex_proto::expr as pb;
 use vortex_session::VortexSession;
 
 use crate::ArrayRef;
-use crate::ExecutionCtx;
 use crate::arrays::StructArray;
-use crate::arrays::struct_::StructArrayExt;
 use crate::builtins::ArrayBuiltins;
 use crate::builtins::ExprBuiltins;
 use crate::dtype::DType;
@@ -44,7 +43,7 @@ impl ScalarFnVTable for GetItem {
     type Options = FieldName;
 
     fn id(&self) -> ScalarFnId {
-        ScalarFnId::new("vortex.get_item")
+        ScalarFnId::from("vortex.get_item")
     }
 
     fn serialize(&self, instance: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
@@ -106,13 +105,12 @@ impl ScalarFnVTable for GetItem {
         Ok(field_dtype)
     }
 
-    fn execute(
-        &self,
-        field_name: &FieldName,
-        args: &dyn ExecutionArgs,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<ArrayRef> {
-        let input = args.get(0)?.execute::<StructArray>(ctx)?;
+    fn execute(&self, field_name: &FieldName, mut args: ExecutionArgs) -> VortexResult<ArrayRef> {
+        let input = args
+            .inputs
+            .pop()
+            .vortex_expect("missing input for GetItem expression")
+            .execute::<StructArray>(args.ctx)?;
         let field = input.unmasked_field_by_name(field_name).cloned()?;
 
         match input.dtype().nullability() {
@@ -219,7 +217,9 @@ impl ScalarFnVTable for GetItem {
 mod tests {
     use vortex_buffer::buffer;
 
+    use crate::Array;
     use crate::IntoArray;
+    use crate::arrays::StructArray;
     use crate::dtype::DType;
     use crate::dtype::FieldNames;
     use crate::dtype::Nullability;
@@ -231,7 +231,6 @@ mod tests {
     use crate::expr::lit;
     use crate::expr::pack;
     use crate::expr::root;
-    use crate::scalar_fn::fns::get_item::StructArray;
     use crate::validity::Validity;
 
     fn test_array() -> StructArray {
@@ -246,7 +245,7 @@ mod tests {
     fn get_item_by_name() {
         let st = test_array();
         let get_item = get_item("a", root());
-        let item = st.into_array().apply(&get_item).unwrap();
+        let item = st.to_array().apply(&get_item).unwrap();
         assert_eq!(item.dtype(), &DType::from(PType::I32))
     }
 
@@ -254,7 +253,7 @@ mod tests {
     fn get_item_by_name_none() {
         let st = test_array();
         let get_item = get_item("c", root());
-        assert!(st.into_array().apply(&get_item).is_err());
+        assert!(st.to_array().apply(&get_item).is_err());
     }
 
     #[test]
@@ -267,7 +266,7 @@ mod tests {
             Validity::AllInvalid,
         )
         .unwrap()
-        .into_array();
+        .to_array();
 
         let get_item_expr = get_item("a", root());
         let item = st.apply(&get_item_expr).unwrap();
@@ -370,6 +369,6 @@ mod tests {
         )
         .unwrap();
 
-        st.into_array().apply(&get_item("data", root())).unwrap();
+        st.to_array().apply(&get_item("data", root())).unwrap();
     }
 }

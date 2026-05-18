@@ -10,11 +10,11 @@ use vortex_error::VortexError;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
 
+use crate::Array;
 use crate::ArrayRef;
 use crate::IntoArray;
-use crate::arrays::Extension;
 use crate::arrays::ExtensionArray;
-use crate::arrays::extension::ExtensionArrayExt;
+use crate::arrays::ExtensionVTable;
 use crate::dtype::DType;
 use crate::dtype::extension::ExtDTypeRef;
 use crate::extension::datetime::AnyTemporal;
@@ -31,26 +31,23 @@ use crate::extension::datetime::Timestamp;
 ///
 /// ## Arrow compatibility
 ///
-/// TemporalData can be created from Arrow arrays containing the following datatypes:
+/// TemporalArray can be created from Arrow arrays containing the following datatypes:
 /// * `Time32`
 /// * `Time64`
 /// * `Timestamp`
 /// * `Date32`
 /// * `Date64`
 ///
-/// Anything that can be constructed and held in a `TemporalData` can also be zero-copy converted
+/// Anything that can be constructed and held in a `TemporalArray` can also be zero-copy converted
 /// back to the relevant Arrow datatype.
 #[derive(Clone, Debug)]
-pub struct TemporalData {
+pub struct TemporalArray {
     /// The underlying Vortex extension array holding all the numeric values.
     ext: ExtensionArray,
 }
 
-/// Type alias for backward compatibility.
-pub type TemporalArray = TemporalData;
-
-impl TemporalData {
-    /// Create a new `TemporalData` holding either i32 day offsets, or i64 millisecond offsets
+impl TemporalArray {
+    /// Create a new `TemporalArray` holding either i32 day offsets, or i64 millisecond offsets
     /// that are evenly divisible by the number of 86,400,000.
     ///
     /// This is equivalent to the data described by either of the `Date32` or `Date64` data types
@@ -72,7 +69,7 @@ impl TemporalData {
         }
     }
 
-    /// Create a new `TemporalData` holding one of the following values:
+    /// Create a new `TemporalArray` holding one of the following values:
     ///
     /// * `i32` values representing seconds since midnight
     /// * `i32` values representing milliseconds since midnight
@@ -100,7 +97,7 @@ impl TemporalData {
         }
     }
 
-    /// Create a new `TemporalData` holding Arrow spec compliant Timestamp data, with an
+    /// Create a new `TemporalArray` holding Arrow spec compliant Timestamp data, with an
     /// optional timezone.
     ///
     /// # Panics
@@ -122,13 +119,13 @@ impl TemporalData {
     }
 }
 
-impl TemporalData {
+impl TemporalArray {
     /// Access the underlying temporal values in the underlying ExtensionArray storage.
     ///
     /// These values are to be interpreted based on the time unit and optional time-zone stored
     /// in the TemporalMetadata.
     pub fn temporal_values(&self) -> &ArrayRef {
-        self.ext.storage_array()
+        self.ext.storage()
     }
 
     /// Retrieve the temporal metadata.
@@ -150,22 +147,28 @@ impl TemporalData {
     }
 }
 
-impl From<TemporalData> for ArrayRef {
-    fn from(value: TemporalData) -> Self {
+impl AsRef<dyn Array> for TemporalArray {
+    fn as_ref(&self) -> &dyn Array {
+        self.ext.as_ref()
+    }
+}
+
+impl From<TemporalArray> for ArrayRef {
+    fn from(value: TemporalArray) -> Self {
         value.ext.into_array()
     }
 }
 
-impl IntoArray for TemporalData {
+impl IntoArray for TemporalArray {
     fn into_array(self) -> ArrayRef {
         self.into()
     }
 }
 
-impl TryFrom<ArrayRef> for TemporalData {
+impl TryFrom<ArrayRef> for TemporalArray {
     type Error = VortexError;
 
-    /// Try to specialize a generic Vortex array as a TemporalData.
+    /// Try to specialize a generic Vortex array as a TemporalArray.
     ///
     /// # Errors
     ///
@@ -175,7 +178,7 @@ impl TryFrom<ArrayRef> for TemporalData {
     /// `TemporalMetadata` variants, an error is returned.
     fn try_from(value: ArrayRef) -> Result<Self, Self::Error> {
         let ext = value
-            .as_opt::<Extension>()
+            .as_opt::<ExtensionVTable>()
             .ok_or_else(|| vortex_err!("array must be an ExtensionArray"))?;
         if !ext.ext_dtype().is::<AnyTemporal>() {
             vortex_bail!(
@@ -183,26 +186,24 @@ impl TryFrom<ArrayRef> for TemporalData {
                 ext.ext_dtype()
             );
         }
-        Ok(Self {
-            ext: ext.into_owned(),
-        })
+        Ok(Self { ext: ext.clone() })
     }
 }
 
 // Conversions to/from ExtensionArray
-impl From<&TemporalData> for ExtensionArray {
-    fn from(value: &TemporalData) -> Self {
+impl From<&TemporalArray> for ExtensionArray {
+    fn from(value: &TemporalArray) -> Self {
         value.ext.clone()
     }
 }
 
-impl From<TemporalData> for ExtensionArray {
-    fn from(value: TemporalData) -> Self {
+impl From<TemporalArray> for ExtensionArray {
+    fn from(value: TemporalArray) -> Self {
         value.ext
     }
 }
 
-impl TryFrom<ExtensionArray> for TemporalData {
+impl TryFrom<ExtensionArray> for TemporalArray {
     type Error = VortexError;
 
     fn try_from(ext: ExtensionArray) -> Result<Self, Self::Error> {

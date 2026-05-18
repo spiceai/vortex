@@ -4,25 +4,24 @@
 use std::ops::Range;
 
 use vortex_array::ArrayRef;
-use vortex_array::ArrayView;
 use vortex_array::IntoArray;
-use vortex_array::arrays::slice::SliceReduce;
+use vortex_array::arrays::SliceReduce;
 use vortex_error::VortexResult;
 
-use crate::DateTimeParts;
-use crate::array::DateTimePartsArraySlotsExt;
+use crate::DateTimePartsArray;
+use crate::DateTimePartsVTable;
 
-impl SliceReduce for DateTimeParts {
-    fn slice(array: ArrayView<'_, Self>, range: Range<usize>) -> VortexResult<Option<ArrayRef>> {
+impl SliceReduce for DateTimePartsVTable {
+    fn slice(array: &Self::Array, range: Range<usize>) -> VortexResult<Option<ArrayRef>> {
         // SAFETY: slicing all components preserves values
-        Ok(Some(
-            DateTimeParts::try_new(
+        Ok(Some(unsafe {
+            DateTimePartsArray::new_unchecked(
                 array.dtype().clone(),
                 array.days().slice(range.clone())?,
                 array.seconds().slice(range.clone())?,
                 array.subseconds().slice(range)?,
-            )?
-            .into_array(),
-        ))
+            )
+            .into_array()
+        }))
     }
 }

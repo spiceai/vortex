@@ -57,12 +57,6 @@ impl FileSystem for PrefixFileSystem {
             .open_read(&format!("{}{}", self.prefix, path.trim_start_matches('/')))
             .await
     }
-
-    async fn delete(&self, path: &str) -> VortexResult<()> {
-        self.inner
-            .delete(&format!("{}{}", self.prefix, path.trim_start_matches('/')))
-            .await
-    }
 }
 
 impl dyn FileSystem + 'static {

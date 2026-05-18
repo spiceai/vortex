@@ -2,10 +2,12 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 mod reader;
+pub mod writer;
 
 use std::sync::Arc;
 
 use reader::StructReader;
+use vortex_array::ArrayContext;
 use vortex_array::DeserializeMetadata;
 use vortex_array::EmptyMetadata;
 use vortex_array::dtype::DType;
@@ -20,7 +22,6 @@ use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
 use vortex_session::SessionExt;
 use vortex_session::VortexSession;
-use vortex_session::registry::ReadContext;
 
 use crate::LayoutChildType;
 use crate::LayoutEncodingRef;
@@ -36,13 +37,13 @@ use crate::vtable;
 
 vtable!(Struct);
 
-impl VTable for Struct {
+impl VTable for StructVTable {
     type Layout = StructLayout;
     type Encoding = StructLayoutEncoding;
     type Metadata = EmptyMetadata;
 
     fn id(_encoding: &Self::Encoding) -> LayoutId {
-        LayoutId::new("vortex.struct")
+        LayoutId::new_ref("vortex.struct")
     }
 
     fn encoding(_layout: &Self::Layout) -> LayoutEncodingRef {
@@ -130,7 +131,7 @@ impl VTable for Struct {
         _metadata: &<Self::Metadata as DeserializeMetadata>::Output,
         _segment_ids: Vec<SegmentId>,
         children: &dyn LayoutChildren,
-        _ctx: &ReadContext,
+        _ctx: &ArrayContext,
     ) -> VortexResult<Self::Layout> {
         let struct_dt = dtype
             .as_struct_fields_opt()
@@ -173,9 +174,6 @@ impl VTable for Struct {
 #[derive(Debug)]
 pub struct StructLayoutEncoding;
 
-/// Decomposes a struct-typed column into one child per field, enabling columnar projection.
-///
-/// Queries that only need a subset of fields can skip reading the rest entirely.
 #[derive(Clone, Debug)]
 pub struct StructLayout {
     row_count: u64,

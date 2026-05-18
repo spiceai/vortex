@@ -4,17 +4,18 @@
 use std::ffi::c_char;
 use std::sync::Arc;
 
+use itertools::Itertools;
 use vortex::array::ExecutionCtx;
+use vortex::array::arrays::BinaryView;
+use vortex::array::arrays::Inlined;
 use vortex::array::arrays::VarBinViewArray;
-use vortex::array::arrays::varbinview::BinaryView;
-use vortex::array::arrays::varbinview::Inlined;
-use vortex::array::arrays::varbinview::VarBinViewDataParts;
-use vortex::array::validity::Validity;
+use vortex::array::arrays::VarBinViewArrayParts;
 use vortex::buffer::Buffer;
 use vortex::buffer::ByteBuffer;
 use vortex::error::VortexResult;
 use vortex::mask::Mask;
 
+use crate::duckdb::LogicalType;
 use crate::duckdb::VectorBuffer;
 use crate::duckdb::VectorRef;
 use crate::exporter::ColumnExporter;
@@ -32,26 +33,31 @@ pub(crate) fn new_exporter(
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<Box<dyn ColumnExporter>> {
     let len = array.len();
-    let VarBinViewDataParts {
+    let VarBinViewArrayParts {
         validity,
-        dtype: _dtype,
+        dtype,
         views,
         buffers,
-    } = array.into_data_parts();
-
-    if matches!(validity, Validity::AllInvalid) {
-        return Ok(all_invalid::new_exporter());
-    }
+    } = array.into_parts();
     let validity = validity.to_array(len).execute::<Mask>(ctx)?;
+    if validity.all_false() {
+        let ltype = LogicalType::try_from(dtype)?;
+        return Ok(all_invalid::new_exporter(len, &ltype));
+    }
 
-    let buffers: Vec<_> = buffers.iter().cloned().map(|b| b.unwrap_host()).collect();
+    let buffers = buffers
+        .iter()
+        .cloned()
+        .map(|b| b.unwrap_host())
+        .collect_vec();
+
     let buffers: Arc<[ByteBuffer]> = Arc::from(buffers);
 
     Ok(validity::new_exporter(
         validity,
         Box::new(VarBinViewExporter {
             views: Buffer::<BinaryView>::from_byte_buffer(views.unwrap_host()),
-            vector_buffers: buffers.iter().cloned().map(VectorBuffer::new).collect(),
+            vector_buffers: buffers.iter().cloned().map(VectorBuffer::new).collect_vec(),
             buffers,
         }),
     ))
@@ -139,10 +145,10 @@ fn to_ptr_binary_view<'a>(
 #[cfg(test)]
 mod tests {
     use Nullability::Nullable;
-    use vortex::array::VortexSessionExecute;
     use vortex::dtype::DType;
     use vortex::dtype::Nullability;
     use vortex::error::VortexResult;
+    use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::VarBinViewArray;
 
     use crate::SESSION;
@@ -161,7 +167,7 @@ mod tests {
         chunk.set_len(3);
 
         assert_eq!(
-            format!("{}", String::try_from(&*chunk)?),
+            format!("{}", String::try_from(&*chunk).unwrap()),
             r#"Chunk - [1 Columns]
 - CONSTANT VARCHAR: 3 = [ NULL]
 "#
@@ -181,7 +187,7 @@ mod tests {
         chunk.set_len(3);
 
         assert_eq!(
-            format!("{}", String::try_from(&*chunk)?),
+            format!("{}", String::try_from(&*chunk).unwrap()),
             r#"Chunk - [1 Columns]
 - CONSTANT VARCHAR: 3 = [ NULL]
 "#
@@ -203,7 +209,7 @@ mod tests {
         chunk.set_len(3);
 
         assert_eq!(
-            format!("{}", String::try_from(&*chunk)?),
+            format!("{}", String::try_from(&*chunk).unwrap()),
             r#"Chunk - [1 Columns]
 - FLAT VARCHAR: 3 = [ NULL, NULL, Hi]
 "#

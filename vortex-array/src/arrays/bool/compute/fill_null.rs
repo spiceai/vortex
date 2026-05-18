@@ -7,32 +7,31 @@ use vortex_error::vortex_err;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::IntoArray;
-use crate::array::ArrayView;
-use crate::arrays::Bool;
+use crate::ToCanonical;
 use crate::arrays::BoolArray;
-use crate::arrays::bool::BoolArrayExt;
+use crate::arrays::BoolVTable;
 use crate::scalar::Scalar;
 use crate::scalar_fn::fns::fill_null::FillNullKernel;
 use crate::validity::Validity;
+use crate::vtable::ValidityHelper;
 
-impl FillNullKernel for Bool {
+impl FillNullKernel for BoolVTable {
     fn fill_null(
-        array: ArrayView<'_, Bool>,
+        array: &BoolArray,
         fill_value: &Scalar,
-        ctx: &mut ExecutionCtx,
+        _ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
         let fill = fill_value
             .as_bool()
             .value()
             .ok_or_else(|| vortex_err!("Fill value must be non null"))?;
 
-        Ok(Some(match array.validity()? {
+        Ok(Some(match array.validity() {
             Validity::Array(v) => {
-                let v_bool = v.execute::<BoolArray>(ctx)?;
                 let bool_buffer = if fill {
-                    array.to_bit_buffer() | &!v_bool.to_bit_buffer()
+                    array.to_bit_buffer() | &!v.to_bool().to_bit_buffer()
                 } else {
-                    array.to_bit_buffer() & v_bool.to_bit_buffer()
+                    array.to_bit_buffer() & v.to_bool().to_bit_buffer()
                 };
                 BoolArray::new(bool_buffer, fill_value.dtype().nullability().into()).into_array()
             }
@@ -47,12 +46,9 @@ mod tests {
     use vortex_buffer::BitBuffer;
     use vortex_buffer::bitbuffer;
 
-    use crate::IntoArray;
     use crate::arrays::BoolArray;
-    use crate::arrays::bool::BoolArrayExt;
     use crate::builtins::ArrayBuiltins;
-    #[expect(deprecated)]
-    use crate::canonical::ToCanonical as _;
+    use crate::canonical::ToCanonical;
     use crate::dtype::DType;
     use crate::dtype::Nullability;
     use crate::scalar::Scalar;
@@ -66,9 +62,8 @@ mod tests {
             BitBuffer::from_iter([true, true, false, false]),
             Validity::from_iter([true, false, true, false]),
         );
-        #[expect(deprecated)]
         let non_null_array = bool_array
-            .into_array()
+            .to_array()
             .fill_null(Scalar::from(fill_value))
             .unwrap()
             .to_bool();

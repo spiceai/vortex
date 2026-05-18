@@ -3,6 +3,7 @@
 
 //! Core [`ScalarValue`] type definition.
 
+use std::cmp::Ordering;
 use std::fmt::Display;
 use std::fmt::Formatter;
 
@@ -13,8 +14,8 @@ use vortex_error::vortex_panic;
 
 use crate::dtype::DType;
 use crate::scalar::DecimalValue;
+// use crate::scalar::ExtScalarValueRef;
 use crate::scalar::PValue;
-use crate::scalar::Scalar;
 
 /// The value stored in a [`Scalar`][crate::scalar::Scalar].
 ///
@@ -32,17 +33,37 @@ pub enum ScalarValue {
     Utf8(BufferString),
     /// A binary (byte array) value.
     Binary(ByteBuffer),
-    /// A tuple of potentially null scalar values.
-    ///
-    /// Used as the underlying representation for list, fixed-size list, and struct scalars.
-    Tuple(Vec<Option<ScalarValue>>),
-    /// A row-specific scalar wrapped by `DType::Variant`.
-    Variant(Box<Scalar>),
+    /// A list of potentially null scalar values.
+    List(Vec<Option<ScalarValue>>),
+    // /// An extension value reference.
+    // ///
+    // /// This internally contains a `ScalarValue` and an vtable that implements
+    // /// [`ExtScalarVTable`](crate::scalar::ExtScalarVTable)
+    // Extension(ExtScalarValueRef),
 }
 
 impl ScalarValue {
     /// Returns the zero / identity value for the given [`DType`].
-    pub(super) fn zero_value(dtype: &DType) -> Self {
+    ///
+    /// # Zero Values
+    ///
+    /// Here is the list of zero values for each [`DType`] (when the [`DType`] is non-nullable):
+    ///
+    /// - `Null`: Does not have a "zero" value
+    /// - `Bool`: `false`
+    /// - `Primitive`: `0`
+    /// - `Decimal`: `0`
+    /// - `Utf8`: `""`
+    /// - `Binary`: An empty buffer
+    /// - `List`: An empty list
+    /// - `FixedSizeList`: A list (with correct size) of zero values, which is determined by the
+    ///   element [`DType`]
+    /// - `Struct`: A struct where each field has a zero value, which is determined by the field
+    ///   [`DType`]
+    ///
+    /// - `Extension`: TODO(connor): Is this right?
+    ///   The zero value of the storage [`DType`]
+    pub fn zero_value(dtype: &DType) -> Self {
         match dtype {
             DType::Null => vortex_panic!("Null dtype has no zero value"),
             DType::Bool(_) => Self::Bool(false),
@@ -50,25 +71,19 @@ impl ScalarValue {
             DType::Decimal(dt, ..) => Self::Decimal(DecimalValue::zero(dt)),
             DType::Utf8(_) => Self::Utf8(BufferString::empty()),
             DType::Binary(_) => Self::Binary(ByteBuffer::empty()),
-            DType::List(..) => Self::Tuple(vec![]),
+            DType::List(..) => Self::List(vec![]),
             DType::FixedSizeList(edt, size, _) => {
                 let elements = (0..*size).map(|_| Some(Self::zero_value(edt))).collect();
-                Self::Tuple(elements)
+                Self::List(elements)
             }
             DType::Struct(fields, _) => {
                 let field_values = fields
                     .fields()
                     .map(|f| Some(Self::zero_value(&f)))
                     .collect();
-                Self::Tuple(field_values)
+                Self::List(field_values)
             }
-            DType::Extension(ext_dtype) => {
-                // Since we have no way to define a "zero" extension value (since we have no idea
-                // what the semantics of the extension is), a best effort attempt is to just use the
-                // zero storage value and try to make an extension scalar from that.
-                Self::zero_value(ext_dtype.storage_dtype())
-            }
-            DType::Variant(_) => Self::Variant(Box::new(Scalar::null(DType::Null))),
+            DType::Extension(ext_dtype) => Self::zero_value(ext_dtype.storage_dtype()), // TODO(connor): Fix this!
         }
     }
 
@@ -78,7 +93,7 @@ impl ScalarValue {
     /// For non-nullable and nested types that may need null values in their children (as of right
     /// now, that is _only_ `FixedSizeList` and `Struct`), this function will provide `None` as the
     /// default child values (whereas [`ScalarValue::zero_value`] would provide `Some(_)`).
-    pub(super) fn default_value(dtype: &DType) -> Option<Self> {
+    pub fn default_value(dtype: &DType) -> Option<Self> {
         if dtype.is_nullable() {
             return None;
         }
@@ -90,32 +105,41 @@ impl ScalarValue {
             DType::Decimal(dt, ..) => Self::Decimal(DecimalValue::zero(dt)),
             DType::Utf8(_) => Self::Utf8(BufferString::empty()),
             DType::Binary(_) => Self::Binary(ByteBuffer::empty()),
-            DType::List(..) => Self::Tuple(vec![]),
+            DType::List(..) => Self::List(vec![]),
             DType::FixedSizeList(edt, size, _) => {
                 let elements = (0..*size).map(|_| Self::default_value(edt)).collect();
-                Self::Tuple(elements)
+                Self::List(elements)
             }
             DType::Struct(fields, _) => {
                 let field_values = fields.fields().map(|f| Self::default_value(&f)).collect();
-                Self::Tuple(field_values)
+                Self::List(field_values)
             }
-            DType::Extension(ext_dtype) => {
-                // Since we have no way to define a "default" extension value (since we have no idea
-                // what the semantics of the extension is), a best effort attempt is to just use the
-                // default storage value and try to make an extension scalar from that.
-                Self::default_value(ext_dtype.storage_dtype())?
-            }
-            DType::Variant(_) => Self::Variant(Box::new(Scalar::null(DType::Null))),
+            DType::Extension(ext_dtype) => Self::default_value(ext_dtype.storage_dtype())?, // TODO(connor): Fix this!
         })
+    }
+}
+
+impl PartialOrd for ScalarValue {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        match (self, other) {
+            (ScalarValue::Bool(a), ScalarValue::Bool(b)) => a.partial_cmp(b),
+            (ScalarValue::Primitive(a), ScalarValue::Primitive(b)) => a.partial_cmp(b),
+            (ScalarValue::Decimal(a), ScalarValue::Decimal(b)) => a.partial_cmp(b),
+            (ScalarValue::Utf8(a), ScalarValue::Utf8(b)) => a.partial_cmp(b),
+            (ScalarValue::Binary(a), ScalarValue::Binary(b)) => a.partial_cmp(b),
+            (ScalarValue::List(a), ScalarValue::List(b)) => a.partial_cmp(b),
+            // (ScalarValue::Extension(a), ScalarValue::Extension(b)) => a.partial_cmp(b),
+            _ => None,
+        }
     }
 }
 
 impl Display for ScalarValue {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            ScalarValue::Bool(b) => write!(f, "{b}"),
-            ScalarValue::Primitive(p) => write!(f, "{p}"),
-            ScalarValue::Decimal(d) => write!(f, "{d}"),
+            ScalarValue::Bool(b) => write!(f, "{}", b),
+            ScalarValue::Primitive(p) => write!(f, "{}", p),
+            ScalarValue::Decimal(d) => write!(f, "{}", d),
             ScalarValue::Utf8(s) => {
                 let bufstr = s.as_str();
                 let str_len = bufstr.chars().count();
@@ -141,7 +165,7 @@ impl Display for ScalarValue {
                     write!(f, "{}", to_hex(b))
                 }
             }
-            ScalarValue::Tuple(elements) => {
+            ScalarValue::List(elements) => {
                 write!(f, "[")?;
                 for (i, element) in elements.iter().enumerate() {
                     if i > 0 {
@@ -153,8 +177,8 @@ impl Display for ScalarValue {
                     }
                 }
                 write!(f, "]")
-            }
-            ScalarValue::Variant(value) => write!(f, "{value}"),
+            } //
+              // ScalarValue::Extension(e) => write!(f, "{}", e),
         }
     }
 }

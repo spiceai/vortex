@@ -1,7 +1,5 @@
 pub mod vortex
 
-pub use vortex::aggregate_fn
-
 pub use vortex::compute
 
 pub use vortex::expr
@@ -22,9 +20,11 @@ pub use vortex::compressor::BtrBlocksCompressor
 
 pub use vortex::compressor::BtrBlocksCompressorBuilder
 
-pub use vortex::compressor::Scheme
+pub use vortex::compressor::FloatCode
 
-pub use vortex::compressor::SchemeId
+pub use vortex::compressor::IntCode
+
+pub use vortex::compressor::StringCode
 
 pub mod vortex::dtype
 

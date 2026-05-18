@@ -3,43 +3,46 @@
 
 //! This module defines the default layout strategy for a Vortex file.
 
-use std::any::Any;
 use std::sync::Arc;
 use std::sync::LazyLock;
 
-use vortex_alp::ALP;
-use vortex_alp::ALPRD;
-use vortex_array::ArrayId;
-use vortex_array::VTable;
-use vortex_array::arrays::Bool;
-use vortex_array::arrays::Chunked;
-use vortex_array::arrays::Constant;
-use vortex_array::arrays::Decimal;
-use vortex_array::arrays::Dict;
-use vortex_array::arrays::Extension;
-use vortex_array::arrays::FixedSizeList;
-use vortex_array::arrays::List;
-use vortex_array::arrays::ListView;
-use vortex_array::arrays::Masked;
-use vortex_array::arrays::Null;
-use vortex_array::arrays::Patched;
-use vortex_array::arrays::Primitive;
-use vortex_array::arrays::Struct;
-use vortex_array::arrays::VarBin;
-use vortex_array::arrays::VarBinView;
-use vortex_array::arrays::patched::use_experimental_patches;
+// Compressed encodings from encoding crates
+// Canonical array encodings from vortex-array
+use vortex_alp::ALPRDVTable;
+use vortex_alp::ALPVTable;
+use vortex_array::arrays::BoolVTable;
+use vortex_array::arrays::ChunkedVTable;
+use vortex_array::arrays::ConstantVTable;
+use vortex_array::arrays::DecimalVTable;
+use vortex_array::arrays::DictVTable;
+use vortex_array::arrays::ExtensionVTable;
+use vortex_array::arrays::FixedSizeListVTable;
+use vortex_array::arrays::ListVTable;
+use vortex_array::arrays::ListViewVTable;
+use vortex_array::arrays::MaskedVTable;
+use vortex_array::arrays::NullVTable;
+use vortex_array::arrays::PrimitiveVTable;
+use vortex_array::arrays::StructVTable;
+use vortex_array::arrays::VarBinVTable;
+use vortex_array::arrays::VarBinViewVTable;
 use vortex_array::dtype::FieldPath;
+use vortex_array::session::ArrayRegistry;
+#[cfg(feature = "zstd")]
 use vortex_btrblocks::BtrBlocksCompressorBuilder;
-use vortex_btrblocks::SchemeExt;
-use vortex_btrblocks::schemes::integer::IntDictScheme;
-use vortex_bytebool::ByteBool;
-use vortex_datetime_parts::DateTimeParts;
-use vortex_decimal_byte_parts::DecimalByteParts;
-use vortex_fastlanes::BitPacked;
-use vortex_fastlanes::Delta;
-use vortex_fastlanes::FoR;
-use vortex_fastlanes::RLE;
-use vortex_fsst::FSST;
+#[cfg(feature = "zstd")]
+use vortex_btrblocks::FloatCode;
+#[cfg(feature = "zstd")]
+use vortex_btrblocks::IntCode;
+#[cfg(feature = "zstd")]
+use vortex_btrblocks::StringCode;
+use vortex_bytebool::ByteBoolVTable;
+use vortex_datetime_parts::DateTimePartsVTable;
+use vortex_decimal_byte_parts::DecimalBytePartsVTable;
+use vortex_fastlanes::BitPackedVTable;
+use vortex_fastlanes::DeltaVTable;
+use vortex_fastlanes::FoRVTable;
+use vortex_fastlanes::RLEVTable;
+use vortex_fsst::FSSTVTable;
 use vortex_layout::LayoutStrategy;
 use vortex_layout::layouts::buffered::BufferedStrategy;
 use vortex_layout::layouts::chunked::writer::ChunkedLayoutStrategy;
@@ -53,18 +56,16 @@ use vortex_layout::layouts::repartition::RepartitionWriterOptions;
 use vortex_layout::layouts::table::TableStrategy;
 use vortex_layout::layouts::zoned::writer::ZonedLayoutOptions;
 use vortex_layout::layouts::zoned::writer::ZonedStrategy;
-use vortex_pco::Pco;
-use vortex_runend::RunEnd;
-use vortex_sequence::Sequence;
-use vortex_session::SessionVar;
-use vortex_sparse::Sparse;
+use vortex_pco::PcoVTable;
+use vortex_runend::RunEndVTable;
+use vortex_sequence::SequenceVTable;
+use vortex_sparse::SparseVTable;
 use vortex_utils::aliases::hash_map::HashMap;
-use vortex_utils::aliases::hash_set::HashSet;
-use vortex_zigzag::ZigZag;
-#[cfg(feature = "zstd")]
-use vortex_zstd::Zstd;
+use vortex_zigzag::ZigZagVTable;
 #[cfg(all(feature = "zstd", feature = "unstable_encodings"))]
-use vortex_zstd::ZstdBuffers;
+use vortex_zstd::ZstdBuffersVTable;
+#[cfg(feature = "zstd")]
+use vortex_zstd::ZstdVTable;
 
 const ONE_MEG: u64 = 1 << 20;
 
@@ -72,89 +73,62 @@ const ONE_MEG: u64 = 1 << 20;
 ///
 /// This includes all canonical encodings from vortex-array plus all compressed
 /// encodings from the various encoding crates.
-pub static ALLOWED_ENCODINGS: LazyLock<HashSet<ArrayId>> = LazyLock::new(|| {
-    let mut allowed = HashSet::new();
+pub static ALLOWED_ENCODINGS: LazyLock<ArrayRegistry> = LazyLock::new(|| {
+    let registry = ArrayRegistry::default();
 
     // Canonical encodings from vortex-array
-    allowed.insert(Null.id());
-    allowed.insert(Bool.id());
-    allowed.insert(Primitive.id());
-    allowed.insert(Decimal.id());
-    allowed.insert(VarBin.id());
-    allowed.insert(VarBinView.id());
-    allowed.insert(List.id());
-    allowed.insert(ListView.id());
-    allowed.insert(FixedSizeList.id());
-    allowed.insert(Struct.id());
-    allowed.insert(Extension.id());
-    allowed.insert(Chunked.id());
-    allowed.insert(Constant.id());
-    allowed.insert(Masked.id());
-    allowed.insert(Dict.id());
+    registry.register(NullVTable::ID, NullVTable);
+    registry.register(BoolVTable::ID, BoolVTable);
+    registry.register(PrimitiveVTable::ID, PrimitiveVTable);
+    registry.register(DecimalVTable::ID, DecimalVTable);
+    registry.register(VarBinVTable::ID, VarBinVTable);
+    registry.register(VarBinViewVTable::ID, VarBinViewVTable);
+    registry.register(ListVTable::ID, ListVTable);
+    registry.register(ListViewVTable::ID, ListViewVTable);
+    registry.register(FixedSizeListVTable::ID, FixedSizeListVTable);
+    registry.register(StructVTable::ID, StructVTable);
+    registry.register(ExtensionVTable::ID, ExtensionVTable);
+    registry.register(ChunkedVTable::ID, ChunkedVTable);
+    registry.register(ConstantVTable::ID, ConstantVTable);
+    registry.register(MaskedVTable::ID, MaskedVTable);
+    registry.register(DictVTable::ID, DictVTable);
 
     // Compressed encodings from encoding crates
-    allowed.insert(ALP.id());
-    allowed.insert(ALPRD.id());
-    allowed.insert(BitPacked.id());
-    allowed.insert(ByteBool.id());
-    allowed.insert(DateTimeParts.id());
-    allowed.insert(DecimalByteParts.id());
-    allowed.insert(Delta.id());
-    allowed.insert(FoR.id());
-    allowed.insert(FSST.id());
-    allowed.insert(Pco.id());
-    allowed.insert(RLE.id());
-    allowed.insert(RunEnd.id());
-    allowed.insert(Sequence.id());
-    allowed.insert(Sparse.id());
-    allowed.insert(ZigZag.id());
-
-    // Experimental encodings
-
-    if use_experimental_patches() {
-        allowed.insert(Patched.id());
-    }
+    registry.register(ALPVTable::ID, ALPVTable);
+    registry.register(ALPRDVTable::ID, ALPRDVTable);
+    registry.register(BitPackedVTable::ID, BitPackedVTable);
+    registry.register(ByteBoolVTable::ID, ByteBoolVTable);
+    registry.register(DateTimePartsVTable::ID, DateTimePartsVTable);
+    registry.register(DecimalBytePartsVTable::ID, DecimalBytePartsVTable);
+    registry.register(DeltaVTable::ID, DeltaVTable);
+    registry.register(FoRVTable::ID, FoRVTable);
+    registry.register(FSSTVTable::ID, FSSTVTable);
+    registry.register(PcoVTable::ID, PcoVTable);
+    registry.register(RLEVTable::ID, RLEVTable);
+    registry.register(RunEndVTable::ID, RunEndVTable);
+    registry.register(SequenceVTable::ID, SequenceVTable);
+    registry.register(SparseVTable::ID, SparseVTable);
+    registry.register(ZigZagVTable::ID, ZigZagVTable);
 
     #[cfg(feature = "zstd")]
-    allowed.insert(Zstd.id());
+    registry.register(ZstdVTable::ID, ZstdVTable);
     #[cfg(all(feature = "zstd", feature = "unstable_encodings"))]
-    allowed.insert(ZstdBuffers.id());
+    registry.register(ZstdBuffersVTable::ID, ZstdBuffersVTable);
 
-    allowed
+    registry
 });
 
-/// How the compressor was configured on [`WriteStrategyBuilder`].
-#[derive(Clone)]
-enum CompressorConfig {
-    /// A [`BtrBlocksCompressorBuilder`] that [`WriteStrategyBuilder::build`] will finalize.
-    /// `IntDictScheme` is automatically excluded from the data compressor to prevent recursive
-    /// dictionary encoding.
-    BtrBlocks(BtrBlocksCompressorBuilder),
-    /// An opaque compressor used as-is for both data and stats compression.
-    Opaque(Arc<dyn CompressorPlugin>),
-}
-
-impl std::fmt::Debug for CompressorConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::BtrBlocks(_) => f.write_str("BtrBlocks"),
-            Self::Opaque(_) => f.write_str("Opaque"),
-        }
-    }
-}
-
-/// Build a new [writer strategy](LayoutStrategy) to compress and reorganize chunks of a Vortex
-/// file.
+/// Build a new [writer strategy][LayoutStrategy] to compress and reorganize chunks of a Vortex file.
 ///
 /// Vortex provides an out-of-the-box file writer that optimizes the layout of chunks on-disk,
 /// repartitioning and compressing them to strike a balance between size on-disk,
 /// bulk decoding performance, and IOPS required to perform an indexed read.
 #[derive(Clone)]
 pub struct WriteStrategyBuilder {
-    compressor: CompressorConfig,
+    compressor: Option<Arc<dyn CompressorPlugin>>,
     row_block_size: usize,
     field_writers: HashMap<FieldPath, Arc<dyn LayoutStrategy>>,
-    allow_encodings: Option<HashSet<ArrayId>>,
+    allow_encodings: Option<ArrayRegistry>,
     flat_strategy: Option<Arc<dyn LayoutStrategy>>,
 }
 
@@ -171,31 +145,30 @@ impl std::fmt::Debug for WriteStrategyBuilder {
     }
 }
 
-impl SessionVar for WriteStrategyBuilder {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-}
-
 impl Default for WriteStrategyBuilder {
     /// Create a new empty builder. It can be further configured,
     /// and then finally built yielding the [`LayoutStrategy`].
     fn default() -> Self {
         Self {
-            compressor: CompressorConfig::BtrBlocks(BtrBlocksCompressorBuilder::default()),
+            compressor: None,
             row_block_size: 8192,
             field_writers: HashMap::new(),
-            allow_encodings: Some(ALLOWED_ENCODINGS.clone()),
+            allow_encodings: None,
             flat_strategy: None,
         }
     }
 }
 
 impl WriteStrategyBuilder {
+    /// Override the [compressor][CompressorPlugin] used for compressing chunks in the file.
+    ///
+    /// If not provided, this will use a BtrBlocks-style cascading compressor that tries to balance
+    /// total size with decoding performance.
+    pub fn with_compressor<C: CompressorPlugin>(mut self, compressor: C) -> Self {
+        self.compressor = Some(Arc::new(compressor));
+        self
+    }
+
     /// Override the row block size used to determine the zone map sizes.
     pub fn with_row_block_size(mut self, row_block_size: usize) -> Self {
         self.row_block_size = row_block_size;
@@ -214,7 +187,7 @@ impl WriteStrategyBuilder {
     }
 
     /// Override the allowed array encodings for normalization.
-    pub fn with_allow_encodings(mut self, allow_encodings: HashSet<ArrayId>) -> Self {
+    pub fn with_allow_encodings(mut self, allow_encodings: ArrayRegistry) -> Self {
         self.allow_encodings = Some(allow_encodings);
         self
     }
@@ -228,20 +201,46 @@ impl WriteStrategyBuilder {
         self
     }
 
-    /// Override the default [`BtrBlocksCompressorBuilder`] used for compression.
+    /// Configure a write strategy that emits only CUDA-compatible encodings.
     ///
-    /// The builder is finalized during [`build`](Self::build), producing two compressors: one for
-    /// data (with `IntDictScheme` excluded) and one for stats.
-    pub fn with_btrblocks_builder(mut self, builder: BtrBlocksCompressorBuilder) -> Self {
-        self.compressor = CompressorConfig::BtrBlocks(builder);
+    /// This configures BtrBlocks to exclude schemes without CUDA kernel support.
+    /// With the `unstable_encodings` feature, strings use buffer-level Zstd compression
+    /// (`ZstdBuffersArray`) which preserves the array buffer layout for zero-conversion
+    /// GPU decompression. Without it, strings use interleaved Zstd compression.
+    #[cfg(feature = "zstd")]
+    pub fn with_cuda_compatible_encodings(mut self) -> Self {
+        let mut builder = BtrBlocksCompressorBuilder::default()
+            .exclude_int([IntCode::Sparse, IntCode::Rle])
+            .exclude_float([FloatCode::AlpRd, FloatCode::Rle, FloatCode::Sparse])
+            .exclude_string([StringCode::Dict, StringCode::Fsst]);
+
+        #[cfg(feature = "unstable_encodings")]
+        {
+            builder = builder.include_string([StringCode::ZstdBuffers]);
+        }
+        #[cfg(not(feature = "unstable_encodings"))]
+        {
+            builder = builder.include_string([StringCode::Zstd]);
+        }
+
+        self.compressor = Some(Arc::new(builder.build()));
         self
     }
 
-    /// Set the compressor to an opaque [`CompressorPlugin`].
+    /// Configure a write strategy that uses compact encodings (Pco for numerics, Zstd for
+    /// strings/binary).
     ///
-    /// The compressor is used as-is for both data and stats compression.
-    pub fn with_compressor<C: CompressorPlugin>(mut self, compressor: C) -> Self {
-        self.compressor = CompressorConfig::Opaque(Arc::new(compressor));
+    /// This provides better compression ratios than the default BtrBlocks strategy,
+    /// especially for floating-point heavy datasets.
+    #[cfg(feature = "zstd")]
+    pub fn with_compact_encodings(mut self) -> Self {
+        let btrblocks = BtrBlocksCompressorBuilder::default()
+            .include_string([StringCode::Zstd])
+            .include_int([IntCode::Pco])
+            .include_float([FloatCode::Pco])
+            .build();
+
+        self.compressor = Some(Arc::new(btrblocks));
         self
     }
 
@@ -257,24 +256,15 @@ impl WriteStrategyBuilder {
         };
 
         // 7. for each chunk create a flat layout
-        let chunked = ChunkedLayoutStrategy::new(Arc::clone(&flat));
+        let chunked = ChunkedLayoutStrategy::new(flat.clone());
         // 6. buffer chunks so they end up with closer segment ids physically
         let buffered = BufferedStrategy::new(chunked, 2 * ONE_MEG); // 2MB
-
-        // 5. compress each chunk.
-        // Exclude IntDictScheme from the data compressor because DictStrategy (step 3) already
-        // dictionary-encodes columns. Allowing IntDictScheme here would redundantly
-        // dictionary-encode the integer codes produced by that earlier step.
-        let data_compressor: Arc<dyn CompressorPlugin> = match &self.compressor {
-            CompressorConfig::BtrBlocks(builder) => Arc::new(
-                builder
-                    .clone()
-                    .exclude_schemes([IntDictScheme.id()])
-                    .build(),
-            ),
-            CompressorConfig::Opaque(compressor) => Arc::clone(compressor),
+        // 5. compress each chunk
+        let compressing = if let Some(ref compressor) = self.compressor {
+            CompressingStrategy::new_opaque(buffered, compressor.clone())
+        } else {
+            CompressingStrategy::new_btrblocks(buffered, true)
         };
-        let compressing = CompressingStrategy::new(buffered, data_compressor);
 
         // 4. prior to compression, coalesce up to a minimum size
         let coalescing = RepartitionStrategy::new(
@@ -294,11 +284,11 @@ impl WriteStrategyBuilder {
         );
 
         // 2.1. | 3.1. compress stats tables and dict values.
-        let stats_compressor: Arc<dyn CompressorPlugin> = match self.compressor {
-            CompressorConfig::BtrBlocks(builder) => Arc::new(builder.build()),
-            CompressorConfig::Opaque(compressor) => compressor,
+        let compress_then_flat = if let Some(ref compressor) = self.compressor {
+            CompressingStrategy::new_opaque(flat, compressor.clone())
+        } else {
+            CompressingStrategy::new_btrblocks(flat, false)
         };
-        let compress_then_flat = CompressingStrategy::new(flat, stats_compressor);
 
         // 3. apply dict encoding or fallback
         let dict = DictStrategy::new(

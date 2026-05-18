@@ -18,7 +18,6 @@ mod encoding;
 mod flatbuffers;
 mod layout;
 mod reader;
-pub mod scan;
 pub mod segments;
 pub mod sequence;
 pub mod session;

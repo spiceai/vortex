@@ -3,18 +3,16 @@
 
 use pyo3::prelude::*;
 use vortex::array::IntoArray;
-use vortex::array::LEGACY_SESSION;
-use vortex::array::VortexSessionExecute;
-use vortex::array::arrays::Dict;
-use vortex::array::arrays::PrimitiveArray;
-use vortex::encodings::alp::ALP;
-use vortex::encodings::alp::ALPRD;
-use vortex::encodings::datetime_parts::DateTimeParts;
-use vortex::encodings::fsst::FSST;
-use vortex::encodings::runend::RunEnd;
-use vortex::encodings::sequence::Sequence;
-use vortex::encodings::sparse::Sparse;
-use vortex::encodings::zigzag::ZigZag;
+use vortex::array::ToCanonical;
+use vortex::array::arrays::DictVTable;
+use vortex::encodings::alp::ALPRDVTable;
+use vortex::encodings::alp::ALPVTable;
+use vortex::encodings::datetime_parts::DateTimePartsVTable;
+use vortex::encodings::fsst::FSSTVTable;
+use vortex::encodings::runend::RunEndVTable;
+use vortex::encodings::sequence::SequenceVTable;
+use vortex::encodings::sparse::SparseVTable;
+use vortex::encodings::zigzag::ZigZagVTable;
 use vortex::encodings::zigzag::zigzag_encode;
 
 use crate::PyVortex;
@@ -28,7 +26,7 @@ use crate::error::PyVortexResult;
 pub(crate) struct PyAlpArray;
 
 impl EncodingSubclass for PyAlpArray {
-    type VTable = ALP;
+    type VTable = ALPVTable;
 }
 
 /// Concrete class for arrays with `vortex.alprd` encoding.
@@ -36,7 +34,7 @@ impl EncodingSubclass for PyAlpArray {
 pub(crate) struct PyAlpRdArray;
 
 impl EncodingSubclass for PyAlpRdArray {
-    type VTable = ALPRD;
+    type VTable = ALPRDVTable;
 }
 
 /// Concrete class for arrays with `vortex.datetimeparts` encoding.
@@ -44,7 +42,7 @@ impl EncodingSubclass for PyAlpRdArray {
 pub(crate) struct PyDateTimePartsArray;
 
 impl EncodingSubclass for PyDateTimePartsArray {
-    type VTable = DateTimeParts;
+    type VTable = DateTimePartsVTable;
 }
 
 /// Concrete class for arrays with `vortex.dict` encoding.
@@ -52,7 +50,7 @@ impl EncodingSubclass for PyDateTimePartsArray {
 pub(crate) struct PyDictArray;
 
 impl EncodingSubclass for PyDictArray {
-    type VTable = Dict;
+    type VTable = DictVTable;
 }
 
 /// Concrete class for arrays with `vortex.fsst` encoding.
@@ -60,7 +58,7 @@ impl EncodingSubclass for PyDictArray {
 pub(crate) struct PyFsstArray;
 
 impl EncodingSubclass for PyFsstArray {
-    type VTable = FSST;
+    type VTable = FSSTVTable;
 }
 
 /// Concrete class for arrays with `vortex.runend` encoding.
@@ -68,7 +66,7 @@ impl EncodingSubclass for PyFsstArray {
 pub(crate) struct PyRunEndArray;
 
 impl EncodingSubclass for PyRunEndArray {
-    type VTable = RunEnd;
+    type VTable = RunEndVTable;
 }
 
 /// Concrete class for arrays with `vortex.sparse` encoding.
@@ -76,7 +74,7 @@ impl EncodingSubclass for PyRunEndArray {
 pub(crate) struct PySparseArray;
 
 impl EncodingSubclass for PySparseArray {
-    type VTable = Sparse;
+    type VTable = SparseVTable;
 }
 
 /// Concrete class for arrays with `vortex.zigzag` encoding.
@@ -84,19 +82,16 @@ impl EncodingSubclass for PySparseArray {
 pub(crate) struct PyZigZagArray;
 
 impl EncodingSubclass for PyZigZagArray {
-    type VTable = ZigZag;
+    type VTable = ZigZagVTable;
 }
 
 #[pymethods]
 impl PyZigZagArray {
     #[staticmethod]
     pub fn encode(array: PyArrayRef) -> PyVortexResult<PyArrayRef> {
-        // PyZigZagArray (and PyArrayRef) do not currently carry a VortexSession;
-        // threading one through would change the FromPyObject contract. Use
-        // LEGACY_SESSION until the wrappers are refactored.
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
-        let primitive = array.inner().clone().execute::<PrimitiveArray>(&mut ctx)?;
-        Ok(PyVortex(zigzag_encode(primitive.as_view())?.into_array()))
+        Ok(PyVortex(
+            zigzag_encode(array.inner().clone().to_primitive())?.into_array(),
+        ))
     }
 }
 
@@ -105,5 +100,5 @@ impl PyZigZagArray {
 pub(crate) struct PySequenceArray;
 
 impl EncodingSubclass for PySequenceArray {
-    type VTable = Sequence;
+    type VTable = SequenceVTable;
 }

@@ -2,7 +2,6 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::ptr;
-use std::sync::Arc;
 
 use vortex::array::iter::ArrayIterator;
 
@@ -42,7 +41,7 @@ pub unsafe extern "C-unwind" fn vx_array_iterator_next(
         let element = iter.next();
 
         if let Some(element) = element {
-            Ok(vx_array::new(Arc::new(element?)))
+            Ok(vx_array::new(element?))
         } else {
             // Drop the iter pointer.
             Ok(ptr::null_mut())

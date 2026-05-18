@@ -32,7 +32,7 @@ mod tests {
         type NativeValue<'a> = &'a str;
 
         fn id(&self) -> ExtId {
-            ExtId::new("apples")
+            ExtId::new_ref("apples")
         }
 
         fn serialize_metadata(&self, _metadata: &Self::Metadata) -> VortexResult<Vec<u8>> {
@@ -43,12 +43,18 @@ mod tests {
             Ok(0)
         }
 
-        fn validate_dtype(_ext_dtype: &ExtDType<Self>) -> VortexResult<()> {
+        fn validate_dtype(
+            &self,
+            _options: &Self::Metadata,
+            _storage_dtype: &DType,
+        ) -> VortexResult<()> {
             Ok(())
         }
 
         fn unpack_native<'a>(
-            _ext_dtype: &'a ExtDType<Self>,
+            &self,
+            _metadata: &'a Self::Metadata,
+            _storage_dtype: &'a DType,
             _storage_value: &'a ScalarValue,
         ) -> VortexResult<Self::NativeValue<'a>> {
             Ok("")
@@ -152,7 +158,7 @@ mod tests {
             Some(ScalarValue::Primitive(PValue::F32(f32_value))),
         ];
 
-        let scalar = Scalar::new(struct_dtype, Some(ScalarValue::Tuple(field_values)));
+        let scalar = Scalar::new(struct_dtype, Some(ScalarValue::List(field_values)));
 
         let struct_scalar = scalar.as_struct();
         let fields: Vec<_> = (0..3)
@@ -209,7 +215,7 @@ mod tests {
             ))),
         ];
 
-        let scalar = Scalar::new(list_dtype, Some(ScalarValue::Tuple(elements)));
+        let scalar = Scalar::new(list_dtype, Some(ScalarValue::List(elements)));
 
         let list_scalar = scalar.as_list();
         let elements = list_scalar.elements().unwrap();
@@ -247,7 +253,7 @@ mod tests {
             type NativeValue<'a> = &'a str;
 
             fn id(&self) -> ExtId {
-                ExtId::new("f16_ext")
+                ExtId::new_ref("f16_ext")
             }
 
             fn serialize_metadata(&self, _metadata: &Self::Metadata) -> VortexResult<Vec<u8>> {
@@ -258,12 +264,18 @@ mod tests {
                 vortex_bail!("not implemented")
             }
 
-            fn validate_dtype(_ext_dtype: &ExtDType<Self>) -> VortexResult<()> {
+            fn validate_dtype(
+                &self,
+                _options: &Self::Metadata,
+                _storage_dtype: &DType,
+            ) -> VortexResult<()> {
                 Ok(())
             }
 
             fn unpack_native<'a>(
-                _ext_dtype: &'a ExtDType<Self>,
+                &self,
+                _metadata: &'a Self::Metadata,
+                _storage_dtype: &'a DType,
                 _storage_value: &'a ScalarValue,
             ) -> VortexResult<Self::NativeValue<'a>> {
                 Ok("")
@@ -304,7 +316,7 @@ mod tests {
             type NativeValue<'a> = &'a str;
 
             fn id(&self) -> ExtId {
-                ExtId::new("struct_ext")
+                ExtId::new_ref("struct_ext")
             }
 
             fn serialize_metadata(&self, _metadata: &Self::Metadata) -> VortexResult<Vec<u8>> {
@@ -315,12 +327,18 @@ mod tests {
                 vortex_bail!("not implemented")
             }
 
-            fn validate_dtype(_ext_dtype: &ExtDType<Self>) -> VortexResult<()> {
+            fn validate_dtype(
+                &self,
+                _options: &Self::Metadata,
+                _storage_dtype: &DType,
+            ) -> VortexResult<()> {
                 Ok(())
             }
 
             fn unpack_native<'a>(
-                _ext_dtype: &'a ExtDType<Self>,
+                &self,
+                _metadata: &'a Self::Metadata,
+                _storage_dtype: &'a DType,
                 _storage_value: &'a ScalarValue,
             ) -> VortexResult<Self::NativeValue<'a>> {
                 Ok("")
@@ -353,7 +371,7 @@ mod tests {
 
         let scalar = Scalar::new(
             DType::Extension(ext_dtype.erased()),
-            Some(ScalarValue::Tuple(field_values)),
+            Some(ScalarValue::List(field_values)),
         );
 
         // Verify the struct field was coerced

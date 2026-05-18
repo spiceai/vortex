@@ -137,7 +137,7 @@ impl SegmentCacheSourceAdapter {
 
 impl SegmentSource for SegmentCacheSourceAdapter {
     fn request(&self, id: SegmentId) -> SegmentFuture {
-        let cache = Arc::clone(&self.cache);
+        let cache = self.cache.clone();
         let delegate = self.source.request(id);
 
         async move {

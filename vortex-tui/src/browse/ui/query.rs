@@ -23,8 +23,8 @@ use ratatui::widgets::StatefulWidget;
 use ratatui::widgets::Table;
 use ratatui::widgets::TableState;
 use ratatui::widgets::Widget;
-use tokio::sync::oneshot;
-use vortex::session::VortexSession;
+use tokio::runtime::Handle;
+use tokio::task::block_in_place;
 
 use crate::browse::app::AppState;
 use crate::datafusion_helper::arrow_value_to_json;
@@ -73,12 +73,6 @@ pub enum QueryFocus {
     ResultsTable,
 }
 
-/// Result from a background query task.
-pub(crate) struct PendingQueryResult {
-    pub row_count: Option<Result<usize, String>>,
-    pub query_result: Result<QueryResults, String>,
-}
-
 /// State for the SQL query interface.
 pub struct QueryState {
     /// The SQL query input text.
@@ -111,12 +105,6 @@ pub struct QueryState {
     pub base_query: String,
     /// ORDER BY clause if any.
     pub order_clause: Option<String>,
-    /// Whether a query execution is pending (needs to be spawned).
-    pending_execution: bool,
-    /// Whether a row count query is needed on next spawn.
-    needs_row_count: bool,
-    /// Receiver for in-flight background query result.
-    pub(crate) pending_rx: Option<oneshot::Receiver<PendingQueryResult>>,
 }
 
 impl Default for QueryState {
@@ -138,9 +126,6 @@ impl Default for QueryState {
             total_row_count: None,
             base_query: "SELECT * FROM data".to_string(),
             order_clause: None,
-            pending_execution: false,
-            needs_row_count: false,
-            pending_rx: None,
         }
     }
 }
@@ -203,8 +188,13 @@ impl QueryState {
         };
     }
 
-    /// Prepare initial query - parses SQL, sets flags for async execution.
-    pub fn prepare_initial_query(&mut self) {
+    /// Execute initial query - parses SQL, gets total count, fetches first page.
+    pub fn execute_initial_query(
+        &mut self,
+        session: &vortex::session::VortexSession,
+        file_path: &str,
+    ) {
+        self.running = true;
         self.error = None;
 
         // Parse the SQL to extract base query, order clause, and page size
@@ -214,24 +204,27 @@ impl QueryState {
         self.page_size = limit.unwrap_or(20);
         self.current_page = 0;
 
-        self.needs_row_count = true;
-        self.rebuild_sql();
+        // Get total row count
+        self.total_row_count = get_row_count(session, file_path, &self.base_query).ok();
+
+        // Build and execute the query
+        self.rebuild_and_execute(session, file_path);
     }
 
-    /// Prepare navigation to next page.
-    pub fn prepare_next_page(&mut self) {
+    /// Navigate to next page.
+    pub fn next_page(&mut self, session: &vortex::session::VortexSession, file_path: &str) {
         let total_pages = self.total_pages();
         if self.current_page + 1 < total_pages {
             self.current_page += 1;
-            self.rebuild_sql();
+            self.rebuild_and_execute(session, file_path);
         }
     }
 
-    /// Prepare navigation to previous page.
-    pub fn prepare_prev_page(&mut self) {
+    /// Navigate to previous page.
+    pub fn prev_page(&mut self, session: &vortex::session::VortexSession, file_path: &str) {
         if self.current_page > 0 {
             self.current_page -= 1;
-            self.rebuild_sql();
+            self.rebuild_and_execute(session, file_path);
         }
     }
 
@@ -243,8 +236,8 @@ impl QueryState {
         }
     }
 
-    /// Build SQL query from current state and set the pending execution flag.
-    fn rebuild_sql(&mut self) {
+    /// Build SQL query from current state and execute it.
+    fn rebuild_and_execute(&mut self, session: &vortex::session::VortexSession, file_path: &str) {
         let offset = self.current_page * self.page_size;
 
         let new_sql = match &self.order_clause {
@@ -267,49 +260,8 @@ impl QueryState {
 
         self.running = true;
         self.error = None;
-        self.pending_execution = true;
-    }
 
-    /// Spawn a background task for the pending query, if any.
-    ///
-    /// After calling `prepare_*` methods, call this to kick off execution.
-    /// The result will arrive on [`pending_rx`] and should be applied with
-    /// [`apply_query_result`].
-    pub(crate) fn spawn_pending(&mut self, session: &VortexSession, file_path: &str) {
-        if !self.pending_execution {
-            return;
-        }
-        self.pending_execution = false;
-
-        let (tx, rx) = oneshot::channel();
-        let session = session.clone();
-        let file_path = file_path.to_string();
-        let sql = self.sql_input.clone();
-        let base_query = self.base_query.clone();
-        let needs_row_count = self.needs_row_count;
-        self.needs_row_count = false;
-
-        tokio::spawn(async move {
-            let row_count = match needs_row_count {
-                true => Some(get_row_count(&session, &file_path, &base_query).await),
-                false => None,
-            };
-            let query_result = execute_query(&session, &file_path, &sql).await;
-            drop(tx.send(PendingQueryResult {
-                row_count,
-                query_result,
-            }));
-        });
-
-        self.pending_rx = Some(rx);
-    }
-
-    /// Apply a completed background query result to the state.
-    pub(crate) fn apply_query_result(&mut self, result: PendingQueryResult) {
-        if let Some(row_count) = result.row_count {
-            self.total_row_count = row_count.ok();
-        }
-        match result.query_result {
+        match execute_query(session, file_path, &self.sql_input) {
             Ok(results) => {
                 self.results = Some(results);
                 self.table_state.select(Some(0));
@@ -394,8 +346,13 @@ impl QueryState {
             .unwrap_or(0)
     }
 
-    /// Prepare sort on a column by modifying the ORDER BY clause and setting execution flag.
-    pub fn prepare_sort(&mut self, column: usize) {
+    /// Apply sort on a column by modifying the ORDER BY clause and re-executing.
+    pub fn apply_sort(
+        &mut self,
+        session: &vortex::session::VortexSession,
+        column: usize,
+        file_path: &str,
+    ) {
         // Get the column name from results
         let column_name = match &self.results {
             Some(results) if column < results.column_names.len() => {
@@ -427,9 +384,9 @@ impl QueryState {
             Some(format!("ORDER BY \"{column_name}\" {direction}"))
         };
 
-        // Reset to first page and set pending execution
+        // Reset to first page and re-execute
         self.current_page = 0;
-        self.rebuild_sql();
+        self.rebuild_and_execute(session, file_path);
     }
 }
 
@@ -441,56 +398,64 @@ pub struct QueryResults {
 }
 
 /// Execute a SQL query against the Vortex file.
-async fn execute_query(
-    session: &VortexSession,
+pub fn execute_query(
+    session: &vortex::session::VortexSession,
     file_path: &str,
     sql: &str,
 ) -> Result<QueryResults, String> {
-    let batches = execute_vortex_query(session, file_path, sql).await?;
+    block_in_place(|| {
+        Handle::current().block_on(async {
+            let batches = execute_vortex_query(session, file_path, sql).await?;
 
-    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
-    let column_names = if let Some(batch) = batches.first() {
-        let schema = batch.schema();
-        schema.fields().iter().map(|f| f.name().clone()).collect()
-    } else {
-        vec![]
-    };
+            let column_names = if let Some(batch) = batches.first() {
+                let schema = batch.schema();
+                schema.fields().iter().map(|f| f.name().clone()).collect()
+            } else {
+                vec![]
+            };
 
-    Ok(QueryResults {
-        batches,
-        total_rows,
-        column_names,
+            Ok(QueryResults {
+                batches,
+                total_rows,
+                column_names,
+            })
+        })
     })
 }
 
 /// Get total row count for a base query using COUNT(*).
-async fn get_row_count(
-    session: &VortexSession,
+pub fn get_row_count(
+    session: &vortex::session::VortexSession,
     file_path: &str,
     base_query: &str,
 ) -> Result<usize, String> {
-    let count_sql = format!("SELECT COUNT(*) as count FROM ({base_query}) AS subquery");
+    block_in_place(|| {
+        Handle::current().block_on(async {
+            let count_sql = format!("SELECT COUNT(*) as count FROM ({base_query}) AS subquery");
 
-    let batches = execute_vortex_query(session, file_path, &count_sql).await?;
+            let batches = execute_vortex_query(session, file_path, &count_sql).await?;
 
-    // Extract count from result
-    if let Some(batch) = batches.first()
-        && batch.num_rows() > 0
-        && batch.num_columns() > 0
-    {
-        use arrow_array::Int64Array;
-        if let Some(arr) = batch.column(0).as_any().downcast_ref::<Int64Array>() {
-            #[expect(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-            return Ok(arr.value(0) as usize);
-        }
-    }
+            // Extract count from result
+            if let Some(batch) = batches.first()
+                && batch.num_rows() > 0
+                && batch.num_columns() > 0
+            {
+                use arrow_array::Int64Array;
+                if let Some(arr) = batch.column(0).as_any().downcast_ref::<Int64Array>() {
+                    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                    return Ok(arr.value(0) as usize);
+                }
+            }
 
-    Ok(0)
+            Ok(0)
+        })
+    })
 }
 
 /// Render the Query tab UI.
-pub fn render_query(app: &mut AppState, area: Rect, buf: &mut Buffer) {
+pub fn render_query(app: &mut AppState<'_>, area: Rect, buf: &mut Buffer) {
     let [input_area, results_area] =
         Layout::vertical([Constraint::Length(5), Constraint::Min(10)]).areas(area);
 
@@ -498,7 +463,7 @@ pub fn render_query(app: &mut AppState, area: Rect, buf: &mut Buffer) {
     render_results_table(app, results_area, buf);
 }
 
-fn render_sql_input(app: &mut AppState, area: Rect, buf: &mut Buffer) {
+fn render_sql_input(app: &mut AppState<'_>, area: Rect, buf: &mut Buffer) {
     let is_focused = app.query_state.focus == QueryFocus::SqlInput;
 
     let border_color = if is_focused {
@@ -550,7 +515,7 @@ fn render_sql_input(app: &mut AppState, area: Rect, buf: &mut Buffer) {
     paragraph.render(inner, buf);
 }
 
-fn render_results_table(app: &mut AppState, area: Rect, buf: &mut Buffer) {
+fn render_results_table(app: &mut AppState<'_>, area: Rect, buf: &mut Buffer) {
     let is_focused = app.query_state.focus == QueryFocus::ResultsTable;
 
     let border_color = if is_focused {
@@ -562,9 +527,9 @@ fn render_results_table(app: &mut AppState, area: Rect, buf: &mut Buffer) {
     // Show status in title
     let title = if app.query_state.running {
         "Results (running...)".to_string()
-    } else if let Some(error) = &app.query_state.error {
+    } else if let Some(ref error) = app.query_state.error {
         format!("Results (error: {})", truncate_str(error, 50))
-    } else if let Some(_results) = &app.query_state.results {
+    } else if let Some(ref _results) = app.query_state.results {
         let total_rows = app.query_state.total_row_count.unwrap_or(0);
         let total_pages = app.query_state.total_pages();
         format!(
@@ -586,7 +551,7 @@ fn render_results_table(app: &mut AppState, area: Rect, buf: &mut Buffer) {
     let inner = block.inner(area);
     block.render(area, buf);
 
-    if let Some(error) = &app.query_state.error {
+    if let Some(ref error) = app.query_state.error {
         let error_text = Paragraph::new(error.as_str())
             .style(Style::default().fg(Color::Red))
             .wrap(ratatui::widgets::Wrap { trim: true });
@@ -594,7 +559,7 @@ fn render_results_table(app: &mut AppState, area: Rect, buf: &mut Buffer) {
         return;
     }
 
-    let Some(results) = &app.query_state.results else {
+    let Some(ref results) = app.query_state.results else {
         let help = Paragraph::new("Enter a SQL query above and press Enter to execute.\nThe table is available as 'data'.\n\nExample: SELECT * FROM data WHERE column > 10 LIMIT 100")
             .style(Style::default().fg(Color::Gray));
         help.render(inner, buf);
@@ -637,7 +602,7 @@ fn render_results_table(app: &mut AppState, area: Rect, buf: &mut Buffer) {
     let rows = get_all_rows(results, &app.query_state);
 
     // Calculate column widths
-    #[expect(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation)]
     let widths: Vec<Constraint> = results
         .column_names
         .iter()

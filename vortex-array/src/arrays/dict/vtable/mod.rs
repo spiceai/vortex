@@ -1,146 +1,101 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::hash::Hasher;
-
 use kernel::PARENT_KERNELS;
-use prost::Message;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
-use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
-use vortex_session::registry::CachedId;
 
-use super::DictData;
+use super::DictArray;
 use super::DictMetadata;
-use super::DictOwnedExt;
-use super::DictParts;
-use super::array::DictSlots;
-use super::array::DictSlotsView;
-use crate::AnyCanonical;
-use crate::ArrayEq;
-use crate::ArrayHash;
+use super::take_canonical;
+use crate::Array;
 use crate::ArrayRef;
 use crate::Canonical;
-use crate::Precision;
-use crate::array::Array;
-use crate::array::ArrayId;
-use crate::array::ArrayParts;
-use crate::array::ArrayView;
-use crate::array::VTable;
+use crate::DeserializeMetadata;
+use crate::IntoArray;
+use crate::ProstMetadata;
+use crate::SerializeMetadata;
 use crate::arrays::ConstantArray;
-use crate::arrays::Primitive;
-use crate::arrays::dict::DictArrayExt;
-use crate::arrays::dict::DictArraySlotsExt;
 use crate::arrays::dict::compute::rules::PARENT_RULES;
-use crate::arrays::dict::execute::take_canonical;
 use crate::buffer::BufferHandle;
 use crate::dtype::DType;
 use crate::dtype::Nullability;
 use crate::dtype::PType;
 use crate::executor::ExecutionCtx;
-use crate::executor::ExecutionResult;
-use crate::require_child;
 use crate::scalar::Scalar;
 use crate::serde::ArrayChildren;
-use crate::validity::Validity;
+use crate::vtable;
+use crate::vtable::ArrayId;
+use crate::vtable::VTable;
 
+mod array;
 mod kernel;
 mod operations;
 mod validity;
+mod visitor;
 
-/// A [`Dict`]-encoded Vortex array.
-pub type DictArray = Array<Dict>;
+vtable!(Dict);
 
-#[derive(Clone, Debug)]
-pub struct Dict;
+#[derive(Debug)]
+pub struct DictVTable;
 
-impl ArrayHash for DictData {
-    fn array_hash<H: Hasher>(&self, _state: &mut H, _precision: Precision) {}
+impl DictVTable {
+    pub const ID: ArrayId = ArrayId::new_ref("vortex.dict");
 }
 
-impl ArrayEq for DictData {
-    fn array_eq(&self, _other: &Self, _precision: Precision) -> bool {
-        true
-    }
-}
+impl VTable for DictVTable {
+    type Array = DictArray;
 
-impl VTable for Dict {
-    type ArrayData = DictData;
+    type Metadata = ProstMetadata<DictMetadata>;
 
+    type ArrayVTable = Self;
     type OperationsVTable = Self;
     type ValidityVTable = Self;
+    type VisitorVTable = Self;
 
-    fn id(&self) -> ArrayId {
-        static ID: CachedId = CachedId::new("vortex.dict");
-        *ID
+    fn id(_array: &Self::Array) -> ArrayId {
+        Self::ID
     }
 
-    fn validate(
-        &self,
-        _data: &DictData,
-        dtype: &DType,
-        len: usize,
-        slots: &[Option<ArrayRef>],
-    ) -> VortexResult<()> {
-        let view = DictSlotsView::from_slots(slots);
-        let codes = view.codes;
-        let values = view.values;
-        vortex_ensure!(codes.len() == len, "DictArray codes length mismatch");
-        vortex_ensure!(
-            values
-                .dtype()
-                .union_nullability(codes.dtype().nullability())
-                == *dtype,
-            "DictArray dtype does not match codes/values dtype"
-        );
-        Ok(())
+    fn metadata(array: &DictArray) -> VortexResult<Self::Metadata> {
+        Ok(ProstMetadata(DictMetadata {
+            codes_ptype: PType::try_from(array.codes().dtype())? as i32,
+            values_len: u32::try_from(array.values().len()).map_err(|_| {
+                vortex_err!(
+                    "Dictionary values size {} overflowed u32",
+                    array.values().len()
+                )
+            })?,
+            is_nullable_codes: Some(array.codes().dtype().is_nullable()),
+            all_values_referenced: Some(array.all_values_referenced),
+        }))
     }
 
-    fn nbuffers(_array: ArrayView<'_, Self>) -> usize {
-        0
-    }
-
-    fn buffer(_array: ArrayView<'_, Self>, idx: usize) -> BufferHandle {
-        vortex_panic!("DictArray buffer index {idx} out of bounds")
-    }
-
-    fn buffer_name(_array: ArrayView<'_, Self>, _idx: usize) -> Option<String> {
-        None
-    }
-
-    fn serialize(
-        array: ArrayView<'_, Self>,
-        _session: &VortexSession,
-    ) -> VortexResult<Option<Vec<u8>>> {
-        Ok(Some(
-            DictMetadata {
-                codes_ptype: PType::try_from(array.codes().dtype())? as i32,
-                values_len: u32::try_from(array.values().len()).map_err(|_| {
-                    vortex_err!(
-                        "Dictionary values size {} overflowed u32",
-                        array.values().len()
-                    )
-                })?,
-                is_nullable_codes: Some(array.codes().dtype().is_nullable()),
-                all_values_referenced: Some(array.has_all_values_referenced()),
-            }
-            .encode_to_vec(),
-        ))
+    fn serialize(metadata: Self::Metadata) -> VortexResult<Option<Vec<u8>>> {
+        Ok(Some(metadata.serialize()))
     }
 
     fn deserialize(
-        &self,
+        bytes: &[u8],
+        _dtype: &DType,
+        _len: usize,
+        _buffers: &[BufferHandle],
+        _session: &VortexSession,
+    ) -> VortexResult<Self::Metadata> {
+        let metadata = <Self::Metadata as DeserializeMetadata>::deserialize(bytes)?;
+        Ok(ProstMetadata(metadata))
+    }
+
+    fn build(
         dtype: &DType,
         len: usize,
-        metadata: &[u8],
+        metadata: &Self::Metadata,
         _buffers: &[BufferHandle],
         children: &dyn ArrayChildren,
-        _session: &VortexSession,
-    ) -> VortexResult<ArrayParts<Self>> {
-        let metadata = DictMetadata::decode(metadata)?;
+    ) -> VortexResult<DictArray> {
         if children.len() != 2 {
             vortex_bail!(
                 "Expected 2 children for dict encoding, found {}",
@@ -158,46 +113,49 @@ impl VTable for Dict {
         let values = children.get(1, dtype, metadata.values_len as usize)?;
         let all_values_referenced = metadata.all_values_referenced.unwrap_or(false);
 
-        Ok(ArrayParts::new(self.clone(), dtype.clone(), len, unsafe {
-            DictData::new_unchecked().set_all_values_referenced(all_values_referenced)
+        // SAFETY: We've validated the metadata and children.
+        Ok(unsafe {
+            DictArray::new_unchecked(codes, values).set_all_values_referenced(all_values_referenced)
         })
-        .with_slots(vec![Some(codes), Some(values)]))
     }
 
-    fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {
-        DictSlots::NAMES[idx].to_string()
+    fn with_children(array: &mut Self::Array, children: Vec<ArrayRef>) -> VortexResult<()> {
+        vortex_ensure!(
+            children.len() == 2,
+            "DictArray expects exactly 2 children (codes, values), got {}",
+            children.len()
+        );
+        let [codes, values]: [ArrayRef; 2] = children
+            .try_into()
+            .map_err(|_| vortex_err!("Failed to convert children to array"))?;
+        array.codes = codes;
+        array.values = values;
+        Ok(())
     }
 
-    fn execute(array: Array<Self>, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
-        if array.is_empty() {
-            let result_dtype = array
-                .dtype()
-                .union_nullability(array.codes().dtype().nullability());
-            return Ok(ExecutionResult::done(Canonical::empty(&result_dtype)));
+    fn execute(array: &Self::Array, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
+        if let Some(canonical) = execute_fast_path(array, ctx)? {
+            return Ok(canonical);
         }
 
-        let array = require_child!(array, array.codes(), DictSlots::CODES => Primitive);
+        // TODO(joe): if the values are constant return a constant
+        let values = array.values().clone().execute::<Canonical>(ctx)?;
+        let codes = array
+            .codes()
+            .clone()
+            .execute::<Canonical>(ctx)?
+            .into_primitive();
 
-        if matches!(array.codes().validity()?, Validity::AllInvalid) {
-            return Ok(ExecutionResult::done(ConstantArray::new(
-                Scalar::null(array.dtype().as_nullable()),
-                array.codes().len(),
-            )));
-        }
+        // TODO(ngates): if indices are sorted and unique (strict-sorted), then we should delegate to
+        //  the filter function since they're typically optimised for this case.
+        // TODO(ngates): if indices min is quite high, we could slice self and offset the indices
+        //  such that canonicalize does less work.
 
-        let array = require_child!(array, array.values(), DictSlots::VALUES => AnyCanonical);
-
-        let DictParts { values, codes, .. } = array.into_parts();
-
-        Ok(ExecutionResult::done(take_canonical(
-            values.as_::<AnyCanonical>(),
-            &codes.downcast::<Primitive>(),
-            ctx,
-        )?))
+        Ok(take_canonical(values, &codes, ctx)?.into_array())
     }
 
     fn reduce_parent(
-        array: ArrayView<'_, Self>,
+        array: &Self::Array,
         parent: &ArrayRef,
         child_idx: usize,
     ) -> VortexResult<Option<ArrayRef>> {
@@ -205,11 +163,35 @@ impl VTable for Dict {
     }
 
     fn execute_parent(
-        array: ArrayView<'_, Self>,
+        array: &Self::Array,
         parent: &ArrayRef,
         child_idx: usize,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
         PARENT_KERNELS.execute(array, parent, child_idx, ctx)
     }
+}
+
+/// Check for fast-path execution conditions.
+pub(super) fn execute_fast_path(
+    array: &DictArray,
+    _ctx: &mut ExecutionCtx,
+) -> VortexResult<Option<ArrayRef>> {
+    // Empty array - nothing to do
+    if array.is_empty() {
+        let result_dtype = array
+            .dtype()
+            .union_nullability(array.codes().dtype().nullability());
+        return Ok(Some(Canonical::empty(&result_dtype).into_array()));
+    }
+
+    // All codes are null - result is all nulls
+    if array.codes.all_invalid()? {
+        return Ok(Some(
+            ConstantArray::new(Scalar::null(array.dtype().as_nullable()), array.codes.len())
+                .into_array(),
+        ));
+    }
+
+    Ok(None)
 }

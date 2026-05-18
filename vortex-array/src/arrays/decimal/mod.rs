@@ -2,16 +2,14 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 mod array;
-pub use array::DecimalArrayExt;
-pub use array::DecimalData;
-pub use array::DecimalDataParts;
-pub use vtable::DecimalArray;
+pub use array::DecimalArray;
+pub use array::DecimalArrayParts;
 
 pub(crate) mod compute;
 
 mod vtable;
 pub use compute::rules::DecimalMaskedValidityRule;
-pub use vtable::Decimal;
+pub use vtable::DecimalVTable;
 
 mod utils;
 pub use utils::*;

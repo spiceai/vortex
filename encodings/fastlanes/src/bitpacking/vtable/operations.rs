@@ -1,21 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use vortex_array::ArrayView;
-use vortex_array::ExecutionCtx;
 use vortex_array::scalar::Scalar;
 use vortex_array::vtable::OperationsVTable;
 use vortex_error::VortexResult;
 
-use crate::BitPacked;
+use crate::BitPackedArray;
+use crate::BitPackedVTable;
 use crate::bitpack_decompress;
-use crate::bitpacking::array::BitPackedArrayExt;
-impl OperationsVTable<BitPacked> for BitPacked {
-    fn scalar_at(
-        array: ArrayView<'_, BitPacked>,
-        index: usize,
-        _ctx: &mut ExecutionCtx,
-    ) -> VortexResult<Scalar> {
+
+impl OperationsVTable<BitPackedVTable> for BitPackedVTable {
+    fn scalar_at(array: &BitPackedArray, index: usize) -> VortexResult<Scalar> {
         Ok(
             if let Some(patches) = array.patches()
                 && let Some(patch) = patches.get_patched(index)?
@@ -31,10 +26,10 @@ impl OperationsVTable<BitPacked> for BitPacked {
 #[cfg(test)]
 mod test {
     use std::ops::Range;
+    use std::sync::LazyLock;
 
-    use vortex_array::ArrayRef;
+    use vortex_array::Array;
     use vortex_array::IntoArray;
-    use vortex_array::LEGACY_SESSION;
     use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::arrays::SliceArray;
@@ -46,38 +41,42 @@ mod test {
     use vortex_array::dtype::PType;
     use vortex_array::patches::Patches;
     use vortex_array::scalar::Scalar;
+    use vortex_array::session::ArraySession;
     use vortex_array::validity::Validity;
+    use vortex_array::vtable::VTable;
     use vortex_buffer::Alignment;
     use vortex_buffer::Buffer;
     use vortex_buffer::ByteBuffer;
     use vortex_buffer::buffer;
 
-    use crate::BitPacked;
     use crate::BitPackedArray;
-    use crate::BitPackedData;
-    use crate::bitpacking::array::BitPackedArrayExt;
+    use crate::BitPackedVTable;
 
-    fn bp(array: &ArrayRef, bit_width: u8) -> BitPackedArray {
-        BitPackedData::encode(array, bit_width, &mut LEGACY_SESSION.create_execution_ctx()).unwrap()
-    }
+    static SESSION: LazyLock<vortex_session::VortexSession> =
+        LazyLock::new(|| vortex_session::VortexSession::empty().with::<ArraySession>());
 
-    fn slice_via_reduce(array: &BitPackedArray, range: Range<usize>) -> BitPackedArray {
-        let array_ref = array.clone().into_array();
-        let slice_array = SliceArray::new(array_ref.clone(), range);
-        let sliced = array_ref
-            .reduce_parent(&slice_array.into_array(), 0)
-            .expect("execute_parent failed")
-            .expect("expected slice kernel to execute");
-        sliced.as_::<BitPacked>().into_owned()
+    fn slice_via_kernel(array: &BitPackedArray, range: Range<usize>) -> BitPackedArray {
+        let slice_array = SliceArray::new(array.clone().into_array(), range);
+        let mut ctx = SESSION.create_execution_ctx();
+        let sliced = <BitPackedVTable as VTable>::execute_parent(
+            array,
+            &slice_array.into_array(),
+            0,
+            &mut ctx,
+        )
+        .expect("execute_parent failed")
+        .expect("expected slice kernel to execute");
+        sliced.as_::<BitPackedVTable>().clone()
     }
 
     #[test]
     pub fn slice_block() {
-        let arr = bp(
-            &PrimitiveArray::from_iter((0u32..2048).map(|v| v % 64)).into_array(),
+        let arr = BitPackedArray::encode(
+            PrimitiveArray::from_iter((0u32..2048).map(|v| v % 64)).as_ref(),
             6,
-        );
-        let sliced = slice_via_reduce(&arr, 1024..2048);
+        )
+        .unwrap();
+        let sliced = slice_via_kernel(&arr, 1024..2048);
         assert_nth_scalar!(sliced, 0, 1024u32 % 64);
         assert_nth_scalar!(sliced, 1023, 2047u32 % 64);
         assert_eq!(sliced.offset(), 0);
@@ -86,11 +85,12 @@ mod test {
 
     #[test]
     pub fn slice_within_block() {
-        let arr = bp(
-            &PrimitiveArray::from_iter((0u32..2048).map(|v| v % 64)).into_array(),
+        let arr = BitPackedArray::encode(
+            PrimitiveArray::from_iter((0u32..2048).map(|v| v % 64)).as_ref(),
             6,
-        );
-        let sliced = slice_via_reduce(&arr, 512..1434);
+        )
+        .unwrap();
+        let sliced = slice_via_kernel(&arr, 512..1434);
         assert_nth_scalar!(sliced, 0, 512u32 % 64);
         assert_nth_scalar!(sliced, 921, 1433u32 % 64);
         assert_eq!(sliced.offset(), 512);
@@ -99,10 +99,11 @@ mod test {
 
     #[test]
     fn slice_within_block_u8s() {
-        let packed = bp(
-            &PrimitiveArray::from_iter((0..10_000).map(|i| (i % 63) as u8)).into_array(),
+        let packed = BitPackedArray::encode(
+            PrimitiveArray::from_iter((0..10_000).map(|i| (i % 63) as u8)).as_ref(),
             7,
-        );
+        )
+        .unwrap();
 
         let compressed = packed.slice(768..9999).unwrap();
         assert_nth_scalar!(compressed, 0, (768 % 63) as u8);
@@ -111,10 +112,11 @@ mod test {
 
     #[test]
     fn slice_block_boundary_u8s() {
-        let packed = bp(
-            &PrimitiveArray::from_iter((0..10_000).map(|i| (i % 63) as u8)).into_array(),
+        let packed = BitPackedArray::encode(
+            PrimitiveArray::from_iter((0..10_000).map(|i| (i % 63) as u8)).as_ref(),
             7,
-        );
+        )
+        .unwrap();
 
         let compressed = packed.slice(7168..9216).unwrap();
         assert_nth_scalar!(compressed, 0, (7168 % 63) as u8);
@@ -123,16 +125,17 @@ mod test {
 
     #[test]
     fn double_slice_within_block() {
-        let arr = bp(
-            &PrimitiveArray::from_iter((0u32..2048).map(|v| v % 64)).into_array(),
+        let arr = BitPackedArray::encode(
+            PrimitiveArray::from_iter((0u32..2048).map(|v| v % 64)).as_ref(),
             6,
-        );
-        let sliced = slice_via_reduce(&arr, 512..1434);
+        )
+        .unwrap();
+        let sliced = slice_via_kernel(&arr, 512..1434);
         assert_nth_scalar!(sliced, 0, 512u32 % 64);
         assert_nth_scalar!(sliced, 921, 1433u32 % 64);
         assert_eq!(sliced.offset(), 512);
         assert_eq!(sliced.len(), 922);
-        let doubly_sliced = slice_via_reduce(&sliced, 127..911);
+        let doubly_sliced = slice_via_kernel(&sliced, 127..911);
         assert_nth_scalar!(doubly_sliced, 0, (512u32 + 127) % 64);
         assert_nth_scalar!(doubly_sliced, 783, (512u32 + 910) % 64);
         assert_eq!(doubly_sliced.offset(), 639);
@@ -141,9 +144,8 @@ mod test {
 
     #[test]
     fn slice_empty_patches() {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
         // We create an array that has 1 element that does not fit in the 6-bit range.
-        let array = BitPackedData::encode(&buffer![0u32..=64].into_array(), 6, &mut ctx).unwrap();
+        let array = BitPackedArray::encode(&buffer![0u32..=64].into_array(), 6).unwrap();
 
         assert!(array.patches().is_some());
 
@@ -151,7 +153,7 @@ mod test {
         assert_eq!(patch_indices.len(), 1);
 
         // Slicing drops the empty patches array.
-        let sliced_bp = slice_via_reduce(&array, 0..64);
+        let sliced_bp = slice_via_kernel(&array, 0..64);
         assert!(sliced_bp.patches().is_none());
     }
 
@@ -159,10 +161,9 @@ mod test {
     fn take_after_slice() {
         // Check that our take implementation respects the offsets applied after slicing.
 
-        let array = bp(
-            &PrimitiveArray::from_iter((63u32..).take(3072)).into_array(),
-            6,
-        );
+        let array =
+            BitPackedArray::encode(PrimitiveArray::from_iter((63u32..).take(3072)).as_ref(), 6)
+                .unwrap();
 
         // Slice the array.
         // The resulting array will still have 3 1024-element chunks.
@@ -181,53 +182,46 @@ mod test {
 
     #[test]
     fn scalar_at_invalid_patches() {
-        let packed_array = BitPacked::try_new(
-            BufferHandle::new_host(ByteBuffer::copy_from_aligned(
-                [0u8; 128],
-                Alignment::of::<u32>(),
-            )),
-            PType::U32,
-            Validity::AllInvalid,
-            Some(
-                Patches::new(
-                    8,
-                    0,
-                    buffer![1u32].into_array(),
-                    PrimitiveArray::new(buffer![999u32], Validity::AllValid).into_array(),
-                    None,
-                )
-                .unwrap(),
-            ),
-            1,
-            8,
-            0,
-        )
-        .unwrap()
-        .into_array();
+        let packed_array = unsafe {
+            BitPackedArray::new_unchecked(
+                BufferHandle::new_host(ByteBuffer::copy_from_aligned(
+                    [0u8; 128],
+                    Alignment::of::<u32>(),
+                )),
+                DType::Primitive(PType::U32, true.into()),
+                Validity::AllInvalid,
+                Some(
+                    Patches::new(
+                        8,
+                        0,
+                        buffer![1u32].into_array(),
+                        PrimitiveArray::new(buffer![999u32], Validity::AllValid).to_array(),
+                        None,
+                    )
+                    .unwrap(),
+                ),
+                1,
+                8,
+                0,
+            )
+            .into_array()
+        };
         assert_eq!(
-            packed_array
-                .execute_scalar(1, &mut LEGACY_SESSION.create_execution_ctx())
-                .unwrap(),
+            packed_array.scalar_at(1).unwrap(),
             Scalar::null(DType::Primitive(PType::U32, Nullability::Nullable))
         );
     }
 
     #[test]
     fn scalar_at() {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
         let values = (0u32..257).collect::<Buffer<_>>();
         let uncompressed = values.clone().into_array();
-        let packed = BitPackedData::encode(&uncompressed, 8, &mut ctx).unwrap();
+        let packed = BitPackedArray::encode(&uncompressed, 8).unwrap();
         assert!(packed.patches().is_some());
 
         let patches = packed.patches().unwrap().indices().clone();
         assert_eq!(
-            usize::try_from(
-                &patches
-                    .execute_scalar(0, &mut LEGACY_SESSION.create_execution_ctx())
-                    .unwrap()
-            )
-            .unwrap(),
+            usize::try_from(&patches.scalar_at(0).unwrap()).unwrap(),
             256
         );
 

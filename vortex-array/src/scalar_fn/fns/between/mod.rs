@@ -3,25 +3,28 @@
 
 mod kernel;
 
+use std::any::Any;
 use std::fmt::Display;
 use std::fmt::Formatter;
 
 pub use kernel::*;
 use prost::Message;
-use vortex_array::expr::and;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
+use vortex_error::vortex_err;
 use vortex_proto::expr as pb;
 use vortex_session::VortexSession;
 
+use crate::Array;
 use crate::ArrayRef;
 use crate::Canonical;
 use crate::ExecutionCtx;
 use crate::IntoArray;
 use crate::arrays::ConstantArray;
-use crate::arrays::Decimal;
-use crate::arrays::Primitive;
+use crate::arrays::DecimalVTable;
+use crate::arrays::PrimitiveVTable;
 use crate::builtins::ArrayBuiltins;
+use crate::compute::Options;
 use crate::dtype::DType;
 use crate::dtype::DType::Bool;
 use crate::expr::StatsCatalog;
@@ -60,6 +63,12 @@ impl Display for BetweenOptions {
     }
 }
 
+impl Options for BetweenOptions {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 /// Strictness of the comparison.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum StrictComparison {
@@ -95,9 +104,9 @@ impl StrictComparison {
 /// (empty array, null bounds), or `None` if between should proceed with the
 /// encoding-specific implementation.
 pub(super) fn precondition(
-    arr: &ArrayRef,
-    lower: &ArrayRef,
-    upper: &ArrayRef,
+    arr: &dyn Array,
+    lower: &dyn Array,
+    upper: &dyn Array,
 ) -> VortexResult<Option<ArrayRef>> {
     let return_dtype =
         Bool(arr.dtype().nullability() | lower.dtype().nullability() | upper.dtype().nullability());
@@ -105,6 +114,16 @@ pub(super) fn precondition(
     // Bail early if the array is empty.
     if arr.is_empty() {
         return Ok(Some(Canonical::empty(&return_dtype).into_array()));
+    }
+
+    // A quick check to see if either bound is a null constant array.
+    if (lower.is_invalid(0)? || upper.is_invalid(0)?)
+        && let (Some(c_lower), Some(c_upper)) = (lower.as_constant(), upper.as_constant())
+        && (c_lower.is_null() || c_upper.is_null())
+    {
+        return Ok(Some(
+            ConstantArray::new(Scalar::null(return_dtype), arr.len()).into_array(),
+        ));
     }
 
     if lower.as_constant().is_some_and(|v| v.is_null())
@@ -122,9 +141,9 @@ pub(super) fn precondition(
 ///
 /// Falls back to compare + boolean and if no kernel handles the input.
 fn between_canonical(
-    arr: &ArrayRef,
-    lower: &ArrayRef,
-    upper: &ArrayRef,
+    arr: &dyn Array,
+    lower: &dyn Array,
+    upper: &dyn Array,
     options: &BetweenOptions,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
@@ -133,29 +152,30 @@ fn between_canonical(
     }
 
     // Try type-specific kernels
-    if let Some(prim) = arr.as_opt::<Primitive>()
+    if let Some(prim) = arr.as_opt::<PrimitiveVTable>()
         && let Some(result) =
-            <Primitive as BetweenKernel>::between(prim, lower, upper, options, ctx)?
+            <PrimitiveVTable as BetweenKernel>::between(prim, lower, upper, options, ctx)?
     {
         return Ok(result);
     }
-    if let Some(dec) = arr.as_opt::<Decimal>()
-        && let Some(result) = <Decimal as BetweenKernel>::between(dec, lower, upper, options, ctx)?
+    if let Some(dec) = arr.as_opt::<DecimalVTable>()
+        && let Some(result) =
+            <DecimalVTable as BetweenKernel>::between(dec, lower, upper, options, ctx)?
     {
         return Ok(result);
     }
 
     // TODO(joe): return lazy compare once the executor supports this
     // Fall back to compare + boolean and
-    let lower_cmp = lower.clone().binary(
-        arr.clone(),
+    let lower_cmp = lower.to_array().binary(
+        arr.to_array(),
         Operator::from(options.lower_strict.to_compare_operator()),
     )?;
-    let upper_cmp = arr.clone().binary(
-        upper.clone(),
+    let upper_cmp = arr.to_array().binary(
+        upper.to_array(),
         Operator::from(options.upper_strict.to_compare_operator()),
     )?;
-    execute_boolean(&lower_cmp, &upper_cmp, Operator::And, ctx)
+    execute_boolean(&lower_cmp, &upper_cmp, Operator::And)
 }
 
 /// An optimized scalar expression to compute whether values fall between two bounds.
@@ -176,7 +196,7 @@ impl ScalarFnVTable for Between {
     type Options = BetweenOptions;
 
     fn id(&self) -> ScalarFnId {
-        ScalarFnId::new("vortex.between")
+        ScalarFnId::from("vortex.between")
     }
 
     fn serialize(&self, instance: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
@@ -274,26 +294,28 @@ impl ScalarFnVTable for Between {
         ))
     }
 
-    fn execute(
-        &self,
-        options: &Self::Options,
-        args: &dyn ExecutionArgs,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<ArrayRef> {
-        let arr = args.get(0)?;
-        let lower = args.get(1)?;
-        let upper = args.get(2)?;
+    fn execute(&self, options: &Self::Options, args: ExecutionArgs) -> VortexResult<ArrayRef> {
+        let [arr, lower, upper]: [ArrayRef; _] = args
+            .inputs
+            .try_into()
+            .map_err(|_| vortex_err!("Expected 3 arguments for Between expression",))?;
 
         // canonicalize the arr and we might be able to run a between kernels over that.
         if !arr.is_canonical() {
-            return arr.execute::<Canonical>(ctx)?.into_array().between(
+            return arr.execute::<Canonical>(args.ctx)?.into_array().between(
                 lower,
                 upper,
                 options.clone(),
             );
         }
 
-        between_canonical(&arr, &lower, &upper, options, ctx)
+        between_canonical(
+            arr.as_ref(),
+            lower.as_ref(),
+            upper.as_ref(),
+            options,
+            args.ctx,
+        )
     }
 
     fn stat_falsification(
@@ -309,18 +331,9 @@ impl ScalarFnVTable for Between {
         let lhs = Binary.new_expr(options.lower_strict.to_operator(), [lower, arr.clone()]);
         let rhs = Binary.new_expr(options.upper_strict.to_operator(), [arr, upper]);
 
-        and(lhs, rhs).stat_falsification(catalog)
-    }
-
-    fn validity(
-        &self,
-        _options: &Self::Options,
-        expression: &Expression,
-    ) -> VortexResult<Option<Expression>> {
-        let arr = expression.child(0).validity()?;
-        let lower = expression.child(1).validity()?;
-        let upper = expression.child(2).validity()?;
-        Ok(Some(and(and(arr, lower), upper)))
+        Binary
+            .new_expr(Operator::And, [lhs, rhs])
+            .stat_falsification(catalog)
     }
 
     fn is_null_sensitive(&self, _instance: &Self::Options) -> bool {
@@ -334,13 +347,13 @@ impl ScalarFnVTable for Between {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::LazyLock;
-
     use rstest::rstest;
     use vortex_buffer::buffer;
 
     use super::*;
     use crate::IntoArray;
+    use crate::LEGACY_SESSION;
+    use crate::ToCanonical;
     use crate::VortexSessionExecute;
     use crate::arrays::BoolArray;
     use crate::arrays::DecimalArray;
@@ -355,12 +368,8 @@ mod tests {
     use crate::expr::root;
     use crate::scalar::DecimalValue;
     use crate::scalar::Scalar;
-    use crate::session::ArraySession;
     use crate::test_harness::to_int_indices;
     use crate::validity::Validity;
-
-    static SESSION: LazyLock<VortexSession> =
-        LazyLock::new(|| VortexSession::empty().with::<ArraySession>());
 
     #[test]
     fn test_display() {
@@ -402,18 +411,17 @@ mod tests {
         let upper = buffer![2, 1, 1, 0, 0].into_array();
 
         let matches = between_canonical(
-            &array,
-            &lower,
-            &upper,
+            array.as_ref(),
+            lower.as_ref(),
+            upper.as_ref(),
             &BetweenOptions {
                 lower_strict,
                 upper_strict,
             },
-            &mut SESSION.create_execution_ctx(),
+            &mut LEGACY_SESSION.create_execution_ctx(),
         )
         .unwrap()
-        .execute::<BoolArray>(&mut SESSION.create_execution_ctx())
-        .unwrap();
+        .to_bool();
 
         let indices = to_int_indices(matches).unwrap();
         assert_eq!(indices, expected);
@@ -428,60 +436,56 @@ mod tests {
         let upper = ConstantArray::new(
             Scalar::null(DType::Primitive(PType::I32, Nullability::Nullable)),
             5,
-        )
-        .into_array();
+        );
 
         let matches = between_canonical(
-            &array,
-            &lower,
-            &upper,
+            array.as_ref(),
+            lower.as_ref(),
+            upper.as_ref(),
             &BetweenOptions {
                 lower_strict: StrictComparison::NonStrict,
                 upper_strict: StrictComparison::NonStrict,
             },
-            &mut SESSION.create_execution_ctx(),
+            &mut LEGACY_SESSION.create_execution_ctx(),
         )
         .unwrap()
-        .execute::<BoolArray>(&mut SESSION.create_execution_ctx())
-        .unwrap();
+        .to_bool();
 
         let indices = to_int_indices(matches).unwrap();
         assert!(indices.is_empty());
 
         // upper is a fixed constant
-        let upper = ConstantArray::new(Scalar::from(2), 5).into_array();
+        let upper = ConstantArray::new(Scalar::from(2), 5);
         let matches = between_canonical(
-            &array,
-            &lower,
-            &upper,
+            array.as_ref(),
+            lower.as_ref(),
+            upper.as_ref(),
             &BetweenOptions {
                 lower_strict: StrictComparison::NonStrict,
                 upper_strict: StrictComparison::NonStrict,
             },
-            &mut SESSION.create_execution_ctx(),
+            &mut LEGACY_SESSION.create_execution_ctx(),
         )
         .unwrap()
-        .execute::<BoolArray>(&mut SESSION.create_execution_ctx())
-        .unwrap();
+        .to_bool();
         let indices = to_int_indices(matches).unwrap();
         assert_eq!(indices, vec![0, 1, 3]);
 
         // lower is also a constant
-        let lower = ConstantArray::new(Scalar::from(0), 5).into_array();
+        let lower = ConstantArray::new(Scalar::from(0), 5);
 
         let matches = between_canonical(
-            &array,
-            &lower,
-            &upper,
+            array.as_ref(),
+            lower.as_ref(),
+            upper.as_ref(),
             &BetweenOptions {
                 lower_strict: StrictComparison::NonStrict,
                 upper_strict: StrictComparison::NonStrict,
             },
-            &mut SESSION.create_execution_ctx(),
+            &mut LEGACY_SESSION.create_execution_ctx(),
         )
         .unwrap()
-        .execute::<BoolArray>(&mut SESSION.create_execution_ctx())
-        .unwrap();
+        .to_bool();
         let indices = to_int_indices(matches).unwrap();
         assert_eq!(indices, vec![0, 1, 2, 3, 4]);
     }
@@ -490,7 +494,7 @@ mod tests {
     fn test_between_decimal() {
         let values = buffer![100i128, 200i128, 300i128, 400i128];
         let decimal_type = DecimalDType::new(3, 2);
-        let array = DecimalArray::new(values, decimal_type, Validity::NonNullable).into_array();
+        let array = DecimalArray::new(values, decimal_type, Validity::NonNullable);
 
         let lower = ConstantArray::new(
             Scalar::decimal(
@@ -499,8 +503,7 @@ mod tests {
                 Nullability::NonNullable,
             ),
             array.len(),
-        )
-        .into_array();
+        );
         let upper = ConstantArray::new(
             Scalar::decimal(
                 DecimalValue::I128(400i128),
@@ -508,19 +511,18 @@ mod tests {
                 Nullability::NonNullable,
             ),
             array.len(),
-        )
-        .into_array();
+        );
 
         // Strict lower bound, non-strict upper bound
         let between_strict = between_canonical(
-            &array,
-            &lower,
-            &upper,
+            array.as_ref(),
+            lower.as_ref(),
+            upper.as_ref(),
             &BetweenOptions {
                 lower_strict: StrictComparison::Strict,
                 upper_strict: StrictComparison::NonStrict,
             },
-            &mut SESSION.create_execution_ctx(),
+            &mut LEGACY_SESSION.create_execution_ctx(),
         )
         .unwrap();
         assert_arrays_eq!(
@@ -530,14 +532,14 @@ mod tests {
 
         // Non-strict lower bound, strict upper bound
         let between_strict = between_canonical(
-            &array,
-            &lower,
-            &upper,
+            array.as_ref(),
+            lower.as_ref(),
+            upper.as_ref(),
             &BetweenOptions {
                 lower_strict: StrictComparison::NonStrict,
                 upper_strict: StrictComparison::Strict,
             },
-            &mut SESSION.create_execution_ctx(),
+            &mut LEGACY_SESSION.create_execution_ctx(),
         )
         .unwrap();
         assert_arrays_eq!(

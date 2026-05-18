@@ -13,7 +13,6 @@ mod array;
 mod arrow;
 pub mod compress;
 mod compute;
-pub mod decompress_bool;
 mod iter;
 mod kernel;
 mod ops;
@@ -26,40 +25,37 @@ pub mod _benchmarking {
     use super::*;
 }
 
-use vortex_array::ArrayVTable;
-use vortex_array::aggregate_fn::AggregateFnVTable;
-use vortex_array::aggregate_fn::fns::is_constant::IsConstant;
-use vortex_array::aggregate_fn::fns::is_sorted::IsSorted;
-use vortex_array::aggregate_fn::fns::min_max::MinMax;
-use vortex_array::aggregate_fn::session::AggregateFnSessionExt;
+use vortex_array::ArrayBufferVisitor;
+use vortex_array::ArrayChildVisitor;
 use vortex_array::session::ArraySessionExt;
+use vortex_array::vtable::VisitorVTable;
 use vortex_session::VortexSession;
 
-/// Initialize run-end encoding in the given session.
-pub fn initialize(session: &VortexSession) {
-    session.arrays().register(RunEnd);
+impl VisitorVTable<RunEndVTable> for RunEndVTable {
+    fn visit_buffers(_array: &RunEndArray, _visitor: &mut dyn ArrayBufferVisitor) {}
 
-    // Register the RunEnd-specific aggregate kernels.
-    session.aggregate_fns().register_aggregate_kernel(
-        RunEnd.id(),
-        Some(MinMax.id()),
-        &compute::min_max::RunEndMinMaxKernel,
-    );
-    session.aggregate_fns().register_aggregate_kernel(
-        RunEnd.id(),
-        Some(IsConstant.id()),
-        &compute::is_constant::RunEndIsConstantKernel,
-    );
-    session.aggregate_fns().register_aggregate_kernel(
-        RunEnd.id(),
-        Some(IsSorted.id()),
-        &compute::is_sorted::RunEndIsSortedKernel,
-    );
+    fn nbuffers(_array: &RunEndArray) -> usize {
+        0
+    }
+
+    fn visit_children(array: &RunEndArray, visitor: &mut dyn ArrayChildVisitor) {
+        visitor.visit_child("ends", array.ends());
+        visitor.visit_child("values", array.values());
+    }
+
+    fn nchildren(_array: &RunEndArray) -> usize {
+        2
+    }
+}
+
+/// Initialize run-end encoding in the given session.
+pub fn initialize(session: &mut VortexSession) {
+    session.arrays().register(RunEndVTable::ID, RunEndVTable);
 }
 
 #[cfg(test)]
 mod tests {
-    use prost::Message;
+    use vortex_array::ProstMetadata;
     use vortex_array::dtype::PType;
     use vortex_array::test_harness::check_metadata;
 
@@ -70,12 +66,11 @@ mod tests {
     fn test_runend_metadata() {
         check_metadata(
             "runend.metadata",
-            &RunEndMetadata {
+            ProstMetadata(RunEndMetadata {
                 ends_ptype: PType::U64 as i32,
                 num_runs: u64::MAX,
                 offset: u64::MAX,
-            }
-            .encode_to_vec(),
+            }),
         );
     }
 }

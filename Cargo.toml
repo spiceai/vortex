@@ -1,7 +1,6 @@
 [workspace]
 members = [
     # Core crates in dependency order
-    "vortex-array-macros",
     "vortex-error",
     "vortex-buffer",
     "vortex-mask",
@@ -12,8 +11,6 @@ members = [
     "vortex-io",
     "vortex-proto",
     "vortex-array",
-    "vortex-tensor",
-    "vortex-compressor",
     "vortex-btrblocks",
     "vortex-layout",
     "vortex-scan",
@@ -34,9 +31,7 @@ members = [
     "vortex-jni",
     "vortex-python",
     "vortex-tui",
-    "vortex-web/crate",
-    "vortex-sqllogictest",
-    "vortex-test/compat-gen",
+    "vortex-test/e2e",
     "vortex-test/e2e-cuda",
     "xtask",
     # Encodings
@@ -52,14 +47,13 @@ members = [
     "encodings/zigzag",
     "encodings/zstd",
     "encodings/bytebool",
-    "encodings/parquet-variant",
     # Benchmarks
     "benchmarks/lance-bench",
     "benchmarks/compress-bench",
     "benchmarks/datafusion-bench",
     "benchmarks/duckdb-bench",
     "benchmarks/random-access-bench",
-    "benchmarks/vector-search-bench",
+    "vortex-sqllogictest",
 ]
 exclude = ["java/testfiles", "wasm-test"]
 resolver = "2"
@@ -82,33 +76,31 @@ keywords = ["vortex"]
 license = "Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/spiraldb/vortex"
-rust-version = "1.91.0"
+rust-version = "1.90"
 version = "0.1.0"
 
 [workspace.dependencies]
-aho-corasick = "1.1.3"
 anyhow = "1.0.97"
 arbitrary = "1.3.2"
-arc-swap = "1.9"
+arc-swap = "1.8"
 arcref = "0.2.0"
-arrow-arith = "58"
-arrow-array = "58"
-arrow-buffer = "58"
-arrow-cast = "58"
-arrow-data = "58"
-arrow-ipc = "58"
-arrow-ord = "58"
-arrow-schema = "58"
-arrow-select = "58"
-arrow-string = "58"
+arrayref = "0.3.7"
+arrow-arith = "57.1"
+arrow-array = "57.1"
+arrow-buffer = "57.1"
+arrow-cast = "57.1"
+arrow-data = "57.1"
+arrow-ipc = "57.1"
+arrow-ord = "57.1"
+arrow-schema = "57.1"
+arrow-select = "57.1"
+arrow-string = "57.1"
 async-fs = "2.2.0"
 async-lock = "3.4"
 async-stream = "0.3.6"
 async-trait = "0.1.89"
-base16ct = "1.0.0"
-bigdecimal = "0.4.8"
 bindgen = "0.72.0"
-bit-vec = "0.9.0"
+bit-vec = "0.8.0"
 bitvec = "1.0.1"
 bytes = "1.11.1"
 bzip2 = "0.6.0"
@@ -118,9 +110,9 @@ cc = "1.2"
 cfg-if = "1.0.1"
 chrono = "0.4.42"
 clap = "4.5"
-criterion = "0.8"
+criterion = "0.7"
 crossterm = "0.29"
-cudarc = { version = "0.19.0", features = [
+cudarc = { version = "0.18.2", features = [
     # The NSight Compute version available on lambda.ai hosts does not inject a symbol for
     # several functions that cudarc expects to load when this is set to "cuda-12080". We
     # don't use any CUDA 12.8 specific features currently so this is fine.
@@ -128,24 +120,23 @@ cudarc = { version = "0.19.0", features = [
 ] }
 custom-labels = "0.4.4"
 dashmap = "6.1.0"
-datafusion = { version = "53", default-features = false, features = ["sql"] }
-datafusion-catalog = { version = "53" }
-datafusion-common = { version = "53" }
-datafusion-common-runtime = { version = "53" }
-datafusion-datasource = { version = "53", default-features = false }
-datafusion-execution = { version = "53" }
-datafusion-expr = { version = "53" }
-datafusion-functions = { version = "53" }
-datafusion-physical-expr = { version = "53" }
-datafusion-physical-expr-adapter = { version = "53" }
-datafusion-physical-expr-common = { version = "53" }
-datafusion-physical-plan = { version = "53" }
-datafusion-pruning = { version = "53" }
-datafusion-sqllogictest = { version = "53" }
+datafusion = { version = "52", default-features = false, features = ["sql"] }
+datafusion-catalog = { version = "52" }
+datafusion-common = { version = "52" }
+datafusion-common-runtime = { version = "52" }
+datafusion-datasource = { version = "52", default-features = false }
+datafusion-execution = { version = "52" }
+datafusion-expr = { version = "52" }
+datafusion-functions = { version = "52" }
+datafusion-physical-expr = { version = "52" }
+datafusion-physical-expr-adapter = { version = "52" }
+datafusion-physical-expr-common = { version = "52" }
+datafusion-physical-plan = { version = "52" }
+datafusion-pruning = { version = "52" }
+datafusion-sqllogictest = { version = "52" }
 dirs = "6.0.0"
 divan = { package = "codspeed-divan-compat", version = "4.0.4" }
 enum-iterator = "2.0.0"
-env_logger = "0.11"
 fastlanes = "0.5"
 flatbuffers = "25.2.10"
 fsst-rs = "0.5.5"
@@ -155,42 +146,36 @@ get_dir = "0.5.0"
 glob = "0.3.2"
 goldenfile = "1"
 half = { version = "2.7.1", features = ["std", "num-traits"] }
-hashbrown = "0.17.0"
+hashbrown = "0.16.1"
 humansize = "2.1.3"
 indicatif = "0.18.0"
 insta = "1.43"
 inventory = "0.3.20"
 itertools = "0.14.0"
-jetscii = "0.5.3"
 jiff = "0.2.0"
-jni = { version = "0.22.0" }
 kanal = "0.1.1"
-lasso = { version = "0.7", features = ["multi-threaded"] }
 lending-iterator = "0.1.7"
 libfuzzer-sys = "0.4"
 libloading = "0.8"
 liblzma = "0.4"
 log = { version = "0.4.21" }
 loom = { version = "0.7", features = ["checkpoint"] }
-memchr = "2.8.0"
 memmap2 = "0.9.5"
 mimalloc = "0.1.42"
 moka = { version = "0.12.10", default-features = false }
 multiversion = "0.8.0"
-noodles-bgzf = "0.46.0"
-noodles-vcf = { version = "0.87.0", features = ["async"] }
+noodles-bgzf = "0.44.0"
+noodles-vcf = "0.82.0"
 num-traits = "0.2.19"
 num_enum = { version = "0.7.3", default-features = false }
-object_store = { version = "0.13.1", default-features = false }
+object_store = { version = "0.12.4", default-features = false }
 once_cell = "1.21"
-oneshot = { version = "0.2.0", features = ["async"] }
+oneshot = "0.1.13"
 opentelemetry = "0.31.0"
 opentelemetry-otlp = "0.31.0"
 opentelemetry_sdk = "0.31.0"
 parking_lot = { version = "0.12.3", features = ["nightly"] }
-parquet = "58"
-parquet-variant = "58"
-parquet-variant-compute = "58"
+parquet = "57.1"
 paste = "1.0.15"
 pco = "1.0.1"
 pin-project-lite = "0.2.15"
@@ -199,23 +184,21 @@ proc-macro2 = "1.0.95"
 prost = "0.14"
 prost-build = "0.14"
 prost-types = "0.14"
-public-api = { git = "https://github.com/vortex-data/cargo-public-api.git", branch = "main" }
-pyo3 = { version = "0.28.0" }
-pyo3-bytes = "0.6"
+public-api = "0.50"
+pyo3 = { version = "0.27.0" }
+pyo3-bytes = "0.5"
 pyo3-log = "0.13.0"
-pyo3-object_store = "0.9.0"
-quote = "1.0.44"
-rand = "0.10.1"
-rand_distr = "0.6"
-ratatui = { version = "0.30", default-features = false }
+quote = "1.0.41"
+rand = "0.9.0"
+rand_distr = "0.5"
+ratatui = "0.30"
 regex = "1.11.0"
-regex-automata = "0.4"
-reqwest = { version = "0.13.0", features = [
-    "blocking",
+reqwest = { version = "0.12.4", features = [
     "charset",
     "http2",
-    "rustls",
-    "system-proxy",
+    "macos-system-configuration",
+    "blocking",
+    "rustls-tls",
 ], default-features = false }
 roaring = "0.11.0"
 rstest = "0.26.1"
@@ -224,41 +207,38 @@ rustc-hash = "2.1"
 serde = "1.0.220"
 serde_json = "1.0.138"
 serde_test = "1.0.176"
-sha2 = "0.11.0"
 simdutf8 = "0.1.5"
-similar = "3.0.0"
-sketches-ddsketch = "0.4.0"
+similar = "2.7.0"
+sketches-ddsketch = "0.3.0"
 smol = "2.0.2"
 static_assertions = "1.1"
-strum = "0.28"
-syn = { version = "2.0.117", features = ["full"] }
-sysinfo = "0.38.0"
+strum = "0.27"
+syn = { version = "2.0.113", features = ["full"] }
+sysinfo = "0.37.0"
 tabled = { version = "0.20.0", default-features = false }
-taffy = "0.10.0"
+taffy = "0.9.0"
 take_mut = "0.2.2"
 tar = "0.4"
 target-lexicon = "0.13"
-temp-env = "0.3"
 tempfile = "3"
-termtree = { version = "1.0" }
-test-with = "0.16"
+termtree = { version = "0.5" }
+test-with = "0.14"
 thiserror = "2.0.3"
 tokio = { version = "1.48" }
 tokio-stream = "0.1.17"
 tokio-util = "0.7.17"
-vortex-array-macros = { version = "0.1.0", path = "./vortex-array-macros" }
-# Pull these into non-public crates to support DF 58
-tpchgen = { version = "2.0.2", git = "https://github.com/clflushopt/tpchgen-rs.git", rev = "438e9c2dbc25b2fff82c0efc08b3f13b5707874f" }
-tpchgen-arrow = { version = "2.0.2", git = "https://github.com/clflushopt/tpchgen-rs.git", rev = "438e9c2dbc25b2fff82c0efc08b3f13b5707874f" }
+tpchgen = { version = "2.0.2" }
+tpchgen-arrow = { version = "2.0.2" }
 tracing = { version = "0.1.41", default-features = false }
 tracing-perfetto = "0.1.5"
 tracing-subscriber = "0.3"
 url = "2.5.7"
-uuid = { version = "1.21", features = ["js"] }
-wasm-bindgen-futures = "0.4.54"
+uuid = { version = "1.19", features = ["js"] }
+walkdir = "2.5.0"
+wasm-bindgen-futures = "0.4.39"
 xshell = "0.2.6"
 zigzag = "0.1.0"
-zip = "8.0.0"
+zip = "6.0.0"
 zstd = { version = "0.13.3", default-features = false, features = [
     "zdict_builder",
 ] }
@@ -270,7 +250,6 @@ vortex-array = { version = "0.1.0", path = "./vortex-array", default-features = 
 vortex-btrblocks = { version = "0.1.0", path = "./vortex-btrblocks", default-features = false }
 vortex-buffer = { version = "0.1.0", path = "./vortex-buffer", default-features = false }
 vortex-bytebool = { version = "0.1.0", path = "./encodings/bytebool", default-features = false }
-vortex-compressor = { version = "0.1.0", path = "./vortex-compressor", default-features = false }
 vortex-datafusion = { version = "0.1.0", path = "./vortex-datafusion", default-features = false }
 vortex-datetime-parts = { version = "0.1.0", path = "./encodings/datetime-parts", default-features = false }
 vortex-decimal-byte-parts = { version = "0.1.0", path = "encodings/decimal-byte-parts", default-features = false }
@@ -291,7 +270,6 @@ vortex-scan = { version = "0.1.0", path = "./vortex-scan", default-features = fa
 vortex-sequence = { version = "0.1.0", path = "encodings/sequence", default-features = false }
 vortex-session = { version = "0.1.0", path = "./vortex-session", default-features = false }
 vortex-sparse = { version = "0.1.0", path = "./encodings/sparse", default-features = false }
-vortex-tensor = { version = "0.1.0", path = "./vortex-tensor", default-features = false }
 vortex-utils = { version = "0.1.0", path = "./vortex-utils", default-features = false }
 vortex-zigzag = { version = "0.1.0", path = "./encodings/zigzag", default-features = false }
 vortex-zstd = { version = "0.1.0", path = "./encodings/zstd", default-features = false }
@@ -299,12 +277,17 @@ vortex-zstd = { version = "0.1.0", path = "./encodings/zstd", default-features =
 
 # No version constraints for unpublished crates.
 vortex-bench = { path = "./vortex-bench", default-features = false }
-vortex-compat = { path = "./vortex-test/compat-gen" }
 vortex-cuda = { path = "./vortex-cuda", default-features = false }
 vortex-cuda-macros = { path = "./vortex-cuda/macros" }
 vortex-duckdb = { path = "./vortex-duckdb", default-features = false }
+vortex-test-e2e = { path = "./vortex-test/e2e", default-features = false }
 vortex-test-e2e-cuda = { path = "./vortex-test/e2e-cuda", default-features = false }
 vortex-tui = { path = "./vortex-tui" }
+
+[workspace.dependencies.getrandom_v03]
+features = ["wasm_js"]
+package = "getrandom"
+version = "0.3.1"
 
 [workspace.lints.rust]
 let_underscore_drop = "deny"
@@ -315,7 +298,8 @@ unused_lifetimes = "deny"
 unused_qualifications = "deny"
 unexpected_cfgs = { level = "deny", check-cfg = [
     "cfg(codspeed)",
-    'cfg(target_os, values("unknown"))',
+    "cfg(disable_loom)",
+    "cfg(vortex_nightly)",
 ] }
 warnings = "warn"
 
@@ -346,17 +330,9 @@ mem_forget = "deny"
 multiple_crate_versions = "allow"
 needless_range_loop = "allow"
 or_fun_call = "deny"
-ref_option = "deny"
-ref_option_ref = "deny"
 panic = "deny"
 # panic_in_result_fn = "deny" -- we cannot disable this for tests to use assertions
-clone_on_ref_ptr = "deny"
 redundant_clone = "deny"
-redundant_static_lifetimes = "deny"
-ref_binding_to_reference = "deny"
-ref_patterns = "deny"
-repeat_vec_with_capacity = "deny"
-reserve_after_initialization = "deny"
 same_name_method = "deny"
 tests_outside_test_module = "deny"
 # todo = "deny"
@@ -388,15 +364,3 @@ lto = false
 [profile.bench_assert]
 debug-assertions = true
 inherits = "bench"
-
-[profile.ci]
-inherits = "dev"
-debug = "line-tables-only"
-incremental = false
-
-# This rule only applies to dependencies that are not members of the workspace.
-[profile.ci.package."*"]
-debug = false
-debug-assertions = false
-strip = "debuginfo"
-incremental = false

@@ -7,6 +7,7 @@ use std::fmt::Display;
 use std::fmt::Formatter;
 use std::sync::Arc;
 
+use arcref::ArcRef;
 use itertools::Itertools;
 use vortex_array::SerializeMetadata;
 use vortex_array::dtype::DType;
@@ -15,7 +16,6 @@ use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
 use vortex_session::VortexSession;
-use vortex_session::registry::Id;
 
 use crate::LayoutEncodingId;
 use crate::LayoutEncodingRef;
@@ -26,8 +26,7 @@ use crate::display::display_tree_with_segment_sizes;
 use crate::segments::SegmentId;
 use crate::segments::SegmentSource;
 
-/// A unique identifier for a layout.
-pub type LayoutId = Id;
+pub type LayoutId = ArcRef<str>;
 
 pub type LayoutRef = Arc<dyn Layout>;
 
@@ -97,8 +96,8 @@ impl LayoutChildType {
     pub fn name(&self) -> Arc<str> {
         match self {
             LayoutChildType::Chunk((idx, _offset)) => format!("[{idx}]").into(),
-            LayoutChildType::Auxiliary(name) => Arc::clone(name),
-            LayoutChildType::Transparent(name) => Arc::clone(name),
+            LayoutChildType::Auxiliary(name) => name.clone(),
+            LayoutChildType::Transparent(name) => name.clone(),
             LayoutChildType::Field(name) => name.clone().into(),
         }
     }
@@ -318,18 +317,16 @@ impl<V: VTable> Layout for LayoutAdapter<V> {
 
 mod private {
     use super::*;
-    use crate::layouts::foreign::ForeignLayout;
 
     pub trait Sealed {}
 
     impl<V: VTable> Sealed for LayoutAdapter<V> {}
-    impl Sealed for ForeignLayout {}
 }
 
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
-    use vortex_session::registry::ReadContext;
+    use vortex_array::ArrayContext;
 
     use super::*;
 
@@ -466,7 +463,7 @@ mod tests {
         ];
 
         for field_name in special_fields {
-            let field = LayoutChildType::Field(Arc::clone(&field_name).into());
+            let field = LayoutChildType::Field(field_name.clone().into());
             assert_eq!(field.name(), field_name);
             assert_eq!(field.row_offset(), Some(0));
         }
@@ -485,7 +482,7 @@ mod tests {
         use crate::layouts::struct_::StructLayout;
         use crate::segments::SegmentId;
 
-        let ctx = ReadContext::new([]);
+        let ctx = ArrayContext::empty();
 
         // Create a flat layout for dict values (utf8 strings)
         let dict_values =
@@ -514,8 +511,7 @@ mod tests {
         );
 
         // Create dict layout (column "name")
-        let dict_layout =
-            DictLayout::new(Arc::clone(&dict_values), Arc::clone(&dict_codes)).into_layout();
+        let dict_layout = DictLayout::new(dict_values.clone(), dict_codes.clone()).into_layout();
 
         // Test dict layout display (no direct segments)
         assert_eq!(format!("{}", dict_layout), "vortex.dict(utf8, rows=10)");
@@ -541,10 +537,7 @@ mod tests {
         let chunked_layout = ChunkedLayout::new(
             10,
             DType::Primitive(PType::I64, NonNullable),
-            crate::OwnedLayoutChildren::layout_children(vec![
-                Arc::clone(&chunk1),
-                Arc::clone(&chunk2),
-            ]),
+            crate::OwnedLayoutChildren::layout_children(vec![chunk1.clone(), chunk2.clone()]),
         )
         .into_layout();
 

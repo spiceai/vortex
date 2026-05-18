@@ -6,9 +6,6 @@ on:
       fuzz_target:
         required: true
         type: string
-      fuzz_name:
-        required: false
-        type: string
       crash_file:
         required: true
         type: string
@@ -49,16 +46,16 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        uses: actions/checkout@v6
 
       - name: Download fuzzer logs
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8
+        uses: actions/download-artifact@v6
         with:
           name: ${{ inputs.logs_artifact_name }}
           path: ./logs
 
       - name: Download crash artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8
+        uses: actions/download-artifact@v6
         with:
           name: ${{ inputs.artifact_name }}
           path: ./crash_artifacts
@@ -118,7 +115,7 @@ jobs:
           steps.dedup.outputs.duplicate != 'true' ||
           steps.dedup.outputs.confidence != 'exact'
         continue-on-error: true
-        uses: anthropics/claude-code-action@567fe954a4527e81f132d87d1bdbcc94f7737434  # v1
+        uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.claude_code_oauth_token }}
           github_token: ${{ secrets.gh_token }}
@@ -151,7 +148,6 @@ jobs:
             --dedup-result dedup_result.json \
             --claude-analysis claude_analysis.txt \
             -v "FUZZ_TARGET=${{ inputs.fuzz_target }}" \
-            -v "FUZZ_NAME=${{ inputs.fuzz_name || inputs.fuzz_target }}" \
             -v "CRASH_FILE=${{ inputs.crash_file }}" \
             -v "BRANCH=${{ inputs.branch }}" \
             -v "COMMIT=${{ inputs.commit }}" \

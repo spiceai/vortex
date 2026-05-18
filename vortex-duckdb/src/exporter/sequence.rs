@@ -35,7 +35,6 @@ impl ColumnExporter for SequenceExporter {
     ) -> VortexResult<()> {
         let offset = offset.as_i64();
         let start = (offset * self.step) + self.start;
-        // TODO why don't we apply validity mask here?
 
         vector.to_sequence(start, self.step, len.as_u64());
         Ok(())
@@ -44,9 +43,8 @@ impl ColumnExporter for SequenceExporter {
 
 #[cfg(test)]
 mod tests {
-    use vortex::array::VortexSessionExecute;
     use vortex::dtype::Nullability;
-    use vortex::encodings::sequence::Sequence;
+    use vortex_array::VortexSessionExecute;
 
     use super::*;
     use crate::SESSION;
@@ -56,7 +54,7 @@ mod tests {
 
     #[test]
     fn test_sequence() {
-        let arr = Sequence::try_new_typed(2, 5, Nullability::NonNullable, 100).unwrap();
+        let arr = SequenceArray::typed_new(2, 5, Nullability::NonNullable, 100).unwrap();
         let mut chunk = DataChunk::new([LogicalType::new(cpp::duckdb_type::DUCKDB_TYPE_INTEGER)]);
 
         new_exporter(&arr)

@@ -6,20 +6,19 @@ use vortex_mask::Mask;
 
 use crate::ArrayRef;
 use crate::IntoArray;
-use crate::array::ArrayView;
-use crate::arrays::Masked;
 use crate::arrays::MaskedArray;
+use crate::arrays::MaskedVTable;
 use crate::arrays::filter::FilterReduce;
-use crate::arrays::masked::MaskedArraySlotsExt;
+use crate::vtable::ValidityHelper;
 
-impl FilterReduce for Masked {
-    fn filter(array: ArrayView<'_, Masked>, mask: &Mask) -> VortexResult<Option<ArrayRef>> {
+impl FilterReduce for MaskedVTable {
+    fn filter(array: &MaskedArray, mask: &Mask) -> VortexResult<Option<ArrayRef>> {
         // Filter the validity to get the new validity
-        let filtered_validity = array.validity()?.filter(mask)?;
+        let filtered_validity = array.validity().filter(mask)?;
 
         // Filter the child array
         // The child is guaranteed to have no nulls, so filtering it is straightforward
-        let filtered_child = array.child().filter(mask.clone())?;
+        let filtered_child = array.child.filter(mask.clone())?;
 
         // Construct new MaskedArray
         Ok(Some(
@@ -58,6 +57,6 @@ mod tests {
         ).unwrap()
     )]
     fn test_filter_masked_conformance(#[case] array: MaskedArray) {
-        test_filter_conformance(&array.into_array());
+        test_filter_conformance(array.as_ref());
     }
 }

@@ -3,76 +3,52 @@
 
 package dev.vortex.api;
 
+import java.util.List;
 import java.util.Optional;
-import java.util.OptionalLong;
 import org.immutables.value.Value;
 
 /**
- * Scan configuration passed to {@link DataSource#scan(ScanOptions)}.
- *
- * <p>All fields are optional. A call to {@link #of()} returns a default that reads every row and column.
+ * Create a new set of options for configuring the scan.
  */
 @Value.Immutable
 public interface ScanOptions {
-
-    /** Projection expression. If empty, all columns are returned. */
-    Optional<Expression> projection();
-
-    /** Filter expression applied before returning rows. */
-    Optional<Expression> filter();
-
-    /** Inclusive start of the row range to read. */
-    OptionalLong rowRangeBegin();
-
-    /** Exclusive end of the row range to read. */
-    OptionalLong rowRangeEnd();
+    /**
+     * Columns to project out.
+     */
+    List<String> columns();
 
     /**
-     * Sorted ascending row indices that should be included in (or excluded from) the scan, depending on
-     * {@link #selectionMode()}.
+     * Optional pruning expression that is pushed down to the scan.
      */
-    Optional<long[]> selectionIndices();
+    Optional<Expression> predicate();
 
-    /** Meaning of {@link #selectionIndices()}. */
-    @Value.Default
-    default SelectionMode selectionMode() {
-        return SelectionMode.INCLUDE_ALL;
-    }
+    /**
+     * Optional start (inclusive) and end (exclusive) row indices to select a range of rows
+     * in the scan.
+     */
+    Optional<long[]> rowRange();
 
-    /** Maximum row count to return. Absent means "no limit". */
-    OptionalLong limit();
+    /**
+     * Optional row indices to select specific rows.
+     * These must be sorted in ascending order.
+     */
+    Optional<long[]> rowIndices();
 
-    /** If {@code true}, the scan preserves the original row order across partitions. */
-    @Value.Default
-    default boolean ordered() {
-        return false;
-    }
-
+    /**
+     * Creates a new ScanOptions instance with default values.
+     *
+     * @return a ScanOptions instance with empty columns list, no predicate, no row range, and no row indices
+     */
     static ScanOptions of() {
         return ImmutableScanOptions.builder().build();
     }
 
+    /**
+     * Creates a new builder for constructing ScanOptions instances.
+     *
+     * @return a new builder instance that can be used to configure and build ScanOptions
+     */
     static ImmutableScanOptions.Builder builder() {
         return ImmutableScanOptions.builder();
-    }
-
-    /** How to interpret {@link #selectionIndices()}. */
-    enum SelectionMode {
-        /** Ignore {@link #selectionIndices()}. */
-        INCLUDE_ALL((byte) 0),
-        /** Return only rows at the indices. */
-        INCLUDE((byte) 1),
-        /** Return rows except those at the indices. */
-        EXCLUDE((byte) 2);
-
-        private final byte code;
-
-        SelectionMode(byte code) {
-            this.code = code;
-        }
-
-        public byte code() {
-            return code;
-        }
     }
 }

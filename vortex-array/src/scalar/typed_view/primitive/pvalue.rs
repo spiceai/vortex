@@ -221,7 +221,6 @@ impl PValue {
     }
 
     /// Creates a zero value for the given primitive type.
-    // TODO(joe): use PType
     pub fn zero(ptype: &PType) -> PValue {
         match ptype {
             PType::U8 => PValue::U8(0),

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-#![expect(clippy::unwrap_used)]
-#![expect(clippy::expect_used)]
+#![allow(clippy::unwrap_used)]
+#![allow(clippy::expect_used)]
 
 use std::clone::Clone;
 use std::fmt::Display;
@@ -26,7 +26,6 @@ use tpcds::TpcDsBenchmark;
 use tpch::benchmark::TpcHBenchmark;
 pub use utils::file::*;
 pub use utils::logging::*;
-use vortex::compressor::BtrBlocksCompressorBuilder;
 use vortex::error::VortexExpect;
 use vortex::error::vortex_err;
 use vortex::file::VortexWriteOptions;
@@ -53,7 +52,6 @@ pub mod statpopgen;
 pub mod tpcds;
 pub mod tpch;
 pub mod utils;
-pub mod vector_dataset;
 
 pub use benchmark::Benchmark;
 pub use benchmark::TableSpec;
@@ -233,7 +231,7 @@ impl CompactionStrategy {
         match self {
             CompactionStrategy::Compact => options.with_strategy(
                 WriteStrategyBuilder::default()
-                    .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact())
+                    .with_compact_encodings()
                     .build(),
             ),
             CompactionStrategy::Default => options,

@@ -37,11 +37,14 @@ impl TpcHBenchmark {
     pub fn new(scale_factor: String, use_remote_data_dir: Option<String>) -> anyhow::Result<Self> {
         Ok(Self {
             scale_factor: scale_factor.clone(),
-            data_url: Self::create_data_url(use_remote_data_dir.as_deref(), &scale_factor)?,
+            data_url: Self::create_data_url(&use_remote_data_dir, &scale_factor)?,
         })
     }
 
-    fn create_data_url(remote_data_dir: Option<&str>, scale_factor: &str) -> anyhow::Result<Url> {
+    fn create_data_url(
+        remote_data_dir: &Option<String>,
+        scale_factor: &str,
+    ) -> anyhow::Result<Url> {
         match remote_data_dir {
             None => {
                 let data_dir = "tpch".to_data_path();
@@ -136,7 +139,7 @@ impl Benchmark for TpcHBenchmark {
         ]
     }
 
-    #[expect(clippy::expect_used)]
+    #[expect(clippy::expect_used, clippy::unwrap_in_result)]
     fn pattern(&self, table_name: &str, format: Format) -> Option<Pattern> {
         Some(
             format!("{}_*.{}", table_name, format.ext())

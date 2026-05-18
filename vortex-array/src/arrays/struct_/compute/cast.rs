@@ -8,21 +8,20 @@ use vortex_error::vortex_ensure;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::IntoArray;
-use crate::array::ArrayView;
 use crate::arrays::ConstantArray;
-use crate::arrays::Struct;
 use crate::arrays::StructArray;
-use crate::arrays::struct_::StructArrayExt;
+use crate::arrays::StructVTable;
 use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
 use crate::scalar::Scalar;
 use crate::scalar_fn::fns::cast::CastKernel;
+use crate::vtable::ValidityHelper;
 
-impl CastKernel for Struct {
+impl CastKernel for StructVTable {
     fn cast(
-        array: ArrayView<'_, Struct>,
+        array: &StructArray,
         dtype: &DType,
-        ctx: &mut ExecutionCtx,
+        _ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
         let Some(target_sdtype) = dtype.as_struct_fields_opt() else {
             return Ok(None);
@@ -39,7 +38,10 @@ impl CastKernel for Struct {
 
         let mut cast_fields = Vec::with_capacity(target_sdtype.nfields());
         if fields_match_order {
-            for (field, target_type) in array.iter_unmasked_fields().zip_eq(target_sdtype.fields())
+            for (field, target_type) in array
+                .unmasked_fields()
+                .iter()
+                .zip_eq(target_sdtype.fields())
             {
                 let cast_field = field.cast(target_type)?;
                 cast_fields.push(cast_field);
@@ -64,7 +66,8 @@ impl CastKernel for Struct {
                     }
                     Some(src_field_idx) => {
                         // Field exists in source field. Cast it to the target type.
-                        let cast_field = array.unmasked_field(src_field_idx).cast(target_type)?;
+                        let cast_field =
+                            array.unmasked_fields()[src_field_idx].cast(target_type)?;
                         cast_fields.push(cast_field);
                     }
                 }
@@ -72,8 +75,9 @@ impl CastKernel for Struct {
         }
 
         let validity = array
-            .validity()?
-            .cast_nullability(dtype.nullability(), array.len(), ctx)?;
+            .validity()
+            .clone()
+            .cast_nullability(dtype.nullability(), array.len())?;
 
         StructArray::try_new(
             target_sdtype.names().clone(),
@@ -90,13 +94,12 @@ mod tests {
     use rstest::rstest;
     use vortex_buffer::buffer;
 
+    use crate::Array;
     use crate::IntoArray;
-    #[expect(deprecated)]
-    use crate::ToCanonical as _;
+    use crate::ToCanonical;
     use crate::arrays::PrimitiveArray;
     use crate::arrays::StructArray;
     use crate::arrays::VarBinArray;
-    use crate::arrays::struct_::StructArrayExt;
     use crate::builtins::ArrayBuiltins;
     use crate::compute::conformance::cast::test_cast_conformance;
     use crate::dtype::DType;
@@ -112,7 +115,7 @@ mod tests {
     #[case(create_nested_struct())]
     #[case(create_simple_struct())]
     fn test_cast_struct_conformance(#[case] array: StructArray) {
-        test_cast_conformance(&array.into_array());
+        test_cast_conformance(array.as_ref());
     }
 
     fn create_test_struct(nullable: bool) -> StructArray {
@@ -176,12 +179,12 @@ mod tests {
     fn cast_nullable_all_invalid() {
         let empty_struct = StructArray::try_new(
             FieldNames::from(["a"]),
-            vec![PrimitiveArray::new::<i32>(buffer![], Validity::AllInvalid).into_array()],
+            vec![PrimitiveArray::new::<i32>(buffer![], Validity::AllInvalid).to_array()],
             0,
             Validity::AllInvalid,
         )
         .unwrap()
-        .into_array();
+        .to_array();
 
         let target_dtype = DType::struct_(
             [("a", DType::Primitive(PType::I32, Nullability::NonNullable))],
@@ -204,15 +207,10 @@ mod tests {
 
         let target_dtype = struct_array.dtype().as_nullable();
 
-        let result = struct_array
-            .into_array()
-            .cast(target_dtype.clone())
-            .unwrap();
+        let result = struct_array.to_array().cast(target_dtype.clone()).unwrap();
         assert_eq!(result.dtype(), &target_dtype);
         assert_eq!(result.len(), 3);
-        #[expect(deprecated)]
-        let nfields = result.to_struct().struct_fields().nfields();
-        assert_eq!(nfields, 2);
+        assert_eq!(result.to_struct().unmasked_fields().len(), 2);
     }
 
     #[test]
@@ -235,14 +233,9 @@ mod tests {
         let struct_array =
             StructArray::try_new(names, vec![field1, field2], 3, Validity::NonNullable).unwrap();
 
-        let result = struct_array
-            .into_array()
-            .cast(target_dtype.clone())
-            .unwrap();
+        let result = struct_array.to_array().cast(target_dtype.clone()).unwrap();
         assert_eq!(result.dtype(), &target_dtype);
         assert_eq!(result.len(), 3);
-        #[expect(deprecated)]
-        let nfields = result.to_struct().struct_fields().nfields();
-        assert_eq!(nfields, 3);
+        assert_eq!(result.to_struct().unmasked_fields().len(), 3);
     }
 }

@@ -4,9 +4,6 @@ categories:
   - title: "⚠️ Breaks"
     labels:
       - "changelog/break"
-  - title: "🚧 Deprecation"
-    labels:
-      - "changelog/deprecation"
   - title: "✨ Features"
     labels:
       - "changelog/feature"

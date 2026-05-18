@@ -1,17 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-#![expect(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used)]
 
 use divan::Bencher;
-use rand::RngExt;
+use rand::Rng;
 use rand::SeedableRng;
 use rand::distr::Uniform;
 use rand::rngs::StdRng;
-use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
-use vortex_array::LEGACY_SESSION;
-use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::StructArray;
 use vortex_array::dtype::FieldNames;
 use vortex_array::validity::Validity;
@@ -25,7 +22,7 @@ const ARRAY_SIZE: usize = 100_000;
 const NUM_ACCESSES: usize = 1000;
 
 #[divan::bench]
-fn execute_scalar_struct_simple(bencher: Bencher) {
+fn scalar_at_struct_simple(bencher: Bencher) {
     let mut rng = StdRng::seed_from_u64(0);
     let range = Uniform::new(0i64, 100_000_000).unwrap();
 
@@ -42,7 +39,6 @@ fn execute_scalar_struct_simple(bencher: Bencher) {
         Validity::NonNullable,
     )
     .unwrap();
-    let struct_array: ArrayRef = struct_array.into_array();
 
     let indices: Vec<usize> = (0..NUM_ACCESSES)
         .map(|_| rng.random_range(0..ARRAY_SIZE))
@@ -51,15 +47,14 @@ fn execute_scalar_struct_simple(bencher: Bencher) {
     bencher
         .with_inputs(|| (&struct_array, &indices))
         .bench_refs(|(array, indices)| {
-            let mut ctx = LEGACY_SESSION.create_execution_ctx();
             for &idx in indices.iter() {
-                divan::black_box(array.execute_scalar(idx, &mut ctx).unwrap());
+                divan::black_box(array.scalar_at(idx).unwrap());
             }
         });
 }
 
 #[divan::bench]
-fn execute_scalar_struct_wide(bencher: Bencher) {
+fn scalar_at_struct_wide(bencher: Bencher) {
     let mut rng = StdRng::seed_from_u64(0);
     let range = Uniform::new(0i64, 100_000_000).unwrap();
 
@@ -77,10 +72,8 @@ fn execute_scalar_struct_wide(bencher: Bencher) {
         "field1", "field2", "field3", "field4", "field5", "field6", "field7", "field8",
     ]);
 
-    let struct_array: ArrayRef =
-        StructArray::try_new(field_names, fields, ARRAY_SIZE, Validity::NonNullable)
-            .unwrap()
-            .into_array();
+    let struct_array =
+        StructArray::try_new(field_names, fields, ARRAY_SIZE, Validity::NonNullable).unwrap();
 
     let indices: Vec<usize> = (0..NUM_ACCESSES)
         .map(|_| rng.random_range(0..ARRAY_SIZE))
@@ -89,9 +82,8 @@ fn execute_scalar_struct_wide(bencher: Bencher) {
     bencher
         .with_inputs(|| (&struct_array, &indices))
         .bench_refs(|(array, indices)| {
-            let mut ctx = LEGACY_SESSION.create_execution_ctx();
             for &idx in indices.iter() {
-                divan::black_box(array.execute_scalar(idx, &mut ctx).unwrap());
+                divan::black_box(array.scalar_at(idx).unwrap());
             }
         });
 }

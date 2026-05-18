@@ -2,10 +2,10 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 mod array;
-pub mod plugin;
+mod metadata;
 mod rules;
+mod slice;
 mod vtable;
 
-pub use array::ScalarFnArrayExt;
-pub use vtable::ScalarFnFactoryExt;
+pub use array::*;
 pub use vtable::*;

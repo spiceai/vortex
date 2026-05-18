@@ -5,7 +5,6 @@
 
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
-use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
 
 use crate::dtype::DType;
@@ -42,7 +41,7 @@ impl Scalar {
             return Scalar::try_new(target_dtype.clone(), self.value().cloned());
         }
 
-        // TODO(connor): This isn't really correct for extension types.
+        // TODO(connor): This isn't really correct but this will get fixed soon.
         // If the target is an extension type, then we want to cast to its storage type.
         if let Some(ext_dtype) = target_dtype.as_extension_opt() {
             let cast_storage_scalar_value = self.cast(ext_dtype.storage_dtype())?.into_value();
@@ -59,7 +58,6 @@ impl Scalar {
             DType::Struct(..) => self.as_struct().cast(target_dtype),
             DType::List(..) | DType::FixedSizeList(..) => self.as_list().cast(target_dtype),
             DType::Extension(..) => self.as_extension().cast(target_dtype),
-            DType::Variant(_) => vortex_bail!("Variant scalars can't be cast to {target_dtype}"),
         }
     }
 

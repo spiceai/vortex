@@ -78,6 +78,9 @@ Struct Fields
 .. c:autotype:: vx_struct_fields
     :file: vortex.h
 
+.. c:autofunction:: vx_struct_fields_clone
+    :file: vortex.h
+
 .. c:autofunction:: vx_struct_fields_free
     :file: vortex.h
 

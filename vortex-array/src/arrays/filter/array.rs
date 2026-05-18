@@ -1,24 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::fmt::Display;
-use std::fmt::Formatter;
-
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure_eq;
 use vortex_mask::Mask;
 
 use crate::ArrayRef;
-use crate::array::Array;
-use crate::array::ArrayParts;
-use crate::array::TypedArrayRef;
-use crate::arrays::Filter;
+use crate::stats::ArrayStats;
 
-/// The source array being filtered.
-pub(super) const CHILD_SLOT: usize = 0;
-pub(super) const NUM_SLOTS: usize = 1;
-pub(super) const SLOT_NAMES: [&str; NUM_SLOTS] = ["child"];
+/// Decomposed parts of the filter array.
+pub struct FilterArrayParts {
+    /// Child array that is filtered by the mask
+    pub child: ArrayRef,
+    /// Mask to apply at filter time. Child elements with set indices are kept, the rest discarded.
+    pub mask: Mask,
+}
 
 // TODO(connor): Write docs on why we have this, and what we had in the old world so that the future
 // does not repeat the mistakes of the past.
@@ -26,55 +23,41 @@ pub(super) const SLOT_NAMES: [&str; NUM_SLOTS] = ["child"];
 ///
 /// The resulting array contains only the elements where the mask is true.
 #[derive(Clone, Debug)]
-pub struct FilterData {
+pub struct FilterArray {
+    /// The source array being filtered.
+    pub(super) child: ArrayRef,
+
     /// The boolean mask selecting which elements to keep.
     pub(super) mask: Mask,
+
+    /// The stats for this array.
+    pub(super) stats: ArrayStats,
 }
 
-impl Display for FilterData {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "mask_len: {}", self.mask.len())
-    }
-}
-
-pub struct FilterDataParts {
-    pub mask: Mask,
-}
-
-pub trait FilterArrayExt: TypedArrayRef<Filter> {
-    fn child(&self) -> &ArrayRef {
-        self.as_ref().slots()[CHILD_SLOT]
-            .as_ref()
-            .vortex_expect("validated filter child slot")
-    }
-}
-impl<T: TypedArrayRef<Filter>> FilterArrayExt for T {}
-
-impl FilterData {
-    pub fn new(mask: Mask) -> Self {
-        Self { mask }
+impl FilterArray {
+    pub fn new(array: ArrayRef, mask: Mask) -> Self {
+        Self::try_new(array, mask).vortex_expect("FilterArray construction failed")
     }
 
-    fn try_new(array_len: usize, mask: Mask) -> VortexResult<Self> {
+    pub fn try_new(array: ArrayRef, mask: Mask) -> VortexResult<Self> {
         vortex_ensure_eq!(
-            array_len,
+            array.len(),
             mask.len(),
             "FilterArray length mismatch: array has length {} but mask has length {}",
-            array_len,
+            array.len(),
             mask.len()
         );
 
-        Ok(Self { mask })
+        Ok(Self {
+            child: array,
+            mask,
+            stats: ArrayStats::default(),
+        })
     }
 
-    /// Returns the length of this array (number of elements after filtering).
-    pub fn len(&self) -> usize {
-        self.mask.true_count()
-    }
-
-    /// Returns `true` if this array is empty.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+    /// The child array being filtered.
+    pub fn child(&self) -> &ArrayRef {
+        &self.child
     }
 
     /// The mask used to filter the child array.
@@ -82,33 +65,11 @@ impl FilterData {
         &self.mask
     }
 
-    pub fn into_parts(self) -> FilterDataParts {
-        FilterDataParts { mask: self.mask }
-    }
-}
-
-impl Array<Filter> {
-    /// Creates a new `FilterArray`.
-    pub fn new(array: ArrayRef, mask: Mask) -> Self {
-        let dtype = array.dtype().clone();
-        let len = mask.true_count();
-        let data = FilterData::new(mask);
-        unsafe {
-            Array::from_parts_unchecked(
-                ArrayParts::new(Filter, dtype, len, data).with_slots(vec![Some(array)]),
-            )
+    /// Consume the array and return its individual components.
+    pub fn into_parts(self) -> FilterArrayParts {
+        FilterArrayParts {
+            child: self.child,
+            mask: self.mask,
         }
-    }
-
-    /// Constructs a new `FilterArray`.
-    pub fn try_new(array: ArrayRef, mask: Mask) -> VortexResult<Self> {
-        let dtype = array.dtype().clone();
-        let len = mask.true_count();
-        let data = FilterData::try_new(array.len(), mask)?;
-        Ok(unsafe {
-            Array::from_parts_unchecked(
-                ArrayParts::new(Filter, dtype, len, data).with_slots(vec![Some(array)]),
-            )
-        })
     }
 }

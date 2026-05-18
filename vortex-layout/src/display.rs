@@ -5,13 +5,13 @@ use std::sync::Arc;
 
 use futures::future::try_join_all;
 use termtree::Tree;
-use vortex_array::serde::SerializedArray;
+use vortex_array::serde::ArrayParts;
 use vortex_error::VortexResult;
 use vortex_utils::aliases::hash_map::HashMap;
 
 use crate::LayoutRef;
-use crate::layouts::flat::Flat;
 use crate::layouts::flat::FlatLayout;
+use crate::layouts::flat::FlatVTable;
 use crate::segments::SegmentId;
 use crate::segments::SegmentSource;
 
@@ -32,10 +32,10 @@ pub(super) async fn display_tree_with_segment_sizes(
 
     // Fetch segments in parallel and parse buffer info
     let fetch_futures = segments_to_fetch.iter().map(|&segment_id| {
-        let segment_source = Arc::clone(&segment_source);
+        let segment_source = segment_source.clone();
         async move {
             let buffer = segment_source.request(segment_id).await?;
-            let parts = SerializedArray::try_from(buffer)?;
+            let parts = ArrayParts::try_from(buffer)?;
             VortexResult::Ok((segment_id, parts.buffer_lengths()))
         }
     });
@@ -55,7 +55,7 @@ fn collect_segments_to_fetch(
     segment_ids: &mut Vec<SegmentId>,
 ) -> VortexResult<()> {
     // For FlatLayout, only add if there's no inline array_tree
-    if let Some(flat_layout) = layout.as_opt::<Flat>() {
+    if let Some(flat_layout) = layout.as_opt::<FlatVTable>() {
         if flat_layout.array_tree().is_none() {
             segment_ids.push(flat_layout.segment_id());
         }
@@ -80,7 +80,7 @@ fn format_flat_layout_buffers(
 
     // First, try to get buffer info from inline array_tree
     if let Some(array_tree) = flat_layout.array_tree()
-        && let Ok(parts) = SerializedArray::from_array_tree(array_tree.as_ref().to_vec())
+        && let Ok(parts) = ArrayParts::from_array_tree(array_tree.as_ref().to_vec())
     {
         return format_buffer_sizes(&parts.buffer_lengths(), *segment_id);
     }
@@ -147,7 +147,7 @@ impl DisplayLayoutTree {
         }
 
         // For FlatLayout, show buffer info
-        if let Some(flat_layout) = layout.as_opt::<Flat>() {
+        if let Some(flat_layout) = layout.as_opt::<FlatVTable>() {
             node_parts.push(format_flat_layout_buffers(
                 flat_layout,
                 self.segment_buffer_sizes.as_ref(),
@@ -202,7 +202,7 @@ impl DisplayLayoutTree {
 
 impl std::fmt::Display for DisplayLayoutTree {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.make_tree(Arc::clone(&self.layout)) {
+        match self.make_tree(self.layout.clone()) {
             Ok(tree) => write!(f, "{}", tree),
             Err(e) => write!(f, "Error building layout tree: {}", e),
         }
@@ -225,266 +225,244 @@ mod tests {
     use vortex_array::dtype::Nullability::NonNullable;
     use vortex_array::dtype::PType;
     use vortex_array::dtype::StructFields;
-    use vortex_array::serde::SerializedArray;
+    use vortex_array::serde::ArrayParts;
     use vortex_array::validity::Validity;
     use vortex_buffer::BitBufferMut;
     use vortex_buffer::buffer;
     use vortex_io::runtime::single::block_on;
-    use vortex_io::session::RuntimeSessionExt;
+    use vortex_utils::env::EnvVarGuard;
 
     use crate::IntoLayout;
     use crate::OwnedLayoutChildren;
     use crate::layouts::chunked::ChunkedLayout;
-    use crate::layouts::flat::Flat;
+    use crate::layouts::flat::FlatVTable;
     use crate::layouts::flat::writer::FlatLayoutStrategy;
     use crate::layouts::struct_::StructLayout;
     use crate::segments::TestSegments;
     use crate::sequence::SequenceId;
     use crate::sequence::SequentialArrayStreamExt;
     use crate::strategy::LayoutStrategy;
-    use crate::test::SESSION;
 
     /// Test display_tree with inline array_tree metadata (no segment source needed).
     #[test]
     fn test_display_tree_inline_array_tree() {
-        // LazyLock caches the env var on first read, so only nextest (separate processes) can isolate it.
-        if std::env::var("NEXTEST_RUN_ID").is_ok() {
-            temp_env::with_var("FLAT_LAYOUT_INLINE_ARRAY_NODE", Some("1"), || {
-                block_on(|handle| async move {
-                    let session = SESSION.clone().with_handle(handle);
-                    let ctx = ArrayContext::empty();
-                    let segments = Arc::new(TestSegments::default());
+        let _guard = EnvVarGuard::set("FLAT_LAYOUT_INLINE_ARRAY_NODE", "1");
+        block_on(|handle| async move {
+            let ctx = ArrayContext::empty();
+            let segments = Arc::new(TestSegments::default());
 
-                    // Create nullable i64 array (2 buffers: data + validity)
-                    let (ptr1, eof1) = SequenceId::root().split();
-                    let mut validity_builder = BitBufferMut::with_capacity(5);
-                    for b in [true, false, true, true, false] {
-                        validity_builder.append(b);
-                    }
-                    let validity = Validity::Array(
-                        BoolArray::new(validity_builder.freeze(), Validity::NonNullable)
-                            .into_array(),
-                    );
-                    let array1 = PrimitiveArray::new(buffer![1i64, 2, 3, 4, 5], validity);
-                    let layout1 = FlatLayoutStrategy::default()
-                        .write_stream(
-                            ctx.clone(),
-                            Arc::<TestSegments>::clone(&segments),
-                            array1.into_array().to_array_stream().sequenced(ptr1),
-                            eof1,
-                            &session,
-                        )
-                        .await
-                        .unwrap();
+            // Create nullable i64 array (2 buffers: data + validity)
+            let (ptr1, eof1) = SequenceId::root().split();
+            let mut validity_builder = BitBufferMut::with_capacity(5);
+            for b in [true, false, true, true, false] {
+                validity_builder.append(b);
+            }
+            let validity = Validity::Array(
+                BoolArray::new(validity_builder.freeze(), Validity::NonNullable).into_array(),
+            );
+            let array1 = PrimitiveArray::new(buffer![1i64, 2, 3, 4, 5], validity);
+            let layout1 = FlatLayoutStrategy::default()
+                .write_stream(
+                    ctx.clone(),
+                    segments.clone(),
+                    array1.to_array_stream().sequenced(ptr1),
+                    eof1,
+                    handle.clone(),
+                )
+                .await
+                .unwrap();
 
-                    // Create utf8 array (2 buffers: views + data)
-                    let (ptr2, eof2) = SequenceId::root().split();
-                    let mut builder = VarBinViewBuilder::with_capacity(DType::Utf8(NonNullable), 5);
-                    for s in [
-                        "hello world this is long",
-                        "another long string",
-                        "short",
-                        "medium str",
-                        "x",
-                    ] {
-                        builder.append_value(s);
-                    }
-                    let layout2 = FlatLayoutStrategy::default()
-                        .write_stream(
-                            ctx.clone(),
-                            Arc::<TestSegments>::clone(&segments),
-                            builder
-                                .finish()
-                                .into_array()
-                                .to_array_stream()
-                                .sequenced(ptr2),
-                            eof2,
-                            &session,
-                        )
-                        .await
-                        .unwrap();
+            // Create utf8 array (2 buffers: views + data)
+            let (ptr2, eof2) = SequenceId::root().split();
+            let mut builder = VarBinViewBuilder::with_capacity(DType::Utf8(NonNullable), 5);
+            for s in [
+                "hello world this is long",
+                "another long string",
+                "short",
+                "medium str",
+                "x",
+            ] {
+                builder.append_value(s);
+            }
+            let layout2 = FlatLayoutStrategy::default()
+                .write_stream(
+                    ctx.clone(),
+                    segments.clone(),
+                    builder.finish().to_array_stream().sequenced(ptr2),
+                    eof2,
+                    handle.clone(),
+                )
+                .await
+                .unwrap();
 
-                    // Create struct layout
-                    let struct_layout = StructLayout::new(
-                        5,
-                        DType::Struct(
-                            StructFields::new(
-                                vec![FieldName::from("numbers"), FieldName::from("strings")].into(),
-                                vec![
-                                    DType::Primitive(PType::I64, Nullability::Nullable),
-                                    DType::Utf8(NonNullable),
-                                ],
-                            ),
-                            NonNullable,
-                        ),
+            // Create struct layout
+            let struct_layout = StructLayout::new(
+                5,
+                DType::Struct(
+                    StructFields::new(
+                        vec![FieldName::from("numbers"), FieldName::from("strings")].into(),
                         vec![
-                            ChunkedLayout::new(
-                                5,
-                                DType::Primitive(PType::I64, Nullability::Nullable),
-                                OwnedLayoutChildren::layout_children(vec![layout1]),
-                            )
-                            .into_layout(),
-                            layout2,
+                            DType::Primitive(PType::I64, Nullability::Nullable),
+                            DType::Utf8(NonNullable),
                         ],
+                    ),
+                    NonNullable,
+                ),
+                vec![
+                    ChunkedLayout::new(
+                        5,
+                        DType::Primitive(PType::I64, Nullability::Nullable),
+                        OwnedLayoutChildren::layout_children(vec![layout1]),
                     )
-                    .into_layout();
+                    .into_layout(),
+                    layout2,
+                ],
+            )
+            .into_layout();
 
-                    let output = format!("{}", struct_layout.display_tree_verbose(true));
+            let output = format!("{}", struct_layout.display_tree_verbose(true));
 
-                    let expected = "\
+            let expected = "\
 vortex.struct, dtype: {numbers=i64?, strings=utf8}, children: 2, rows: 5
 ├── numbers: vortex.chunked, dtype: i64?, children: 1, rows: 5
 │   └── [0]: vortex.flat, dtype: i64?, metadata: 171 bytes, rows: 5, segment 0, buffers=[40B, 1B], total=41B
 └── strings: vortex.flat, dtype: utf8, metadata: 110 bytes, rows: 5, segment 1, buffers=[43B, 80B], total=123B
 ";
-                    assert_eq!(output, expected);
-                })
-            })
-        }
+            assert_eq!(output, expected);
+        })
     }
 
     /// Test display_tree_with_segments using async segment source to fetch buffer sizes.
     #[test]
     fn test_display_tree_with_segment_source() {
-        if std::env::var("NEXTEST_RUN_ID").is_ok() {
-            temp_env::with_var("FLAT_LAYOUT_INLINE_ARRAY_NODE", None::<&str>, || {
-                block_on(|handle| async move {
-                    let session = SESSION.clone().with_handle(handle);
-                    let ctx = ArrayContext::empty();
-                    let segments = Arc::new(TestSegments::default());
+        // Ensure inline array node is disabled for this test
+        let _guard = EnvVarGuard::remove("FLAT_LAYOUT_INLINE_ARRAY_NODE");
+        block_on(|handle| async move {
+            let ctx = ArrayContext::empty();
+            let segments = Arc::new(TestSegments::default());
 
-                    // Create simple i32 array
-                    let (ptr1, eof1) = SequenceId::root().split();
-                    let array1 =
-                        PrimitiveArray::new(buffer![1i32, 2, 3, 4, 5], Validity::NonNullable);
-                    let layout1 = FlatLayoutStrategy::default()
-                        .write_stream(
-                            ctx.clone(),
-                            Arc::<TestSegments>::clone(&segments),
-                            array1.into_array().to_array_stream().sequenced(ptr1),
-                            eof1,
-                            &session,
-                        )
-                        .await
-                        .unwrap();
+            // Create simple i32 array
+            let (ptr1, eof1) = SequenceId::root().split();
+            let array1 = PrimitiveArray::new(buffer![1i32, 2, 3, 4, 5], Validity::NonNullable);
+            let layout1 = FlatLayoutStrategy::default()
+                .write_stream(
+                    ctx.clone(),
+                    segments.clone(),
+                    array1.to_array_stream().sequenced(ptr1),
+                    eof1,
+                    handle.clone(),
+                )
+                .await
+                .unwrap();
 
-                    // Create another i32 array
-                    let (ptr2, eof2) = SequenceId::root().split();
-                    let array2 =
-                        PrimitiveArray::new(buffer![6i32, 7, 8, 9, 10], Validity::NonNullable);
-                    let layout2 = FlatLayoutStrategy::default()
-                        .write_stream(
-                            ctx.clone(),
-                            Arc::<TestSegments>::clone(&segments),
-                            array2.into_array().to_array_stream().sequenced(ptr2),
-                            eof2,
-                            &session,
-                        )
-                        .await
-                        .unwrap();
+            // Create another i32 array
+            let (ptr2, eof2) = SequenceId::root().split();
+            let array2 = PrimitiveArray::new(buffer![6i32, 7, 8, 9, 10], Validity::NonNullable);
+            let layout2 = FlatLayoutStrategy::default()
+                .write_stream(
+                    ctx.clone(),
+                    segments.clone(),
+                    array2.to_array_stream().sequenced(ptr2),
+                    eof2,
+                    handle.clone(),
+                )
+                .await
+                .unwrap();
 
-                    // Create chunked layout
-                    let chunked_layout = ChunkedLayout::new(
-                        10,
-                        DType::Primitive(PType::I32, NonNullable),
-                        OwnedLayoutChildren::layout_children(vec![layout1, layout2]),
-                    )
-                    .into_layout();
+            // Create chunked layout
+            let chunked_layout = ChunkedLayout::new(
+                10,
+                DType::Primitive(PType::I32, NonNullable),
+                OwnedLayoutChildren::layout_children(vec![layout1, layout2]),
+            )
+            .into_layout();
 
-                    let output = chunked_layout
-                        .display_tree_with_segments(segments)
-                        .await
-                        .unwrap();
+            let output = chunked_layout
+                .display_tree_with_segments(segments)
+                .await
+                .unwrap();
 
-                    let expected = "\
+            let expected = "\
 vortex.chunked, dtype: i32, children: 2, rows: 10
 ├── [0]: vortex.flat, dtype: i32, rows: 5, segment 0, buffers=[20B], total=20B
 └── [1]: vortex.flat, dtype: i32, rows: 5, segment 1, buffers=[20B], total=20B
 ";
-                    assert_eq!(output.to_string(), expected);
-                })
-            })
-        }
+            assert_eq!(output.to_string(), expected);
+        })
     }
 
     /// Test display_array_tree with inline array node metadata.
     #[test]
     fn test_display_array_tree_with_inline_node() {
-        if std::env::var("NEXTEST_RUN_ID").is_ok() {
-            temp_env::with_var("FLAT_LAYOUT_INLINE_ARRAY_NODE", Some("1"), || {
-                let ctx = ArrayContext::empty();
-                let segments = Arc::new(TestSegments::default());
-                let (ptr, eof) = SequenceId::root().split();
+        let _guard = EnvVarGuard::set("FLAT_LAYOUT_INLINE_ARRAY_NODE", "1");
 
-                // Create a simple primitive array
-                let array = PrimitiveArray::new(buffer![1i32, 2, 3, 4, 5], Validity::AllValid);
-                let layout = block_on(|handle| async {
-                    let session = SESSION.clone().with_handle(handle);
-                    FlatLayoutStrategy::default()
-                        .write_stream(
-                            ctx.clone(),
-                            Arc::<TestSegments>::clone(&segments),
-                            array.into_array().to_array_stream().sequenced(ptr),
-                            eof,
-                            &session,
-                        )
-                        .await
-                        .unwrap()
-                });
+        let ctx = ArrayContext::empty();
+        let segments = Arc::new(TestSegments::default());
+        let (ptr, eof) = SequenceId::root().split();
 
-                let flat_layout = layout.as_::<Flat>();
+        // Create a simple primitive array
+        let array = PrimitiveArray::new(buffer![1i32, 2, 3, 4, 5], Validity::AllValid);
+        let layout = block_on(|handle| async {
+            FlatLayoutStrategy::default()
+                .write_stream(
+                    ctx.clone(),
+                    segments.clone(),
+                    array.to_array_stream().sequenced(ptr),
+                    eof,
+                    handle,
+                )
+                .await
+                .unwrap()
+        });
 
-                let array_tree = flat_layout.array_tree().expect(
-                    "array_tree should be populated when FLAT_LAYOUT_INLINE_ARRAY_NODE is set",
-                );
+        let flat_layout = layout.as_::<FlatVTable>();
 
-                let parts = SerializedArray::from_array_tree(array_tree.as_ref().to_vec())
-                    .expect("should parse array_tree");
-                assert_eq!(parts.buffer_lengths(), vec![20]); // 5 i32 values = 20 bytes
+        let array_tree = flat_layout
+            .array_tree()
+            .expect("array_tree should be populated when FLAT_LAYOUT_INLINE_ARRAY_NODE is set");
 
-                assert_eq!(
-                    layout.display_tree().to_string(),
-                    "\
+        let parts = ArrayParts::from_array_tree(array_tree.as_ref().to_vec())
+            .expect("should parse array_tree");
+        assert_eq!(parts.buffer_lengths(), vec![20]); // 5 i32 values = 20 bytes
+
+        assert_eq!(
+            layout.display_tree().to_string(),
+            "\
 vortex.flat, dtype: i32?, segment 0, buffers=[20B], total=20B
 "
-                );
-            })
-        }
+        );
     }
 
     /// Test display_tree without inline array node (shows segment ID).
     #[test]
     fn test_display_tree_without_inline_node() {
-        if std::env::var("NEXTEST_RUN_ID").is_ok() {
-            temp_env::with_var("FLAT_LAYOUT_INLINE_ARRAY_NODE", Some("1"), || {
-                let ctx = ArrayContext::empty();
-                let segments = Arc::new(TestSegments::default());
-                let (ptr, eof) = SequenceId::root().split();
+        let _guard = EnvVarGuard::set("FLAT_LAYOUT_INLINE_ARRAY_NODE", "1");
 
-                // Create a simple primitive array
-                let array = PrimitiveArray::new(buffer![10i64, 20, 30], Validity::NonNullable);
-                let layout = block_on(|handle| async {
-                    let session = SESSION.clone().with_handle(handle);
-                    FlatLayoutStrategy::default()
-                        .write_stream(
-                            ctx,
-                            Arc::<TestSegments>::clone(&segments),
-                            array.into_array().to_array_stream().sequenced(ptr),
-                            eof,
-                            &session,
-                        )
-                        .await
-                        .unwrap()
-                });
+        let ctx = ArrayContext::empty();
+        let segments = Arc::new(TestSegments::default());
+        let (ptr, eof) = SequenceId::root().split();
 
-                // Test display_tree exact output (with inline array_tree enabled by env var from other test)
-                assert_eq!(
-                    layout.display_tree().to_string(),
-                    "\
+        // Create a simple primitive array
+        let array = PrimitiveArray::new(buffer![10i64, 20, 30], Validity::NonNullable);
+        let layout = block_on(|handle| async {
+            FlatLayoutStrategy::default()
+                .write_stream(
+                    ctx,
+                    segments.clone(),
+                    array.to_array_stream().sequenced(ptr),
+                    eof,
+                    handle,
+                )
+                .await
+                .unwrap()
+        });
+
+        // Test display_tree exact output (with inline array_tree enabled by env var from other test)
+        assert_eq!(
+            layout.display_tree().to_string(),
+            "\
 vortex.flat, dtype: i64, segment 0, buffers=[24B], total=24B
 "
-                );
-            })
-        }
+        );
     }
 }

@@ -14,10 +14,8 @@ use vortex_session::VortexSession;
 use vortex_utils::aliases::hash_set::HashSet;
 
 use crate::ArrayRef;
-use crate::ExecutionCtx;
 use crate::IntoArray as _;
 use crate::arrays::StructArray;
-use crate::arrays::struct_::StructArrayExt;
 use crate::dtype::DType;
 use crate::dtype::FieldNames;
 use crate::dtype::Nullability;
@@ -51,7 +49,7 @@ impl ScalarFnVTable for Merge {
     type Options = DuplicateHandling;
 
     fn id(&self) -> ScalarFnId {
-        ScalarFnId::from("vortex.merge")
+        ScalarFnId::new_ref("vortex.merge")
     }
 
     fn serialize(&self, instance: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
@@ -140,19 +138,14 @@ impl ScalarFnVTable for Merge {
         ))
     }
 
-    fn execute(
-        &self,
-        options: &Self::Options,
-        args: &dyn ExecutionArgs,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<ArrayRef> {
+    fn execute(&self, options: &Self::Options, args: ExecutionArgs) -> VortexResult<ArrayRef> {
         // Collect fields in order of appearance. Later fields overwrite earlier fields.
         let mut field_names = Vec::new();
         let mut arrays = Vec::new();
         let mut duplicate_names = HashSet::<_>::new();
 
-        for i in 0..args.num_inputs() {
-            let array = args.get(i)?.execute::<StructArray>(ctx)?;
+        for input in args.inputs {
+            let array = input.execute::<StructArray>(args.ctx)?;
             if array.dtype().is_nullable() {
                 vortex_bail!("merge expects non-nullable input");
             }
@@ -160,7 +153,7 @@ impl ScalarFnVTable for Merge {
             for (field_name, field_array) in array
                 .names()
                 .iter()
-                .zip_eq(array.iter_unmasked_fields().cloned())
+                .zip_eq(array.unmasked_fields().iter().cloned())
             {
                 // Update or insert field.
                 if let Some(idx) = field_names.iter().position(|name| name == field_name) {
@@ -182,7 +175,7 @@ impl ScalarFnVTable for Merge {
 
         // TODO(DK): When children are allowed to be nullable, this needs to change.
         let validity = Validity::NonNullable;
-        let len = args.row_count();
+        let len = args.row_count;
         Ok(
             StructArray::try_new(FieldNames::from(field_names), arrays, len, validity)?
                 .into_array(),
@@ -215,10 +208,10 @@ impl ScalarFnVTable for Merge {
             for name in child_dtype.names().iter() {
                 if let Some(idx) = names.iter().position(|n| n == name) {
                     duplicate_names.insert(name.clone());
-                    children[idx] = Arc::clone(&child);
+                    children[idx] = child.clone();
                 } else {
                     names.push(name.clone());
-                    children.push(Arc::clone(&child));
+                    children.push(child.clone());
                 }
             }
 
@@ -289,12 +282,11 @@ mod tests {
     use vortex_error::VortexResult;
     use vortex_error::vortex_bail;
 
-    use crate::ArrayRef;
+    use crate::Array;
     use crate::IntoArray;
-    #[expect(deprecated)]
-    use crate::ToCanonical as _;
+    use crate::ToCanonical;
     use crate::arrays::PrimitiveArray;
-    use crate::arrays::struct_::StructArrayExt;
+    use crate::arrays::StructArray;
     use crate::assert_arrays_eq;
     use crate::dtype::DType;
     use crate::dtype::Nullability::NonNullable;
@@ -308,26 +300,20 @@ mod tests {
     use crate::expr::merge_opts;
     use crate::expr::root;
     use crate::scalar_fn::fns::merge::DuplicateHandling;
-    use crate::scalar_fn::fns::merge::StructArray;
     use crate::scalar_fn::fns::pack::Pack;
 
-    fn primitive_field(array: &ArrayRef, field_path: &[&str]) -> VortexResult<PrimitiveArray> {
+    fn primitive_field(array: &dyn Array, field_path: &[&str]) -> VortexResult<PrimitiveArray> {
         let mut field_path = field_path.iter();
 
         let Some(field) = field_path.next() else {
             vortex_bail!("empty field path");
         };
 
-        #[expect(deprecated)]
         let mut array = array.to_struct().unmasked_field_by_name(field)?.clone();
         for field in field_path {
-            #[expect(deprecated)]
-            let next = array.to_struct().unmasked_field_by_name(field)?.clone();
-            array = next;
+            array = array.to_struct().unmasked_field_by_name(field)?.clone();
         }
-        #[expect(deprecated)]
-        let result = array.to_primitive();
-        Ok(result)
+        Ok(array.to_primitive())
     }
 
     #[test]
@@ -497,16 +483,13 @@ mod tests {
         ])
         .unwrap()
         .into_array();
-        #[expect(deprecated)]
-        let actual_array = test_array.apply(&expr).unwrap().to_struct();
+        let actual_array = test_array.clone().apply(&expr).unwrap().to_struct();
 
-        #[expect(deprecated)]
-        let inner_struct = actual_array
-            .unmasked_field_by_name("a")
-            .unwrap()
-            .to_struct();
         assert_eq!(
-            inner_struct
+            actual_array
+                .unmasked_field_by_name("a")
+                .unwrap()
+                .to_struct()
                 .names()
                 .iter()
                 .map(|name| name.as_ref())
@@ -541,8 +524,7 @@ mod tests {
         ])
         .unwrap()
         .into_array();
-        #[expect(deprecated)]
-        let actual_array = test_array.apply(&expr).unwrap().to_struct();
+        let actual_array = test_array.clone().apply(&expr).unwrap().to_struct();
 
         assert_eq!(actual_array.names(), ["a", "c", "b", "d"]);
     }

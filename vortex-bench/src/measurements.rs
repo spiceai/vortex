@@ -243,8 +243,7 @@ pub struct QueryMeasurement {
     pub query_idx: usize,
     pub target: Target,
     pub benchmark_dataset: BenchmarkDataset,
-    pub benchmark_runner: String,
-    /// The storage backend against which this test was run. One of: s3, nvme.
+    /// The storage backend against which this test was run. One of: s3, gcs, nvme.
     pub storage: String,
     pub runs: Vec<Duration>,
 }
@@ -280,8 +279,6 @@ pub struct QueryMeasurementJson {
     pub name: String,
     pub storage: String,
     pub dataset: BenchmarkDataset,
-    /// The cloud runner used to run this
-    pub runner: String,
     pub unit: String,
     pub value: u128,
     pub all_runtimes: Vec<u128>,
@@ -313,7 +310,6 @@ impl ToJson for QueryMeasurement {
             name,
             storage: self.storage.clone(),
             dataset: self.benchmark_dataset.clone(),
-            runner: self.benchmark_runner.clone(),
             unit: "ns".to_string(),
             value: self.median_run().as_nanos(),
             all_runtimes: self.runs.iter().map(|r| r.as_nanos()).collect_vec(),
@@ -434,7 +430,6 @@ pub struct MemoryMeasurement {
     pub query_idx: usize,
     pub target: Target,
     pub benchmark_dataset: BenchmarkDataset,
-    pub benchmark_runner: String,
     pub storage: String,
     pub physical_memory_delta: i64,
     pub virtual_memory_delta: i64,
@@ -447,7 +442,6 @@ impl MemoryMeasurement {
         query_idx: usize,
         target: Target,
         benchmark_dataset: BenchmarkDataset,
-        benchmark_runner: String,
         storage: String,
         memory_result: MemoryMeasurementResult,
     ) -> Self {
@@ -455,7 +449,6 @@ impl MemoryMeasurement {
             query_idx,
             target,
             benchmark_dataset,
-            benchmark_runner,
             storage,
             physical_memory_delta: memory_result.physical_memory_delta,
             virtual_memory_delta: memory_result.virtual_memory_delta,
@@ -481,7 +474,6 @@ impl ToJson for MemoryMeasurement {
             name,
             storage: self.storage.clone(),
             dataset: self.benchmark_dataset.clone(),
-            runner: self.benchmark_runner.clone(),
             physical_memory_delta: self.physical_memory_delta,
             virtual_memory_delta: self.virtual_memory_delta,
             peak_physical_memory: self.peak_physical_memory,
@@ -515,7 +507,6 @@ pub struct MemoryMeasurementJson {
     pub name: String,
     pub storage: String,
     pub dataset: BenchmarkDataset,
-    pub runner: String,
     pub physical_memory_delta: i64,
     pub virtual_memory_delta: i64,
     pub peak_physical_memory: u64,

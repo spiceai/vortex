@@ -12,28 +12,28 @@ use super::cast::upcast_decimal_values;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::IntoArray;
-use crate::array::ArrayView;
-use crate::arrays::BoolArray;
-use crate::arrays::Decimal;
-use crate::arrays::DecimalArray;
+use crate::ToCanonical;
+use crate::arrays::DecimalVTable;
+use crate::arrays::decimal::DecimalArray;
 use crate::dtype::NativeDecimalType;
 use crate::match_each_decimal_value_type;
 use crate::scalar::DecimalValue;
 use crate::scalar::Scalar;
 use crate::scalar_fn::fns::fill_null::FillNullKernel;
 use crate::validity::Validity;
+use crate::vtable::ValidityHelper;
 
-impl FillNullKernel for Decimal {
+impl FillNullKernel for DecimalVTable {
     fn fill_null(
-        array: ArrayView<'_, Decimal>,
+        array: &DecimalArray,
         fill_value: &Scalar,
-        ctx: &mut ExecutionCtx,
+        _ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
         let result_validity = Validity::from(fill_value.dtype().nullability());
 
-        Ok(Some(match array.validity()? {
+        Ok(Some(match array.validity() {
             Validity::Array(is_valid) => {
-                let is_invalid = is_valid.execute::<BoolArray>(ctx)?.into_bit_buffer().not();
+                let is_invalid = is_valid.to_bool().to_bit_buffer().not();
                 let decimal_scalar = fill_value.as_decimal();
                 let decimal_value = decimal_scalar
                     .decimal_value()
@@ -53,7 +53,7 @@ impl FillNullKernel for Decimal {
 }
 
 fn fill_invalid_positions<T: NativeDecimalType>(
-    array: ArrayView<'_, Decimal>,
+    array: &DecimalArray,
     is_invalid: &BitBuffer,
     decimal_value: &DecimalValue,
     result_validity: Validity,
@@ -64,15 +64,14 @@ fn fill_invalid_positions<T: NativeDecimalType>(
             let target = max(array.values_type(), decimal_value.decimal_type());
             let upcasted = upcast_decimal_values(array, target)?;
             match_each_decimal_value_type!(upcasted.values_type(), |U| {
-                let upcasted = upcasted.as_view();
-                fill_invalid_positions::<U>(upcasted, is_invalid, decimal_value, result_validity)
+                fill_invalid_positions::<U>(&upcasted, is_invalid, decimal_value, result_validity)
             })
         }
     }
 }
 
 fn fill_buffer<T: NativeDecimalType>(
-    array: ArrayView<'_, Decimal>,
+    array: &DecimalArray,
     is_invalid: &BitBuffer,
     fill_val: T,
     result_validity: Validity,
@@ -88,14 +87,10 @@ fn fill_buffer<T: NativeDecimalType>(
 mod tests {
     use vortex_buffer::buffer;
 
-    use crate::IntoArray;
-    use crate::LEGACY_SESSION;
-    use crate::VortexSessionExecute;
-    use crate::arrays::DecimalArray;
+    use crate::arrays::decimal::DecimalArray;
     use crate::assert_arrays_eq;
     use crate::builtins::ArrayBuiltins;
-    #[expect(deprecated)]
-    use crate::canonical::ToCanonical as _;
+    use crate::canonical::ToCanonical;
     use crate::dtype::DecimalDType;
     use crate::dtype::Nullability;
     use crate::scalar::DecimalValue;
@@ -109,9 +104,8 @@ mod tests {
             [None, Some(800i128), None, Some(1000i128), None],
             decimal_dtype,
         );
-        #[expect(deprecated)]
         let p = arr
-            .into_array()
+            .to_array()
             .fill_null(Scalar::decimal(
                 DecimalValue::I128(4200i128),
                 DecimalDType::new(19, 2),
@@ -127,14 +121,7 @@ mod tests {
             p.buffer::<i128>().as_slice(),
             vec![4200, 800, 4200, 1000, 4200]
         );
-        assert!(
-            p.as_ref()
-                .validity()
-                .unwrap()
-                .execute_mask(p.as_ref().len(), &mut LEGACY_SESSION.create_execution_ctx())
-                .unwrap()
-                .all_true()
-        );
+        assert!(p.validity_mask().unwrap().all_true());
     }
 
     #[test]
@@ -146,9 +133,8 @@ mod tests {
             decimal_dtype,
         );
 
-        #[expect(deprecated)]
         let p = arr
-            .into_array()
+            .to_array()
             .fill_null(Scalar::decimal(
                 DecimalValue::I128(25500i128),
                 DecimalDType::new(19, 2),
@@ -168,9 +154,8 @@ mod tests {
         let decimal_dtype = DecimalDType::new(3, 0);
         let arr = DecimalArray::from_option_iter([None, Some(10i8), None], decimal_dtype);
         // i8 max is 127, so 200 doesn't fit — the array should be widened to i16.
-        #[expect(deprecated)]
         let result = arr
-            .into_array()
+            .to_array()
             .fill_null(Scalar::decimal(
                 DecimalValue::I128(200i128),
                 DecimalDType::new(3, 0),
@@ -193,9 +178,8 @@ mod tests {
             decimal_dtype,
             Validity::NonNullable,
         );
-        #[expect(deprecated)]
         let p = arr
-            .into_array()
+            .to_array()
             .fill_null(Scalar::decimal(
                 DecimalValue::I128(25500i128),
                 DecimalDType::new(19, 2),

@@ -8,14 +8,13 @@ use std::hash::Hash;
 use vortex_error::VortexResult;
 
 use crate::dtype::DType;
-use crate::dtype::extension::ExtDType;
 use crate::dtype::extension::ExtId;
 use crate::scalar::ScalarValue;
 
 /// The public API for defining new extension types.
 ///
-/// This is the non-object-safe trait that plugin authors implement to define a new extension type.
-/// It specifies the type's identity, metadata, serialization, and validation.
+/// This is the non-object-safe trait that plugin authors implement to define a new extension
+/// type. It specifies the type's identity, metadata, serialization, and validation.
 pub trait ExtVTable: 'static + Sized + Send + Sync + Clone + Debug + Eq + Hash {
     /// Associated type containing the deserialized metadata for this extension type.
     type Metadata: 'static + Send + Sync + Clone + Debug + Display + Eq + Hash;
@@ -37,63 +36,40 @@ pub trait ExtVTable: 'static + Sized + Send + Sync + Clone + Debug + Eq + Hash {
     fn deserialize_metadata(&self, metadata: &[u8]) -> VortexResult<Self::Metadata>;
 
     /// Validate that the given storage type is compatible with this extension type.
-    fn validate_dtype(ext_dtype: &ExtDType<Self>) -> VortexResult<()>;
-
-    /// Can a value of `other` be implicitly widened into this type? (e.g. GeographyType might
-    /// accept Point, LineString, etc.)
-    ///
-    /// Implementors only need to override one of `can_coerce_from` or `can_coerce_to`. We have both
-    /// so that either side of the coercion can provide the logic.
-    fn can_coerce_from(ext_dtype: &ExtDType<Self>, other: &DType) -> bool {
-        let _ = (ext_dtype, other);
-        false
-    }
-
-    /// Can this type be implicitly widened into `other`?
-    ///
-    /// Implementors only need to override one of `can_coerce_from` or `can_coerce_to`. We have both
-    /// so that either side of the coercion can provide the logic.
-    fn can_coerce_to(ext_dtype: &ExtDType<Self>, other: &DType) -> bool {
-        let _ = (ext_dtype, other);
-        false
-    }
-
-    /// Given two types in a Uniform context, what is their least supertype?
-    ///
-    /// Return None if no supertype exists.
-    fn least_supertype(ext_dtype: &ExtDType<Self>, other: &DType) -> Option<DType> {
-        let _ = (ext_dtype, other);
-        None
-    }
+    fn validate_dtype(&self, metadata: &Self::Metadata, storage_dtype: &DType) -> VortexResult<()>;
 
     // Methods related to the extension scalar values.
 
     /// Validate the given storage value is compatible with the extension type.
     ///
-    /// By default, this calls [`unpack_native()`](ExtVTable::unpack_native) and discards the
-    /// result.
+    /// By default, this calls [`unpack_native()`](ExtVTable::unpack_native) and discards the result.
     ///
     /// # Errors
     ///
     /// Returns an error if the storage [`ScalarValue`] is not compatible with the extension type.
     fn validate_scalar_value(
-        ext_dtype: &ExtDType<Self>,
+        &self,
+        metadata: &Self::Metadata,
+        storage_dtype: &DType,
         storage_value: &ScalarValue,
     ) -> VortexResult<()> {
-        Self::unpack_native(ext_dtype, storage_value).map(|_| ())
+        self.unpack_native(metadata, storage_dtype, storage_value)
+            .map(|_| ())
     }
 
     /// Validate and unpack a native value from the storage [`ScalarValue`].
     ///
     /// Note that [`ExtVTable::validate_dtype()`] is always called first to validate the storage
-    /// [`crate::dtype::DType`], and the [`Scalar`](crate::scalar::Scalar) implementation will
-    /// verify that the storage value is compatible with the storage dtype on construction.
+    /// [`DType`], and the [`Scalar`](crate::scalar::Scalar) implementation will verify that the
+    /// storage value is compatible with the storage dtype on construction.
     ///
     /// # Errors
     ///
     /// Returns an error if the storage [`ScalarValue`] is not compatible with the extension type.
     fn unpack_native<'a>(
-        ext_dtype: &'a ExtDType<Self>,
+        &self,
+        metadata: &'a Self::Metadata,
+        storage_dtype: &'a DType,
         storage_value: &'a ScalarValue,
     ) -> VortexResult<Self::NativeValue<'a>>;
 }

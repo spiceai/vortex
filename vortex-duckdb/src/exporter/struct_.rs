@@ -5,12 +5,11 @@ use vortex::array::ExecutionCtx;
 use vortex::array::IntoArray;
 use vortex::array::arrays::BoolArray;
 use vortex::array::arrays::StructArray;
-use vortex::array::arrays::bool::BoolArrayExt;
-use vortex::array::arrays::struct_::StructDataParts;
+use vortex::array::arrays::StructArrayParts;
 use vortex::array::builtins::ArrayBuiltins;
-use vortex::array::validity::Validity;
 use vortex::error::VortexResult;
 
+use crate::duckdb::LogicalType;
 use crate::duckdb::VectorRef;
 use crate::exporter::ColumnExporter;
 use crate::exporter::ConversionCache;
@@ -28,35 +27,32 @@ pub(crate) fn new_exporter(
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<Box<dyn ColumnExporter>> {
     let len = array.len();
-    let StructDataParts {
+    let StructArrayParts {
         validity,
-        struct_fields: _struct_fields,
+        struct_fields,
         fields,
         ..
-    } = array.into_data_parts();
-
-    if matches!(validity, Validity::AllInvalid) {
-        return Ok(all_invalid::new_exporter());
-    };
+    } = array.into_parts();
     let validity = validity.to_array(len).execute::<BoolArray>(ctx)?;
+
+    if validity.to_bit_buffer().true_count() == 0 {
+        let ltype = LogicalType::try_from(struct_fields)?;
+        return Ok(all_invalid::new_exporter(len, &ltype));
+    }
 
     let children = fields
         .iter()
         .map(|child| {
             if validity.to_bit_buffer().true_count() != validity.len() {
                 // TODO(joe): use new mask.
-                new_array_exporter(
-                    child.clone().mask(validity.clone().into_array())?,
-                    cache,
-                    ctx,
-                )
+                new_array_exporter(child.clone().mask(validity.to_array())?, cache, ctx)
             } else {
                 new_array_exporter(child.clone().into_array(), cache, ctx)
             }
         })
         .collect::<VortexResult<Vec<_>>>()?;
     Ok(validity::new_exporter(
-        validity.execute_mask(ctx),
+        validity.to_mask(),
         Box::new(StructExporter { children }),
     ))
 }
@@ -81,7 +77,6 @@ mod tests {
     use std::ffi::CString;
 
     use vortex::array::IntoArray;
-    use vortex::array::VortexSessionExecute;
     use vortex::array::arrays::ConstantArray;
     use vortex::array::arrays::DictArray;
     use vortex::array::arrays::PrimitiveArray;
@@ -90,6 +85,7 @@ mod tests {
     use vortex::buffer::BitBuffer;
     use vortex::buffer::buffer;
     use vortex::error::VortexExpect;
+    use vortex_array::VortexSessionExecute;
 
     use super::*;
     use crate::SESSION;

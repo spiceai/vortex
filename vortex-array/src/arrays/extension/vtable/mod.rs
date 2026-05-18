@@ -1,159 +1,74 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+mod array;
+mod canonical;
+mod kernel;
+mod operations;
+mod validity;
+mod visitor;
+
 use kernel::PARENT_KERNELS;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
-use vortex_error::vortex_ensure_eq;
-use vortex_error::vortex_err;
-use vortex_error::vortex_panic;
+use vortex_error::vortex_ensure;
 use vortex_session::VortexSession;
-use vortex_session::registry::CachedId;
 
 use crate::ArrayRef;
-use crate::EmptyArrayData;
+use crate::EmptyMetadata;
 use crate::ExecutionCtx;
-use crate::ExecutionResult;
-use crate::array::Array;
-use crate::array::ArrayId;
-use crate::array::ArrayParts;
-use crate::array::ArrayView;
-use crate::array::VTable;
-use crate::array::ValidityVTableFromChild;
-use crate::arrays::extension::array::SLOT_NAMES;
-use crate::arrays::extension::array::STORAGE_SLOT;
+use crate::arrays::extension::ExtensionArray;
 use crate::arrays::extension::compute::rules::PARENT_RULES;
-use crate::arrays::extension::compute::rules::RULES;
 use crate::buffer::BufferHandle;
 use crate::dtype::DType;
 use crate::serde::ArrayChildren;
+use crate::vtable;
+use crate::vtable::ArrayId;
+use crate::vtable::VTable;
+use crate::vtable::ValidityVTableFromChild;
 
-mod kernel;
-mod operations;
-mod validity;
+vtable!(Extension);
 
-/// An extension array that wraps another array with additional type information.
-///
-/// **⚠️ Unstable API**: This is an experimental feature that may change significantly
-/// in future versions. The extension type system is still evolving.
-///
-/// Unlike Apache Arrow's extension arrays, Vortex extension arrays provide a more flexible
-/// mechanism for adding semantic meaning to existing array types without requiring
-/// changes to the core type system.
-///
-/// ## Design Philosophy
-///
-/// Extension arrays serve as a type-safe wrapper that:
-/// - Preserves the underlying storage format and operations
-/// - Adds semantic type information via `ExtDType`
-/// - Enables custom serialization and deserialization logic
-/// - Allows domain-specific interpretations of generic data
-///
-/// ## Storage and Type Relationship
-///
-/// The extension array maintains a strict contract:
-/// - **Storage array**: Contains the actual data in a standard Vortex encoding
-/// - **Extension type**: Defines how to interpret the storage data semantically
-/// - **Type safety**: The storage array's dtype must match the extension type's storage dtype
-///
-/// ## Use Cases
-///
-/// Extension arrays are ideal for:
-/// - **Custom numeric types**: Units of measurement, currencies
-/// - **Temporal types**: Custom date/time formats, time zones, calendars
-/// - **Domain-specific types**: UUIDs, IP addresses, geographic coordinates
-/// - **Encoded types**: Base64 strings, compressed data, encrypted values
-///
-/// ## Validity and Operations
-///
-/// Extension arrays delegate validity and most operations to their storage array:
-/// - Validity is inherited from the underlying storage
-/// - Slicing preserves the extension type
-/// - Scalar access wraps storage scalars with extension metadata
-#[derive(Clone, Debug)]
-pub struct Extension;
+impl VTable for ExtensionVTable {
+    type Array = ExtensionArray;
 
-/// A [`Extension`]-encoded Vortex array.
-pub type ExtensionArray = Array<Extension>;
+    type Metadata = EmptyMetadata;
 
-impl VTable for Extension {
-    type ArrayData = EmptyArrayData;
-
+    type ArrayVTable = Self;
     type OperationsVTable = Self;
     type ValidityVTable = ValidityVTableFromChild;
+    type VisitorVTable = Self;
 
-    fn id(&self) -> ArrayId {
-        static ID: CachedId = CachedId::new("vortex.ext");
-        *ID
+    fn id(_array: &Self::Array) -> ArrayId {
+        Self::ID
     }
 
-    fn validate(
-        &self,
-        _data: &EmptyArrayData,
-        dtype: &DType,
-        len: usize,
-        slots: &[Option<ArrayRef>],
-    ) -> VortexResult<()> {
-        let storage = slots[STORAGE_SLOT]
-            .as_ref()
-            .vortex_expect("ExtensionArray storage slot");
-        vortex_ensure_eq!(
-            storage.len(),
-            len,
-            "ExtensionArray length {} does not match outer length {len}",
-            storage.len(),
-        );
-
-        let ext_dtype = dtype
-            .as_extension_opt()
-            .ok_or_else(|| vortex_err!("not an extension dtype"))?;
-
-        let actual_dtype = DType::Extension(ext_dtype.clone());
-        vortex_ensure_eq!(
-            &actual_dtype,
-            dtype,
-            "ExtensionArray dtype {actual_dtype} does not match outer dtype {dtype}",
-        );
-
-        Ok(())
+    fn metadata(_array: &ExtensionArray) -> VortexResult<Self::Metadata> {
+        Ok(EmptyMetadata)
     }
 
-    fn nbuffers(_array: ArrayView<'_, Self>) -> usize {
-        0
-    }
-
-    fn buffer(_array: ArrayView<'_, Self>, idx: usize) -> BufferHandle {
-        vortex_panic!("ExtensionArray buffer index {idx} out of bounds")
-    }
-
-    fn buffer_name(_array: ArrayView<'_, Self>, _idx: usize) -> Option<String> {
-        None
-    }
-
-    fn serialize(
-        _array: ArrayView<'_, Self>,
-        _session: &VortexSession,
-    ) -> VortexResult<Option<Vec<u8>>> {
+    fn serialize(_metadata: Self::Metadata) -> VortexResult<Option<Vec<u8>>> {
         Ok(Some(vec![]))
     }
 
     fn deserialize(
-        &self,
+        _bytes: &[u8],
+        _dtype: &DType,
+        _len: usize,
+        _buffers: &[BufferHandle],
+        _session: &VortexSession,
+    ) -> VortexResult<Self::Metadata> {
+        Ok(EmptyMetadata)
+    }
+
+    fn build(
         dtype: &DType,
         len: usize,
-        metadata: &[u8],
-
+        _metadata: &Self::Metadata,
         _buffers: &[BufferHandle],
         children: &dyn ArrayChildren,
-        _session: &VortexSession,
-    ) -> VortexResult<ArrayParts<Self>> {
-        if !metadata.is_empty() {
-            vortex_bail!(
-                "ExtensionArray expects empty metadata, got {} bytes",
-                metadata.len()
-            );
-        }
+    ) -> VortexResult<ExtensionArray> {
         let DType::Extension(ext_dtype) = dtype else {
             vortex_bail!("Not an extension DType");
         };
@@ -161,38 +76,47 @@ impl VTable for Extension {
             vortex_bail!("Expected 1 child, got {}", children.len());
         }
         let storage = children.get(0, ext_dtype.storage_dtype(), len)?;
-        Ok(
-            ArrayParts::new(self.clone(), dtype.clone(), len, EmptyArrayData)
-                .with_slots(vec![Some(storage)]),
-        )
+        Ok(ExtensionArray::new(ext_dtype.clone(), storage))
     }
 
-    fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {
-        SLOT_NAMES[idx].to_string()
+    fn with_children(array: &mut Self::Array, children: Vec<ArrayRef>) -> VortexResult<()> {
+        vortex_ensure!(
+            children.len() == 1,
+            "ExtensionArray expects exactly 1 child (storage), got {}",
+            children.len()
+        );
+        array.storage = children
+            .into_iter()
+            .next()
+            .vortex_expect("children length already validated");
+        Ok(())
     }
 
-    fn execute(array: Array<Self>, _ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
-        Ok(ExecutionResult::done(array))
+    fn execute(array: &Self::Array, _ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
+        Ok(array.to_array())
+    }
+
+    fn reduce_parent(
+        array: &Self::Array,
+        parent: &ArrayRef,
+        child_idx: usize,
+    ) -> VortexResult<Option<ArrayRef>> {
+        PARENT_RULES.evaluate(array, parent, child_idx)
     }
 
     fn execute_parent(
-        array: ArrayView<'_, Self>,
+        array: &Self::Array,
         parent: &ArrayRef,
         child_idx: usize,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
         PARENT_KERNELS.execute(array, parent, child_idx, ctx)
     }
+}
 
-    fn reduce(array: ArrayView<'_, Self>) -> VortexResult<Option<ArrayRef>> {
-        RULES.evaluate(array)
-    }
+#[derive(Debug)]
+pub struct ExtensionVTable;
 
-    fn reduce_parent(
-        array: ArrayView<'_, Self>,
-        parent: &ArrayRef,
-        child_idx: usize,
-    ) -> VortexResult<Option<ArrayRef>> {
-        PARENT_RULES.evaluate(array, parent, child_idx)
-    }
+impl ExtensionVTable {
+    pub const ID: ArrayId = ArrayId::new_ref("vortex.ext");
 }

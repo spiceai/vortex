@@ -9,28 +9,26 @@ use vortex_error::vortex_bail;
 use vortex_mask::AllOr;
 use vortex_mask::Mask;
 
+use crate::Array;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
-use crate::IntoArray;
-use crate::array::ArrayView;
-use crate::arrays::VarBinView;
+use crate::arrays::BinaryView;
 use crate::arrays::VarBinViewArray;
-use crate::arrays::varbinview::BinaryView;
-use crate::arrays::varbinview::VarBinViewArrayExt;
+use crate::arrays::VarBinViewVTable;
 use crate::builders::DeduplicatedBuffers;
 use crate::builders::LazyBitBufferBuilder;
 use crate::scalar_fn::fns::zip::ZipKernel;
 
 // A dedicated VarBinView zip kernel that builds the result directly by adjusting views and validity,
 // instead of routing through the generic builder (which would redo buffer lookups per mask slice).
-impl ZipKernel for VarBinView {
+impl ZipKernel for VarBinViewVTable {
     fn zip(
-        if_true: ArrayView<'_, VarBinView>,
-        if_false: &ArrayRef,
-        mask: &ArrayRef,
-        ctx: &mut ExecutionCtx,
+        if_true: &VarBinViewArray,
+        if_false: &dyn Array,
+        mask: &Mask,
+        _ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
-        let Some(if_false) = if_false.as_opt::<VarBinView>() else {
+        let Some(if_false) = if_false.as_opt::<VarBinViewVTable>() else {
             return Ok(None);
         };
 
@@ -47,18 +45,16 @@ impl ZipKernel for VarBinView {
         // to the new buffer index in the result array
         let mut buffers = DeduplicatedBuffers::default();
         let true_lookup =
-            buffers.extend_from_iter(if_true.data_buffers().iter().map(|b| b.as_host().clone()));
+            buffers.extend_from_iter(if_true.buffers().iter().map(|b| b.as_host().clone()));
         let false_lookup =
-            buffers.extend_from_iter(if_false.data_buffers().iter().map(|b| b.as_host().clone()));
+            buffers.extend_from_iter(if_false.buffers().iter().map(|b| b.as_host().clone()));
 
         let mut views_builder = BufferMut::<BinaryView>::with_capacity(len);
         let mut validity_builder = LazyBitBufferBuilder::new(len);
 
-        let true_validity = if_true.varbinview_validity().execute_mask(len, ctx)?;
-        let false_validity = if_false.varbinview_validity().execute_mask(len, ctx)?;
+        let true_validity = if_true.validity_mask()?;
+        let false_validity = if_false.validity_mask()?;
 
-        let mask = mask.try_to_mask_fill_null_false(ctx)?;
-        let if_false_view = if_false;
         match mask.slices() {
             AllOr::All => push_range(
                 if_true,
@@ -69,7 +65,7 @@ impl ZipKernel for VarBinView {
                 &mut validity_builder,
             ),
             AllOr::None => push_range(
-                if_false_view,
+                if_false,
                 &false_lookup,
                 &false_validity,
                 0..len,
@@ -81,7 +77,7 @@ impl ZipKernel for VarBinView {
                 for (start, end) in slices {
                     if pos < *start {
                         push_range(
-                            if_false_view,
+                            if_false,
                             &false_lookup,
                             &false_validity,
                             pos..*start,
@@ -101,7 +97,7 @@ impl ZipKernel for VarBinView {
                 }
                 if pos < len {
                     push_range(
-                        if_false_view,
+                        if_false,
                         &false_lookup,
                         &false_validity,
                         pos..len,
@@ -125,12 +121,12 @@ impl ZipKernel for VarBinView {
             )
         };
 
-        Ok(Some(array.into_array()))
+        Ok(Some(array.to_array()))
     }
 }
 
 fn push_range(
-    array: ArrayView<'_, VarBinView>,
+    array: &VarBinViewArray,
     buffer_lookup: &[u32],
     validity: &Mask,
     range: Range<usize>,
@@ -177,6 +173,7 @@ fn push_range(
     }
 }
 
+#[inline]
 fn push_view(
     view: BinaryView,
     buffer_lookup: &[u32],
@@ -210,12 +207,11 @@ fn push_view(
 mod tests {
     use vortex_mask::Mask;
 
-    use crate::IntoArray;
     use crate::accessor::ArrayAccessor;
     use crate::arrays::VarBinViewArray;
-    use crate::builtins::ArrayBuiltins;
+    use crate::canonical::ToCanonical;
     #[expect(deprecated)]
-    use crate::canonical::ToCanonical as _;
+    use crate::compute::zip;
     use crate::dtype::DType;
     use crate::dtype::Nullability;
 
@@ -248,12 +244,7 @@ mod tests {
         let mask = Mask::from_iter([true, false, true, false, false, true]);
 
         #[expect(deprecated)]
-        let zipped = mask
-            .clone()
-            .into_array()
-            .zip(a.into_array(), b.into_array())
-            .unwrap()
-            .to_varbinview();
+        let zipped = zip(a.as_ref(), b.as_ref(), &mask).unwrap().to_varbinview();
 
         let values = zipped.with_iterator(|it| {
             it.map(|v| v.map(|bytes| String::from_utf8(bytes.to_vec()).unwrap()))

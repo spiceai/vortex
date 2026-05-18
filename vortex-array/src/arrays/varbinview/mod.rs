@@ -2,10 +2,8 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 mod array;
-pub use array::VarBinViewArrayExt;
-pub use array::VarBinViewData;
-pub use array::VarBinViewDataParts;
-pub use vtable::VarBinViewArray;
+pub use array::VarBinViewArray;
+pub use array::VarBinViewArrayParts;
 
 mod accessor;
 pub(crate) mod compact;
@@ -13,7 +11,7 @@ pub(crate) mod compact;
 pub(crate) mod compute;
 
 mod vtable;
-pub use vtable::VarBinView;
+pub use vtable::VarBinViewVTable;
 
 pub mod build_views;
 

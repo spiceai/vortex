@@ -1,40 +1,40 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use vortex_array::Array;
 use vortex_array::ArrayRef;
-use vortex_array::ArrayView;
 use vortex_array::IntoArray;
-use vortex_array::arrays::Filter;
-use vortex_array::arrays::filter::FilterReduceAdaptor;
-use vortex_array::arrays::slice::SliceReduceAdaptor;
+use vortex_array::arrays::FilterArray;
+use vortex_array::arrays::FilterReduceAdaptor;
+use vortex_array::arrays::FilterVTable;
+use vortex_array::arrays::SliceReduceAdaptor;
 use vortex_array::optimizer::rules::ArrayParentReduceRule;
 use vortex_array::optimizer::rules::ParentRuleSet;
 use vortex_array::scalar_fn::fns::cast::CastReduceAdaptor;
 use vortex_array::scalar_fn::fns::mask::MaskReduceAdaptor;
-use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 
-use crate::DecimalByteParts;
-use crate::decimal_byte_parts::DecimalBytePartsArrayExt;
+use crate::DecimalBytePartsArray;
+use crate::DecimalBytePartsVTable;
 
-pub(super) const PARENT_RULES: ParentRuleSet<DecimalByteParts> = ParentRuleSet::new(&[
+pub(super) const PARENT_RULES: ParentRuleSet<DecimalBytePartsVTable> = ParentRuleSet::new(&[
     ParentRuleSet::lift(&DecimalBytePartsFilterPushDownRule),
-    ParentRuleSet::lift(&CastReduceAdaptor(DecimalByteParts)),
-    ParentRuleSet::lift(&FilterReduceAdaptor(DecimalByteParts)),
-    ParentRuleSet::lift(&MaskReduceAdaptor(DecimalByteParts)),
-    ParentRuleSet::lift(&SliceReduceAdaptor(DecimalByteParts)),
+    ParentRuleSet::lift(&CastReduceAdaptor(DecimalBytePartsVTable)),
+    ParentRuleSet::lift(&FilterReduceAdaptor(DecimalBytePartsVTable)),
+    ParentRuleSet::lift(&MaskReduceAdaptor(DecimalBytePartsVTable)),
+    ParentRuleSet::lift(&SliceReduceAdaptor(DecimalBytePartsVTable)),
 ]);
 
 #[derive(Debug)]
 struct DecimalBytePartsFilterPushDownRule;
 
-impl ArrayParentReduceRule<DecimalByteParts> for DecimalBytePartsFilterPushDownRule {
-    type Parent = Filter;
+impl ArrayParentReduceRule<DecimalBytePartsVTable> for DecimalBytePartsFilterPushDownRule {
+    type Parent = FilterVTable;
 
     fn reduce_parent(
         &self,
-        child: ArrayView<'_, DecimalByteParts>,
-        parent: ArrayView<'_, Filter>,
+        child: &DecimalBytePartsArray,
+        parent: &FilterArray,
         _child_idx: usize,
     ) -> VortexResult<Option<ArrayRef>> {
         // TODO(ngates): we should benchmark whether to push-down filters with "lower parts".
@@ -43,15 +43,9 @@ impl ArrayParentReduceRule<DecimalByteParts> for DecimalBytePartsFilterPushDownR
             return Ok(None);
         }
 
-        let new_msp = child.msp().filter(parent.filter_mask().clone())?;
-        let new_child = DecimalByteParts::try_new(
-            new_msp,
-            *child
-                .dtype()
-                .as_decimal_opt()
-                .vortex_expect("must be a decimal dtype"),
-        )?
-        .into_array();
+        let new_msp = child.msp.filter(parent.filter_mask().clone())?;
+        let new_child =
+            DecimalBytePartsArray::try_new(new_msp, *child.decimal_dtype())?.into_array();
         Ok(Some(new_child))
     }
 }

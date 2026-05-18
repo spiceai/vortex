@@ -23,7 +23,6 @@ mod list;
 mod primitive;
 mod struct_;
 mod utf8;
-mod variant;
 
 pub use binary::*;
 pub use bool::*;
@@ -33,4 +32,3 @@ pub use list::*;
 pub use primitive::*;
 pub use struct_::*;
 pub use utf8::*;
-pub use variant::*;

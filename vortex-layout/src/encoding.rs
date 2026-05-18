@@ -7,13 +7,12 @@ use std::fmt::Display;
 use std::fmt::Formatter;
 
 use arcref::ArcRef;
+use vortex_array::ArrayContext;
 use vortex_array::DeserializeMetadata;
 use vortex_array::dtype::DType;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_panic;
-use vortex_session::registry::Id;
-use vortex_session::registry::ReadContext;
 
 use crate::IntoLayout;
 use crate::LayoutChildren;
@@ -21,8 +20,7 @@ use crate::LayoutRef;
 use crate::VTable;
 use crate::segments::SegmentId;
 
-/// A unique identifier for a layout encoding.
-pub type LayoutEncodingId = Id;
+pub type LayoutEncodingId = ArcRef<str>;
 pub type LayoutEncodingRef = ArcRef<dyn LayoutEncoding>;
 
 pub trait LayoutEncoding: 'static + Send + Sync + Debug + private::Sealed {
@@ -37,7 +35,7 @@ pub trait LayoutEncoding: 'static + Send + Sync + Debug + private::Sealed {
         metadata: &[u8],
         segment_ids: Vec<SegmentId>,
         children: &dyn LayoutChildren,
-        ctx: &ReadContext,
+        ctx: &ArrayContext,
     ) -> VortexResult<LayoutRef>;
 }
 
@@ -60,7 +58,7 @@ impl<V: VTable> LayoutEncoding for LayoutEncodingAdapter<V> {
         metadata: &[u8],
         segment_ids: Vec<SegmentId>,
         children: &dyn LayoutChildren,
-        ctx: &ReadContext,
+        ctx: &ArrayContext,
     ) -> VortexResult<LayoutRef> {
         let metadata = <V::Metadata as DeserializeMetadata>::deserialize(metadata)?;
         let layout = V::build(
@@ -130,10 +128,8 @@ impl dyn LayoutEncoding + '_ {
 
 mod private {
     use super::*;
-    use crate::layouts::foreign::ForeignLayoutEncoding;
 
     pub trait Sealed {}
 
     impl<V: VTable> Sealed for LayoutEncodingAdapter<V> {}
-    impl Sealed for ForeignLayoutEncoding {}
 }

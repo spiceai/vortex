@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use crate::arrays::List;
-use crate::arrays::dict::TakeExecuteAdaptor;
-use crate::arrays::filter::FilterExecuteAdaptor;
+use crate::arrays::FilterExecuteAdaptor;
+use crate::arrays::ListVTable;
+use crate::arrays::TakeExecuteAdaptor;
 use crate::kernel::ParentKernelSet;
-use crate::scalar_fn::fns::cast::CastExecuteAdaptor;
 
-pub(crate) const PARENT_KERNELS: ParentKernelSet<List> = ParentKernelSet::new(&[
-    ParentKernelSet::lift(&CastExecuteAdaptor(List)),
-    ParentKernelSet::lift(&FilterExecuteAdaptor(List)),
-    ParentKernelSet::lift(&TakeExecuteAdaptor(List)),
+pub(crate) const PARENT_KERNELS: ParentKernelSet<ListVTable> = ParentKernelSet::new(&[
+    ParentKernelSet::lift(&FilterExecuteAdaptor(ListVTable)),
+    ParentKernelSet::lift(&TakeExecuteAdaptor(ListVTable)),
 ]);

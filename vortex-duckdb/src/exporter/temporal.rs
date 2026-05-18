@@ -46,11 +46,11 @@ pub(crate) fn new_exporter(
 #[cfg(test)]
 mod tests {
     use vortex::array::IntoArray as _;
-    use vortex::array::VortexSessionExecute;
     use vortex::array::arrays::PrimitiveArray;
     use vortex::array::arrays::TemporalArray;
     use vortex::buffer::buffer;
     use vortex::extension::datetime::TimeUnit;
+    use vortex_array::VortexSessionExecute;
 
     use crate::SESSION;
     use crate::cpp;
@@ -87,7 +87,7 @@ mod tests {
     fn test_timestamp_us() {
         let arr = TemporalArray::new_timestamp(
             PrimitiveArray::from_iter((0..10).map(|i| 1_000_000 * i + 1750265188000001i64))
-                .into_array(),
+                .to_array(),
             TimeUnit::Microseconds,
             None,
         );
@@ -111,7 +111,7 @@ mod tests {
     #[test]
     fn test_timestamp_time_us() {
         let arr = TemporalArray::new_time(
-            PrimitiveArray::from_iter((1i64..10).map(|i| 1_000_000 * i)).into_array(),
+            PrimitiveArray::from_iter((1i64..10).map(|i| 1_000_000 * i)).to_array(),
             TimeUnit::Microseconds,
         );
 

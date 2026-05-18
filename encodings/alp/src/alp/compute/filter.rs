@@ -2,38 +2,36 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use vortex_array::ArrayRef;
-use vortex_array::ArrayView;
 use vortex_array::ExecutionCtx;
-use vortex_array::IntoArray;
-use vortex_array::arrays::filter::FilterKernel;
+use vortex_array::arrays::FilterKernel;
 use vortex_error::VortexResult;
 use vortex_mask::Mask;
 
-use crate::ALP;
-use crate::ALPArrayExt;
-use crate::ALPArraySlotsExt;
+use crate::ALPArray;
+use crate::ALPVTable;
 
-impl FilterKernel for ALP {
+impl FilterKernel for ALPVTable {
     fn filter(
-        array: ArrayView<'_, Self>,
+        array: &ALPArray,
         mask: &Mask,
-        ctx: &mut ExecutionCtx,
+        _ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
         let patches = array
             .patches()
-            .map(|p| p.filter(mask, ctx))
+            .map(|p| p.filter(mask))
             .transpose()?
             .flatten();
 
         // SAFETY: filtering the values does not change correctness
         unsafe {
             Ok(Some(
-                ALP::new_unchecked(
+                ALPArray::new_unchecked(
                     array.encoded().filter(mask.clone())?,
                     array.exponents(),
                     patches,
+                    array.dtype().clone(),
                 )
-                .into_array(),
+                .to_array(),
             ))
         }
     }
@@ -44,8 +42,7 @@ mod test {
     use rstest::rstest;
     use vortex_array::ArrayRef;
     use vortex_array::IntoArray;
-    use vortex_array::LEGACY_SESSION;
-    use vortex_array::VortexSessionExecute;
+    use vortex_array::ToCanonical;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::compute::conformance::filter::test_filter_conformance;
     use vortex_buffer::buffer;
@@ -62,9 +59,7 @@ mod test {
         11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0
     ].into_array())]
     fn test_filter_alp_conformance(#[case] array: ArrayRef) {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
-        let array_primitive = array.execute::<PrimitiveArray>(&mut ctx).unwrap();
-        let alp = alp_encode(array_primitive.as_view(), None, &mut ctx).unwrap();
-        test_filter_conformance(&alp.into_array());
+        let alp = alp_encode(&array.to_primitive(), None).unwrap();
+        test_filter_conformance(alp.as_ref());
     }
 }

@@ -2,7 +2,6 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::rc::Rc;
-use std::rc::Weak as RcWeak;
 use std::sync::Arc;
 
 use futures::Stream;
@@ -58,7 +57,7 @@ impl Sender {
         let weak_local = Rc::downgrade(local);
 
         // Drive scheduling tasks.
-        let weak_local2 = RcWeak::clone(&weak_local);
+        let weak_local2 = weak_local.clone();
         local
             .spawn(async move {
                 while let Ok(spawn) = scheduling_recv.as_async().recv().await {
@@ -75,7 +74,7 @@ impl Sender {
             .detach();
 
         // Drive CPU tasks.
-        let weak_local2 = RcWeak::clone(&weak_local);
+        let weak_local2 = weak_local.clone();
         local
             .spawn(async move {
                 while let Ok(spawn) = cpu_recv.as_async().recv().await {
@@ -91,7 +90,7 @@ impl Sender {
             .detach();
 
         // Drive blocking tasks.
-        let weak_local2 = RcWeak::clone(&weak_local);
+        let weak_local2 = weak_local.clone();
         local
             .spawn(async move {
                 while let Ok(spawn) = blocking_recv.as_async().recv().await {
@@ -163,7 +162,7 @@ impl BlockingRuntime for SingleThreadRuntime {
     type BlockingIterator<'a, R: 'a> = SingleThreadIterator<'a, R>;
 
     fn handle(&self) -> Handle {
-        let executor: Arc<dyn Executor> = Arc::clone(&self.sender) as Arc<dyn Executor>;
+        let executor: Arc<dyn Executor> = self.sender.clone();
         Handle::new(Arc::downgrade(&executor))
     }
 
@@ -180,7 +179,7 @@ impl BlockingRuntime for SingleThreadRuntime {
         R: Send + 'a,
     {
         SingleThreadIterator {
-            executor: Rc::clone(&self.executor),
+            executor: self.executor.clone(),
             stream: stream.boxed_local(),
         }
     }
@@ -282,7 +281,7 @@ mod tests {
     #[test]
     fn test_spawn_cpu_task() {
         let counter = Arc::new(AtomicUsize::new(0));
-        let c = Arc::clone(&counter);
+        let c = counter.clone();
 
         block_on(|handle| async move {
             handle

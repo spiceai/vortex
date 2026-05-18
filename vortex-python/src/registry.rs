@@ -3,6 +3,7 @@
 
 use pyo3::Bound;
 use pyo3::PyResult;
+use pyo3::Python;
 use pyo3::prelude::*;
 use vortex::array::session::ArraySessionExt;
 
@@ -31,6 +32,6 @@ pub(crate) fn register(cls: &Bound<PyAny>) -> PyVortexResult<()> {
     let id = id_from_obj(cls)?;
     // TODO(ngates): we would need to register the Python class object in a PyVortexSession
     //  to call back into it during deserialize operations.
-    SESSION.arrays().register(PythonVTable { id });
+    SESSION.arrays().register(id, PythonVTable);
     Ok(())
 }

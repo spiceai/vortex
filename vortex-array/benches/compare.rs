@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-#![expect(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used)]
 
 use divan::Bencher;
-use rand::RngExt;
+use rand::Rng;
 use rand::SeedableRng;
 use rand::distr::Uniform;
 use rand::prelude::StdRng;
@@ -21,7 +21,7 @@ fn main() {
     divan::main();
 }
 
-const ARRAY_SIZE: usize = 65_536;
+const ARRAY_SIZE: usize = 10_000_000;
 
 #[divan::bench]
 fn compare_bool(bencher: Bencher) {
@@ -37,8 +37,8 @@ fn compare_bool(bencher: Bencher) {
         .bench_refs(|input| {
             input
                 .0
-                .clone()
-                .binary(input.1.clone(), Operator::Gte)
+                .to_array()
+                .binary(input.1.to_array(), Operator::Gte)
                 .unwrap()
                 .execute::<Canonical>(&mut input.2)
         });
@@ -65,8 +65,8 @@ fn compare_int(bencher: Bencher) {
         .bench_refs(|input| {
             input
                 .0
-                .clone()
-                .binary(input.1.clone(), Operator::Gte)
+                .to_array()
+                .binary(input.1.to_array(), Operator::Gte)
                 .unwrap()
                 .execute::<Canonical>(&mut input.2)
         });

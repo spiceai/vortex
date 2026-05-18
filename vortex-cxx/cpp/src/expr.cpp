@@ -50,8 +50,7 @@ DEFINE_BINARY_OP(checked_add)
 
 Expr select(const std::vector<std::string_view> &fields, Expr child) {
     ::rust::Vec<::rust::String> rs_fields;
-    rs_fields.reserve(fields.size());
-    for (std::string_view f : fields) {
+    for (auto f : fields) {
         rs_fields.emplace_back(f.data(), f.length());
     }
     return Expr(ffi::select(rs_fields, std::move(child).IntoImpl()));

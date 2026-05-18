@@ -16,10 +16,8 @@ use vortex_proto::expr::select_opts::Opts;
 use vortex_session::VortexSession;
 
 use crate::ArrayRef;
-use crate::ExecutionCtx;
 use crate::IntoArray;
 use crate::arrays::StructArray;
-use crate::arrays::struct_::StructArrayExt;
 use crate::dtype::DType;
 use crate::dtype::FieldName;
 use crate::dtype::FieldNames;
@@ -48,7 +46,7 @@ impl ScalarFnVTable for Select {
     type Options = FieldSelection;
 
     fn id(&self) -> ScalarFnId {
-        ScalarFnId::from("vortex.select")
+        ScalarFnId::new_ref("vortex.select")
     }
 
     fn serialize(&self, instance: &FieldSelection) -> VortexResult<Option<Vec<u8>>> {
@@ -94,7 +92,7 @@ impl ScalarFnVTable for Select {
 
     fn child_name(&self, _instance: &FieldSelection, child_idx: usize) -> ChildName {
         match child_idx {
-            0 => ChildName::from("child"),
+            0 => ChildName::new_ref("child"),
             _ => unreachable!(),
         }
     }
@@ -143,10 +141,13 @@ impl ScalarFnVTable for Select {
     fn execute(
         &self,
         selection: &FieldSelection,
-        args: &dyn ExecutionArgs,
-        ctx: &mut ExecutionCtx,
+        mut args: ExecutionArgs,
     ) -> VortexResult<ArrayRef> {
-        let child = args.get(0)?.execute::<StructArray>(ctx)?;
+        let child = args
+            .inputs
+            .pop()
+            .vortex_expect("Missing input child")
+            .execute::<StructArray>(args.ctx)?;
 
         let result = match selection {
             FieldSelection::Include(f) => child.project(f.as_ref()),
@@ -161,7 +162,7 @@ impl ScalarFnVTable for Select {
             }
         }?;
 
-        result.into_array().execute(ctx)
+        result.into_array().execute(args.ctx)
     }
 
     fn simplify(
@@ -307,9 +308,8 @@ mod tests {
     use vortex_buffer::buffer;
 
     use crate::IntoArray;
-    #[expect(deprecated)]
-    use crate::ToCanonical as _;
-    use crate::arrays::struct_::StructArrayExt;
+    use crate::ToCanonical;
+    use crate::arrays::StructArray;
     use crate::dtype::DType;
     use crate::dtype::FieldName;
     use crate::dtype::FieldNames;
@@ -322,7 +322,6 @@ mod tests {
     use crate::expr::select_exclude;
     use crate::expr::test_harness;
     use crate::scalar_fn::fns::select::Select;
-    use crate::scalar_fn::fns::select::StructArray;
 
     fn test_array() -> StructArray {
         StructArray::from_fields(&[
@@ -336,8 +335,7 @@ mod tests {
     pub fn include_columns() {
         let st = test_array();
         let select = select(vec![FieldName::from("a")], root());
-        #[expect(deprecated)]
-        let selected = st.into_array().apply(&select).unwrap().to_struct();
+        let selected = st.to_array().apply(&select).unwrap().to_struct();
         let selected_names = selected.names().clone();
         assert_eq!(selected_names.as_ref(), &["a"]);
     }
@@ -346,8 +344,7 @@ mod tests {
     pub fn exclude_columns() {
         let st = test_array();
         let select = select_exclude(vec![FieldName::from("a")], root());
-        #[expect(deprecated)]
-        let selected = st.into_array().apply(&select).unwrap().to_struct();
+        let selected = st.to_array().apply(&select).unwrap().to_struct();
         let selected_names = selected.names().clone();
         assert_eq!(selected_names.as_ref(), &["b"]);
     }

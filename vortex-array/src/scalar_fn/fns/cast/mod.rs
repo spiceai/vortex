@@ -7,6 +7,7 @@ use std::fmt::Formatter;
 
 pub use kernel::*;
 use prost::Message;
+use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
@@ -15,20 +16,20 @@ use vortex_session::VortexSession;
 
 use crate::AnyColumnar;
 use crate::ArrayRef;
-use crate::ArrayView;
 use crate::CanonicalView;
 use crate::ColumnarView;
 use crate::ExecutionCtx;
-use crate::arrays::Bool;
-use crate::arrays::Constant;
-use crate::arrays::Decimal;
-use crate::arrays::Extension;
-use crate::arrays::FixedSizeList;
-use crate::arrays::ListView;
-use crate::arrays::Null;
-use crate::arrays::Primitive;
-use crate::arrays::Struct;
-use crate::arrays::VarBinView;
+use crate::arrays::BoolVTable;
+use crate::arrays::ConstantArray;
+use crate::arrays::ConstantVTable;
+use crate::arrays::DecimalVTable;
+use crate::arrays::ExtensionVTable;
+use crate::arrays::FixedSizeListVTable;
+use crate::arrays::ListViewVTable;
+use crate::arrays::NullVTable;
+use crate::arrays::PrimitiveVTable;
+use crate::arrays::StructVTable;
+use crate::arrays::VarBinViewVTable;
 use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
 use crate::expr::StatsCatalog;
@@ -53,7 +54,7 @@ impl ScalarFnVTable for Cast {
     type Options = DType;
 
     fn id(&self) -> ScalarFnId {
-        ScalarFnId::new("vortex.cast")
+        ScalarFnId::from("vortex.cast")
     }
 
     fn serialize(&self, dtype: &DType) -> VortexResult<Option<Vec<u8>>> {
@@ -101,26 +102,26 @@ impl ScalarFnVTable for Cast {
         Ok(dtype.clone())
     }
 
-    fn execute(
-        &self,
-        target_dtype: &DType,
-        args: &dyn ExecutionArgs,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<ArrayRef> {
-        let input = args.get(0)?;
+    fn execute(&self, target_dtype: &DType, mut args: ExecutionArgs) -> VortexResult<ArrayRef> {
+        let input = args
+            .inputs
+            .pop()
+            .vortex_expect("missing input for Cast expression");
 
         let Some(columnar) = input.as_opt::<AnyColumnar>() else {
-            return input.execute::<ArrayRef>(ctx)?.cast(target_dtype.clone());
+            return input
+                .execute::<ArrayRef>(args.ctx)?
+                .cast(target_dtype.clone());
         };
 
         match columnar {
             ColumnarView::Canonical(canonical) => {
-                match cast_canonical(canonical, target_dtype, ctx)? {
+                match cast_canonical(canonical.clone(), target_dtype, args.ctx)? {
                     Some(result) => Ok(result),
                     None => vortex_bail!(
                         "No CastKernel to cast canonical array {} from {} to {}",
-                        canonical.to_array_ref().encoding_id(),
-                        canonical.to_array_ref().dtype(),
+                        canonical.as_ref().encoding_id(),
+                        canonical.as_ref().dtype(),
                         target_dtype,
                     ),
                 }
@@ -198,37 +199,28 @@ impl ScalarFnVTable for Cast {
 }
 
 /// Cast a canonical array to the target dtype by dispatching to the appropriate
-/// [`CastKernel`] for each canonical encoding.
-///
-/// Canonical encodings that can manipulate validity directly all implement [`CastKernel`] —
-/// the kernel is the execution-time complement of their [`CastReduce`] rule and can compute
-/// statistics (e.g. min of the validity array) when the reduce rule had to give up.
-/// Encodings that delegate to scalars or storage (e.g. [`Null`], [`Constant`], [`Extension`])
-/// only implement [`CastReduce`] because they never need execution-level information.
+/// [`CastReduce`] or [`CastKernel`] for each canonical encoding.
 fn cast_canonical(
     canonical: CanonicalView<'_>,
     dtype: &DType,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<Option<ArrayRef>> {
     match canonical {
-        CanonicalView::Null(a) => <Null as CastReduce>::cast(a, dtype),
-        CanonicalView::Bool(a) => <Bool as CastKernel>::cast(a, dtype, ctx),
-        CanonicalView::Primitive(a) => <Primitive as CastKernel>::cast(a, dtype, ctx),
-        CanonicalView::Decimal(a) => <Decimal as CastKernel>::cast(a, dtype, ctx),
-        CanonicalView::VarBinView(a) => <VarBinView as CastKernel>::cast(a, dtype, ctx),
-        CanonicalView::List(a) => <ListView as CastKernel>::cast(a, dtype, ctx),
-        CanonicalView::FixedSizeList(a) => <FixedSizeList as CastKernel>::cast(a, dtype, ctx),
-        CanonicalView::Struct(a) => <Struct as CastKernel>::cast(a, dtype, ctx),
-        CanonicalView::Extension(a) => <Extension as CastReduce>::cast(a, dtype),
-        CanonicalView::Variant(_) => {
-            vortex_bail!("Variant arrays don't support casting")
-        }
+        CanonicalView::Null(a) => <NullVTable as CastReduce>::cast(a, dtype),
+        CanonicalView::Bool(a) => <BoolVTable as CastReduce>::cast(a, dtype),
+        CanonicalView::Primitive(a) => <PrimitiveVTable as CastKernel>::cast(a, dtype, ctx),
+        CanonicalView::Decimal(a) => <DecimalVTable as CastKernel>::cast(a, dtype, ctx),
+        CanonicalView::VarBinView(a) => <VarBinViewVTable as CastReduce>::cast(a, dtype),
+        CanonicalView::List(a) => <ListViewVTable as CastReduce>::cast(a, dtype),
+        CanonicalView::FixedSizeList(a) => <FixedSizeListVTable as CastReduce>::cast(a, dtype),
+        CanonicalView::Struct(a) => <StructVTable as CastKernel>::cast(a, dtype, ctx),
+        CanonicalView::Extension(a) => <ExtensionVTable as CastReduce>::cast(a, dtype),
     }
 }
 
 /// Cast a constant array by dispatching to its [`CastReduce`] implementation.
-fn cast_constant(array: ArrayView<Constant>, dtype: &DType) -> VortexResult<Option<ArrayRef>> {
-    <Constant as CastReduce>::cast(array, dtype)
+fn cast_constant(array: &ConstantArray, dtype: &DType) -> VortexResult<Option<ArrayRef>> {
+    <ConstantVTable as CastReduce>::cast(array, dtype)
 }
 
 #[cfg(test)]

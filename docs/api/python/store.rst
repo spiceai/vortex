@@ -1,18 +1,17 @@
-====================
 Object Store support
 ====================
 
-Vortex arrays support reading and writing to many object storage systems:
+Vortex arrays support reading and writing to object storage systems such as, S3, Google Cloud Storage, and
+Azure Blob Storage.
 
-.. toctree::
-   :maxdepth: 1
+.. autosummary::
+   :nosignatures:
 
-   store/aws
-   store/gcs
-   store/azure
-   store/http
-   store/local
-   store/memory
-   store/config
+.. raw:: html
 
-.. autofunction:: vortex.store.from_url
+   <hr>
+
+.. automodule:: vortex.store
+    :members:
+    :imported-members:
+

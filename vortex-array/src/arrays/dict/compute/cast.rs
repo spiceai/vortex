@@ -3,22 +3,23 @@
 
 use vortex_error::VortexResult;
 
-use super::Dict;
 use super::DictArray;
+use super::DictVTable;
+use crate::Array;
 use crate::ArrayRef;
 use crate::IntoArray;
-use crate::array::ArrayView;
-use crate::arrays::dict::DictArrayExt;
-use crate::arrays::dict::DictArraySlotsExt;
 use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
 use crate::scalar_fn::fns::cast::CastReduce;
 
-impl CastReduce for Dict {
-    fn cast(array: ArrayView<'_, Dict>, dtype: &DType) -> VortexResult<Option<ArrayRef>> {
+impl CastReduce for DictVTable {
+    fn cast(array: &DictArray, dtype: &DType) -> VortexResult<Option<ArrayRef>> {
         // Can have un-reference null values making the cast of values fail without a possible mask.
         // TODO(joe): optimize this, could look at accessible values and fill_null not those?
-        if !dtype.is_nullable() && !array.values().validity()?.no_nulls() {
+        if !dtype.is_nullable()
+            && array.values().dtype().is_nullable()
+            && !array.values().all_valid()?
+        {
             return Ok(None);
         }
         // Cast the dictionary values to the target type
@@ -50,11 +51,9 @@ mod tests {
     use vortex_buffer::buffer;
 
     use crate::IntoArray;
-    #[expect(deprecated)]
-    use crate::ToCanonical as _;
-    use crate::arrays::Dict;
+    use crate::ToCanonical;
     use crate::arrays::PrimitiveArray;
-    use crate::arrays::dict::DictArraySlotsExt;
+    use crate::arrays::dict::DictVTable;
     use crate::assert_arrays_eq;
     use crate::builders::dict::dict_encode;
     use crate::builtins::ArrayBuiltins;
@@ -69,7 +68,7 @@ mod tests {
         let dict = dict_encode(&values).unwrap();
 
         let casted = dict
-            .into_array()
+            .to_array()
             .cast(DType::Primitive(PType::I64, Nullability::NonNullable))
             .unwrap();
         assert_eq!(
@@ -77,7 +76,6 @@ mod tests {
             &DType::Primitive(PType::I64, Nullability::NonNullable)
         );
 
-        #[expect(deprecated)]
         let decoded = casted.to_primitive();
         assert_arrays_eq!(decoded, PrimitiveArray::from_iter([1i64, 2, 3, 2, 1]));
     }
@@ -86,10 +84,10 @@ mod tests {
     fn test_cast_dict_nullable() {
         let values =
             PrimitiveArray::from_option_iter([Some(10i32), None, Some(20), Some(10), None]);
-        let dict = dict_encode(&values.into_array()).unwrap();
+        let dict = dict_encode(values.as_ref()).unwrap();
 
         let casted = dict
-            .into_array()
+            .to_array()
             .cast(DType::Primitive(PType::I64, Nullability::Nullable))
             .unwrap();
         assert_eq!(
@@ -113,8 +111,7 @@ mod tests {
 
         // Cast to NonNullable (should be identity since already NonNullable)
         let non_nullable = dict
-            .clone()
-            .into_array()
+            .to_array()
             .cast(DType::Primitive(PType::I32, Nullability::NonNullable))
             .unwrap();
         assert_eq!(
@@ -123,7 +120,7 @@ mod tests {
         );
 
         // Check that codes and values are still NonNullable
-        let non_nullable_dict = non_nullable.as_::<Dict>();
+        let non_nullable_dict = non_nullable.as_::<DictVTable>();
         assert_eq!(
             non_nullable_dict.codes().dtype().nullability(),
             Nullability::NonNullable
@@ -143,7 +140,7 @@ mod tests {
         );
 
         // Check that both codes and values are now Nullable
-        let nullable_dict = nullable.as_::<Dict>();
+        let nullable_dict = nullable.as_::<DictVTable>();
         assert_eq!(
             nullable_dict.codes().dtype().nullability(),
             Nullability::NonNullable
@@ -162,11 +159,20 @@ mod tests {
             &DType::Primitive(PType::I32, Nullability::NonNullable)
         );
 
+        // Check that both codes and values are NonNullable again
+        let back_dict = back_to_non_nullable.as_::<DictVTable>();
+        assert_eq!(
+            back_dict.codes().dtype().nullability(),
+            Nullability::NonNullable
+        );
+        assert_eq!(
+            back_dict.values().dtype().nullability(),
+            Nullability::NonNullable
+        );
+
         // Verify values are unchanged
-        #[expect(deprecated)]
-        let original_values = dict.as_array().to_primitive();
-        #[expect(deprecated)]
-        let final_values = back_to_non_nullable.to_primitive();
+        let original_values = dict.to_primitive();
+        let final_values = back_dict.to_primitive();
         assert_arrays_eq!(original_values, final_values);
     }
 
@@ -176,12 +182,12 @@ mod tests {
     #[case(dict_encode(&PrimitiveArray::from_option_iter([Some(1i32), None, Some(2), Some(1), None]).into_array()).unwrap().into_array())]
     #[case(dict_encode(&buffer![1.5f32, 2.5, 1.5, 3.5].into_array()).unwrap().into_array())]
     fn test_cast_dict_conformance(#[case] array: crate::ArrayRef) {
-        test_cast_conformance(&array);
+        test_cast_conformance(array.as_ref());
     }
 
     #[test]
     fn test_cast_dict_with_unreferenced_null_values_to_nonnullable() {
-        use crate::arrays::DictArray;
+        use crate::arrays::dict::DictArray;
         use crate::validity::Validity;
 
         // Create a dict with nullable values that have unreferenced null entries.
@@ -203,7 +209,7 @@ mod tests {
 
         // Casting to NonNullable should succeed since all logical values are non-null.
         let result = dict
-            .into_array()
+            .to_array()
             .cast(DType::Primitive(PType::F64, Nullability::NonNullable));
         assert!(
             result.is_ok(),
@@ -214,8 +220,9 @@ mod tests {
             casted.dtype(),
             &DType::Primitive(PType::F64, Nullability::NonNullable)
         );
-        #[expect(deprecated)]
-        let casted_prim = casted.to_primitive();
-        assert_arrays_eq!(casted_prim, PrimitiveArray::from_iter([1.0f64, 3.0, 1.0]));
+        assert_arrays_eq!(
+            casted.to_primitive(),
+            PrimitiveArray::from_iter([1.0f64, 3.0, 1.0])
+        );
     }
 }

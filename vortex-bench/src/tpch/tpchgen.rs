@@ -136,7 +136,7 @@ pub async fn generate_tpch_tables(options: TpchGenOptions) -> Result<()> {
     let (tx, rx) = mpsc::unbounded_channel();
 
     for f in all_futures {
-        let limiter = Arc::clone(&limiter);
+        let limiter = limiter.clone();
         let tx = tx.clone();
         tokio::task::spawn(async move {
             let _guard = limiter.acquire().await?;
@@ -232,7 +232,7 @@ fn generate_table_files(
                 let iter = create_single_batch_iterator(generator, &options_clone, partition_idx)?;
 
                 // Create generator and process batches in streaming fashion
-                let schema = Arc::clone(iter.schema());
+                let schema = iter.schema().clone();
 
                 // Create writer based on format
                 let mut writer: Box<dyn FileWriter + Send> = match write_format {
@@ -269,7 +269,7 @@ fn generate_table_files(
 }
 
 /// Calculate the number of partitions without creating expensive iterators
-#[expect(clippy::cast_possible_truncation)]
+#[allow(clippy::cast_possible_truncation)]
 fn calculate_num_parts(generator: TableGenerator, options: &TpchGenOptions) -> Result<usize> {
     let scale_factor = options.scale_factor.parse::<f64>()?;
 
@@ -277,7 +277,7 @@ fn calculate_num_parts(generator: TableGenerator, options: &TpchGenOptions) -> R
         .uncompressed_data_size()
         .zip(options.max_file_size_mb)
     {
-        #[expect(clippy::cast_precision_loss)]
+        #[allow(clippy::cast_precision_loss)]
         let file_size = (data_size as f64 * scale_factor).ceil() as u64;
         file_size.div_ceil(max_file_size)
     } else {
@@ -288,7 +288,7 @@ fn calculate_num_parts(generator: TableGenerator, options: &TpchGenOptions) -> R
 }
 
 /// Create a single batch iterator for a specific partition
-#[expect(clippy::cast_possible_truncation)]
+#[allow(clippy::cast_possible_truncation)]
 fn create_single_batch_iterator(
     generator: TableGenerator,
     options: &TpchGenOptions,

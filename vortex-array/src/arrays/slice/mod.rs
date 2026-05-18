@@ -1,13 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Reduce and execute adaptors for slice operations.
-//!
-//! Encodings that know how to slice themselves implement [`SliceReduce`] (metadata-only)
-//! or [`SliceKernel`] (buffer-reading). The adaptors [`SliceReduceAdaptor`] and
-//! [`SliceExecuteAdaptor`] bridge these into the execution model as
-//! [`ArrayParentReduceRule`] and [`ExecuteParentKernel`] respectively.
-
 mod array;
 mod rules;
 mod slice_;
@@ -15,9 +8,7 @@ mod vtable;
 
 use std::ops::Range;
 
-pub use array::SliceArrayExt;
-pub use array::SliceData;
-pub use array::SliceDataParts;
+pub use array::*;
 use vortex_error::VortexResult;
 pub use vtable::*;
 
@@ -25,11 +16,10 @@ use crate::ArrayRef;
 use crate::Canonical;
 use crate::ExecutionCtx;
 use crate::IntoArray;
-use crate::array::ArrayView;
-use crate::array::VTable;
 use crate::kernel::ExecuteParentKernel;
 use crate::matcher::Matcher;
 use crate::optimizer::rules::ArrayParentReduceRule;
+use crate::vtable::VTable;
 
 pub trait SliceReduce: VTable {
     /// Slice an array with the provided range without reading buffers.
@@ -43,7 +33,7 @@ pub trait SliceReduce: VTable {
     /// The range is guaranteed to be within bounds of the array (i.e., `range.end <= array.len()`).
     ///
     /// Additionally, the range is guaranteed to be non-empty (i.e., `range.start < range.end`).
-    fn slice(array: ArrayView<'_, Self>, range: Range<usize>) -> VortexResult<Option<ArrayRef>>;
+    fn slice(array: &Self::Array, range: Range<usize>) -> VortexResult<Option<ArrayRef>>;
 }
 
 pub trait SliceKernel: VTable {
@@ -58,15 +48,15 @@ pub trait SliceKernel: VTable {
     ///
     /// Additionally, the range is guaranteed to be non-empty (i.e., `range.start < range.end`).
     fn slice(
-        array: ArrayView<'_, Self>,
+        array: &Self::Array,
         range: Range<usize>,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>>;
 }
 
-fn precondition<V: VTable>(array: ArrayView<'_, V>, range: &Range<usize>) -> Option<ArrayRef> {
+fn precondition<V: VTable>(array: &V::Array, range: &Range<usize>) -> Option<ArrayRef> {
     if range.start == 0 && range.end == array.len() {
-        return Some(array.array().clone());
+        return Some(array.to_array());
     };
     if range.start == range.end {
         return Some(Canonical::empty(array.dtype()).into_array());
@@ -74,7 +64,6 @@ fn precondition<V: VTable>(array: ArrayView<'_, V>, range: &Range<usize>) -> Opt
     None
 }
 
-/// Adaptor that wraps a [`SliceReduce`] impl as an [`ArrayParentReduceRule`].
 #[derive(Default, Debug)]
 pub struct SliceReduceAdaptor<V>(pub V);
 
@@ -82,11 +71,11 @@ impl<V> ArrayParentReduceRule<V> for SliceReduceAdaptor<V>
 where
     V: SliceReduce,
 {
-    type Parent = Slice;
+    type Parent = SliceVTable;
 
     fn reduce_parent(
         &self,
-        array: ArrayView<'_, V>,
+        array: &V::Array,
         parent: <Self::Parent as Matcher>::Match<'_>,
         child_idx: usize,
     ) -> VortexResult<Option<ArrayRef>> {
@@ -98,7 +87,6 @@ where
     }
 }
 
-/// Adaptor that wraps a [`SliceKernel`] impl as an [`ExecuteParentKernel`].
 #[derive(Default, Debug)]
 pub struct SliceExecuteAdaptor<V>(pub V);
 
@@ -106,11 +94,11 @@ impl<V> ExecuteParentKernel<V> for SliceExecuteAdaptor<V>
 where
     V: SliceKernel,
 {
-    type Parent = Slice;
+    type Parent = SliceVTable;
 
     fn execute_parent(
         &self,
-        array: ArrayView<'_, V>,
+        array: &V::Array,
         parent: <Self::Parent as Matcher>::Match<'_>,
         child_idx: usize,
         ctx: &mut ExecutionCtx,

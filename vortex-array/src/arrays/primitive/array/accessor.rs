@@ -3,31 +3,25 @@
 
 use std::iter;
 
-use vortex_error::VortexExpect;
-
-#[expect(deprecated)]
-use crate::ToCanonical as _;
+use crate::ToCanonical;
 use crate::accessor::ArrayAccessor;
-use crate::arrays::PrimitiveArray;
+use crate::arrays::primitive::PrimitiveArray;
 use crate::dtype::NativePType;
 use crate::validity::Validity;
+use crate::vtable::ValidityHelper;
 
 impl<T: NativePType> ArrayAccessor<T> for PrimitiveArray {
     fn with_iterator<F, R>(&self, f: F) -> R
     where
         F: for<'a> FnOnce(&mut dyn Iterator<Item = Option<&'a T>>) -> R,
     {
-        match self
-            .validity()
-            .vortex_expect("primitive validity should be derivable")
-        {
+        match self.validity() {
             Validity::NonNullable | Validity::AllValid => {
                 let mut iter = self.as_slice::<T>().iter().map(Some);
                 f(&mut iter)
             }
             Validity::AllInvalid => f(&mut iter::repeat_n(None, self.len())),
             Validity::Array(v) => {
-                #[expect(deprecated)]
                 let validity = v.to_bool().into_bit_buffer();
                 let mut iter = self
                     .as_slice::<T>()

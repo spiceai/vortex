@@ -39,15 +39,6 @@ impl VortexSession {
     ///
     /// If a variable of that type already exists.
     pub fn with<V: SessionVar + Default>(self) -> Self {
-        self.with_some(V::default())
-    }
-
-    /// Inserts a new session variable of type `V`.
-    ///
-    /// # Panics
-    ///
-    /// If a variable of that type already exists.
-    pub fn with_some<V: SessionVar>(self, var: V) -> Self {
         match self.0.entry(TypeId::of::<V>()) {
             Entry::Occupied(_) => {
                 vortex_panic!(
@@ -56,7 +47,7 @@ impl VortexSession {
                 );
             }
             Entry::Vacant(e) => {
-                e.insert(Box::new(var));
+                e.insert(Box::new(V::default()));
             }
         }
         self
@@ -68,36 +59,17 @@ impl VortexSession {
     ///
     /// If a variable of that type already exists.
     pub fn set<V: SessionVar>(self, val: V) -> Self {
-        self.with_some(val)
-    }
-
-    /// Allow deserializing unknown plugin IDs as non-executable foreign placeholders.
-    pub fn allow_unknown(self) -> Self {
-        let mut policy = <Self as SessionExt>::get_mut::<UnknownPluginPolicy>(&self);
-        policy.allow_unknown = true;
-        drop(policy);
-        self
-    }
-
-    /// Returns whether unknown plugins should deserialize as foreign placeholders.
-    pub fn allows_unknown(&self) -> bool {
-        <Self as SessionExt>::get_opt::<UnknownPluginPolicy>(self)
-            .map(|p| p.allow_unknown)
-            .unwrap_or(false)
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct UnknownPluginPolicy {
-    allow_unknown: bool,
-}
-
-impl SessionVar for UnknownPluginPolicy {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
+        match self.0.entry(TypeId::of::<V>()) {
+            Entry::Occupied(_) => {
+                vortex_panic!(
+                    "Session variable of type {} already exists",
+                    type_name::<V>()
+                );
+            }
+            Entry::Vacant(e) => {
+                e.insert(Box::new(val));
+            }
+        }
         self
     }
 }
@@ -215,11 +187,19 @@ impl Hasher for IdHasher {
 }
 
 /// This trait defines variables that can be stored against a Vortex session.
-///
-/// Users should implement this trait for anything that you want to store on a `VortexSession`.
 pub trait SessionVar: Any + Send + Sync + Debug + 'static {
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
+}
+
+impl<T: Send + Sync + Debug + 'static> SessionVar for T {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 }
 
 // NOTE(ngates): we don't want to expose that the internals of a session is a DashMap, so we have
@@ -262,19 +242,5 @@ impl<'a, T> RefMut<'a, T> {
         F: FnOnce(&mut T) -> &mut U,
     {
         RefMut(self.0.map(f))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::VortexSession;
-
-    #[test]
-    fn allow_unknown_flag_is_opt_in() {
-        let session = VortexSession::empty();
-        assert!(!session.allows_unknown());
-
-        let session = session.allow_unknown();
-        assert!(session.allows_unknown());
     }
 }

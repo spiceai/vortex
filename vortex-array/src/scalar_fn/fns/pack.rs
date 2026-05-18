@@ -4,7 +4,6 @@
 use std::fmt::Display;
 use std::fmt::Formatter;
 use std::hash::Hash;
-use std::sync::Arc;
 
 use itertools::Itertools as _;
 use prost::Message;
@@ -13,7 +12,6 @@ use vortex_proto::expr as pb;
 use vortex_session::VortexSession;
 
 use crate::ArrayRef;
-use crate::ExecutionCtx;
 use crate::IntoArray;
 use crate::arrays::StructArray;
 use crate::dtype::DType;
@@ -55,7 +53,7 @@ impl ScalarFnVTable for Pack {
     type Options = PackOptions;
 
     fn id(&self) -> ScalarFnId {
-        ScalarFnId::from("vortex.pack")
+        ScalarFnId::new_ref("vortex.pack")
     }
 
     fn serialize(&self, instance: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
@@ -91,7 +89,7 @@ impl ScalarFnVTable for Pack {
 
     fn child_name(&self, instance: &Self::Options, child_idx: usize) -> ChildName {
         match instance.names.get(child_idx) {
-            Some(name) => ChildName::from(Arc::clone(name.inner())),
+            Some(name) => ChildName::from(name.inner().clone()),
             None => unreachable!(
                 "Invalid child index {} for Pack expression with {} fields",
                 child_idx,
@@ -132,20 +130,13 @@ impl ScalarFnVTable for Pack {
         Ok(Some(lit(true)))
     }
 
-    fn execute(
-        &self,
-        options: &Self::Options,
-        args: &dyn ExecutionArgs,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<ArrayRef> {
-        let len = args.row_count();
-        let value_arrays: Vec<ArrayRef> = (0..args.num_inputs())
-            .map(|i| args.get(i))
-            .collect::<VortexResult<_>>()?;
+    fn execute(&self, options: &Self::Options, args: ExecutionArgs) -> VortexResult<ArrayRef> {
+        let len = args.row_count;
+        let value_arrays = args.inputs;
         let validity: Validity = options.nullability.into();
         StructArray::try_new(options.names.clone(), value_arrays, len, validity)?
             .into_array()
-            .execute(ctx)
+            .execute(args.ctx)
     }
 
     // This applies a nullability
@@ -166,19 +157,19 @@ mod tests {
 
     use super::Pack;
     use super::PackOptions;
+    use crate::Array;
     use crate::ArrayRef;
     use crate::IntoArray;
-    #[expect(deprecated)]
-    use crate::ToCanonical as _;
+    use crate::ToCanonical;
     use crate::arrays::PrimitiveArray;
-    use crate::arrays::struct_::StructArrayExt;
+    use crate::arrays::StructArray;
     use crate::assert_arrays_eq;
     use crate::dtype::Nullability;
     use crate::expr::col;
     use crate::expr::pack;
     use crate::scalar_fn::ScalarFnVTableExt;
-    use crate::scalar_fn::fns::pack::StructArray;
     use crate::validity::Validity;
+    use crate::vtable::ValidityHelper;
 
     fn test_array() -> ArrayRef {
         StructArray::from_fields(&[
@@ -189,23 +180,18 @@ mod tests {
         .into_array()
     }
 
-    fn primitive_field(array: &ArrayRef, field_path: &[&str]) -> VortexResult<PrimitiveArray> {
+    fn primitive_field(array: &dyn Array, field_path: &[&str]) -> VortexResult<PrimitiveArray> {
         let mut field_path = field_path.iter();
 
         let Some(field) = field_path.next() else {
             vortex_bail!("empty field path");
         };
 
-        #[expect(deprecated)]
         let mut array = array.to_struct().unmasked_field_by_name(field)?.clone();
         for field in field_path {
-            #[expect(deprecated)]
-            let next = array.to_struct().unmasked_field_by_name(field)?.clone();
-            array = next;
+            array = array.to_struct().unmasked_field_by_name(field)?.clone();
         }
-        #[expect(deprecated)]
-        let result = array.to_primitive();
-        Ok(result)
+        Ok(array.to_primitive())
     }
 
     #[test]
@@ -221,9 +207,7 @@ mod tests {
         let test_array = test_array();
         let actual_array = test_array.clone().apply(&expr).unwrap();
         assert_eq!(actual_array.len(), test_array.len());
-        #[expect(deprecated)]
-        let nfields = actual_array.to_struct().struct_fields().nfields();
-        assert_eq!(nfields, 0);
+        assert_eq!(actual_array.to_struct().struct_fields().nfields(), 0);
     }
 
     #[test]
@@ -236,22 +220,21 @@ mod tests {
             [col("a"), col("b"), col("a")],
         );
 
-        #[expect(deprecated)]
         let actual_array = test_array().apply(&expr).unwrap().to_struct();
 
         assert_eq!(actual_array.names(), ["one", "two", "three"]);
-        assert!(matches!(actual_array.validity(), Ok(Validity::NonNullable)));
+        assert_eq!(actual_array.validity(), &Validity::NonNullable);
 
         assert_arrays_eq!(
-            primitive_field(&actual_array.clone().into_array(), &["one"]).unwrap(),
+            primitive_field(actual_array.as_ref(), &["one"]).unwrap(),
             PrimitiveArray::from_iter([0i32, 1, 2])
         );
         assert_arrays_eq!(
-            primitive_field(&actual_array.clone().into_array(), &["two"]).unwrap(),
+            primitive_field(actual_array.as_ref(), &["two"]).unwrap(),
             PrimitiveArray::from_iter([4i32, 5, 6])
         );
         assert_arrays_eq!(
-            primitive_field(&actual_array.into_array(), &["three"]).unwrap(),
+            primitive_field(actual_array.as_ref(), &["three"]).unwrap(),
             PrimitiveArray::from_iter([0i32, 1, 2])
         );
     }
@@ -276,25 +259,24 @@ mod tests {
             ],
         );
 
-        #[expect(deprecated)]
         let actual_array = test_array().apply(&expr).unwrap().to_struct();
 
         assert_eq!(actual_array.names(), ["one", "two", "three"]);
 
         assert_arrays_eq!(
-            primitive_field(&actual_array.clone().into_array(), &["one"]).unwrap(),
+            primitive_field(actual_array.as_ref(), &["one"]).unwrap(),
             PrimitiveArray::from_iter([0i32, 1, 2])
         );
         assert_arrays_eq!(
-            primitive_field(&actual_array.clone().into_array(), &["two", "two_one"]).unwrap(),
+            primitive_field(actual_array.as_ref(), &["two", "two_one"]).unwrap(),
             PrimitiveArray::from_iter([4i32, 5, 6])
         );
         assert_arrays_eq!(
-            primitive_field(&actual_array.clone().into_array(), &["two", "two_two"]).unwrap(),
+            primitive_field(actual_array.as_ref(), &["two", "two_two"]).unwrap(),
             PrimitiveArray::from_iter([4i32, 5, 6])
         );
         assert_arrays_eq!(
-            primitive_field(&actual_array.into_array(), &["three"]).unwrap(),
+            primitive_field(actual_array.as_ref(), &["three"]).unwrap(),
             PrimitiveArray::from_iter([0i32, 1, 2])
         );
     }
@@ -309,11 +291,10 @@ mod tests {
             [col("a"), col("b"), col("a")],
         );
 
-        #[expect(deprecated)]
         let actual_array = test_array().apply(&expr).unwrap().to_struct();
 
         assert_eq!(actual_array.names(), ["one", "two", "three"]);
-        assert!(matches!(actual_array.validity(), Ok(Validity::AllValid)));
+        assert_eq!(actual_array.validity(), &Validity::AllValid);
     }
 
     #[test]

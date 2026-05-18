@@ -5,24 +5,22 @@ use vortex_error::VortexResult;
 
 use crate::ArrayRef;
 use crate::IntoArray;
-use crate::array::ArrayView;
-use crate::arrays::Bool;
 use crate::arrays::BoolArray;
-use crate::arrays::Masked;
-use crate::arrays::bool::BoolArrayExt;
-use crate::arrays::filter::FilterReduceAdaptor;
-use crate::arrays::slice::SliceReduceAdaptor;
+use crate::arrays::BoolVTable;
+use crate::arrays::MaskedArray;
+use crate::arrays::MaskedVTable;
+use crate::arrays::SliceReduceAdaptor;
 use crate::optimizer::rules::ArrayParentReduceRule;
 use crate::optimizer::rules::ParentRuleSet;
 use crate::scalar_fn::fns::cast::CastReduceAdaptor;
 use crate::scalar_fn::fns::mask::MaskReduceAdaptor;
+use crate::vtable::ValidityHelper;
 
-pub(crate) const RULES: ParentRuleSet<Bool> = ParentRuleSet::new(&[
+pub(crate) const RULES: ParentRuleSet<BoolVTable> = ParentRuleSet::new(&[
     ParentRuleSet::lift(&BoolMaskedValidityRule),
-    ParentRuleSet::lift(&CastReduceAdaptor(Bool)),
-    ParentRuleSet::lift(&MaskReduceAdaptor(Bool)),
-    ParentRuleSet::lift(&SliceReduceAdaptor(Bool)),
-    ParentRuleSet::lift(&FilterReduceAdaptor(Bool)),
+    ParentRuleSet::lift(&CastReduceAdaptor(BoolVTable)),
+    ParentRuleSet::lift(&MaskReduceAdaptor(BoolVTable)),
+    ParentRuleSet::lift(&SliceReduceAdaptor(BoolVTable)),
 ]);
 
 /// Rule to push down validity masking from MaskedArray parent into BoolArray child.
@@ -32,13 +30,13 @@ pub(crate) const RULES: ParentRuleSet<Bool> = ParentRuleSet::new(&[
 #[derive(Default, Debug)]
 pub struct BoolMaskedValidityRule;
 
-impl ArrayParentReduceRule<Bool> for BoolMaskedValidityRule {
-    type Parent = Masked;
+impl ArrayParentReduceRule<BoolVTable> for BoolMaskedValidityRule {
+    type Parent = MaskedVTable;
 
     fn reduce_parent(
         &self,
-        array: ArrayView<'_, Bool>,
-        parent: ArrayView<'_, Masked>,
+        array: &BoolArray,
+        parent: &MaskedArray,
         child_idx: usize,
     ) -> VortexResult<Option<ArrayRef>> {
         if child_idx > 0 {
@@ -50,7 +48,7 @@ impl ArrayParentReduceRule<Bool> for BoolMaskedValidityRule {
         Ok(Some(
             BoolArray::new(
                 array.to_bit_buffer(),
-                array.validity()?.and(parent.validity()?)?,
+                array.validity().clone().and(parent.validity().clone())?,
             )
             .into_array(),
         ))

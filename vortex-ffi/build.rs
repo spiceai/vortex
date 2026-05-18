@@ -1,52 +1,32 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-#![expect(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used)]
+#![allow(clippy::panic)]
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
-use std::process::exit;
 
 fn main() {
-    println!("cargo:rustc-check-cfg=cfg(vortex_asan)");
-    println!("cargo:rerun-if-changed=src");
+    // Set up dependency tracking
+    println!("cargo:rerun-if-changed=src/");
     println!("cargo:rerun-if-changed=cbindgen.toml");
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=build.rs");
-    for env in ["MIRI", "MIRIFLAGS", "CARGO_ENCODED_RUSTFLAGS"] {
-        println!("cargo:rerun-if-env-changed={env}");
-    }
 
-    let is_asan = env::var("CARGO_ENCODED_RUSTFLAGS")
-        .unwrap_or_default()
-        .contains("address");
-    if is_asan {
-        println!("cargo:info=building with asan");
-        println!("cargo:rustc-cfg=vortex_asan");
-        println!("cargo:info=Skipping header generation due to sanitizers");
-        return;
-    }
-
-    if env::var("CARGO_ENCODED_RUSTFLAGS")
-        .unwrap_or_default()
-        .contains("sanitizer")
-    {
-        println!("cargo:info=Skipping header generation due to sanitizers");
-    }
-
+    // Skip header generation in environments where cbindgen macro expansion fails
     if env::var("MIRI").is_ok() || env::var("MIRIFLAGS").is_ok() {
-        println!("cargo:info=Skipping header generation under miri (cbindgen incompatible)");
+        println!("cargo:warning=Skipping header generation under miri (cbindgen incompatible)");
         return;
     }
 
-    // cbindgen macro expansion is only available on nightly
-    let rustc = Command::new("rustc").arg("-V").output();
-    let is_nightly = rustc
-        .as_ref()
+    // We require the macro expansion feature of cbindgen to generate the header, which is only available on nightly.
+    let is_nightly = Command::new("rustc")
+        .arg("-V")
+        .output()
         .map(|output| String::from_utf8_lossy(&output.stdout).contains("nightly"))
         .unwrap_or(false);
     if !is_nightly {
-        println!("cargo:info=Skipping header generation as we're not on nightly");
         return;
     }
 
@@ -85,13 +65,21 @@ fn main() {
                 );
             }
         }
-        Err(err) => {
-            if err.to_string().contains("sanitizer") {
-                println!("cargo:info=Skipping header generation due to sanitizers");
+        Err(e) => {
+            // Check if this might be a sanitizer-related incompatibility
+            let error_msg = e.to_string();
+            let rustflags = env::var("RUSTFLAGS").unwrap_or_default();
+
+            if rustflags.contains("sanitizer") || error_msg.contains("sanitizer") {
+                println!(
+                    "cargo:warning=Skipping header generation due to sanitizer incompatibility"
+                );
+                println!("cargo:warning=Error: {}", e);
                 return;
             }
-            println!("cargo:error=Failed to generate header with cbindgen: {err}");
-            exit(1);
+
+            // For non-sanitizer errors, fail hard as these indicate real problems
+            panic!("Failed to generate header with cbindgen: {}", e);
         }
     }
 }

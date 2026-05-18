@@ -3,24 +3,22 @@
 
 use vortex_error::VortexResult;
 
-use super::Dict;
 use super::DictArray;
+use super::DictVTable;
+use crate::Array;
 use crate::ArrayRef;
 use crate::IntoArray;
-use crate::array::ArrayView;
 use crate::arrays::ConstantArray;
-use crate::arrays::dict::DictArrayExt;
-use crate::arrays::dict::DictArraySlotsExt;
-use crate::arrays::scalar_fn::ScalarFnFactoryExt;
+use crate::arrays::ScalarFnArrayExt;
 use crate::optimizer::ArrayOptimizer;
 use crate::scalar_fn::fns::like::Like;
 use crate::scalar_fn::fns::like::LikeOptions;
 use crate::scalar_fn::fns::like::LikeReduce;
 
-impl LikeReduce for Dict {
+impl LikeReduce for DictVTable {
     fn like(
-        array: ArrayView<'_, Dict>,
-        pattern: &ArrayRef,
+        array: &DictArray,
+        pattern: &dyn Array,
         options: LikeOptions,
     ) -> VortexResult<Option<ArrayRef>> {
         // If we have more values than codes, it is faster to canonicalize first.
@@ -57,10 +55,10 @@ mod tests {
 
     use crate::IntoArray;
     use crate::arrays::BoolArray;
+    use crate::arrays::ConstantArray;
     use crate::arrays::DictArray;
+    use crate::arrays::ScalarFnArrayExt;
     use crate::arrays::VarBinArray;
-    use crate::arrays::dict::compute::like::ConstantArray;
-    use crate::arrays::scalar_fn::ScalarFnFactoryExt;
     use crate::assert_arrays_eq;
     use crate::optimizer::ArrayOptimizer;
     use crate::scalar_fn::fns::like::Like;

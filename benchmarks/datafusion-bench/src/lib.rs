@@ -30,7 +30,7 @@ use vortex_datafusion::VortexFormat;
 use vortex_datafusion::VortexFormatFactory;
 use vortex_datafusion::VortexTableOptions;
 
-#[expect(clippy::expect_used)]
+#[allow(clippy::expect_used)]
 pub fn get_session_context() -> SessionContext {
     let mut rt_builder = RuntimeEnvBuilder::new();
 
@@ -81,10 +81,8 @@ pub fn make_object_store(
                     .with_bucket_name(bucket_name)
                     .build()?,
             );
-            session.register_object_store(
-                &Url::parse(&format!("s3://{bucket_name}/"))?,
-                Arc::<object_store::aws::AmazonS3>::clone(&s3),
-            );
+            session
+                .register_object_store(&Url::parse(&format!("s3://{bucket_name}/"))?, s3.clone());
             Ok(s3)
         }
         "gs" => {
@@ -94,16 +92,13 @@ pub fn make_object_store(
                     .with_bucket_name(bucket_name)
                     .build()?,
             );
-            session.register_object_store(
-                &Url::parse(&format!("gs://{bucket_name}/"))?,
-                Arc::<object_store::gcp::GoogleCloudStorage>::clone(&gcs),
-            );
+            session
+                .register_object_store(&Url::parse(&format!("gs://{bucket_name}/"))?, gcs.clone());
             Ok(gcs)
         }
         _ => {
             let fs = Arc::new(LocalFileSystem::default());
-            session
-                .register_object_store(&Url::parse("file:/")?, Arc::<LocalFileSystem>::clone(&fs));
+            session.register_object_store(&Url::parse("file:/")?, fs.clone());
             Ok(fs)
         }
     }

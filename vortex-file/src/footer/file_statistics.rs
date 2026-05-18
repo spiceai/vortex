@@ -20,7 +20,6 @@ use vortex_flatbuffers::FlatBufferRoot;
 use vortex_flatbuffers::WriteFlatBuffer;
 use vortex_flatbuffers::array::ArrayStats;
 use vortex_flatbuffers::footer as fb;
-use vortex_session::VortexSession;
 
 /// Contains statistical information about the data in a Vortex file.
 ///
@@ -91,7 +90,6 @@ impl FileStatistics {
     pub fn from_flatbuffer<'a>(
         fb: &fb::FileStatistics<'a>,
         file_dtype: &DType,
-        session: &VortexSession,
     ) -> VortexResult<Self> {
         let field_stats = fb.field_stats().unwrap_or_default();
         let mut array_stats: Vec<ArrayStats> = field_stats.iter().collect();
@@ -103,7 +101,7 @@ impl FileStatistics {
                 .into_iter()
                 .zip(struct_fields.fields())
                 .map(|(array_stat, field_dtype)| {
-                    StatsSet::from_flatbuffer(&array_stat, &field_dtype, session)
+                    StatsSet::from_flatbuffer(&array_stat, &field_dtype)
                 })
                 .try_collect()?;
 
@@ -119,7 +117,7 @@ impl FileStatistics {
             let array_stat = array_stats
                 .pop()
                 .vortex_expect("we just checked that there was 1 field");
-            let stats_set = StatsSet::from_flatbuffer(&array_stat, file_dtype, session)?;
+            let stats_set = StatsSet::from_flatbuffer(&array_stat, file_dtype)?;
 
             Ok(Self {
                 stats: Arc::new([stats_set]),

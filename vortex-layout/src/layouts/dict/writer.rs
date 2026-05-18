@@ -18,10 +18,10 @@ use futures::pin_mut;
 use futures::stream::BoxStream;
 use futures::stream::once;
 use futures::try_join;
+use vortex_array::Array;
 use vortex_array::ArrayContext;
 use vortex_array::ArrayRef;
-use vortex_array::VortexSessionExecute;
-use vortex_array::arrays::Dict;
+use vortex_array::arrays::DictVTable;
 use vortex_array::builders::dict::DictConstraints;
 use vortex_array::builders::dict::DictEncoder;
 use vortex_array::builders::dict::dict_encoder;
@@ -34,8 +34,7 @@ use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
 use vortex_io::kanal_ext::KanalExt;
-use vortex_io::session::RuntimeSessionExt;
-use vortex_session::VortexSession;
+use vortex_io::runtime::Handle;
 
 use crate::IntoLayout;
 use crate::LayoutRef;
@@ -132,13 +131,13 @@ impl LayoutStrategy for DictStrategy {
         segment_sink: SegmentSinkRef,
         stream: SendableSequentialStream,
         mut eof: SequencePointer,
-        session: &VortexSession,
+        handle: Handle,
     ) -> VortexResult<LayoutRef> {
         // Fallback if dtype is not supported
         if !dict_layout_supported(stream.dtype()) {
             return self
                 .fallback
-                .write_stream(ctx, segment_sink, stream, eof, session)
+                .write_stream(ctx, segment_sink, stream, eof, handle)
                 .await;
         }
 
@@ -152,16 +151,15 @@ impl LayoutStrategy for DictStrategy {
         let should_fallback = match first_chunk {
             None => true, // empty stream
             Some(chunk) => {
-                let mut exec_ctx = session.create_execution_ctx();
-                let compressed = BtrBlocksCompressor::default().compress(&chunk, &mut exec_ctx)?;
-                !compressed.is::<Dict>()
+                let compressed = BtrBlocksCompressor::default().compress(&chunk)?;
+                !compressed.is::<DictVTable>()
             }
         };
         if should_fallback {
             // first chunk did not compress to dict, or did not exist. Skip dict layout
             return self
                 .fallback
-                .write_stream(ctx, segment_sink, stream, eof, session)
+                .write_stream(ctx, segment_sink, stream, eof, handle)
                 .await;
         }
 
@@ -174,42 +172,37 @@ impl LayoutStrategy for DictStrategy {
         // Each of these pairs becomes a child dict layout.
         let runs = DictionaryTransformer::new(dict_stream);
 
-        let handle = session.handle();
         let dtype2 = dtype.clone();
         let child_layouts = stream! {
             pin_mut!(runs);
 
             while let Some((codes_stream, values_fut)) = runs.next().await {
-                let codes = Arc::clone(&self.codes);
+                let codes = self.codes.clone();
                 let codes_eof = eof.split_off();
                 let ctx2 = ctx.clone();
-                let segment_sink2 = Arc::clone(&segment_sink);
-                let session2 = session.clone();
+                let segment_sink2 = segment_sink.clone();
                 let codes_fut = handle.spawn_nested(move |h| async move {
-                    let session2 = session2.with_handle(h);
                     codes.write_stream(
                         ctx2,
                         segment_sink2,
                         codes_stream.sendable(),
                         codes_eof,
-                        &session2,
+                        h,
                     ).await
                 });
 
-                let values = Arc::clone(&self.values);
+                let values = self.values.clone();
                 let values_eof = eof.split_off();
                 let ctx2 = ctx.clone();
-                let segment_sink2 = Arc::clone(&segment_sink);
+                let segment_sink2 = segment_sink.clone();
                 let dtype2 = dtype2.clone();
-                let session2 = session.clone();
                 let values_layout = handle.spawn_nested(move |h| async move {
-                    let session2 = session2.with_handle(h);
                     values.write_stream(
                         ctx2,
                         segment_sink2,
                         SequentialStreamAdapter::new(dtype2, once(values_fut)).sendable(),
                         values_eof,
-                        &session2,
+                        h,
                     ).await
                 });
 
@@ -548,14 +541,14 @@ enum EncodingState {
     Done((ArrayRef, ArrayRef, ArrayRef)),
 }
 
-fn start_encoding(constraints: &DictConstraints, chunk: &ArrayRef) -> VortexResult<EncodingState> {
+fn start_encoding(constraints: &DictConstraints, chunk: &dyn Array) -> VortexResult<EncodingState> {
     let encoder = dict_encoder(chunk, constraints);
     encode_chunk(encoder, chunk)
 }
 
 fn encode_chunk(
     mut encoder: Box<dyn DictEncoder>,
-    chunk: &ArrayRef,
+    chunk: &dyn Array,
 ) -> VortexResult<EncodingState> {
     let encoded = encoder.encode(chunk);
     match remainder(chunk, encoded.len())? {
@@ -564,7 +557,7 @@ fn encode_chunk(
     }
 }
 
-fn remainder(array: &ArrayRef, encoded_len: usize) -> VortexResult<Option<ArrayRef>> {
+fn remainder(array: &dyn Array, encoded_len: usize) -> VortexResult<Option<ArrayRef>> {
     if encoded_len < array.len() {
         Ok(Some(array.slice(encoded_len..array.len())?))
     } else {

@@ -6,7 +6,6 @@ use std::sync::Arc;
 use futures::executor::block_on;
 use parking_lot::RwLock;
 use vortex_array::dtype::DType;
-use vortex_array::memory::MemorySessionExt;
 use vortex_array::session::ArraySessionExt;
 use vortex_buffer::Alignment;
 use vortex_buffer::ByteBuffer;
@@ -33,7 +32,6 @@ use crate::EOF_SIZE;
 use crate::MAX_POSTSCRIPT_SIZE;
 use crate::VortexFile;
 use crate::footer::Footer;
-use crate::segments::BufferSegmentSource;
 use crate::segments::FileSegmentSource;
 use crate::segments::InitialReadSegmentCache;
 use crate::segments::RequestMetrics;
@@ -62,9 +60,7 @@ pub struct VortexOpenOptions {
     labels: Vec<Label>,
 }
 
-pub trait OpenOptionsSessionExt:
-    ArraySessionExt + LayoutSessionExt + RuntimeSessionExt + MemorySessionExt
-{
+pub trait OpenOptionsSessionExt: ArraySessionExt + LayoutSessionExt + RuntimeSessionExt {
     /// Create a new [`VortexOpenOptions`] using the provided session to open a file.
     fn open_options(&self) -> VortexOpenOptions {
         VortexOpenOptions {
@@ -80,10 +76,7 @@ pub trait OpenOptionsSessionExt:
         }
     }
 }
-impl<S: ArraySessionExt + LayoutSessionExt + RuntimeSessionExt + MemorySessionExt>
-    OpenOptionsSessionExt for S
-{
-}
+impl<S: ArraySessionExt + LayoutSessionExt + RuntimeSessionExt> OpenOptionsSessionExt for S {}
 
 impl VortexOpenOptions {
     /// Configure the initial read size for the Vortex file.
@@ -163,42 +156,14 @@ impl VortexOpenOptions {
     pub async fn open_path(self, path: impl AsRef<std::path::Path>) -> VortexResult<VortexFile> {
         use vortex_io::std_file::FileReadAt;
         let handle = self.session.handle();
-        let allocator = self.session.allocator();
-        let source = Arc::new(FileReadAt::open_with_allocator(path, handle, allocator)?);
+        let source = Arc::new(FileReadAt::open(path, handle)?);
         self.open(source).await
     }
 
     /// Open a Vortex file from an in-memory buffer.
-    ///
-    /// This uses a `BufferSegmentSource` that resolves segments synchronously
-    /// by slicing the buffer directly, bypassing the async I/O pipeline.
     pub fn open_buffer<B: Into<ByteBuffer>>(self, buffer: B) -> VortexResult<VortexFile> {
-        let buffer: ByteBuffer = buffer.into();
-
-        if self.segment_cache.is_some() {
-            tracing::warn!("segment cache is ignored for in-memory `open_buffer`");
-        }
-        if self.metrics_registry.is_some() {
-            tracing::warn!("metrics registry is ignored for in-memory `open_buffer`");
-        }
-
-        let mut opts = self.with_initial_read_size(0);
-
-        let footer = match opts.footer.take() {
-            Some(footer) => footer,
-            None => block_on(opts.read_footer(&buffer))?,
-        };
-
-        let segment_source = Arc::new(BufferSegmentSource::new(
-            buffer,
-            Arc::clone(footer.segment_map()),
-        ));
-
-        Ok(VortexFile {
-            footer,
-            segment_source,
-            session: opts.session,
-        })
+        // We know this is in memory, so we can open it synchronously.
+        block_on(self.with_initial_read_size(0).open_read(buffer.into()))
     }
 
     /// An API for opening a [`VortexFile`] using any [`VortexReadAt`] implementation.
@@ -232,7 +197,7 @@ impl VortexOpenOptions {
 
         // Create a segment source backed by the VortexRead implementation.
         let segment_source = Arc::new(SharedSegmentSource::new(FileSegmentSource::open(
-            Arc::clone(footer.segment_map()),
+            footer.segment_map().clone(),
             reader,
             self.session.handle(),
             metrics,
@@ -336,12 +301,10 @@ impl VortexOpenOptions {
         use vortex_io::object_store::ObjectStoreReadAt;
 
         let handle = self.session.handle();
-        let allocator = self.session.allocator();
-        let source = Arc::new(ObjectStoreReadAt::new_with_allocator(
-            Arc::clone(object_store),
+        let source = Arc::new(ObjectStoreReadAt::new(
+            object_store.clone(),
             path.into(),
             handle,
-            allocator,
         ));
         self.open(source).await
     }
@@ -356,15 +319,9 @@ mod tests {
     use vortex_array::IntoArray;
     use vortex_array::buffer::BufferHandle;
     use vortex_array::dtype::session::DTypeSession;
-    use vortex_array::memory::DefaultHostAllocator;
-    use vortex_array::memory::HostAllocator;
-    use vortex_array::memory::MemorySessionExt;
-    use vortex_array::memory::WritableHostBuffer;
     use vortex_array::scalar_fn::session::ScalarFnSession;
     use vortex_array::session::ArraySession;
-    use vortex_buffer::Alignment;
     use vortex_buffer::Buffer;
-    use vortex_buffer::ByteBuffer;
     use vortex_buffer::ByteBufferMut;
     use vortex_io::session::RuntimeSession;
     use vortex_layout::session::LayoutSession;
@@ -406,31 +363,18 @@ mod tests {
         }
     }
 
-    #[derive(Debug)]
-    struct CountingAllocator {
-        allocations: Arc<AtomicUsize>,
-    }
-
-    impl HostAllocator for CountingAllocator {
-        fn allocate(&self, len: usize, alignment: Alignment) -> VortexResult<WritableHostBuffer> {
-            self.allocations.fetch_add(1, Ordering::Relaxed);
-            DefaultHostAllocator.allocate(len, alignment)
-        }
-    }
-
     #[tokio::test]
     async fn test_initial_read_size() {
-        let session = VortexSession::empty()
+        // Create a large file (> 1MB)
+        let mut buf = ByteBufferMut::empty();
+        let mut session = VortexSession::empty()
             .with::<DTypeSession>()
             .with::<ArraySession>()
             .with::<LayoutSession>()
             .with::<ScalarFnSession>()
             .with::<RuntimeSession>();
 
-        crate::register_default_encodings(&session);
-
-        // Create a large file (> 1MB)
-        let mut buf = ByteBufferMut::empty();
+        crate::register_default_encodings(&mut session);
 
         // 1.5M integers -> ~6MB. We use a pattern to avoid Sequence encoding.
         let array = Buffer::from(
@@ -457,8 +401,8 @@ mod tests {
         let first_read_len = Arc::new(AtomicUsize::new(0));
         let reader = CountingRead {
             inner: buffer,
-            total_read: Arc::clone(&total_read),
-            first_read_len: Arc::clone(&first_read_len),
+            total_read: total_read.clone(),
+            first_read_len: first_read_len.clone(),
         };
 
         // Open the file
@@ -473,47 +417,5 @@ mod tests {
         );
         let read = total_read.load(Ordering::Relaxed);
         assert!(read < 1024 * 1024, "Read {} bytes, expected < 1MB", read);
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    #[tokio::test]
-    async fn test_open_path_uses_memory_session_allocator() {
-        let session = VortexSession::empty()
-            .with::<DTypeSession>()
-            .with::<ArraySession>()
-            .with::<LayoutSession>()
-            .with::<ScalarFnSession>()
-            .with::<RuntimeSession>();
-
-        crate::register_default_encodings(&session);
-
-        let mut buf = ByteBufferMut::empty();
-        let array = Buffer::from((0i32..16_384).collect::<Vec<i32>>()).into_array();
-        session
-            .write_options()
-            .write(&mut buf, array.to_array_stream())
-            .await
-            .unwrap();
-
-        let file_path = std::env::temp_dir().join(format!(
-            "vortex-open-memory-session-{}.vx",
-            std::process::id()
-        ));
-        std::fs::write(&file_path, ByteBuffer::from(buf).as_slice()).unwrap();
-
-        let allocations = Arc::new(AtomicUsize::new(0));
-        session
-            .memory_mut()
-            .set_allocator(Arc::new(CountingAllocator {
-                allocations: Arc::clone(&allocations),
-            }));
-
-        let _file = session.open_options().open_path(&file_path).await.unwrap();
-        std::fs::remove_file(&file_path).unwrap();
-
-        assert!(
-            allocations.load(Ordering::Relaxed) > 0,
-            "expected at least one host allocation from MemorySession"
-        );
     }
 }

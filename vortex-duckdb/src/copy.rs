@@ -54,7 +54,7 @@ pub struct GlobalState {
     // Pool of background workers helping to drive the write task.
     // Note that this is optional and without it, we would only drive the task when DuckDB calls
     // into us, and we call `RUNTIME.block_on`.
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     worker_pool: CurrentThreadWorkerPool,
 }
 
@@ -95,7 +95,7 @@ impl CopyFunction for VortexCopyFunction {
             .clone();
         RUNTIME
             .block_on(sink.send(chunk))
-            .map_err(|e| vortex_err!("send error {e}"))?;
+            .map_err(|e| vortex_err!("send error {}", e.to_string()))?;
         Ok(())
     }
 
@@ -130,13 +130,13 @@ impl CopyFunction for VortexCopyFunction {
         // SAFETY: The ClientContext is owned by the Connection and lives for the duration of
         // query execution. DuckDB keeps the connection alive while this copy function runs.
         let ctx = unsafe { client_context.erase_lifetime() };
-
-        // Use DuckDB FS exclusively to match the DuckDB client context configuration.
-        let writer = DuckDbFsWriter::new(ctx, &file_path)
-            .map_err(|e| vortex_err!("Failed to create DuckDB FS writer for {file_path}: {e}"))?;
-
-        let write_task =
-            handle.spawn(async move { SESSION.write_options().write(writer, array_stream).await });
+        let write_task = handle.spawn(async move {
+            // Use DuckDB FS exclusively to match the DuckDB client context configuration.
+            let writer = DuckDbFsWriter::new(ctx, &file_path).map_err(|e| {
+                vortex_err!("Failed to create DuckDB FS writer for {file_path}: {e}")
+            })?;
+            SESSION.write_options().write(writer, array_stream).await
+        });
 
         let worker_pool = RUNTIME.new_pool();
         worker_pool.set_workers_to_available_parallelism();

@@ -7,11 +7,11 @@ mod arbitrary;
 pub use arbitrary::ArbitraryConstantArray;
 
 mod array;
-pub use array::ConstantData;
-pub use vtable::ConstantArray;
+pub use array::ConstantArray;
+pub(crate) use vtable::canonical::constant_canonicalize;
 
 pub(crate) mod compute;
 
 mod vtable;
 
-pub use vtable::Constant;
+pub use vtable::ConstantVTable;

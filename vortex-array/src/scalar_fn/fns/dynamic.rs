@@ -13,8 +13,8 @@ use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 
+use crate::Array;
 use crate::ArrayRef;
-use crate::ExecutionCtx;
 use crate::IntoArray;
 use crate::arrays::ConstantArray;
 use crate::dtype::DType;
@@ -31,7 +31,6 @@ use crate::scalar_fn::ExecutionArgs;
 use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::ScalarFnVTable;
 use crate::scalar_fn::ScalarFnVTableExt;
-use crate::scalar_fn::VecExecutionArgs;
 use crate::scalar_fn::fns::binary::Binary;
 use crate::scalar_fn::fns::operators::CompareOperator;
 use crate::scalar_fn::fns::operators::Operator;
@@ -46,7 +45,7 @@ impl ScalarFnVTable for DynamicComparison {
     type Options = DynamicComparisonExpr;
 
     fn id(&self) -> ScalarFnId {
-        ScalarFnId::from("vortex.dynamic")
+        ScalarFnId::new_ref("vortex.dynamic")
     }
 
     fn arity(&self, _options: &Self::Options) -> Arity {
@@ -93,27 +92,28 @@ impl ScalarFnVTable for DynamicComparison {
         ))
     }
 
-    fn execute(
-        &self,
-        data: &Self::Options,
-        args: &dyn ExecutionArgs,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<ArrayRef> {
+    fn execute(&self, data: &Self::Options, args: ExecutionArgs) -> VortexResult<ArrayRef> {
         if let Some(scalar) = data.rhs.scalar() {
-            let lhs = args.get(0)?;
-            let rhs = ConstantArray::new(scalar, args.row_count()).into_array();
+            let [lhs]: [ArrayRef; _] = args
+                .inputs
+                .try_into()
+                .map_err(|_| vortex_error::vortex_err!("Wrong arg count for DynamicComparison"))?;
+            let rhs = ConstantArray::new(scalar, args.row_count).into_array();
 
-            let delegate_args = VecExecutionArgs::new(vec![lhs, rhs], args.row_count());
             return Binary
                 .bind(Operator::from(data.operator))
-                .execute(&delegate_args, ctx);
+                .execute(ExecutionArgs {
+                    inputs: vec![lhs, rhs],
+                    row_count: args.row_count,
+                    ctx: args.ctx,
+                });
         }
         let ret_dtype =
-            DType::Bool(args.get(0)?.dtype().nullability() | data.rhs.dtype.nullability());
+            DType::Bool(args.inputs[0].dtype().nullability() | data.rhs.dtype.nullability());
 
         Ok(ConstantArray::new(
             Scalar::try_new(ret_dtype, Some(data.default.into()))?,
-            args.row_count(),
+            args.row_count,
         )
         .into_array())
     }
@@ -130,7 +130,7 @@ impl ScalarFnVTable for DynamicComparison {
             CompareOperator::Gt => Some(DynamicComparison.new_expr(
                 DynamicComparisonExpr {
                     operator: CompareOperator::Lte,
-                    rhs: Arc::clone(&dynamic.rhs),
+                    rhs: dynamic.rhs.clone(),
                     default: !dynamic.default,
                 },
                 vec![lhs.stat_max(catalog)?],
@@ -138,7 +138,7 @@ impl ScalarFnVTable for DynamicComparison {
             CompareOperator::Gte => Some(DynamicComparison.new_expr(
                 DynamicComparisonExpr {
                     operator: CompareOperator::Lt,
-                    rhs: Arc::clone(&dynamic.rhs),
+                    rhs: dynamic.rhs.clone(),
                     default: !dynamic.default,
                 },
                 vec![lhs.stat_max(catalog)?],
@@ -146,7 +146,7 @@ impl ScalarFnVTable for DynamicComparison {
             CompareOperator::Lt => Some(DynamicComparison.new_expr(
                 DynamicComparisonExpr {
                     operator: CompareOperator::Gte,
-                    rhs: Arc::clone(&dynamic.rhs),
+                    rhs: dynamic.rhs.clone(),
                     default: !dynamic.default,
                 },
                 vec![lhs.stat_min(catalog)?],
@@ -154,7 +154,7 @@ impl ScalarFnVTable for DynamicComparison {
             CompareOperator::Lte => Some(DynamicComparison.new_expr(
                 DynamicComparisonExpr {
                     operator: CompareOperator::Gt,
-                    rhs: Arc::clone(&dynamic.rhs),
+                    rhs: dynamic.rhs.clone(),
                     default: !dynamic.default,
                 },
                 vec![lhs.stat_min(catalog)?],
@@ -392,7 +392,7 @@ mod tests {
     #[test]
     fn execute_value_flips() -> VortexResult<()> {
         let threshold = Arc::new(AtomicI32::new(5));
-        let threshold_clone = Arc::clone(&threshold);
+        let threshold_clone = threshold.clone();
         let expr = dynamic(
             CompareOperator::Lt,
             move || Some(threshold_clone.load(Ordering::SeqCst).into()),
@@ -402,7 +402,7 @@ mod tests {
         );
         let input = buffer![1i32, 5, 10].into_array();
 
-        let result = input.clone().apply(&expr)?;
+        let result = input.apply(&expr)?;
         assert_arrays_eq!(result, BoolArray::from_iter([true, false, false]));
 
         threshold.store(10, Ordering::SeqCst);

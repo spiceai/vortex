@@ -5,66 +5,51 @@ use std::ops::Range;
 
 use itertools::Itertools;
 use lending_iterator::LendingIterator;
-use vortex_array::ArrayRef;
-use vortex_array::ArrayView;
-use vortex_array::ExecutionCtx;
-use vortex_array::aggregate_fn::AggregateFnRef;
-use vortex_array::aggregate_fn::fns::is_constant::IsConstant;
-use vortex_array::aggregate_fn::fns::is_constant::primitive::IS_CONST_LANE_WIDTH;
-use vortex_array::aggregate_fn::fns::is_constant::primitive::compute_is_constant;
-use vortex_array::aggregate_fn::kernels::DynAggregateKernel;
+use vortex_array::ToCanonical;
+use vortex_array::arrays::IS_CONST_LANE_WIDTH;
 use vortex_array::arrays::PrimitiveArray;
+use vortex_array::arrays::compute_is_constant;
+use vortex_array::compute::IsConstantKernel;
+use vortex_array::compute::IsConstantKernelAdapter;
+use vortex_array::compute::IsConstantOpts;
 use vortex_array::dtype::IntegerPType;
 use vortex_array::match_each_integer_ptype;
 use vortex_array::match_each_unsigned_integer_ptype;
-use vortex_array::scalar::Scalar;
+use vortex_array::register_kernel;
 use vortex_error::VortexResult;
 
-use crate::BitPacked;
-use crate::BitPackedArrayExt;
-use crate::unpack_iter::BitPacked as BitPackedUnpack;
+use crate::BitPackedArray;
+use crate::BitPackedVTable;
+use crate::unpack_iter::BitPacked;
 
-/// BitPacked-specific is_constant kernel with SIMD support.
-#[derive(Debug)]
-pub(crate) struct BitPackedIsConstantKernel;
-
-impl DynAggregateKernel for BitPackedIsConstantKernel {
-    fn aggregate(
+impl IsConstantKernel for BitPackedVTable {
+    fn is_constant(
         &self,
-        aggregate_fn: &AggregateFnRef,
-        batch: &ArrayRef,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<Option<Scalar>> {
-        if !aggregate_fn.is::<IsConstant>() {
+        array: &BitPackedArray,
+        opts: &IsConstantOpts,
+    ) -> VortexResult<Option<bool>> {
+        if opts.is_negligible_cost() {
             return Ok(None);
         }
-
-        let Some(array) = batch.as_opt::<BitPacked>() else {
-            return Ok(None);
-        };
-
-        let result = match_each_integer_ptype!(array.dtype().as_ptype(), |P| {
-            bitpacked_is_constant::<P, { IS_CONST_LANE_WIDTH / size_of::<P>() }>(array, ctx)?
-        });
-
-        Ok(Some(IsConstant::make_partial(batch, result, ctx)?))
+        match_each_integer_ptype!(array.ptype(), |P| {
+            bitpacked_is_constant::<P, { IS_CONST_LANE_WIDTH / size_of::<P>() }>(array)
+        })
+        .map(Some)
     }
 }
 
-fn bitpacked_is_constant<T: BitPackedUnpack, const WIDTH: usize>(
-    array: ArrayView<'_, BitPacked>,
-    ctx: &mut ExecutionCtx,
+register_kernel!(IsConstantKernelAdapter(BitPackedVTable).lift());
+
+fn bitpacked_is_constant<T: BitPacked, const WIDTH: usize>(
+    array: &BitPackedArray,
 ) -> VortexResult<bool> {
-    let mut bit_unpack_iterator = array.unpacked_chunks::<T>()?;
-    let patches = array
-        .patches()
-        .map(|p| -> VortexResult<_> {
-            let values = p.values().clone().execute::<PrimitiveArray>(ctx)?;
-            let indices = p.indices().clone().execute::<PrimitiveArray>(ctx)?;
-            let offset = p.offset();
-            Ok((indices, values, offset))
-        })
-        .transpose()?;
+    let mut bit_unpack_iterator = array.unpacked_chunks::<T>();
+    let patches = array.patches().map(|p| {
+        let values = p.values().to_primitive();
+        let indices = p.indices().to_primitive();
+        let offset = p.offset();
+        (indices, values, offset)
+    });
 
     let mut header_constant_value = None;
     let mut current_idx = 0;
@@ -146,7 +131,7 @@ fn bitpacked_is_constant<T: BitPackedUnpack, const WIDTH: usize>(
     Ok(true)
 }
 
-fn apply_patches<T: BitPackedUnpack>(
+fn apply_patches<T: BitPacked>(
     values: &mut [T],
     values_range: Range<usize>,
     patch_indices: &PrimitiveArray,
@@ -164,7 +149,7 @@ fn apply_patches<T: BitPackedUnpack>(
     });
 }
 
-fn apply_patches_idx_typed<T: BitPackedUnpack, I: IntegerPType>(
+fn apply_patches_idx_typed<T: BitPacked, I: IntegerPType>(
     values: &mut [T],
     values_range: Range<usize>,
     patch_indices: &[I],
@@ -185,19 +170,14 @@ fn apply_patches_idx_typed<T: BitPackedUnpack, I: IntegerPType>(
 #[cfg(test)]
 mod tests {
     use vortex_array::IntoArray;
-    use vortex_array::LEGACY_SESSION;
-    use vortex_array::VortexSessionExecute;
-    use vortex_array::aggregate_fn::fns::is_constant::is_constant;
+    use vortex_array::compute::is_constant;
     use vortex_buffer::buffer;
-    use vortex_error::VortexResult;
 
-    use crate::BitPackedData;
+    use crate::BitPackedArray;
 
     #[test]
-    fn is_constant_with_patches() -> VortexResult<()> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
-        let array = BitPackedData::encode(&buffer![4; 1025].into_array(), 2, &mut ctx)?;
-        assert!(is_constant(&array.into_array(), &mut ctx)?);
-        Ok(())
+    fn is_constant_with_patches() {
+        let array = BitPackedArray::encode(&buffer![4; 1025].into_array(), 2).unwrap();
+        assert!(is_constant(array.as_ref()).unwrap().unwrap());
     }
 }

@@ -3,7 +3,6 @@
 
 //! Type-erased scalar function ([`ScalarFnRef`]).
 
-use std::any::type_name;
 use std::fmt::Debug;
 use std::fmt::Display;
 use std::fmt::Formatter;
@@ -13,11 +12,9 @@ use std::sync::Arc;
 
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
-use vortex_error::vortex_err;
 use vortex_utils::debug_with::DebugWith;
 
 use crate::ArrayRef;
-use crate::ExecutionCtx;
 use crate::dtype::DType;
 use crate::expr::Expression;
 use crate::expr::StatsCatalog;
@@ -31,21 +28,22 @@ use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::ScalarFnVTable;
 use crate::scalar_fn::ScalarFnVTableExt;
 use crate::scalar_fn::SimplifyCtx;
-use crate::scalar_fn::fns::is_not_null::IsNotNull;
+use crate::scalar_fn::fns::is_null::IsNull;
+use crate::scalar_fn::fns::not::Not;
 use crate::scalar_fn::options::ScalarFnOptions;
 use crate::scalar_fn::signature::ScalarFnSignature;
 use crate::scalar_fn::typed::DynScalarFn;
-use crate::scalar_fn::typed::TypedScalarFnInstance;
+use crate::scalar_fn::typed::ScalarFnInner;
 
 /// A type-erased scalar function, pairing a vtable with bound options behind a trait object.
 ///
 /// This stores a [`ScalarFnVTable`] and its options behind an `Arc<dyn DynScalarFn>`, allowing
 /// heterogeneous storage inside [`Expression`] and [`crate::arrays::ScalarFnArray`].
 ///
-/// Use [`super::TypedScalarFnInstance::new()`] to construct, and [`super::TypedScalarFnInstance::erased()`] to
-/// obtain a [`ScalarFnRef`].
+/// Use [`super::ScalarFn::new()`] to construct, and [`super::ScalarFn::erased()`] to obtain a
+/// [`ScalarFnRef`].
 #[derive(Clone)]
-pub struct ScalarFnRef(pub(super) Arc<dyn DynScalarFn>);
+pub struct ScalarFnRef(pub(crate) Arc<dyn DynScalarFn>);
 
 impl ScalarFnRef {
     /// Returns the ID of this scalar function.
@@ -55,15 +53,22 @@ impl ScalarFnRef {
 
     /// Returns whether the scalar function is of the given vtable type.
     pub fn is<V: ScalarFnVTable>(&self) -> bool {
-        self.0.as_any().is::<TypedScalarFnInstance<V>>()
+        self.0.as_any().is::<ScalarFnInner<V>>()
     }
 
     /// Returns the typed options for this scalar function if it matches the given vtable type.
     pub fn as_opt<V: ScalarFnVTable>(&self) -> Option<&V::Options> {
-        self.0
-            .as_any()
-            .downcast_ref::<TypedScalarFnInstance<V>>()
-            .map(|sf| sf.options())
+        self.downcast_inner::<V>().map(|inner| &inner.options)
+    }
+
+    /// Returns a reference to the typed vtable if it matches the given vtable type.
+    pub fn vtable_ref<V: ScalarFnVTable>(&self) -> Option<&V> {
+        self.downcast_inner::<V>().map(|inner| &inner.vtable)
+    }
+
+    /// Downcast the inner to the concrete `ScalarFnInner<V>`.
+    fn downcast_inner<V: ScalarFnVTable>(&self) -> Option<&ScalarFnInner<V>> {
+        self.0.as_any().downcast_ref::<ScalarFnInner<V>>()
     }
 
     /// Returns the typed options for this scalar function if it matches the given vtable type.
@@ -74,42 +79,6 @@ impl ScalarFnRef {
     pub fn as_<V: ScalarFnVTable>(&self) -> &V::Options {
         self.as_opt::<V>()
             .vortex_expect("Expression options type mismatch")
-    }
-
-    /// Downcast to the concrete [`TypedScalarFnInstance`].
-    ///
-    /// Returns `Err(self)` if the downcast fails.
-    pub fn try_downcast<V: ScalarFnVTable>(
-        self,
-    ) -> Result<Arc<TypedScalarFnInstance<V>>, ScalarFnRef> {
-        if self.0.as_any().is::<TypedScalarFnInstance<V>>() {
-            let ptr = Arc::into_raw(self.0) as *const TypedScalarFnInstance<V>;
-            Ok(unsafe { Arc::from_raw(ptr) })
-        } else {
-            Err(self)
-        }
-    }
-
-    /// Downcast to the concrete [`TypedScalarFnInstance`].
-    ///
-    /// # Panics
-    ///
-    /// Panics if the downcast fails.
-    pub fn downcast<V: ScalarFnVTable>(self) -> Arc<TypedScalarFnInstance<V>> {
-        self.try_downcast::<V>()
-            .map_err(|this| {
-                vortex_err!(
-                    "Failed to downcast ScalarFnRef {} to {}",
-                    this.0.id(),
-                    type_name::<V>(),
-                )
-            })
-            .vortex_expect("Failed to downcast ScalarFnRef")
-    }
-
-    /// Try to downcast into a typed [`TypedScalarFnInstance`].
-    pub fn downcast_ref<V: ScalarFnVTable>(&self) -> Option<&TypedScalarFnInstance<V>> {
-        self.0.as_any().downcast_ref::<TypedScalarFnInstance<V>>()
     }
 
     /// The type-erased options for this scalar function.
@@ -127,26 +96,21 @@ impl ScalarFnRef {
         self.0.return_dtype(arg_types)
     }
 
-    /// Coerce the argument types for this scalar function.
-    pub fn coerce_args(&self, arg_types: &[DType]) -> VortexResult<Vec<DType>> {
-        self.0.coerce_args(arg_types)
-    }
-
     /// Transforms the expression into one representing the validity of this expression.
     pub fn validity(&self, expr: &Expression) -> VortexResult<Expression> {
         Ok(self.0.validity(expr)?.unwrap_or_else(|| {
             // TODO(ngates): make validity a mandatory method on VTable to avoid this fallback.
-            IsNotNull.new_expr(EmptyOptions, [expr.clone()])
+            // TODO(ngates): add an IsNotNull expression.
+            Not.new_expr(
+                EmptyOptions,
+                [IsNull.new_expr(EmptyOptions, [expr.clone()])],
+            )
         }))
     }
 
     /// Execute the expression given the input arguments.
-    pub fn execute(
-        &self,
-        args: &dyn ExecutionArgs,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<ArrayRef> {
-        self.0.execute(args, ctx)
+    pub fn execute(&self, ctx: ExecutionArgs) -> VortexResult<ArrayRef> {
+        self.0.execute(ctx)
     }
 
     /// Perform abstract reduction on this scalar function node.

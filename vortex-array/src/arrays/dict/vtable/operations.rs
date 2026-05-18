@@ -4,22 +4,17 @@
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 
-use super::Dict;
-use crate::ExecutionCtx;
-use crate::array::ArrayView;
-use crate::array::OperationsVTable;
-use crate::arrays::dict::DictArraySlotsExt;
+use super::DictVTable;
+use crate::Array;
+use crate::arrays::dict::DictArray;
 use crate::scalar::Scalar;
+use crate::vtable::OperationsVTable;
 
-impl OperationsVTable<Dict> for Dict {
-    fn scalar_at(
-        array: ArrayView<'_, Dict>,
-        index: usize,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<Scalar> {
+impl OperationsVTable<DictVTable> for DictVTable {
+    fn scalar_at(array: &DictArray, index: usize) -> VortexResult<Scalar> {
         let Some(dict_index) = array
             .codes()
-            .execute_scalar(index, ctx)?
+            .scalar_at(index)?
             .as_primitive()
             .as_::<usize>()
         else {
@@ -28,7 +23,7 @@ impl OperationsVTable<Dict> for Dict {
 
         Ok(array
             .values()
-            .execute_scalar(dict_index, ctx)?
+            .scalar_at(dict_index)?
             .cast(array.dtype())
             .vortex_expect("Array dtype will only differ by nullability"))
     }

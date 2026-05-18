@@ -14,35 +14,31 @@
 //! - `matcher.rs` — `Matcher` trait + blanket impl for `V: FooVTable`
 
 mod vtable;
-pub use vtable::*;
+pub use vtable::ExtVTable;
 
 mod plugin;
-pub use plugin::*;
-
-mod foreign;
-pub(crate) use foreign::*;
+pub use plugin::ExtDTypePlugin;
 
 mod typed;
-pub use typed::*;
+pub use typed::ExtDType;
 
 mod erased;
-pub use erased::*;
+pub use erased::ExtDTypeRef;
 
 mod matcher;
-pub use matcher::*;
-use vortex_session::registry::Id;
+pub use matcher::Matcher;
 
 /// A unique identifier for an extension type
-pub type ExtId = Id;
+pub type ExtId = arcref::ArcRef<str>;
 
 /// Private module to seal [`typed::DynExtDType`].
 mod sealed {
     use crate::dtype::extension::ExtVTable;
-    use crate::dtype::extension::typed::ExtDType;
+    use crate::dtype::extension::typed::ExtDTypeInner;
 
     /// Marker trait to prevent external implementations of [`super::typed::DynExtDType`].
     pub(crate) trait Sealed {}
 
     /// This can be the **only** implementor for [`super::typed::DynExtDType`].
-    impl<V: ExtVTable> Sealed for ExtDType<V> {}
+    impl<V: ExtVTable> Sealed for ExtDTypeInner<V> {}
 }

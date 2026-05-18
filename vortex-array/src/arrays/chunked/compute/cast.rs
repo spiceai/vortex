@@ -5,18 +5,16 @@ use vortex_error::VortexResult;
 
 use crate::ArrayRef;
 use crate::IntoArray;
-use crate::array::ArrayView;
-use crate::arrays::Chunked;
 use crate::arrays::ChunkedArray;
-use crate::arrays::chunked::ChunkedArrayExt;
+use crate::arrays::ChunkedVTable;
 use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
 use crate::scalar_fn::fns::cast::CastReduce;
 
-impl CastReduce for Chunked {
-    fn cast(array: ArrayView<'_, Chunked>, dtype: &DType) -> VortexResult<Option<ArrayRef>> {
+impl CastReduce for ChunkedVTable {
+    fn cast(array: &ChunkedArray, dtype: &DType) -> VortexResult<Option<ArrayRef>> {
         let mut cast_chunks = Vec::new();
-        for chunk in array.iter_chunks() {
+        for chunk in array.chunks() {
             cast_chunks.push(chunk.cast(dtype.clone())?);
         }
 
@@ -35,8 +33,8 @@ mod test {
     use vortex_buffer::buffer;
 
     use crate::IntoArray;
-    use crate::arrays::ChunkedArray;
     use crate::arrays::PrimitiveArray;
+    use crate::arrays::chunked::ChunkedArray;
     use crate::assert_arrays_eq;
     use crate::builtins::ArrayBuiltins;
     use crate::compute::conformance::cast::test_cast_conformance;
@@ -94,6 +92,6 @@ mod test {
         DType::Primitive(PType::U8, Nullability::NonNullable)
     ).unwrap().into_array())]
     fn test_cast_chunked_conformance(#[case] array: crate::ArrayRef) {
-        test_cast_conformance(&array);
+        test_cast_conformance(array.as_ref());
     }
 }

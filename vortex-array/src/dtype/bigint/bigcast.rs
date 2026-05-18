@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use num_traits::AsPrimitive;
 use num_traits::ToPrimitive;
 
 use crate::dtype::i256;
@@ -52,12 +51,6 @@ impl ToI256 for i256 {
     }
 }
 
-impl AsPrimitive<i256> for bool {
-    fn as_(self) -> i256 {
-        i256::from_parts(self as u128, 0)
-    }
-}
-
 /// Checked numeric casts up to and including i256 support.
 ///
 /// This is meant as a more inclusive version of `NumCast` from the `num-traits` crate.
@@ -96,15 +89,6 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-
-    #[test]
-    fn test_bool_as_i256() {
-        let value: i256 = false.as_();
-        assert_eq!(value, i256::ZERO);
-
-        let value: i256 = true.as_();
-        assert_eq!(value, i256::ONE);
-    }
 
     // All BigCast types must losslessly round-trip themselves
     #[rstest]

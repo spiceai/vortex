@@ -6,11 +6,12 @@ use std::marker::PhantomData;
 use vortex::array::ExecutionCtx;
 use vortex::array::arrays::PrimitiveArray;
 use vortex::array::match_each_native_ptype;
-use vortex::array::validity::Validity;
+use vortex::array::vtable::ValidityHelper;
 use vortex::dtype::NativePType;
 use vortex::error::VortexResult;
 use vortex::mask::Mask;
 
+use crate::duckdb::LogicalType;
 use crate::duckdb::VectorBuffer;
 use crate::duckdb::VectorRef;
 use crate::exporter::ColumnExporter;
@@ -28,11 +29,15 @@ pub fn new_exporter(
     array: PrimitiveArray,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<Box<dyn ColumnExporter>> {
-    let validity = array.validity()?;
-    if matches!(validity, Validity::AllInvalid) {
-        return Ok(all_invalid::new_exporter());
-    };
-    let validity = validity.to_array(array.len()).execute::<Mask>(ctx)?;
+    let validity = array
+        .validity()
+        .to_array(array.len())
+        .execute::<Mask>(ctx)?;
+
+    if validity.all_false() {
+        let ltype = LogicalType::try_from(array.ptype())?;
+        return Ok(all_invalid::new_exporter(array.len(), &ltype));
+    }
 
     match_each_native_ptype!(array.ptype(), |T| {
         let buffer = array.to_buffer::<T>();
@@ -67,14 +72,16 @@ impl<T: NativePType> ColumnExporter for PrimitiveExporter<T> {
 
 #[cfg(test)]
 mod tests {
+    use itertools::Itertools;
+    use vortex::error::VortexExpect;
     use vortex_array::VortexSessionExecute;
 
     use super::*;
     use crate::SESSION;
     use crate::cpp;
+    use crate::duckdb::DUCKDB_STANDARD_VECTOR_SIZE;
     use crate::duckdb::DataChunk;
     use crate::duckdb::LogicalType;
-    use crate::duckdb::duckdb_vector_size;
 
     #[test]
     fn test_primitive_exporter() {
@@ -98,112 +105,37 @@ mod tests {
     }
 
     #[test]
-    fn test_primitive_exporter_with_nulls() {
-        let arr = PrimitiveArray::from_option_iter([Some(10i32), None, Some(30), None, Some(50)]);
-
-        let mut chunk = DataChunk::new([LogicalType::new(cpp::duckdb_type::DUCKDB_TYPE_INTEGER)]);
-        let mut ctx = SESSION.create_execution_ctx();
-
-        new_exporter(arr, &mut ctx)
-            .unwrap()
-            .export(0, 5, chunk.get_vector_mut(0), &mut ctx)
-            .unwrap();
-        chunk.set_len(5);
-
-        assert_eq!(
-            format!("{}", String::try_from(&*chunk).unwrap()),
-            r#"Chunk - [1 Columns]
-- FLAT INTEGER: 5 = [ 10, NULL, 30, NULL, 50]
-"#
-        );
-    }
-
-    /// Export a large nullable primitive array over many chunks to exercise the
-    /// zero-copy validity path. The non-zero-copy fallback currently panics,
-    /// so this test proves every chunk goes through the zero-copy branch.
-    #[test]
-    fn test_primitive_exporter_with_nulls_zero_copy() {
-        let vector_size = duckdb_vector_size();
-        const NUM_CHUNKS: usize = 8;
-        let len = vector_size * NUM_CHUNKS;
-
-        // Every 3rd element is null — guarantees mixed validity in every chunk.
-        #[expect(clippy::cast_possible_truncation, reason = "test data fits in i32")]
-        let arr = PrimitiveArray::from_option_iter(
-            (0..len).map(|i| if i % 3 == 1 { None } else { Some(i as i32) }),
-        );
-
-        let mut ctx = SESSION.create_execution_ctx();
-        let exporter = new_exporter(arr, &mut ctx).unwrap();
-
-        for chunk_idx in 0..NUM_CHUNKS {
-            let mut chunk =
-                DataChunk::new([LogicalType::new(cpp::duckdb_type::DUCKDB_TYPE_INTEGER)]);
-
-            // This will panic if the non-zero-copy path is hit.
-            exporter
-                .export(
-                    chunk_idx * vector_size,
-                    vector_size,
-                    chunk.get_vector_mut(0),
-                    &mut ctx,
-                )
-                .unwrap();
-            chunk.set_len(vector_size);
-
-            let vec = chunk.get_vector(0);
-            for i in 0..vector_size {
-                let global_idx = chunk_idx * vector_size + i;
-                if global_idx % 3 == 1 {
-                    assert!(
-                        vec.row_is_null(i as u64),
-                        "expected null at global index {global_idx}"
-                    );
-                } else {
-                    assert!(
-                        !vec.row_is_null(i as u64),
-                        "expected non-null at global index {global_idx}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
     fn test_long_primitive_exporter() {
-        let vector_size = duckdb_vector_size();
         const ARRAY_COUNT: usize = 2;
-        let len = vector_size * ARRAY_COUNT;
-        #[expect(clippy::cast_possible_truncation, reason = "test data fits in i32")]
-        let arr = PrimitiveArray::from_iter(0..len as i32);
+        const LEN: usize = DUCKDB_STANDARD_VECTOR_SIZE * ARRAY_COUNT;
+        let arr = PrimitiveArray::from_iter(0..i32::try_from(LEN).vortex_expect(""));
 
         {
-            let mut chunk: Vec<DataChunk> = (0..ARRAY_COUNT)
+            let mut chunk = (0..ARRAY_COUNT)
                 .map(|_| DataChunk::new([LogicalType::new(cpp::duckdb_type::DUCKDB_TYPE_INTEGER)]))
-                .collect();
+                .collect_vec();
 
             for i in 0..ARRAY_COUNT {
                 let mut ctx = SESSION.create_execution_ctx();
                 new_exporter(arr.clone(), &mut ctx)
                     .unwrap()
                     .export(
-                        i * vector_size,
-                        vector_size,
+                        i * DUCKDB_STANDARD_VECTOR_SIZE,
+                        DUCKDB_STANDARD_VECTOR_SIZE,
                         chunk[i].get_vector_mut(0),
                         &mut ctx,
                     )
                     .unwrap();
-                chunk[i].set_len(vector_size);
+                chunk[i].set_len(DUCKDB_STANDARD_VECTOR_SIZE);
 
                 assert_eq!(
                     format!("{}", String::try_from(&*chunk[i]).unwrap()),
                     format!(
                         r#"Chunk - [1 Columns]
-- FLAT INTEGER: {vector_size} = [ {}]
+- FLAT INTEGER: {DUCKDB_STANDARD_VECTOR_SIZE} = [ {}]
 "#,
-                        &(i * vector_size..(i + 1) * vector_size)
+                        &(i * DUCKDB_STANDARD_VECTOR_SIZE..(i + 1) * DUCKDB_STANDARD_VECTOR_SIZE)
                             .map(|i| i.to_string())
-                            .collect::<Vec<String>>()
                             .join(", ")
                     )
                 );

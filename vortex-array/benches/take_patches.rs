@@ -1,19 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-#![expect(clippy::unwrap_used)]
-#![expect(clippy::cast_possible_truncation)]
+#![allow(clippy::unwrap_used)]
+#![allow(clippy::cast_possible_truncation)]
 
 use divan::Bencher;
-use rand::RngExt;
+use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
-use vortex_array::LEGACY_SESSION;
-#[expect(deprecated)]
-use vortex_array::ToCanonical as _;
-use vortex_array::VortexSessionExecute;
+use vortex_array::ToCanonical;
 use vortex_array::patches::Patches;
 use vortex_buffer::Buffer;
 
@@ -48,12 +45,8 @@ fn take_search(bencher: Bencher, (patches_sparsity, index_multiple): (f64, f64))
     );
 
     bencher
-        .with_inputs(|| (&patches, &indices, LEGACY_SESSION.create_execution_ctx()))
-        .bench_refs(|(patches, indices, ctx)| {
-            #[expect(deprecated)]
-            let prim = indices.to_primitive();
-            patches.take_search(prim, false, ctx)
-        });
+        .with_inputs(|| (&patches, &indices))
+        .bench_refs(|(patches, indices)| patches.take_search(indices.to_primitive(), false));
 }
 
 #[divan::bench(args = BENCH_ARGS)]
@@ -67,12 +60,8 @@ fn take_search_chunked(bencher: Bencher, (patches_sparsity, index_multiple): (f6
     );
 
     bencher
-        .with_inputs(|| (&patches, &indices, LEGACY_SESSION.create_execution_ctx()))
-        .bench_refs(|(patches, indices, ctx)| {
-            #[expect(deprecated)]
-            let prim = indices.to_primitive();
-            patches.take_search(prim, false, ctx)
-        });
+        .with_inputs(|| (&patches, &indices))
+        .bench_refs(|(patches, indices)| patches.take_search(indices.to_primitive(), false));
 }
 
 #[divan::bench(args = BENCH_ARGS)]
@@ -86,12 +75,8 @@ fn take_map(bencher: Bencher, (patches_sparsity, index_multiple): (f64, f64)) {
     );
 
     bencher
-        .with_inputs(|| (&patches, &indices, LEGACY_SESSION.create_execution_ctx()))
-        .bench_refs(|(patches, indices, ctx)| {
-            #[expect(deprecated)]
-            let prim = indices.to_primitive();
-            patches.take_map(prim, false, ctx)
-        });
+        .with_inputs(|| (&patches, &indices))
+        .bench_refs(|(patches, indices)| patches.take_map(indices.to_primitive(), false));
 }
 
 fn fixture(len: usize, sparsity: f64, rng: &mut StdRng) -> Patches {

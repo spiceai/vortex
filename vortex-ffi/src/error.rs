@@ -19,15 +19,6 @@ box_wrapper!(
     vx_error
 );
 
-/// Write an error message to `error` which has not been populated before.
-pub(crate) fn write_error(error: *mut *mut vx_error, message: &str) {
-    assert!(!error.is_null());
-    let err = vx_error::new(VortexError {
-        message: message.into(),
-    });
-    unsafe { error.write(err) };
-}
-
 #[inline]
 pub fn try_or_default<T: Default>(
     error_out: *mut *mut vx_error,
@@ -39,25 +30,11 @@ pub fn try_or_default<T: Default>(
             value
         }
         Err(err) => {
-            write_error(error_out, &err.to_string());
+            let err = vx_error::new(Box::new(VortexError {
+                message: err.to_string().into(),
+            }));
+            unsafe { error_out.write(err) };
             T::default()
-        }
-    }
-}
-
-pub fn try_or<T>(
-    error_out: *mut *mut vx_error,
-    error_value: T,
-    function: impl FnOnce() -> VortexResult<T>,
-) -> T {
-    match function() {
-        Ok(value) => {
-            unsafe { error_out.write(ptr::null_mut()) };
-            value
-        }
-        Err(err) => {
-            write_error(error_out, &err.to_string());
-            error_value
         }
     }
 }

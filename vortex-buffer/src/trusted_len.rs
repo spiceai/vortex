@@ -65,7 +65,6 @@ impl<I: Iterator> Iterator for TrustedLenAdapter<I> {
 
 unsafe impl<I: Iterator> TrustedLen for TrustedLenAdapter<I> {}
 
-/// Extension trait for wrapping any iterator in a [`TrustedLenAdapter`].
 pub trait TrustedLenExt: Iterator + Sized {
     /// Wraps this iterator in a `TrustedLenAdapter`.
     ///

@@ -59,10 +59,6 @@ impl ValueRef {
             DUCKDB_TYPE::DUCKDB_TYPE_BIGINT => {
                 ExtractedValue::BigInt(unsafe { cpp::duckdb_get_int64(self.as_ptr()) })
             }
-            DUCKDB_TYPE::DUCKDB_TYPE_HUGEINT => {
-                let huge_int = unsafe { cpp::duckdb_get_hugeint(self.as_ptr()) };
-                ExtractedValue::HugeInt(i128_from_parts(huge_int.upper, huge_int.lower))
-            }
             DUCKDB_TYPE::DUCKDB_TYPE_UTINYINT => {
                 ExtractedValue::UTinyInt(unsafe { cpp::duckdb_get_uint8(self.as_ptr()) })
             }
@@ -74,10 +70,6 @@ impl ValueRef {
             }
             DUCKDB_TYPE::DUCKDB_TYPE_UBIGINT => {
                 ExtractedValue::UBigInt(unsafe { cpp::duckdb_get_uint64(self.as_ptr()) })
-            }
-            DUCKDB_TYPE::DUCKDB_TYPE_UHUGEINT => {
-                let huge_uint = unsafe { cpp::duckdb_get_uhugeint(self.as_ptr()) };
-                ExtractedValue::UHugeInt(u128_from_parts(huge_uint.upper, huge_uint.lower))
             }
             DUCKDB_TYPE::DUCKDB_TYPE_FLOAT => {
                 ExtractedValue::Float(unsafe { cpp::duckdb_get_float(self.as_ptr()) })
@@ -157,7 +149,7 @@ impl ValueRef {
                     .collect::<Vec<_>>(),
             ),
             // ...other types remain unimplemented..
-            other => vortex_panic!("Unsupported DuckDB value type {other:?}"),
+            _ => vortex_panic!("Unsupported DuckDB value type {:?}", self),
         }
     }
 }
@@ -272,11 +264,6 @@ pub fn i128_from_parts(high: i64, low: u64) -> i128 {
     ((high as i128) << 64) | (low as i128)
 }
 
-#[inline]
-pub fn u128_from_parts(high: u64, low: u64) -> u128 {
-    ((high as u128) << 64) | (low as u128)
-}
-
 impl<T> TryFrom<Option<T>> for Value
 where
     T: Into<Value> + NativeDType,
@@ -378,7 +365,6 @@ impl From<&[u8]> for Value {
 }
 
 /// An enum for extracting the underlying typed value from a `Value`.
-#[derive(Debug)]
 pub enum ExtractedValue {
     Null,
     TinyInt(i8),
@@ -390,7 +376,6 @@ pub enum ExtractedValue {
     USmallInt(u16),
     UInteger(u32),
     UBigInt(u64),
-    UHugeInt(u128),
     Float(f32),
     Double(f64),
     Boolean(bool),
@@ -409,7 +394,6 @@ pub enum ExtractedValue {
 #[cfg(test)]
 mod tests {
     use crate::duckdb::i128_from_parts;
-    use crate::duckdb::u128_from_parts;
 
     #[test]
     fn test_huge_int_from_parts() {
@@ -423,18 +407,5 @@ mod tests {
             i128_from_parts(1, u64::MAX),
             (1i128 << 64) + (u64::MAX as i128)
         );
-    }
-
-    #[test]
-    fn test_uhuge_int_from_parts() {
-        assert_eq!(u128_from_parts(0, 0), 0u128);
-        assert_eq!(u128_from_parts(0, 34534912), 34534912u128);
-        assert_eq!(u128_from_parts(0, u64::MAX), u64::MAX as u128);
-        assert_eq!(u128_from_parts(u64::MAX, u64::MAX), u128::MAX);
-        assert_eq!(
-            u128_from_parts(1, u64::MAX),
-            (1u128 << 64) + (u64::MAX as u128)
-        );
-        assert_eq!(u128_from_parts(1, 0), 1u128 << 64);
     }
 }

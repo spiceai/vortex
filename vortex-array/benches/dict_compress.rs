@@ -1,23 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-#![expect(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used)]
 
 use divan::Bencher;
 use rand::distr::Distribution;
 use rand::distr::StandardUniform;
-use vortex_array::Canonical;
-use vortex_array::IntoArray;
-use vortex_array::LEGACY_SESSION;
-use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::VarBinArray;
 use vortex_array::arrays::VarBinViewArray;
 use vortex_array::arrays::dict_test::gen_primitive_for_dict;
 use vortex_array::arrays::dict_test::gen_varbin_words;
 use vortex_array::builders::dict::dict_encode;
+use vortex_array::compute::warm_up_vtables;
 use vortex_array::dtype::NativePType;
 
 fn main() {
+    warm_up_vtables();
     divan::main();
 }
 
@@ -45,7 +43,7 @@ where
 
     bencher
         .with_inputs(|| &primitive_arr)
-        .bench_refs(|arr| dict_encode(&arr.clone().into_array()));
+        .bench_refs(|arr| dict_encode(arr.as_ref()));
 }
 
 #[divan::bench(args = BENCH_ARGS)]
@@ -54,7 +52,7 @@ fn encode_varbin(bencher: Bencher, (len, unique_values): (usize, usize)) {
 
     bencher
         .with_inputs(|| &varbin_arr)
-        .bench_refs(|arr| dict_encode(&arr.clone().into_array()));
+        .bench_refs(|arr| dict_encode(arr.as_ref()));
 }
 
 #[divan::bench(args = BENCH_ARGS)]
@@ -63,7 +61,7 @@ fn encode_varbinview(bencher: Bencher, (len, unique_values): (usize, usize)) {
 
     bencher
         .with_inputs(|| &varbinview_arr)
-        .bench_refs(|arr| dict_encode(&arr.clone().into_array()));
+        .bench_refs(|arr| dict_encode(arr.as_ref()));
 }
 
 #[divan::bench(types = [u8, f32, i64], args = BENCH_ARGS)]
@@ -73,33 +71,29 @@ where
     StandardUniform: Distribution<T>,
 {
     let primitive_arr = gen_primitive_for_dict::<T>(len, unique_values);
-    let dict = dict_encode(&primitive_arr.into_array())
-        .unwrap()
-        .into_array();
+    let dict = dict_encode(primitive_arr.as_ref()).unwrap();
 
     bencher
-        .with_inputs(|| (&dict, LEGACY_SESSION.create_execution_ctx()))
-        .bench_refs(|(dict, ctx)| (**dict).clone().execute::<Canonical>(ctx));
+        .with_inputs(|| &dict)
+        .bench_refs(|dict| dict.to_canonical());
 }
 
 #[divan::bench(args = BENCH_ARGS)]
 fn decode_varbin(bencher: Bencher, (len, unique_values): (usize, usize)) {
     let varbin_arr = VarBinArray::from(gen_varbin_words(len, unique_values));
-    let dict = dict_encode(&varbin_arr.into_array()).unwrap().into_array();
+    let dict = dict_encode(varbin_arr.as_ref()).unwrap();
 
     bencher
-        .with_inputs(|| (&dict, LEGACY_SESSION.create_execution_ctx()))
-        .bench_refs(|(dict, ctx)| (**dict).clone().execute::<Canonical>(ctx));
+        .with_inputs(|| &dict)
+        .bench_refs(|dict| dict.to_canonical());
 }
 
 #[divan::bench(args = BENCH_ARGS)]
 fn decode_varbinview(bencher: Bencher, (len, unique_values): (usize, usize)) {
     let varbinview_arr = VarBinViewArray::from_iter_str(gen_varbin_words(len, unique_values));
-    let dict = dict_encode(&varbinview_arr.into_array())
-        .unwrap()
-        .into_array();
+    let dict = dict_encode(varbinview_arr.as_ref()).unwrap();
 
     bencher
-        .with_inputs(|| (&dict, LEGACY_SESSION.create_execution_ctx()))
-        .bench_refs(|(dict, ctx)| (**dict).clone().execute::<Canonical>(ctx));
+        .with_inputs(|| &dict)
+        .bench_refs(|dict| dict.to_canonical());
 }

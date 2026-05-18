@@ -13,9 +13,9 @@ use indicatif::ProgressBar;
 use itertools::Itertools;
 use regex::Regex;
 use vortex::utils::aliases::hash_map::HashMap;
+use vortex_bench::BenchmarkOutput;
 use vortex_bench::Engine;
 use vortex_bench::Format;
-use vortex_bench::LogFormat;
 use vortex_bench::Target;
 use vortex_bench::compress::CompressMeasurements;
 use vortex_bench::compress::CompressOp;
@@ -23,7 +23,6 @@ use vortex_bench::compress::Compressor;
 use vortex_bench::compress::benchmark_compress;
 use vortex_bench::compress::benchmark_decompress;
 use vortex_bench::compress::calculate_ratios;
-use vortex_bench::create_output_writer;
 use vortex_bench::datasets::Dataset;
 use vortex_bench::datasets::struct_list_of_ints::StructListOfInts;
 use vortex_bench::datasets::taxi_data::TaxiData;
@@ -40,7 +39,7 @@ use vortex_bench::public_bi::PBIDataset::CMSprovider;
 use vortex_bench::public_bi::PBIDataset::Euro2016;
 use vortex_bench::public_bi::PBIDataset::Food;
 use vortex_bench::public_bi::PBIDataset::HashTags;
-use vortex_bench::setup_logging_and_tracing_with_format;
+use vortex_bench::setup_logging_and_tracing;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -70,17 +69,13 @@ struct Args {
     output_path: Option<PathBuf>,
     #[arg(long)]
     tracing: bool,
-    /// Format for the primary stderr log sink. `text` is the default human-readable format;
-    /// `json` emits one JSON object per event, suitable for piping into `jq`.
-    #[arg(long, value_enum, default_value_t = LogFormat::Text)]
-    log_format: LogFormat,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    setup_logging_and_tracing_with_format(args.verbose, args.tracing, args.log_format)?;
+    setup_logging_and_tracing(args.verbose, args.tracing)?;
 
     run_compress(
         args.iterations,
@@ -174,7 +169,8 @@ async fn run_compress(
 
     progress.finish();
 
-    let mut writer = create_output_writer(&display_format, output_path, BENCHMARK_ID)?;
+    let output = BenchmarkOutput::with_path(BENCHMARK_ID, output_path);
+    let mut writer = output.create_writer()?;
 
     match display_format {
         DisplayFormat::Table => {

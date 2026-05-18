@@ -6,7 +6,6 @@
 use std::sync::Arc;
 
 use parking_lot::RwLock;
-use vortex_array::ExecutionCtx;
 use vortex_error::VortexError;
 use vortex_error::VortexResult;
 use vortex_error::vortex_panic;
@@ -15,15 +14,15 @@ use super::MutTypedStatsSetRef;
 use super::StatsSet;
 use super::StatsSetIntoIter;
 use super::TypedStatsSetRef;
-use crate::ArrayRef;
-use crate::aggregate_fn::fns::is_constant::is_constant;
-use crate::aggregate_fn::fns::is_sorted::is_sorted;
-use crate::aggregate_fn::fns::is_sorted::is_strict_sorted;
-use crate::aggregate_fn::fns::min_max::MinMaxResult;
-use crate::aggregate_fn::fns::min_max::min_max;
-use crate::aggregate_fn::fns::nan_count::nan_count;
-use crate::aggregate_fn::fns::sum::sum;
+use crate::Array;
 use crate::builders::builder_with_capacity;
+use crate::compute::MinMaxResult;
+use crate::compute::is_constant;
+use crate::compute::is_sorted;
+use crate::compute::is_strict_sorted;
+use crate::compute::min_max;
+use crate::compute::nan_count;
+use crate::compute::sum;
 use crate::expr::stats::Precision;
 use crate::expr::stats::Stat;
 use crate::expr::stats::StatsProvider;
@@ -42,12 +41,12 @@ pub struct ArrayStats {
 /// Constructed by calling [`ArrayStats::to_ref`].
 pub struct StatsSetRef<'a> {
     // We need to reference back to the array
-    dyn_array_ref: &'a ArrayRef,
+    dyn_array_ref: &'a dyn Array,
     array_stats: &'a ArrayStats,
 }
 
 impl ArrayStats {
-    pub fn to_ref<'a>(&'a self, array: &'a ArrayRef) -> StatsSetRef<'a> {
+    pub fn to_ref<'a>(&'a self, array: &'a dyn Array) -> StatsSetRef<'a> {
         StatsSetRef {
             dyn_array_ref: array,
             array_stats: self,
@@ -82,10 +81,6 @@ impl From<ArrayStats> for StatsSet {
 }
 
 impl StatsSetRef<'_> {
-    pub(crate) fn replace(&self, stats: StatsSet) {
-        *self.array_stats.inner.write() = stats;
-    }
-
     pub fn set_iter(&self, iter: StatsSetIntoIter) {
         let mut guard = self.array_stats.inner.write();
         for (stat, value) in iter {
@@ -135,13 +130,6 @@ impl StatsSetRef<'_> {
         self.array_stats.inner.read().clone()
     }
 
-    /// Returns a clone of the underlying [`ArrayStats`].
-    ///
-    /// Since [`ArrayStats`] uses `Arc` internally, this is a cheap reference-count increment.
-    pub fn to_array_stats(&self) -> ArrayStats {
-        self.array_stats.clone()
-    }
-
     pub fn with_iter<
         F: for<'a> FnOnce(&mut dyn Iterator<Item = &'a (Stat, Precision<ScalarValue>)>) -> R,
         R,
@@ -153,35 +141,35 @@ impl StatsSetRef<'_> {
         f(&mut lock.iter())
     }
 
-    pub fn compute_stat(&self, stat: Stat, ctx: &mut ExecutionCtx) -> VortexResult<Option<Scalar>> {
+    pub fn compute_stat(&self, stat: Stat) -> VortexResult<Option<Scalar>> {
         // If it's already computed and exact, we can return it.
         if let Some(Precision::Exact(s)) = self.get(stat) {
             return Ok(Some(s));
         }
 
         Ok(match stat {
-            Stat::Min => min_max(self.dyn_array_ref, ctx)?.map(|MinMaxResult { min, max: _ }| min),
-            Stat::Max => min_max(self.dyn_array_ref, ctx)?.map(|MinMaxResult { min: _, max }| max),
+            Stat::Min => min_max(self.dyn_array_ref)?.map(|MinMaxResult { min, max: _ }| min),
+            Stat::Max => min_max(self.dyn_array_ref)?.map(|MinMaxResult { min: _, max }| max),
             Stat::Sum => {
                 Stat::Sum
                     .dtype(self.dyn_array_ref.dtype())
                     .is_some()
                     .then(|| {
                         // Sum is supported for this dtype.
-                        sum(self.dyn_array_ref, ctx)
+                        sum(self.dyn_array_ref)
                     })
                     .transpose()?
             }
-            Stat::NullCount => self.dyn_array_ref.invalid_count(ctx).ok().map(Into::into),
+            Stat::NullCount => self.dyn_array_ref.invalid_count().ok().map(Into::into),
             Stat::IsConstant => {
                 if self.dyn_array_ref.is_empty() {
                     None
                 } else {
-                    Some(is_constant(self.dyn_array_ref, ctx)?.into())
+                    is_constant(self.dyn_array_ref)?.map(|v| v.into())
                 }
             }
-            Stat::IsSorted => Some(is_sorted(self.dyn_array_ref, ctx)?.into()),
-            Stat::IsStrictSorted => Some(is_strict_sorted(self.dyn_array_ref, ctx)?.into()),
+            Stat::IsSorted => is_sorted(self.dyn_array_ref)?.map(|v| v.into()),
+            Stat::IsStrictSorted => is_strict_sorted(self.dyn_array_ref)?.map(|v| v.into()),
             Stat::UncompressedSizeInBytes => {
                 let mut builder =
                     builder_with_capacity(self.dyn_array_ref.dtype(), self.dyn_array_ref.len());
@@ -198,7 +186,7 @@ impl StatsSetRef<'_> {
                     .is_some()
                     .then(|| {
                         // NaNCount is supported for this dtype.
-                        nan_count(self.dyn_array_ref, ctx)
+                        nan_count(self.dyn_array_ref)
                     })
                     .transpose()?
                     .map(|s| s.into())
@@ -206,10 +194,10 @@ impl StatsSetRef<'_> {
         })
     }
 
-    pub fn compute_all(&self, stats: &[Stat], ctx: &mut ExecutionCtx) -> VortexResult<StatsSet> {
+    pub fn compute_all(&self, stats: &[Stat]) -> VortexResult<StatsSet> {
         let mut stats_set = StatsSet::default();
         for &stat in stats {
-            if let Some(s) = self.compute_stat(stat, ctx)?
+            if let Some(s) = self.compute_stat(stat)?
                 && let Some(value) = s.into_value()
             {
                 stats_set.set(stat, Precision::exact(value));
@@ -223,9 +211,8 @@ impl StatsSetRef<'_> {
     pub fn compute_as<U: for<'a> TryFrom<&'a Scalar, Error = VortexError>>(
         &self,
         stat: Stat,
-        ctx: &mut ExecutionCtx,
     ) -> Option<U> {
-        self.compute_stat(stat, ctx)
+        self.compute_stat(stat)
             .inspect_err(|e| tracing::warn!("Failed to compute stat {stat}: {e}"))
             .ok()
             .flatten()
@@ -249,38 +236,32 @@ impl StatsSetRef<'_> {
         self.array_stats.clear(stat);
     }
 
-    pub fn compute_min<U: for<'a> TryFrom<&'a Scalar, Error = VortexError>>(
-        &self,
-        ctx: &mut ExecutionCtx,
-    ) -> Option<U> {
-        self.compute_as(Stat::Min, ctx)
+    pub fn compute_min<U: for<'a> TryFrom<&'a Scalar, Error = VortexError>>(&self) -> Option<U> {
+        self.compute_as(Stat::Min)
     }
 
-    pub fn compute_max<U: for<'a> TryFrom<&'a Scalar, Error = VortexError>>(
-        &self,
-        ctx: &mut ExecutionCtx,
-    ) -> Option<U> {
-        self.compute_as(Stat::Max, ctx)
+    pub fn compute_max<U: for<'a> TryFrom<&'a Scalar, Error = VortexError>>(&self) -> Option<U> {
+        self.compute_as(Stat::Max)
     }
 
-    pub fn compute_is_sorted(&self, ctx: &mut ExecutionCtx) -> Option<bool> {
-        self.compute_as(Stat::IsSorted, ctx)
+    pub fn compute_is_sorted(&self) -> Option<bool> {
+        self.compute_as(Stat::IsSorted)
     }
 
-    pub fn compute_is_strict_sorted(&self, ctx: &mut ExecutionCtx) -> Option<bool> {
-        self.compute_as(Stat::IsStrictSorted, ctx)
+    pub fn compute_is_strict_sorted(&self) -> Option<bool> {
+        self.compute_as(Stat::IsStrictSorted)
     }
 
-    pub fn compute_is_constant(&self, ctx: &mut ExecutionCtx) -> Option<bool> {
-        self.compute_as(Stat::IsConstant, ctx)
+    pub fn compute_is_constant(&self) -> Option<bool> {
+        self.compute_as(Stat::IsConstant)
     }
 
-    pub fn compute_null_count(&self, ctx: &mut ExecutionCtx) -> Option<usize> {
-        self.compute_as(Stat::NullCount, ctx)
+    pub fn compute_null_count(&self) -> Option<usize> {
+        self.compute_as(Stat::NullCount)
     }
 
-    pub fn compute_uncompressed_size_in_bytes(&self, ctx: &mut ExecutionCtx) -> Option<usize> {
-        self.compute_as(Stat::UncompressedSizeInBytes, ctx)
+    pub fn compute_uncompressed_size_in_bytes(&self) -> Option<usize> {
+        self.compute_as(Stat::UncompressedSizeInBytes)
     }
 }
 

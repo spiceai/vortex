@@ -2,23 +2,22 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 #![no_main]
+#![allow(clippy::result_large_err)]
 
 use itertools::Itertools;
 use libfuzzer_sys::Corpus;
 use libfuzzer_sys::fuzz_target;
+use vortex_array::Array;
 use vortex_array::Canonical;
 use vortex_array::IntoArray;
-use vortex_array::VortexSessionExecute;
-use vortex_array::arrays::BoolArray;
+use vortex_array::ToCanonical;
 use vortex_array::arrays::ChunkedArray;
-use vortex_array::arrays::bool::BoolArrayExt;
 use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::StructFields;
 use vortex_array::expr::lit;
 use vortex_array::expr::root;
 use vortex_array::scalar_fn::fns::operators::Operator;
-use vortex_btrblocks::BtrBlocksCompressorBuilder;
 use vortex_buffer::ByteBufferMut;
 use vortex_error::VortexExpect;
 use vortex_error::vortex_panic;
@@ -45,16 +44,11 @@ fuzz_target!(|fuzz: FuzzFileAction| -> Corpus {
         return Corpus::Reject;
     }
 
-    let mut ctx = SESSION.create_execution_ctx();
     let expected_array = {
         let bool_mask = array_data
-            .clone()
             .apply(&filter_expr.clone().unwrap_or_else(|| lit(true)))
             .vortex_expect("filter expression evaluation should succeed in fuzz test");
-        let bool_mask_bool = bool_mask
-            .execute::<BoolArray>(&mut ctx)
-            .vortex_expect("execute bool");
-        let mask = bool_mask_bool.to_mask_fill_null_false(&mut ctx);
+        let mask = bool_mask.to_bool().to_mask_fill_null_false();
         let filtered = array_data
             .filter(mask)
             .vortex_expect("filter operation should succeed in fuzz test");
@@ -65,11 +59,12 @@ fuzz_target!(|fuzz: FuzzFileAction| -> Corpus {
 
     let write_options = match compressor_strategy {
         CompressorStrategy::Default => SESSION.write_options(),
-        CompressorStrategy::Compact => SESSION.write_options().with_strategy(
-            WriteStrategyBuilder::default()
-                .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact())
-                .build(),
-        ),
+        CompressorStrategy::Compact => {
+            let strategy = WriteStrategyBuilder::default()
+                .with_compact_encodings()
+                .build();
+            SESSION.write_options().with_strategy(strategy)
+        }
     };
 
     let mut full_buff = ByteBufferMut::empty();
@@ -115,17 +110,11 @@ fuzz_target!(|fuzz: FuzzFileAction| -> Corpus {
     let bool_result = expected_array
         .binary(output_array.clone(), Operator::Eq)
         .vortex_expect("compare operation should succeed in fuzz test")
-        .execute::<BoolArray>(&mut ctx)
-        .vortex_expect("execute bool");
+        .to_bool();
     let true_count = bool_result.to_bit_buffer().true_count();
     if true_count != expected_array.len()
-        && (bool_result
-            .into_array()
-            .all_valid(&mut ctx)
-            .vortex_expect("all_valid")
-            || expected_array
-                .all_valid(&mut ctx)
-                .vortex_expect("all_valid"))
+        && (bool_result.all_valid().vortex_expect("all_valid")
+            || expected_array.all_valid().vortex_expect("all_valid"))
     {
         vortex_panic!(
             "Failed to match original array {}with{}",

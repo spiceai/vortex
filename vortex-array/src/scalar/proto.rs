@@ -39,7 +39,7 @@ impl From<&Scalar> for pb::Scalar {
                     .try_into()
                     .vortex_expect("Failed to convert DType to proto"),
             ),
-            value: Some(Box::new(ScalarValue::to_proto(value.value()))),
+            value: Some(ScalarValue::to_proto(value.value())),
         }
     }
 }
@@ -101,7 +101,7 @@ impl From<&ScalarValue> for pb::ScalarValue {
             ScalarValue::Binary(v) => pb::ScalarValue {
                 kind: Some(Kind::BytesValue(v.to_vec())),
             },
-            ScalarValue::Tuple(v) => {
+            ScalarValue::List(v) => {
                 let mut values = Vec::with_capacity(v.len());
                 for elem in v.iter() {
                     values.push(ScalarValue::to_proto(elem.as_ref()));
@@ -110,9 +110,6 @@ impl From<&ScalarValue> for pb::ScalarValue {
                     kind: Some(Kind::ListValue(ListValue { values })),
                 }
             }
-            ScalarValue::Variant(v) => pb::ScalarValue {
-                kind: Some(Kind::VariantValue(Box::new(pb::Scalar::from(v.as_ref())))),
-            },
         }
     }
 }
@@ -170,12 +167,8 @@ impl Scalar {
     /// # Errors
     ///
     /// Returns an error if type validation fails.
-    pub fn from_proto_value(
-        value: &pb::ScalarValue,
-        dtype: &DType,
-        session: &VortexSession,
-    ) -> VortexResult<Self> {
-        let scalar_value = ScalarValue::from_proto(value, dtype, session)?;
+    pub fn from_proto_value(value: &pb::ScalarValue, dtype: &DType) -> VortexResult<Self> {
+        let scalar_value = ScalarValue::from_proto(value, dtype)?;
 
         Scalar::try_new(dtype.clone(), scalar_value)
     }
@@ -199,7 +192,7 @@ impl Scalar {
             .as_ref()
             .ok_or_else(|| vortex_err!(Serde: "Scalar missing value"))?;
 
-        let value: Option<ScalarValue> = ScalarValue::from_proto(pb_scalar_value, &dtype, session)?;
+        let value: Option<ScalarValue> = ScalarValue::from_proto(pb_scalar_value, &dtype)?;
 
         Scalar::try_new(dtype, value)
     }
@@ -214,13 +207,9 @@ impl ScalarValue {
     /// # Errors
     ///
     /// Returns an error if decoding or type validation fails.
-    pub fn from_proto_bytes(
-        bytes: &[u8],
-        dtype: &DType,
-        session: &VortexSession,
-    ) -> VortexResult<Option<Self>> {
+    pub fn from_proto_bytes(bytes: &[u8], dtype: &DType) -> VortexResult<Option<Self>> {
         let proto = pb::ScalarValue::decode(bytes)?;
-        Self::from_proto(&proto, dtype, session)
+        Self::from_proto(&proto, dtype)
     }
 
     /// Creates a [`ScalarValue`] from its [protobuf](pb::ScalarValue) representation.
@@ -231,11 +220,7 @@ impl ScalarValue {
     /// # Errors
     ///
     /// Returns an error if the protobuf value cannot be converted to the given [`DType`].
-    pub fn from_proto(
-        value: &pb::ScalarValue,
-        dtype: &DType,
-        session: &VortexSession,
-    ) -> VortexResult<Option<Self>> {
+    pub fn from_proto(value: &pb::ScalarValue, dtype: &DType) -> VortexResult<Option<Self>> {
         let kind = value
             .kind
             .as_ref()
@@ -247,24 +232,18 @@ impl ScalarValue {
             _ => dtype,
         };
 
-        Ok(match kind {
-            Kind::NullValue(_) => None,
-            Kind::BoolValue(v) => Some(bool_from_proto(*v, dtype)?),
-            Kind::Int64Value(v) => Some(int64_from_proto(*v, dtype)?),
-            Kind::Uint64Value(v) => Some(uint64_from_proto(*v, dtype)?),
-            Kind::F16Value(v) => Some(f16_from_proto(*v, dtype)?),
-            Kind::F32Value(v) => Some(f32_from_proto(*v, dtype)?),
-            Kind::F64Value(v) => Some(f64_from_proto(*v, dtype)?),
-            Kind::StringValue(s) => Some(string_from_proto(s, dtype)?),
-            Kind::BytesValue(b) => Some(bytes_from_proto(b, dtype)?),
-            Kind::ListValue(v) => Some(list_from_proto(v, dtype, session)?),
-            Kind::VariantValue(v) => match dtype {
-                DType::Variant(_) => Some(ScalarValue::Variant(Box::new(Scalar::from_proto(
-                    v, session,
-                )?))),
-                _ => vortex_bail!(Serde: "expected non-Variant scalar proto for dtype {dtype}"),
-            },
-        })
+        Ok(Some(match kind {
+            Kind::NullValue(_) => return Ok(None),
+            Kind::BoolValue(v) => bool_from_proto(*v, dtype)?,
+            Kind::Int64Value(v) => int64_from_proto(*v, dtype)?,
+            Kind::Uint64Value(v) => uint64_from_proto(*v, dtype)?,
+            Kind::F16Value(v) => f16_from_proto(*v, dtype)?,
+            Kind::F32Value(v) => f32_from_proto(*v, dtype)?,
+            Kind::F64Value(v) => f64_from_proto(*v, dtype)?,
+            Kind::StringValue(s) => string_from_proto(s, dtype)?,
+            Kind::BytesValue(b) => bytes_from_proto(b, dtype)?,
+            Kind::ListValue(v) => list_from_proto(v, dtype)?,
+        }))
     }
 }
 
@@ -394,7 +373,7 @@ fn bytes_from_proto(bytes: &[u8], dtype: &DType) -> VortexResult<ScalarValue> {
     match dtype {
         DType::Utf8(_) => Ok(ScalarValue::Utf8(BufferString::try_from(bytes)?)),
         DType::Binary(_) => Ok(ScalarValue::Binary(ByteBuffer::copy_from(bytes))),
-        // TODO(connor): This is incorrect, we need to verify this matches the inner decimal_dtype.
+        // TODO(connor): This is incorrect, we need to verify this matches the `dtype`.
         DType::Decimal(..) => Ok(ScalarValue::Decimal(match bytes.len() {
             1 => DecimalValue::I8(bytes[0] as i8),
             2 => DecimalValue::I16(i16::from_le_bytes(
@@ -435,26 +414,18 @@ fn bytes_from_proto(bytes: &[u8], dtype: &DType) -> VortexResult<ScalarValue> {
     }
 }
 
-/// Deserialize a [`ScalarValue::Tuple`] from a protobuf `ListValue`.
-fn list_from_proto(
-    v: &ListValue,
-    dtype: &DType,
-    session: &VortexSession,
-) -> VortexResult<ScalarValue> {
+/// Deserialize a [`ScalarValue::List`] from a protobuf `ListValue`.
+fn list_from_proto(v: &ListValue, dtype: &DType) -> VortexResult<ScalarValue> {
     let element_dtype = dtype
         .as_list_element_opt()
         .ok_or_else(|| vortex_err!(Serde: "expected List dtype for ListValue, got {dtype}"))?;
 
     let mut values = Vec::with_capacity(v.values.len());
     for elem in v.values.iter() {
-        values.push(ScalarValue::from_proto(
-            elem,
-            element_dtype.as_ref(),
-            session,
-        )?);
+        values.push(ScalarValue::from_proto(elem, element_dtype.as_ref())?);
     }
 
-    Ok(ScalarValue::Tuple(values))
+    Ok(ScalarValue::List(values))
 }
 
 #[cfg(test)]
@@ -531,7 +502,7 @@ mod tests {
                 Arc::new(DType::Primitive(PType::I32, Nullability::Nullable)),
                 Nullability::Nullable,
             ),
-            Some(ScalarValue::Tuple(vec![
+            Some(ScalarValue::List(vec![
                 Some(ScalarValue::Primitive(42i32.into())),
                 Some(ScalarValue::Primitive(43i32.into())),
             ])),
@@ -606,58 +577,6 @@ mod tests {
     }
 
     #[test]
-    fn test_variant_scalar_roundtrip() {
-        let nums = Scalar::list(
-            Arc::new(DType::Variant(Nullability::NonNullable)),
-            vec![
-                Scalar::variant(Scalar::primitive(-7_i16, Nullability::NonNullable)),
-                Scalar::variant(Scalar::primitive(42_u32, Nullability::NonNullable)),
-                Scalar::variant(Scalar::decimal(
-                    DecimalValue::I128(123_456_789),
-                    DecimalDType::new(18, 0),
-                    Nullability::NonNullable,
-                )),
-            ],
-            Nullability::NonNullable,
-        );
-
-        let nested = Scalar::list(
-            Arc::new(DType::Variant(Nullability::NonNullable)),
-            vec![
-                Scalar::variant(Scalar::from(true)),
-                Scalar::variant(nums),
-                Scalar::variant(Scalar::binary(
-                    ByteBuffer::copy_from(b"abc"),
-                    Nullability::NonNullable,
-                )),
-                Scalar::variant(Scalar::null(DType::Null)),
-            ],
-            Nullability::NonNullable,
-        );
-
-        round_trip(Scalar::variant(nested));
-    }
-
-    #[test]
-    fn test_variant_scalar_proto_preserves_scalar_null_vs_variant_null() {
-        let scalar_null = Scalar::null(DType::Variant(Nullability::Nullable));
-        let variant_null = Scalar::variant(Scalar::null(DType::Null));
-
-        let scalar_null_pb = pb::Scalar::from(&scalar_null);
-        let variant_null_pb = pb::Scalar::from(&variant_null);
-
-        assert_ne!(scalar_null_pb, variant_null_pb);
-        assert_eq!(
-            Scalar::from_proto(&scalar_null_pb, &session()).unwrap(),
-            scalar_null,
-        );
-        assert_eq!(
-            Scalar::from_proto(&variant_null_pb, &session()).unwrap(),
-            variant_null,
-        );
-    }
-
-    #[test]
     fn test_backcompat_f16_serialized_as_u64() {
         // Backwards compatibility test for the legacy f16 serialization format.
         //
@@ -685,7 +604,6 @@ mod tests {
         let scalar_value = ScalarValue::from_proto(
             &pb_scalar_value,
             &DType::Primitive(PType::U64, Nullability::NonNullable),
-            &session(),
         )
         .unwrap();
         assert_eq!(
@@ -697,7 +615,6 @@ mod tests {
         let scalar_value_f16 = ScalarValue::from_proto(
             &pb_scalar_value,
             &DType::Primitive(PType::F16, Nullability::Nullable),
-            &session(),
         )
         .unwrap();
 
@@ -734,7 +651,6 @@ mod tests {
             let read_back = ScalarValue::from_proto(
                 &pb_value,
                 &DType::Primitive(PType::F16, Nullability::NonNullable),
-                &session(),
             )
             .unwrap();
 
@@ -813,7 +729,7 @@ mod tests {
 
         for (name, value, dtype) in exact_roundtrip_cases {
             let pb_value = ScalarValue::to_proto(value.as_ref());
-            let read_back = ScalarValue::from_proto(&pb_value, &dtype, &session()).unwrap();
+            let read_back = ScalarValue::from_proto(&pb_value, &dtype).unwrap();
 
             let original_debug = format!("{value:?}");
             let roundtrip_debug = format!("{read_back:?}");
@@ -848,7 +764,7 @@ mod tests {
 
         for (name, value, dtype, expected) in unsigned_cases {
             let pb_value = ScalarValue::to_proto(Some(&value));
-            let read_back = ScalarValue::from_proto(&pb_value, &dtype, &session()).unwrap();
+            let read_back = ScalarValue::from_proto(&pb_value, &dtype).unwrap();
 
             match read_back.as_ref() {
                 Some(ScalarValue::Primitive(pv)) => {
@@ -892,7 +808,7 @@ mod tests {
 
         for (name, value, dtype, expected) in signed_cases {
             let pb_value = ScalarValue::to_proto(Some(&value));
-            let read_back = ScalarValue::from_proto(&pb_value, &dtype, &session()).unwrap();
+            let read_back = ScalarValue::from_proto(&pb_value, &dtype).unwrap();
 
             match read_back.as_ref() {
                 Some(ScalarValue::Primitive(pv)) => {
@@ -921,8 +837,7 @@ mod tests {
         assert_eq!(
             Scalar::from_proto_value(
                 &pb::ScalarValue::from(&v),
-                &DType::Primitive(PType::U64, Nullability::Nullable),
-                &session()
+                &DType::Primitive(PType::U64, Nullability::Nullable)
             )
             .unwrap(),
             Scalar::primitive(0u64, Nullability::Nullable)
@@ -937,8 +852,7 @@ mod tests {
         assert_eq!(
             Scalar::from_proto_value(
                 &pb::ScalarValue::from(&v),
-                &DType::Primitive(PType::I64, Nullability::Nullable),
-                &session()
+                &DType::Primitive(PType::I64, Nullability::Nullable)
             )
             .unwrap(),
             Scalar::primitive(0i64, Nullability::Nullable)

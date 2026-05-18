@@ -4,7 +4,9 @@
 //! Type-erased extension dtype ([`ExtDTypeRef`]).
 
 use std::any::type_name;
-use std::fmt;
+use std::fmt::Debug;
+use std::fmt::Display;
+use std::fmt::Formatter;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::sync::Arc;
@@ -20,7 +22,7 @@ use crate::dtype::extension::ExtId;
 use crate::dtype::extension::ExtVTable;
 use crate::dtype::extension::Matcher;
 use crate::dtype::extension::typed::DynExtDType;
-use crate::scalar::ScalarValue;
+use crate::dtype::extension::typed::ExtDTypeInner;
 
 /// A type-erased extension dtype.
 ///
@@ -66,6 +68,16 @@ impl ExtDTypeRef {
         }
     }
 
+    /// Serialize the metadata into a byte vector.
+    pub fn serialize_metadata(&self) -> VortexResult<Vec<u8>> {
+        self.0.metadata_serialize()
+    }
+
+    /// Returns a `Display`-able view of just the metadata.
+    pub fn display_metadata(&self) -> impl Display + '_ {
+        MetadataDisplay(&*self.0)
+    }
+
     /// Compute equality ignoring nullability.
     pub fn eq_ignore_nullability(&self, other: &Self) -> bool {
         self.id() == other.id()
@@ -73,46 +85,6 @@ impl ExtDTypeRef {
             && self
                 .storage_dtype()
                 .eq_ignore_nullability(other.storage_dtype())
-    }
-
-    // TODO(connor): We should add a different type that returns something that can be serialized.
-    /// Serialize the metadata into a byte vector.
-    pub fn serialize_metadata(&self) -> VortexResult<Vec<u8>> {
-        self.0.serialize_metadata()
-    }
-
-    /// Returns a `Display`-able view of just the metadata.
-    pub fn display_metadata(&self) -> impl fmt::Display + '_ {
-        MetadataDisplay(&*self.0)
-    }
-
-    /// Formats an extension scalar value using the current dtype for metadata context.
-    pub(crate) fn fmt_storage_value<'a>(
-        &'a self,
-        f: &mut fmt::Formatter<'_>,
-        storage_value: &'a ScalarValue,
-    ) -> fmt::Result {
-        self.0.value_display(f, storage_value)
-    }
-
-    /// Validates that the given storage scalar value is valid for this dtype.
-    pub(crate) fn validate_storage_value(&self, storage_value: &ScalarValue) -> VortexResult<()> {
-        self.0.validate_scalar_value(storage_value)
-    }
-
-    /// Can a value of `other` be implicitly coerced into this extension type?
-    pub fn can_coerce_from(&self, other: &DType) -> bool {
-        self.0.can_coerce_from(other)
-    }
-
-    /// Can this extension type be implicitly coerced into `other`?
-    pub fn can_coerce_to(&self, other: &DType) -> bool {
-        self.0.can_coerce_to(other)
-    }
-
-    /// Compute the least supertype of this extension type and another type.
-    pub fn least_supertype(&self, other: &DType) -> Option<DType> {
-        self.0.least_supertype(other)
     }
 }
 
@@ -141,10 +113,12 @@ impl ExtDTypeRef {
     /// Downcast to the concrete [`ExtDType`].
     ///
     /// Returns `Err(self)` if the downcast fails.
-    pub fn try_downcast<V: ExtVTable>(self) -> Result<Arc<ExtDType<V>>, ExtDTypeRef> {
-        if self.0.as_any().is::<ExtDType<V>>() {
-            let ptr = Arc::into_raw(self.0) as *const ExtDType<V>;
-            Ok(unsafe { Arc::from_raw(ptr) })
+    pub fn try_downcast<V: ExtVTable>(self) -> Result<ExtDType<V>, ExtDTypeRef> {
+        if self.0.as_any().is::<ExtDTypeInner<V>>() {
+            // SAFETY: type matches and ExtDTypeInner<V> is the only implementor
+            let ptr = Arc::into_raw(self.0) as *const ExtDTypeInner<V>;
+            let inner = unsafe { Arc::from_raw(ptr) };
+            Ok(ExtDType(inner))
         } else {
             Err(self)
         }
@@ -155,7 +129,7 @@ impl ExtDTypeRef {
     /// # Panics
     ///
     /// Panics if the downcast fails.
-    pub fn downcast<V: ExtVTable>(self) -> Arc<ExtDType<V>> {
+    pub fn downcast<V: ExtVTable>(self) -> ExtDType<V> {
         self.try_downcast::<V>()
             .map_err(|this| {
                 vortex_err!(
@@ -165,6 +139,28 @@ impl ExtDTypeRef {
                 )
             })
             .vortex_expect("Failed to downcast ExtDTypeRef")
+    }
+}
+
+impl Display for ExtDTypeRef {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let metadata = self.display_metadata().to_string();
+        if metadata.is_empty() {
+            write!(f, "{}", self.id())?;
+        } else {
+            write!(f, "{}[{}]", self.id(), metadata)?;
+        }
+        write!(f, "({})", self.storage_dtype())
+    }
+}
+
+impl Debug for ExtDTypeRef {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExtDType")
+            .field("id", &self.id())
+            .field("metadata", &MetadataDebug(&*self.0))
+            .field("storage_dtype", &self.storage_dtype())
+            .finish()
     }
 }
 
@@ -185,54 +181,20 @@ impl Hash for ExtDTypeRef {
     }
 }
 
-impl fmt::Debug for ExtDTypeRef {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let metadata = self.0.metadata_debug(f);
-
-        f.debug_struct("ExtDType")
-            .field("id", &self.id())
-            .field("metadata", &metadata)
-            .field("storage_dtype", &self.storage_dtype())
-            .finish()
-    }
-}
-
-impl fmt::Display for ExtDTypeRef {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let metadata = MetadataDisplay(&*self.0).to_string();
-
-        if metadata.is_empty() {
-            write!(f, "{}", self.id())?;
-        } else {
-            write!(f, "{}[{}]", self.id(), metadata)?;
-        }
-
-        write!(f, "({})", self.storage_dtype())
-    }
-}
-
 // Private formatting helpers for Display and Debug impls.
 
 struct MetadataDisplay<'a>(&'a dyn DynExtDType);
-impl fmt::Display for MetadataDisplay<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+
+impl Display for MetadataDisplay<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         self.0.metadata_display(f)
     }
 }
 
-// struct PythonDisplay<'a>(&'a dyn DynExtDType);
-// impl fmt::Display for PythonDisplay<'_> {
-//     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-//         let metadata = MetadataDisplay(self.0).to_string();
+struct MetadataDebug<'a>(&'a dyn DynExtDType);
 
-//         let id = self.0.id();
-//         let escaped_id = id.as_ref().escape_default();
-//         if metadata.is_empty() {
-//             write!(f, "\"{escaped_id}\"",)?;
-//         } else {
-//             write!(f, "\"{escaped_id}\"[{}]", metadata)?;
-//         }
-
-//         write!(f, "({})", self.0.storage_dtype())
-//     }
-// }
+impl Debug for MetadataDebug<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        self.0.metadata_debug(f)
+    }
+}

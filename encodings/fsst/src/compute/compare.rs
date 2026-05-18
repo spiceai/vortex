@@ -1,35 +1,40 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use vortex_array::Array;
 use vortex_array::ArrayRef;
-use vortex_array::ArrayView;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
+use vortex_array::ToCanonical;
 use vortex_array::arrays::BoolArray;
 use vortex_array::arrays::ConstantArray;
 use vortex_array::builtins::ArrayBuiltins;
+use vortex_array::compute::compare_lengths_to_empty;
 use vortex_array::dtype::DType;
+use vortex_array::match_each_integer_ptype;
 use vortex_array::scalar::Scalar;
 use vortex_array::scalar_fn::fns::binary::CompareKernel;
 use vortex_array::scalar_fn::fns::operators::CompareOperator;
 use vortex_array::scalar_fn::fns::operators::Operator;
+use vortex_array::validity::Validity;
 use vortex_buffer::BitBuffer;
 use vortex_buffer::ByteBuffer;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 
-use crate::FSST;
-use crate::FSSTArrayExt;
-impl CompareKernel for FSST {
+use crate::FSSTArray;
+use crate::FSSTVTable;
+
+impl CompareKernel for FSSTVTable {
     fn compare(
-        lhs: ArrayView<'_, Self>,
-        rhs: &ArrayRef,
+        lhs: &FSSTArray,
+        rhs: &dyn Array,
         operator: CompareOperator,
-        ctx: &mut ExecutionCtx,
+        _ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
         match rhs.as_constant() {
-            Some(constant) => compare_fsst_constant(lhs, &constant, operator, ctx),
+            Some(constant) => compare_fsst_constant(lhs, &constant, operator),
             // Otherwise, fall back to the default comparison behavior.
             _ => Ok(None),
         }
@@ -38,10 +43,9 @@ impl CompareKernel for FSST {
 
 /// Specialized compare function implementation used when performing against a constant
 fn compare_fsst_constant(
-    left: ArrayView<'_, FSST>,
+    left: &FSSTArray,
     right: &Scalar,
     operator: CompareOperator,
-    ctx: &mut ExecutionCtx,
 ) -> VortexResult<Option<ArrayRef>> {
     let is_rhs_empty = match right.dtype() {
         DType::Binary(_) => right
@@ -60,24 +64,21 @@ fn compare_fsst_constant(
             CompareOperator::Gte => BitBuffer::new_set(left.len()),
             // No value is lt ""
             CompareOperator::Lt => BitBuffer::new_unset(left.len()),
-            _ => left
-                .uncompressed_lengths()
-                .binary(
-                    ConstantArray::new(
-                        Scalar::zero_value(left.uncompressed_lengths().dtype()),
-                        left.uncompressed_lengths().len(),
+            _ => {
+                let uncompressed_lengths = left.uncompressed_lengths().to_primitive();
+                match_each_integer_ptype!(uncompressed_lengths.ptype(), |P| {
+                    compare_lengths_to_empty(
+                        uncompressed_lengths.as_slice::<P>().iter().copied(),
+                        operator,
                     )
-                    .into_array(),
-                    operator.into(),
-                )?
-                .execute(ctx)?,
+                })
+            }
         };
 
         return Ok(Some(
             BoolArray::new(
                 buffer,
-                left.array()
-                    .validity()?
+                Validity::copy_from_array(left.as_ref())?
                     .union_nullability(right.dtype().nullability()),
             )
             .into_array(),
@@ -115,16 +116,15 @@ fn compare_fsst_constant(
 
     let rhs = ConstantArray::new(encoded_scalar, left.len());
     left.codes()
-        .into_array()
+        .to_array()
         .binary(rhs.into_array(), Operator::from(operator))
         .map(Some)
 }
 
 #[cfg(test)]
 mod tests {
-    use vortex_array::IntoArray;
-    use vortex_array::LEGACY_SESSION;
-    use vortex_array::VortexSessionExecute;
+    use vortex_array::Array;
+    use vortex_array::ToCanonical;
     use vortex_array::arrays::BoolArray;
     use vortex_array::arrays::ConstantArray;
     use vortex_array::arrays::VarBinArray;
@@ -141,7 +141,6 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn test_compare_fsst() {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
         let lhs = VarBinArray::from_iter(
             [
                 Some("hello"),
@@ -153,20 +152,16 @@ mod tests {
             DType::Utf8(Nullability::Nullable),
         );
         let compressor = fsst_train_compressor(&lhs);
-        let len = lhs.len();
-        let dtype = lhs.dtype().clone();
-        let lhs = fsst_compress(lhs, len, &dtype, &compressor, &mut ctx);
+        let lhs = fsst_compress(lhs, &compressor);
 
         let rhs = ConstantArray::new("world", lhs.len());
 
         // Ensure fastpath for Eq exists, and returns correct answer
         let equals = lhs
-            .clone()
-            .into_array()
-            .binary(rhs.clone().into_array(), Operator::Eq)
+            .to_array()
+            .binary(rhs.to_array(), Operator::Eq)
             .unwrap()
-            .execute::<BoolArray>(&mut ctx)
-            .unwrap();
+            .to_bool();
 
         assert_eq!(equals.dtype(), &DType::Bool(Nullability::Nullable));
 
@@ -177,12 +172,10 @@ mod tests {
 
         // Ensure fastpath for Eq exists, and returns correct answer
         let not_equals = lhs
-            .clone()
-            .into_array()
-            .binary(rhs.into_array(), Operator::NotEq)
+            .to_array()
+            .binary(rhs.to_array(), Operator::NotEq)
             .unwrap()
-            .execute::<BoolArray>(&mut ctx)
-            .unwrap();
+            .to_bool();
 
         assert_eq!(not_equals.dtype(), &DType::Bool(Nullability::Nullable));
         assert_arrays_eq!(
@@ -194,9 +187,8 @@ mod tests {
         let null_rhs =
             ConstantArray::new(Scalar::null(DType::Utf8(Nullability::Nullable)), lhs.len());
         let equals_null = lhs
-            .clone()
-            .into_array()
-            .binary(null_rhs.clone().into_array(), Operator::Eq)
+            .to_array()
+            .binary(null_rhs.to_array(), Operator::Eq)
             .unwrap();
         assert_arrays_eq!(
             &equals_null,
@@ -204,8 +196,8 @@ mod tests {
         );
 
         let noteq_null = lhs
-            .into_array()
-            .binary(null_rhs.into_array(), Operator::NotEq)
+            .to_array()
+            .binary(null_rhs.to_array(), Operator::NotEq)
             .unwrap();
         assert_arrays_eq!(
             &noteq_null,

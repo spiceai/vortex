@@ -7,15 +7,14 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_panic;
 
+use crate::Array;
 use crate::ArrayRef;
 use crate::IntoArray;
-#[expect(deprecated)]
-use crate::ToCanonical as _;
+use crate::ToCanonical;
 use crate::arrays::DictArray;
-use crate::arrays::Primitive;
-use crate::arrays::VarBin;
-use crate::arrays::VarBinView;
-use crate::arrays::primitive::PrimitiveArrayExt;
+use crate::arrays::PrimitiveVTable;
+use crate::arrays::VarBinVTable;
+use crate::arrays::VarBinViewVTable;
 use crate::dtype::PType;
 use crate::match_each_native_ptype;
 
@@ -35,7 +34,7 @@ pub const UNCONSTRAINED: DictConstraints = DictConstraints {
 
 pub trait DictEncoder: Send {
     /// Assign dictionary codes to the given input array.
-    fn encode(&mut self, array: &ArrayRef) -> ArrayRef;
+    fn encode(&mut self, array: &dyn Array) -> ArrayRef;
 
     /// Clear the encoder state to make it ready for a new round of decoding.
     fn reset(&mut self) -> ArrayRef;
@@ -44,14 +43,14 @@ pub trait DictEncoder: Send {
     fn codes_ptype(&self) -> PType;
 }
 
-pub fn dict_encoder(array: &ArrayRef, constraints: &DictConstraints) -> Box<dyn DictEncoder> {
-    let dict_builder: Box<dyn DictEncoder> = if let Some(pa) = array.as_opt::<Primitive>() {
+pub fn dict_encoder(array: &dyn Array, constraints: &DictConstraints) -> Box<dyn DictEncoder> {
+    let dict_builder: Box<dyn DictEncoder> = if let Some(pa) = array.as_opt::<PrimitiveVTable>() {
         match_each_native_ptype!(pa.ptype(), |P| {
             primitive_dict_builder::<P>(pa.dtype().nullability(), constraints)
         })
-    } else if let Some(vbv) = array.as_opt::<VarBinView>() {
+    } else if let Some(vbv) = array.as_opt::<VarBinViewVTable>() {
         bytes_dict_builder(vbv.dtype().clone(), constraints)
-    } else if let Some(vb) = array.as_opt::<VarBin>() {
+    } else if let Some(vb) = array.as_opt::<VarBinVTable>() {
         bytes_dict_builder(vb.dtype().clone(), constraints)
     } else {
         vortex_panic!("Can only encode primitive or varbin/view arrays")
@@ -63,13 +62,11 @@ pub fn dict_encoder(array: &ArrayRef, constraints: &DictConstraints) -> Box<dyn 
 ///
 /// Vortex encoders must always produce unsigned integer codes; signed codes are only accepted for external compatibility.
 pub fn dict_encode_with_constraints(
-    array: &ArrayRef,
+    array: &dyn Array,
     constraints: &DictConstraints,
 ) -> VortexResult<DictArray> {
     let mut encoder = dict_encoder(array, constraints);
-    let encoded = encoder.encode(array);
-    #[expect(deprecated)]
-    let codes = encoded.to_primitive().narrow()?;
+    let codes = encoder.encode(array).to_primitive().narrow()?;
     // SAFETY: The encoding process will produce a value set of codes and values
     // All values in the dictionary are guaranteed to be referenced by at least one code
     // since we build the dictionary from the codes we observe during encoding
@@ -81,7 +78,7 @@ pub fn dict_encode_with_constraints(
     }
 }
 
-pub fn dict_encode(array: &ArrayRef) -> VortexResult<DictArray> {
+pub fn dict_encode(array: &dyn Array) -> VortexResult<DictArray> {
     let dict_array = dict_encode_with_constraints(array, &UNCONSTRAINED)?;
     if dict_array.len() != array.len() {
         vortex_bail!(

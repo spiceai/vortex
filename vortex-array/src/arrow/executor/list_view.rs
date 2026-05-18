@@ -11,10 +11,10 @@ use vortex_error::vortex_ensure;
 
 use crate::ArrayRef;
 use crate::ExecutionCtx;
-use crate::arrays::ListView;
 use crate::arrays::ListViewArray;
+use crate::arrays::ListViewArrayParts;
+use crate::arrays::ListViewVTable;
 use crate::arrays::PrimitiveArray;
-use crate::arrays::listview::ListViewDataParts;
 use crate::arrow::ArrowArrayExecutor;
 use crate::arrow::executor::validity::to_arrow_null_buffer;
 use crate::builtins::ArrayBuiltins;
@@ -28,7 +28,7 @@ pub(super) fn to_arrow_list_view<O: OffsetSizeTrait + IntegerPType>(
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<arrow_array::ArrayRef> {
     // Check for Vortex ListViewArray and convert directly.
-    let array = match array.try_downcast::<ListView>() {
+    let array = match array.try_into::<ListViewVTable>() {
         Ok(array) => return list_view_to_list_view::<O>(array, elements_field, ctx),
         Err(array) => array,
     };
@@ -43,13 +43,13 @@ fn list_view_to_list_view<O: OffsetSizeTrait + IntegerPType>(
     elements_field: &FieldRef,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<arrow_array::ArrayRef> {
-    let ListViewDataParts {
+    let ListViewArrayParts {
         elements,
         offsets,
         sizes,
         validity,
         ..
-    } = array.into_data_parts();
+    } = array.into_parts();
 
     let elements = elements.execute_arrow(Some(elements_field.data_type()), ctx)?;
     vortex_ensure!(
@@ -71,7 +71,7 @@ fn list_view_to_list_view<O: OffsetSizeTrait + IntegerPType>(
     let null_buffer = to_arrow_null_buffer(validity, offsets.len(), ctx)?;
 
     Ok(Arc::new(GenericListViewArray::<O>::new(
-        Arc::clone(elements_field),
+        elements_field.clone(),
         offsets,
         sizes,
         elements,
@@ -89,16 +89,13 @@ mod tests {
     use vortex_error::VortexResult;
 
     use crate::IntoArray;
-    use crate::LEGACY_SESSION;
-    use crate::VortexSessionExecute;
-    use crate::arrow::ArrowArrayExecutor;
-    use crate::arrow::executor::list_view::ListViewArray;
-    use crate::arrow::executor::list_view::PrimitiveArray;
+    use crate::arrays::ListViewArray;
+    use crate::arrays::PrimitiveArray;
+    use crate::arrow::IntoArrowArray;
     use crate::validity::Validity;
 
     #[test]
     fn test_to_arrow_listview_i32() -> VortexResult<()> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
         // Create a ListViewArray with overlapping views: [[1, 2], [2, 3], [3, 4]]
         let elements = PrimitiveArray::new(buffer![1i32, 2, 3, 4], Validity::NonNullable);
         let offsets = PrimitiveArray::new(buffer![0i32, 1, 2], Validity::NonNullable);
@@ -114,9 +111,7 @@ mod tests {
         // Convert to Arrow ListView with i32 offsets.
         let field = Field::new("item", DataType::Int32, false);
         let arrow_dt = DataType::ListView(field.into());
-        let arrow_array = list_array
-            .into_array()
-            .execute_arrow(Some(&arrow_dt), &mut ctx)?;
+        let arrow_array = list_array.into_array().into_arrow(&arrow_dt)?;
 
         // Verify the type is correct.
         assert_eq!(arrow_array.data_type(), &arrow_dt);
@@ -153,7 +148,6 @@ mod tests {
 
     #[test]
     fn test_to_arrow_listview_i64() -> VortexResult<()> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
         // Create a ListViewArray with nullable elements: [[100], null, [200, 300]]
         let elements = PrimitiveArray::new(buffer![100i64, 200, 300], Validity::NonNullable);
         let offsets = PrimitiveArray::new(buffer![0i64, 1, 1], Validity::NonNullable);
@@ -173,9 +167,7 @@ mod tests {
         // Convert to Arrow LargeListView with i64 offsets.
         let field = Field::new("item", DataType::Int64, false);
         let arrow_dt = DataType::LargeListView(field.into());
-        let arrow_array = list_array
-            .into_array()
-            .execute_arrow(Some(&arrow_dt), &mut ctx)?;
+        let arrow_array = list_array.into_array().into_arrow(&arrow_dt)?;
 
         // Verify the type is correct.
         assert_eq!(arrow_array.data_type(), &arrow_dt);

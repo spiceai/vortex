@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use vortex_array::Array;
 use vortex_array::ArrayRef;
-use vortex_array::ExecutionCtx;
-use vortex_array::IntoArray;
+use vortex_array::ToCanonical;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability::Nullable;
@@ -13,11 +13,7 @@ use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
 use vortex_error::VortexResult;
 
-pub fn cast_canonical_array(
-    array: &ArrayRef,
-    target: &DType,
-    ctx: &mut ExecutionCtx,
-) -> VortexResult<Option<ArrayRef>> {
+pub fn cast_canonical_array(array: &ArrayRef, target: &DType) -> VortexResult<Option<ArrayRef>> {
     // TODO(joe): support more casting options
     let is_int_to_int = target.is_int() && array.dtype().is_int();
     let is_float_to_float = target.is_float() && array.dtype().is_float();
@@ -35,21 +31,18 @@ pub fn cast_canonical_array(
             array.dtype().as_ptype(),
             |In| {
                 match_each_integer_ptype!(target.as_ptype(), |Out| {
+                    // Since the cast itself would truncate.
                     #[allow(clippy::cast_possible_truncation)]
-                    {
-                        let prim = array.clone().execute::<PrimitiveArray>(ctx)?;
-                        PrimitiveArray::new(
-                            prim.as_slice::<In>()
-                                .iter()
-                                .map(|v| *v as Out)
-                                .collect::<Buffer<Out>>(),
-                            Validity::from_mask(
-                                array.validity()?.execute_mask(array.len(), ctx)?,
-                                target.nullability(),
-                            ),
-                        )
-                        .into_array()
-                    }
+                    PrimitiveArray::new(
+                        array
+                            .to_primitive()
+                            .as_slice::<In>()
+                            .iter()
+                            .map(|v| *v as Out)
+                            .collect::<Buffer<Out>>(),
+                        Validity::from_mask(array.validity_mask()?, target.nullability()),
+                    )
+                    .to_array()
                 })
             }
         )))
@@ -65,37 +58,32 @@ pub fn cast_canonical_array(
         }
 
         match (from_ptype, to_ptype) {
-            (PType::F32, PType::F64) => {
-                let prim = array.clone().execute::<PrimitiveArray>(ctx)?;
+            (PType::F32, PType::F64) => Ok(Some(
+                PrimitiveArray::new(
+                    array
+                        .to_primitive()
+                        .as_slice::<f32>()
+                        .iter()
+                        .map(|v| *v as f64)
+                        .collect::<Buffer<f64>>(),
+                    Validity::from_mask(array.validity_mask()?, target.nullability()),
+                )
+                .to_array(),
+            )),
+            (PType::F64, PType::F32) =>
+            {
+                #[allow(clippy::cast_possible_truncation)]
                 Ok(Some(
                     PrimitiveArray::new(
-                        prim.as_slice::<f32>()
-                            .iter()
-                            .map(|v| *v as f64)
-                            .collect::<Buffer<f64>>(),
-                        Validity::from_mask(
-                            array.validity()?.execute_mask(array.len(), ctx)?,
-                            target.nullability(),
-                        ),
-                    )
-                    .into_array(),
-                ))
-            }
-            (PType::F64, PType::F32) => {
-                let prim = array.clone().execute::<PrimitiveArray>(ctx)?;
-                #[expect(clippy::cast_possible_truncation)]
-                Ok(Some(
-                    PrimitiveArray::new(
-                        prim.as_slice::<f64>()
+                        array
+                            .to_primitive()
+                            .as_slice::<f64>()
                             .iter()
                             .map(|v| *v as f32)
                             .collect::<Buffer<f32>>(),
-                        Validity::from_mask(
-                            array.validity()?.execute_mask(array.len(), ctx)?,
-                            target.nullability(),
-                        ),
+                        Validity::from_mask(array.validity_mask()?, target.nullability()),
                     )
-                    .into_array(),
+                    .to_array(),
                 ))
             }
             _ => Ok(None),

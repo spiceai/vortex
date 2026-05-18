@@ -128,7 +128,7 @@ fn segments_by_name_impl(
         .or_default();
 
     for segment_id in root.segment_ids() {
-        let segment_spec = segments[*segment_id as usize];
+        let segment_spec = segments[*segment_id as usize].clone();
         current_segments.push(SegmentDisplay {
             name: name.clone().unwrap_or_else(|| "<unnamed>".into()),
             spec: segment_spec,

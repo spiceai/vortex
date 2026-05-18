@@ -4,11 +4,12 @@
 use cudarc::driver::DeviceRepr;
 use vortex::array::Canonical;
 use vortex::array::arrays::PrimitiveArray;
-use vortex::array::arrays::primitive::PrimitiveDataParts;
+use vortex::array::arrays::PrimitiveArrayParts;
 use vortex::dtype::NativePType;
 use vortex::error::VortexResult;
 use vortex::mask::Mask;
 use vortex_cub::filter::CubFilterable;
+use vortex_cuda_macros::cuda_tests;
 
 use crate::CudaExecutionCtx;
 use crate::kernel::filter::filter_sized;
@@ -22,9 +23,9 @@ pub(super) async fn filter_primitive<T>(
 where
     T: NativePType + DeviceRepr + CubFilterable + Send + Sync + 'static,
 {
-    let PrimitiveDataParts {
+    let PrimitiveArrayParts {
         buffer, validity, ..
-    } = array.into_data_parts();
+    } = array.into_parts();
 
     let filtered_validity = validity.filter(&mask)?;
     let filtered_values = filter_sized::<T>(buffer, mask, ctx).await?;
@@ -36,7 +37,7 @@ where
     )))
 }
 
-#[cfg(test)]
+#[cuda_tests]
 mod tests {
     use rstest::rstest;
     use vortex::array::IntoArray;
@@ -78,7 +79,7 @@ mod tests {
         PrimitiveArray::from_iter([1u32, 2, 3, 4, 5]),
         Mask::from_iter([false, false, false, false, false])
     )]
-    #[crate::test]
+    #[tokio::test]
     async fn test_gpu_filter(
         #[case] input: PrimitiveArray,
         #[case] mask: Mask,
@@ -88,7 +89,7 @@ mod tests {
 
         let filter_array = FilterArray::try_new(input.clone().into_array(), mask.clone())?;
 
-        let cpu_result = crate::canonicalize_cpu(filter_array.clone())?.into_array();
+        let cpu_result = filter_array.to_canonical()?.into_array();
 
         let gpu_result = FilterExecutor
             .execute(filter_array.into_array(), &mut cuda_ctx)
@@ -103,7 +104,7 @@ mod tests {
         Ok(())
     }
 
-    #[crate::test]
+    #[tokio::test]
     async fn test_gpu_filter_large_array() -> VortexResult<()> {
         let mut cuda_ctx = CudaSession::create_execution_ctx(&VortexSession::empty())
             .vortex_expect("failed to create CUDA execution context");
@@ -117,7 +118,7 @@ mod tests {
 
         let filter_array = FilterArray::try_new(input.into_array(), mask)?;
 
-        let cpu_result = crate::canonicalize_cpu(filter_array.clone())?.into_array();
+        let cpu_result = filter_array.to_canonical()?.into_array();
 
         let gpu_result = FilterExecutor
             .execute(filter_array.into_array(), &mut cuda_ctx)

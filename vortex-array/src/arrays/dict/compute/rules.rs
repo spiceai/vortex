@@ -3,23 +3,19 @@
 
 use vortex_error::VortexResult;
 
+use crate::Array;
 use crate::ArrayEq;
 use crate::ArrayRef;
 use crate::IntoArray;
 use crate::Precision;
-use crate::array::ArrayView;
-use crate::array::VTable;
-use crate::arrays::Constant;
+use crate::arrays::AnyScalarFn;
 use crate::arrays::ConstantArray;
-use crate::arrays::Dict;
+use crate::arrays::ConstantVTable;
 use crate::arrays::DictArray;
-use crate::arrays::ScalarFn;
+use crate::arrays::DictVTable;
+use crate::arrays::FilterReduceAdaptor;
 use crate::arrays::ScalarFnArray;
-use crate::arrays::dict::DictArraySlotsExt;
-use crate::arrays::filter::FilterReduceAdaptor;
-use crate::arrays::scalar_fn::AnyScalarFn;
-use crate::arrays::scalar_fn::ScalarFnArrayExt;
-use crate::arrays::slice::SliceReduceAdaptor;
+use crate::arrays::SliceReduceAdaptor;
 use crate::builtins::ArrayBuiltins;
 use crate::optimizer::ArrayOptimizer;
 use crate::optimizer::rules::ArrayParentReduceRule;
@@ -29,29 +25,28 @@ use crate::scalar_fn::fns::cast::CastReduceAdaptor;
 use crate::scalar_fn::fns::like::LikeReduceAdaptor;
 use crate::scalar_fn::fns::mask::MaskReduceAdaptor;
 use crate::scalar_fn::fns::pack::Pack;
-use crate::validity::Validity;
 
-pub(crate) const PARENT_RULES: ParentRuleSet<Dict> = ParentRuleSet::new(&[
-    ParentRuleSet::lift(&FilterReduceAdaptor(Dict)),
-    ParentRuleSet::lift(&CastReduceAdaptor(Dict)),
-    ParentRuleSet::lift(&MaskReduceAdaptor(Dict)),
-    ParentRuleSet::lift(&LikeReduceAdaptor(Dict)),
+pub(crate) const PARENT_RULES: ParentRuleSet<DictVTable> = ParentRuleSet::new(&[
+    ParentRuleSet::lift(&FilterReduceAdaptor(DictVTable)),
+    ParentRuleSet::lift(&CastReduceAdaptor(DictVTable)),
+    ParentRuleSet::lift(&MaskReduceAdaptor(DictVTable)),
+    ParentRuleSet::lift(&LikeReduceAdaptor(DictVTable)),
     ParentRuleSet::lift(&DictionaryScalarFnValuesPushDownRule),
     ParentRuleSet::lift(&DictionaryScalarFnCodesPullUpRule),
-    ParentRuleSet::lift(&SliceReduceAdaptor(Dict)),
+    ParentRuleSet::lift(&SliceReduceAdaptor(DictVTable)),
 ]);
 
 /// Push down a scalar function to run only over the values of a dictionary array.
 #[derive(Debug)]
 struct DictionaryScalarFnValuesPushDownRule;
 
-impl ArrayParentReduceRule<Dict> for DictionaryScalarFnValuesPushDownRule {
+impl ArrayParentReduceRule<DictVTable> for DictionaryScalarFnValuesPushDownRule {
     type Parent = AnyScalarFn;
 
     fn reduce_parent(
         &self,
-        array: ArrayView<'_, Dict>,
-        parent: ArrayView<'_, ScalarFn>,
+        array: &DictArray,
+        parent: &ScalarFnArray,
         child_idx: usize,
     ) -> VortexResult<Option<ArrayRef>> {
         // Check that the scalar function can actually be pushed down.
@@ -82,7 +77,7 @@ impl ArrayParentReduceRule<Dict> for DictionaryScalarFnValuesPushDownRule {
             tracing::trace!(
                 "Not pushing down fallible scalar function {} over dictionary with sparse codes {}",
                 parent.scalar_fn(),
-                Dict.id(),
+                array.encoding_id(),
             );
             return Ok(None);
         }
@@ -90,38 +85,34 @@ impl ArrayParentReduceRule<Dict> for DictionaryScalarFnValuesPushDownRule {
         // Check that all siblings are constant
         // TODO(ngates): we can also support other dictionaries if the values are the same!
         if !parent
-            .iter_children()
+            .children()
+            .iter()
             .enumerate()
-            .all(|(idx, c)| idx == child_idx || c.is::<Constant>())
+            .all(|(idx, c)| idx == child_idx || c.is::<ConstantVTable>())
         {
             return Ok(None);
         }
 
         // If the scalar function is null-sensitive, then we cannot push it down to values if
         // we have any nulls in the codes.
-        if array.codes().dtype().is_nullable()
-            && !matches!(
-                array.codes().validity()?,
-                Validity::NonNullable | Validity::AllValid
-            )
-            && sig.is_null_sensitive()
+        if array.codes.dtype().is_nullable() && !array.codes.all_valid()? && sig.is_null_sensitive()
         {
             tracing::trace!(
                 "Not pushing down null-sensitive scalar function {} over dictionary with null codes {}",
                 parent.scalar_fn(),
-                Dict.id(),
+                array.encoding_id(),
             );
             return Ok(None);
         }
 
         // Now we push the parent scalar function into the dictionary values.
         let values_len = array.values().len();
-        let mut new_children = Vec::with_capacity(parent.nchildren());
-        for (idx, child) in parent.iter_children().enumerate() {
+        let mut new_children = Vec::with_capacity(parent.children().len());
+        for (idx, child) in parent.children().iter().enumerate() {
             if idx == child_idx {
                 new_children.push(array.values().clone());
             } else {
-                let scalar = child.as_::<Constant>().scalar().clone();
+                let scalar = child.as_::<ConstantVTable>().scalar().clone();
                 new_children.push(ConstantArray::new(scalar, values_len).into_array());
             }
         }
@@ -150,25 +141,25 @@ impl ArrayParentReduceRule<Dict> for DictionaryScalarFnValuesPushDownRule {
 #[derive(Debug)]
 struct DictionaryScalarFnCodesPullUpRule;
 
-impl ArrayParentReduceRule<Dict> for DictionaryScalarFnCodesPullUpRule {
+impl ArrayParentReduceRule<DictVTable> for DictionaryScalarFnCodesPullUpRule {
     type Parent = AnyScalarFn;
 
     fn reduce_parent(
         &self,
-        array: ArrayView<'_, Dict>,
-        parent: ArrayView<'_, ScalarFn>,
+        array: &DictArray,
+        parent: &ScalarFnArray,
         child_idx: usize,
     ) -> VortexResult<Option<ArrayRef>> {
         // Don't attempt to pull up if there are less than 2 siblings.
-        if parent.nchildren() < 2 {
+        if parent.children().len() < 2 {
             return Ok(None);
         }
 
         // Check that all siblings are dictionaries, and have the same number of values as us.
         // This is a cheap first loop.
-        if !parent.iter_children().enumerate().all(|(idx, c)| {
+        if !parent.children().iter().enumerate().all(|(idx, c)| {
             idx == child_idx
-                || c.as_opt::<Dict>()
+                || c.as_opt::<DictVTable>()
                     .is_some_and(|c| c.values().len() == array.values().len())
         }) {
             return Ok(None);
@@ -176,30 +167,27 @@ impl ArrayParentReduceRule<Dict> for DictionaryScalarFnCodesPullUpRule {
 
         // Now run the slightly more expensive check that all siblings have the same codes as us.
         // We use the cheaper Precision::Ptr to avoid doing data comparisons.
-        if !parent.iter_children().enumerate().all(|(idx, c)| {
+        if !parent.children().iter().enumerate().all(|(idx, c)| {
             idx == child_idx
-                || c.as_opt::<Dict>()
+                || c.as_opt::<DictVTable>()
                     .is_some_and(|c| c.codes().array_eq(array.codes(), Precision::Value))
         }) {
             return Ok(None);
         }
 
-        let mut new_children = Vec::with_capacity(parent.nchildren());
-        for (idx, child) in parent.iter_children().enumerate() {
+        let mut new_children = Vec::with_capacity(parent.children().len());
+        for (idx, child) in parent.children().iter().enumerate() {
             if idx == child_idx {
                 new_children.push(array.values().clone());
             } else {
-                new_children.push(child.as_::<Dict>().values().clone());
+                new_children.push(child.as_::<DictVTable>().values().clone());
             }
         }
 
-        let new_values = ScalarFnArray::try_new(
-            parent.scalar_fn().clone(),
-            new_children,
-            array.values().len(),
-        )?
-        .into_array()
-        .optimize()?;
+        let new_values =
+            ScalarFnArray::try_new(parent.scalar_fn().clone(), new_children, array.values.len())?
+                .into_array()
+                .optimize()?;
 
         let new_dict =
             unsafe { DictArray::new_unchecked(array.codes().clone(), new_values) }.into_array();

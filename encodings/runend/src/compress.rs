@@ -3,17 +3,11 @@
 
 use itertools::Itertools;
 use vortex_array::ArrayRef;
-use vortex_array::ArrayView;
-use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
+use vortex_array::ToCanonical;
 use vortex_array::arrays::BoolArray;
 use vortex_array::arrays::ConstantArray;
-use vortex_array::arrays::Primitive;
 use vortex_array::arrays::PrimitiveArray;
-use vortex_array::arrays::VarBinViewArray;
-use vortex_array::arrays::bool::BoolArrayExt;
-use vortex_array::arrays::primitive::PrimitiveArrayExt;
-use vortex_array::buffer::BufferHandle;
 use vortex_array::dtype::NativePType;
 use vortex_array::dtype::Nullability;
 use vortex_array::expr::stats::Precision;
@@ -22,6 +16,7 @@ use vortex_array::match_each_native_ptype;
 use vortex_array::match_each_unsigned_integer_ptype;
 use vortex_array::scalar::Scalar;
 use vortex_array::validity::Validity;
+use vortex_array::vtable::ValidityHelper;
 use vortex_buffer::BitBuffer;
 use vortex_buffer::BitBufferMut;
 use vortex_buffer::Buffer;
@@ -34,14 +29,8 @@ use vortex_mask::Mask;
 use crate::iter::trimmed_ends_iter;
 
 /// Run-end encode a `PrimitiveArray`, returning a tuple of `(ends, values)`.
-pub fn runend_encode(
-    array: ArrayView<Primitive>,
-    ctx: &mut ExecutionCtx,
-) -> (PrimitiveArray, ArrayRef) {
-    let validity = match array
-        .validity()
-        .vortex_expect("run-end validity should be derivable")
-    {
+pub fn runend_encode(array: &PrimitiveArray) -> (PrimitiveArray, ArrayRef) {
+    let validity = match array.validity() {
         Validity::NonNullable => None,
         Validity::AllValid => None,
         Validity::AllInvalid => {
@@ -54,12 +43,7 @@ pub fn runend_encode(
                 ConstantArray::new(Scalar::null(array.dtype().clone()), 1).into_array(),
             );
         }
-        Validity::Array(a) => {
-            let bool_array = a
-                .execute::<BoolArray>(ctx)
-                .vortex_expect("validity array must be convertible to bool");
-            Some(bool_array.to_bit_buffer())
-        }
+        Validity::Array(a) => Some(a.to_bool().to_bit_buffer()),
     };
 
     let (ends, values) = match validity {
@@ -84,7 +68,10 @@ pub fn runend_encode(
         }
     };
 
-    let ends = ends.narrow().vortex_expect("Ends must succeed downcasting");
+    let ends = ends
+        .narrow()
+        .vortex_expect("Ends must succeed downcasting")
+        .to_primitive();
 
     ends.statistics()
         .set(Stat::IsStrictSorted, Precision::Exact(true.into()));
@@ -184,12 +171,8 @@ pub fn runend_decode_primitive(
     values: PrimitiveArray,
     offset: usize,
     length: usize,
-    ctx: &mut ExecutionCtx,
 ) -> VortexResult<PrimitiveArray> {
-    let validity_mask = values
-        .as_ref()
-        .validity()?
-        .execute_mask(values.as_ref().len(), ctx)?;
+    let validity_mask = values.validity_mask()?;
     Ok(match_each_native_ptype!(values.ptype(), |P| {
         match_each_unsigned_integer_ptype!(ends.ptype(), |E| {
             runend_decode_typed_primitive(
@@ -203,16 +186,31 @@ pub fn runend_decode_primitive(
     }))
 }
 
-/// Decode a run-end encoded slice of values into a flat `Buffer<T>` and `Validity`.
-///
-/// This is the core decode loop shared by primitive and varbinview run-end decoding.
-fn runend_decode_slice<T: Copy + Default>(
+pub fn runend_decode_bools(
+    ends: PrimitiveArray,
+    values: BoolArray,
+    offset: usize,
+    length: usize,
+) -> VortexResult<BoolArray> {
+    let validity_mask = values.validity_mask()?;
+    Ok(match_each_unsigned_integer_ptype!(ends.ptype(), |E| {
+        runend_decode_typed_bool(
+            trimmed_ends_iter(ends.as_slice::<E>(), offset, length),
+            &values.to_bit_buffer(),
+            validity_mask,
+            values.dtype().nullability(),
+            length,
+        )
+    }))
+}
+
+pub fn runend_decode_typed_primitive<T: NativePType>(
     run_ends: impl Iterator<Item = usize>,
     values: &[T],
     values_validity: Mask,
     values_nullability: Nullability,
     length: usize,
-) -> (Buffer<T>, Validity) {
+) -> PrimitiveArray {
     match values_validity {
         Mask::AllTrue(_) => {
             let mut decoded: BufferMut<T> = BufferMut::with_capacity(length);
@@ -227,9 +225,9 @@ fn runend_decode_slice<T: Copy + Default>(
                 // We preallocate enough capacity because we know the total length
                 unsafe { decoded.push_n_unchecked(*value, end - decoded.len()) };
             }
-            (decoded.into(), values_nullability.into())
+            PrimitiveArray::new(decoded, values_nullability.into())
         }
-        Mask::AllFalse(_) => (Buffer::<T>::zeroed(length), Validity::AllInvalid),
+        Mask::AllFalse(_) => PrimitiveArray::new(Buffer::<T>::zeroed(length), Validity::AllInvalid),
         Mask::Values(mask) => {
             let mut decoded = BufferMut::with_capacity(length);
             let mut decoded_validity = BitBufferMut::with_capacity(length);
@@ -260,66 +258,55 @@ fn runend_decode_slice<T: Copy + Default>(
                     }
                 }
             }
-            (decoded.into(), Validity::from(decoded_validity.freeze()))
+            PrimitiveArray::new(decoded, Validity::from(decoded_validity.freeze()))
         }
     }
 }
 
-pub fn runend_decode_typed_primitive<T: NativePType>(
+pub fn runend_decode_typed_bool(
     run_ends: impl Iterator<Item = usize>,
-    values: &[T],
+    values: &BitBuffer,
     values_validity: Mask,
     values_nullability: Nullability,
     length: usize,
-) -> PrimitiveArray {
-    let (decoded, validity) = runend_decode_slice(
-        run_ends,
-        values,
-        values_validity,
-        values_nullability,
-        length,
-    );
-    PrimitiveArray::new(decoded, validity)
-}
-
-/// Decode a run-end encoded VarBinView array by expanding views directly.
-pub fn runend_decode_varbinview(
-    ends: PrimitiveArray,
-    values: VarBinViewArray,
-    offset: usize,
-    length: usize,
-    ctx: &mut ExecutionCtx,
-) -> VortexResult<VarBinViewArray> {
-    let validity_mask = values
-        .as_ref()
-        .validity()?
-        .execute_mask(values.as_ref().len(), ctx)?;
-    let views = values.views();
-
-    let (decoded_views, validity) = match_each_unsigned_integer_ptype!(ends.ptype(), |E| {
-        runend_decode_slice(
-            trimmed_ends_iter(ends.as_slice::<E>(), offset, length),
-            views,
-            validity_mask,
-            values.dtype().nullability(),
-            length,
-        )
-    });
-
-    let parts = values.into_data_parts();
-    let view_handle = BufferHandle::new_host(decoded_views.into_byte_buffer());
-
-    // SAFETY: we are expanding views from a valid VarBinViewArray with the same
-    // buffers, so all buffer indices and offsets remain valid.
-    Ok(unsafe {
-        VarBinViewArray::new_handle_unchecked(view_handle, parts.buffers, parts.dtype, validity)
-    })
+) -> BoolArray {
+    match values_validity {
+        Mask::AllTrue(_) => {
+            let mut decoded = BitBufferMut::with_capacity(length);
+            for (end, value) in run_ends.zip_eq(values.iter()) {
+                decoded.append_n(value, end - decoded.len());
+            }
+            BoolArray::new(decoded.freeze(), values_nullability.into())
+        }
+        Mask::AllFalse(_) => BoolArray::new(BitBuffer::new_unset(length), Validity::AllInvalid),
+        Mask::Values(mask) => {
+            let mut decoded = BitBufferMut::with_capacity(length);
+            let mut decoded_validity = BitBufferMut::with_capacity(length);
+            for (end, value) in run_ends.zip_eq(
+                values
+                    .iter()
+                    .zip(mask.bit_buffer().iter())
+                    .map(|(v, is_valid)| is_valid.then_some(v)),
+            ) {
+                match value {
+                    None => {
+                        decoded_validity.append_n(false, end - decoded.len());
+                        decoded.append_n(false, end - decoded.len());
+                    }
+                    Some(value) => {
+                        decoded_validity.append_n(true, end - decoded.len());
+                        decoded.append_n(value, end - decoded.len());
+                    }
+                }
+            }
+            BoolArray::new(decoded.freeze(), Validity::from(decoded_validity.freeze()))
+        }
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use vortex_array::LEGACY_SESSION;
-    use vortex_array::VortexSessionExecute;
+mod test {
+    use vortex_array::ToCanonical;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::assert_arrays_eq;
     use vortex_array::validity::Validity;
@@ -331,62 +318,55 @@ mod tests {
     use crate::compress::runend_encode;
 
     #[test]
-    fn encode() -> VortexResult<()> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+    fn encode() {
         let arr = PrimitiveArray::from_iter([1i32, 1, 2, 2, 2, 3, 3, 3, 3, 3]);
-        let (ends, values) = runend_encode(arr.as_view(), &mut ctx);
-        let values = values.execute::<PrimitiveArray>(&mut ctx)?;
+        let (ends, values) = runend_encode(&arr);
+        let values = values.to_primitive();
 
         let expected_ends = PrimitiveArray::from_iter(vec![2u8, 5, 10]);
         assert_arrays_eq!(ends, expected_ends);
         let expected_values = PrimitiveArray::from_iter(vec![1i32, 2, 3]);
         assert_arrays_eq!(values, expected_values);
-        Ok(())
     }
 
     #[test]
-    fn encode_nullable() -> VortexResult<()> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+    fn encode_nullable() {
         let arr = PrimitiveArray::new(
             buffer![1i32, 1, 2, 2, 2, 3, 3, 3, 3, 3],
             Validity::from(BitBuffer::from(vec![
                 true, true, false, false, true, true, true, true, false, false,
             ])),
         );
-        let (ends, values) = runend_encode(arr.as_view(), &mut ctx);
-        let values = values.execute::<PrimitiveArray>(&mut ctx)?;
+        let (ends, values) = runend_encode(&arr);
+        let values = values.to_primitive();
 
         let expected_ends = PrimitiveArray::from_iter(vec![2u8, 4, 5, 8, 10]);
         assert_arrays_eq!(ends, expected_ends);
         let expected_values =
             PrimitiveArray::from_option_iter(vec![Some(1i32), None, Some(2), Some(3), None]);
         assert_arrays_eq!(values, expected_values);
-        Ok(())
     }
 
     #[test]
-    fn encode_all_null() -> VortexResult<()> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+    fn encode_all_null() {
         let arr = PrimitiveArray::new(
             buffer![0, 0, 0, 0, 0],
             Validity::from(BitBuffer::new_unset(5)),
         );
-        let (ends, values) = runend_encode(arr.as_view(), &mut ctx);
-        let values = values.execute::<PrimitiveArray>(&mut ctx)?;
+        let (ends, values) = runend_encode(&arr);
+        let values = values.to_primitive();
 
         let expected_ends = PrimitiveArray::from_iter(vec![5u64]);
         assert_arrays_eq!(ends, expected_ends);
         let expected_values = PrimitiveArray::from_option_iter(vec![Option::<i32>::None]);
         assert_arrays_eq!(values, expected_values);
-        Ok(())
     }
 
     #[test]
     fn decode() -> VortexResult<()> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
         let ends = PrimitiveArray::from_iter([2u32, 5, 10]);
         let values = PrimitiveArray::from_iter([1i32, 2, 3]);
-        let decoded = runend_decode_primitive(ends, values, 0, 10, &mut ctx)?;
+        let decoded = runend_decode_primitive(ends, values, 0, 10)?;
 
         let expected = PrimitiveArray::from_iter(vec![1i32, 1, 2, 2, 2, 3, 3, 3, 3, 3]);
         assert_arrays_eq!(decoded, expected);

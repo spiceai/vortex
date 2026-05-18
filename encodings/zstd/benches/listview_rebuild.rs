@@ -1,33 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-#![expect(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used)]
 
 use divan::Bencher;
 use vortex_array::IntoArray;
-use vortex_array::LEGACY_SESSION;
-use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::ListViewArray;
+use vortex_array::arrays::ListViewRebuildMode;
 use vortex_array::arrays::VarBinViewArray;
-use vortex_array::arrays::listview::ListViewRebuildMode;
 use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
-use vortex_zstd::Zstd;
-use vortex_zstd::ZstdData;
+use vortex_zstd::ZstdArray;
 
 #[divan::bench(sample_size = 1000)]
 fn rebuild_naive(bencher: Bencher) {
     let dudes = VarBinViewArray::from_iter_str(["Washington", "Adams", "Jefferson", "Madison"])
         .into_array();
-    let dtype = dudes.dtype().clone();
-    let validity = dudes.validity().unwrap();
-    let dudes = Zstd::try_new(
-        dtype,
-        ZstdData::from_array(dudes, 9, 1024, &mut LEGACY_SESSION.create_execution_ctx()).unwrap(),
-        validity,
-    )
-    .unwrap()
-    .into_array();
+    let dudes = ZstdArray::from_array(dudes, 9, 1024).unwrap().into_array();
 
     let offsets = std::iter::repeat_n(0u32, 1024)
         .collect::<Buffer<u32>>()

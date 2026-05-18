@@ -4,11 +4,12 @@
 use cudarc::driver::DeviceRepr;
 use vortex::array::Canonical;
 use vortex::array::arrays::DecimalArray;
-use vortex::array::arrays::decimal::DecimalDataParts;
+use vortex::array::arrays::DecimalArrayParts;
 use vortex::dtype::NativeDecimalType;
 use vortex::error::VortexResult;
 use vortex::mask::Mask;
 use vortex_cub::filter::CubFilterable;
+use vortex_cuda_macros::cuda_tests;
 
 use crate::CudaExecutionCtx;
 use crate::kernel::filter::filter_sized;
@@ -18,12 +19,12 @@ pub(super) async fn filter_decimal<D: NativeDecimalType + DeviceRepr + CubFilter
     mask: Mask,
     ctx: &mut CudaExecutionCtx,
 ) -> VortexResult<Canonical> {
-    let DecimalDataParts {
+    let DecimalArrayParts {
         values,
         validity,
         decimal_dtype,
         ..
-    } = array.into_data_parts();
+    } = array.into_parts();
 
     let filtered_validity = validity.filter(&mask)?;
     let filtered_values = filter_sized::<D>(values, mask, ctx).await?;
@@ -36,7 +37,7 @@ pub(super) async fn filter_decimal<D: NativeDecimalType + DeviceRepr + CubFilter
     )))
 }
 
-#[cfg(test)]
+#[cuda_tests]
 mod tests {
     use rstest::rstest;
     use vortex::array::IntoArray;
@@ -84,7 +85,7 @@ mod tests {
         DecimalArray::from_iter([i256::from_i128(1), i256::from_i128(2), i256::from_i128(3), i256::from_i128(4), i256::from_i128(5)], DecimalDType::new(19, 5)),
         Mask::from_iter([false, true, false, true, false])
     )]
-    #[crate::test]
+    #[tokio::test]
     async fn test_gpu_filter_decimal(
         #[case] input: DecimalArray,
         #[case] mask: Mask,
@@ -94,7 +95,7 @@ mod tests {
 
         let filter_array = FilterArray::try_new(input.clone().into_array(), mask.clone())?;
 
-        let cpu_result = crate::canonicalize_cpu(filter_array.clone())?.into_array();
+        let cpu_result = filter_array.to_canonical()?.into_array();
 
         let gpu_result = FilterExecutor
             .execute(filter_array.into_array(), &mut cuda_ctx)
@@ -109,7 +110,7 @@ mod tests {
         Ok(())
     }
 
-    #[crate::test]
+    #[tokio::test]
     async fn test_gpu_filter_decimal_large_array() -> VortexResult<()> {
         let mut cuda_ctx = CudaSession::create_execution_ctx(&VortexSession::empty())
             .vortex_expect("failed to create CUDA execution context");
@@ -123,7 +124,7 @@ mod tests {
 
         let filter_array = FilterArray::try_new(input.into_array(), mask)?;
 
-        let cpu_result = crate::canonicalize_cpu(filter_array.clone())?.into_array();
+        let cpu_result = filter_array.to_canonical()?.into_array();
 
         let gpu_result = FilterExecutor
             .execute(filter_array.into_array(), &mut cuda_ctx)

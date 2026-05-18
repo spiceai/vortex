@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use itertools::Itertools;
 use tracing::debug;
 use vortex::dtype::Nullability;
 use vortex::error::VortexError;
@@ -13,7 +14,6 @@ use vortex::error::vortex_err;
 use vortex::expr::Expression;
 use vortex::expr::and_collect;
 use vortex::expr::col;
-use vortex::expr::is_not_null;
 use vortex::expr::is_null;
 use vortex::expr::list_contains;
 use vortex::expr::lit;
@@ -44,11 +44,12 @@ fn like_pattern_str(value: &duckdb::ExpressionRef) -> VortexResult<Option<String
     }
 }
 
+#[allow(clippy::cognitive_complexity)]
 pub fn try_from_bound_expression(
     value: &duckdb::ExpressionRef,
 ) -> VortexResult<Option<Expression>> {
     let Some(value) = value.as_class() else {
-        debug!("no expression class id {:?}", value.as_class_id());
+        tracing::debug!("no expression class id {:?}", value.as_class_id());
         return Ok(None);
     };
     Ok(Some(match value {
@@ -96,7 +97,7 @@ pub fn try_from_bound_expression(
             DUCKDB_VX_EXPR_TYPE::DUCKDB_VX_EXPR_TYPE_OPERATOR_NOT
             | DUCKDB_VX_EXPR_TYPE::DUCKDB_VX_EXPR_TYPE_OPERATOR_IS_NULL
             | DUCKDB_VX_EXPR_TYPE::DUCKDB_VX_EXPR_TYPE_OPERATOR_IS_NOT_NULL => {
-                let children: Vec<_> = operator.children().collect();
+                let children = operator.children().collect_vec();
                 assert_eq!(children.len(), 1);
                 let Some(child) = try_from_bound_expression(children[0])? else {
                     return Ok(None);
@@ -105,14 +106,14 @@ pub fn try_from_bound_expression(
                     DUCKDB_VX_EXPR_TYPE::DUCKDB_VX_EXPR_TYPE_OPERATOR_NOT => not(child),
                     DUCKDB_VX_EXPR_TYPE::DUCKDB_VX_EXPR_TYPE_OPERATOR_IS_NULL => is_null(child),
                     DUCKDB_VX_EXPR_TYPE::DUCKDB_VX_EXPR_TYPE_OPERATOR_IS_NOT_NULL => {
-                        is_not_null(child)
+                        not(is_null(child))
                     }
                     _ => unreachable!(),
                 }
             }
             DUCKDB_VX_EXPR_TYPE::DUCKDB_VX_EXPR_TYPE_COMPARE_IN => {
                 // First child is element, rest form the list.
-                let children: Vec<_> = operator.children().collect();
+                let children = operator.children().collect_vec();
                 assert!(children.len() >= 2);
                 let Some(element) = try_from_bound_expression(children[0])? else {
                     return Ok(None);
@@ -152,7 +153,7 @@ pub fn try_from_bound_expression(
         },
         duckdb::ExpressionClass::BoundFunction(func) => match func.scalar_function.name() {
             DUCKDB_FUNCTION_NAME_CONTAINS => {
-                let children: Vec<_> = func.children().collect();
+                let children = func.children().collect_vec();
                 assert_eq!(children.len(), 2);
                 let Some(value) = try_from_bound_expression(children[0])? else {
                     return Ok(None);
@@ -164,7 +165,7 @@ pub fn try_from_bound_expression(
                 Like.new_expr(LikeOptions::default(), [value, pattern])
             }
             _ => {
-                debug!("bound function {}", func.scalar_function.name());
+                tracing::debug!("bound function {}", func.scalar_function.name());
                 return Ok(None);
             }
         },

@@ -20,15 +20,11 @@ use crate::dtype::Nullability;
 /// Convert a canonical PrimitiveArray directly to Arrow.
 pub fn canonical_primitive_to_arrow<T: ArrowPrimitiveType>(
     array: PrimitiveArray,
-    ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrowArrayRef>
 where
     T::Native: NativePType,
 {
-    let validity = array
-        .as_ref()
-        .validity()?
-        .execute_mask(array.as_ref().len(), ctx)?;
+    let validity = array.validity_mask()?;
     let null_buffer = to_null_buffer(validity);
     let buffer = array.into_buffer::<T::Native>().into_arrow_scalar_buffer();
     Ok(Arc::new(ArrowPrimitiveArray::<T>::new(buffer, null_buffer)))
@@ -44,5 +40,5 @@ where
     // We use nullable here so we can essentially ignore nullability during the cast.
     let array = array.cast(DType::Primitive(T::Native::PTYPE, Nullability::Nullable))?;
     let primitive = array.execute::<PrimitiveArray>(ctx)?;
-    canonical_primitive_to_arrow::<T>(primitive, ctx)
+    canonical_primitive_to_arrow::<T>(primitive)
 }

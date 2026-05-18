@@ -6,24 +6,20 @@ use vortex_buffer::BufferMut;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 
+use crate::Array;
 use crate::IntoArray;
-use crate::LEGACY_SESSION;
-#[expect(deprecated)]
-use crate::ToCanonical as _;
-use crate::VortexSessionExecute;
-use crate::aggregate_fn::fns::min_max::min_max;
+use crate::ToCanonical;
 use crate::arrays::ConstantArray;
 use crate::arrays::ListViewArray;
-use crate::arrays::listview::ListViewArrayExt;
 use crate::builders::builder_with_capacity;
 use crate::builtins::ArrayBuiltins;
-use crate::dtype::DType;
+use crate::compute;
 use crate::dtype::IntegerPType;
 use crate::dtype::Nullability;
-use crate::dtype::PType;
 use crate::match_each_integer_ptype;
 use crate::scalar::Scalar;
 use crate::scalar_fn::fns::operators::Operator;
+use crate::vtable::ValidityHelper;
 
 /// Modes for rebuilding a [`ListViewArray`].
 pub enum ListViewRebuildMode {
@@ -61,8 +57,7 @@ impl ListViewArray {
     /// Rebuilds the [`ListViewArray`] according to the specified mode.
     pub fn rebuild(&self, mode: ListViewRebuildMode) -> VortexResult<ListViewArray> {
         if self.is_empty() {
-            // SAFETY: An empty array is trivially zero-copyable to a `ListArray`.
-            return Ok(unsafe { self.clone().with_zero_copy_to_list(true) });
+            return Ok(self.clone());
         }
 
         match mode {
@@ -117,7 +112,6 @@ impl ListViewArray {
     fn naive_rebuild<O: IntegerPType, NewOffset: IntegerPType, S: IntegerPType>(
         &self,
     ) -> VortexResult<ListViewArray> {
-        #[expect(deprecated)]
         let sizes_canonical = self.sizes().to_primitive();
         let total: u64 = sizes_canonical
             .as_slice::<S>()
@@ -151,10 +145,8 @@ impl ListViewArray {
     fn rebuild_with_take<O: IntegerPType, NewOffset: IntegerPType, S: IntegerPType>(
         &self,
     ) -> VortexResult<ListViewArray> {
-        #[expect(deprecated)]
         let offsets_canonical = self.offsets().to_primitive();
         let offsets_slice = offsets_canonical.as_slice::<O>();
-        #[expect(deprecated)]
         let sizes_canonical = self.sizes().to_primitive();
         let sizes_slice = sizes_canonical.as_slice::<S>();
 
@@ -166,7 +158,7 @@ impl ListViewArray {
 
         let mut n_elements = NewOffset::zero();
         for index in 0..len {
-            if !self.validity()?.is_valid(index)? {
+            if !self.is_valid(index)? {
                 new_offsets.push(n_elements);
                 new_sizes.push(S::zero());
                 continue;
@@ -191,7 +183,7 @@ impl ListViewArray {
         // non-overlapping, all (offset, size) pairs reference valid elements, and the validity
         // array is preserved from the original.
         Ok(unsafe {
-            ListViewArray::new_unchecked(elements, offsets, sizes, self.validity()?)
+            ListViewArray::new_unchecked(elements, offsets, sizes, self.validity.clone())
                 .with_zero_copy_to_list(true)
         })
     }
@@ -206,10 +198,8 @@ impl ListViewArray {
             .as_list_element_opt()
             .vortex_expect("somehow had a canonical list that was not a list");
 
-        #[expect(deprecated)]
         let offsets_canonical = self.offsets().to_primitive();
         let offsets_slice = offsets_canonical.as_slice::<O>();
-        #[expect(deprecated)]
         let sizes_canonical = self.sizes().to_primitive();
         let sizes_slice = sizes_canonical.as_slice::<S>();
 
@@ -223,7 +213,6 @@ impl ListViewArray {
         let mut new_sizes = BufferMut::<S>::with_capacity(len);
 
         // Canonicalize the elements up front as we will be slicing the elements quite a lot.
-        #[expect(deprecated)]
         let elements_canonical = self
             .elements()
             .to_canonical()
@@ -237,7 +226,7 @@ impl ListViewArray {
 
         let mut n_elements = NewOffset::zero();
         for index in 0..len {
-            if !self.validity()?.is_valid(index)? {
+            if !self.is_valid(index)? {
                 // For NULL lists, place them after the previous item's data to maintain the
                 // no-overlap invariant for zero-copy to `ListArray` arrays.
                 new_offsets.push(n_elements);
@@ -277,7 +266,7 @@ impl ListViewArray {
         // - The array satisfies the zero-copy-to-list property by having sorted offsets, no gaps,
         //   and no overlaps.
         Ok(unsafe {
-            ListViewArray::new_unchecked(elements, offsets, sizes, self.validity()?)
+            ListViewArray::new_unchecked(elements, offsets, sizes, self.validity.clone())
                 .with_zero_copy_to_list(true)
         })
     }
@@ -292,13 +281,9 @@ impl ListViewArray {
             // completely fine for us to use this as a lower-bounded start of the `elements`.
             self.offset_at(0)
         } else {
-            let mut ctx = LEGACY_SESSION.create_execution_ctx();
-            self.offsets()
-                .statistics()
-                .compute_min(&mut ctx)
-                .vortex_expect(
-                    "[ListViewArray::rebuild]: `offsets` must report min statistic that is a `usize`",
-                )
+            self.offsets().statistics().compute_min().vortex_expect(
+                "[ListViewArray::rebuild]: `offsets` must report min statistic that is a `usize`",
+            )
         };
 
         let end = if self.is_zero_copy_to_list() {
@@ -308,23 +293,12 @@ impl ListViewArray {
             let last_size = self.size_at(self.len() - 1);
             last_offset + last_size
         } else {
-            // Cast offsets and sizes to the widest integer type to prevent
-            // overflow when computing offsets + sizes. The end offset may not
-            // fit in the integer width otherwise.
-            let wide_dtype = DType::from(if self.offsets().dtype().as_ptype().is_unsigned_int() {
-                PType::U64
-            } else {
-                PType::I64
-            });
-            let offsets = self.offsets().cast(wide_dtype.clone())?;
-            let sizes = self.sizes().cast(wide_dtype)?;
-
-            let mut ctx = LEGACY_SESSION.create_execution_ctx();
-            let min_max = min_max(
-                &offsets
-                    .binary(sizes, Operator::Add)
+            let min_max = compute::min_max(
+                &self
+                    .offsets()
+                    .clone()
+                    .binary(self.sizes().clone(), Operator::Add)
                     .vortex_expect("`offsets + sizes` somehow overflowed"),
-                &mut ctx,
             )
             .vortex_expect("Something went wrong while computing min and max")
             .vortex_expect("We checked that the array was not empty in the top-level `rebuild`");
@@ -342,7 +316,7 @@ impl ListViewArray {
             let scalar = Scalar::primitive(offset, Nullability::NonNullable);
 
             self.offsets()
-                .clone()
+                .to_array()
                 .binary(
                     ConstantArray::new(scalar, self.offsets().len()).into_array(),
                     Operator::Sub,
@@ -361,7 +335,7 @@ impl ListViewArray {
                 sliced_elements,
                 adjusted_offsets,
                 self.sizes().clone(),
-                self.validity()?,
+                self.validity().clone(),
             )
             .with_zero_copy_to_list(self.is_zero_copy_to_list())
         })
@@ -379,22 +353,20 @@ impl ListViewArray {
 }
 
 #[cfg(test)]
+#[allow(clippy::cast_possible_truncation)]
 mod tests {
     use vortex_buffer::BitBuffer;
     use vortex_error::VortexResult;
 
     use super::ListViewRebuildMode;
     use crate::IntoArray;
-    use crate::LEGACY_SESSION;
-    #[expect(deprecated)]
-    use crate::ToCanonical as _;
-    use crate::VortexSessionExecute;
+    use crate::ToCanonical;
     use crate::arrays::ListViewArray;
     use crate::arrays::PrimitiveArray;
-    use crate::arrays::listview::ListViewArrayExt;
     use crate::assert_arrays_eq;
     use crate::dtype::Nullability;
     use crate::validity::Validity;
+    use crate::vtable::ValidityHelper;
 
     #[test]
     fn test_rebuild_flatten_removes_overlaps() -> VortexResult<()> {
@@ -421,12 +393,12 @@ mod tests {
 
         // Verify the data is correct
         assert_arrays_eq!(
-            flattened.list_elements_at(0)?,
+            flattened.list_elements_at(0).unwrap(),
             PrimitiveArray::from_iter([1i32, 2, 3])
         );
 
         assert_arrays_eq!(
-            flattened.list_elements_at(1)?,
+            flattened.list_elements_at(1).unwrap(),
             PrimitiveArray::from_iter([2i32, 3])
         );
         Ok(())
@@ -454,18 +426,18 @@ mod tests {
 
         // Verify nullability is preserved
         assert_eq!(flattened.dtype().nullability(), Nullability::Nullable);
-        assert!(flattened.validity()?.is_valid(0)?);
-        assert!(!flattened.validity()?.is_valid(1)?);
-        assert!(flattened.validity()?.is_valid(2)?);
+        assert!(flattened.validity().is_valid(0).unwrap());
+        assert!(!flattened.validity().is_valid(1).unwrap());
+        assert!(flattened.validity().is_valid(2).unwrap());
 
         // Verify valid lists contain correct data
         assert_arrays_eq!(
-            flattened.list_elements_at(0)?,
+            flattened.list_elements_at(0).unwrap(),
             PrimitiveArray::from_iter([1i32, 2])
         );
 
         assert_arrays_eq!(
-            flattened.list_elements_at(2)?,
+            flattened.list_elements_at(2).unwrap(),
             PrimitiveArray::from_iter([3i32])
         );
         Ok(())
@@ -500,22 +472,18 @@ mod tests {
 
         // Verify the data is correct.
         assert_arrays_eq!(
-            trimmed.list_elements_at(0)?,
+            trimmed.list_elements_at(0).unwrap(),
             PrimitiveArray::from_iter([1i32, 2])
         );
 
         assert_arrays_eq!(
-            trimmed.list_elements_at(1)?,
+            trimmed.list_elements_at(1).unwrap(),
             PrimitiveArray::from_iter([3i32, 4])
         );
 
         // Note that element at index 2 (97) is preserved as a gap.
-        #[expect(deprecated)]
         let all_elements = trimmed.elements().to_primitive();
-        assert_eq!(
-            all_elements.execute_scalar(2, &mut LEGACY_SESSION.create_execution_ctx())?,
-            97i32.into()
-        );
+        assert_eq!(all_elements.scalar_at(2).unwrap(), 97i32.into());
         Ok(())
     }
 
@@ -555,62 +523,20 @@ mod tests {
         let exact = rebuilt.rebuild(ListViewRebuildMode::MakeExact)?;
 
         // Verify the result is still valid
-        assert!(exact.is_valid(0, &mut LEGACY_SESSION.create_execution_ctx())?);
-        assert!(exact.is_valid(1, &mut LEGACY_SESSION.create_execution_ctx())?);
-        assert!(!exact.is_valid(2, &mut LEGACY_SESSION.create_execution_ctx())?);
-        assert!(!exact.is_valid(3, &mut LEGACY_SESSION.create_execution_ctx())?);
+        assert!(exact.is_valid(0).unwrap());
+        assert!(exact.is_valid(1).unwrap());
+        assert!(!exact.is_valid(2).unwrap());
+        assert!(!exact.is_valid(3).unwrap());
 
         // Verify data is preserved
         assert_arrays_eq!(
-            exact.list_elements_at(0)?,
+            exact.list_elements_at(0).unwrap(),
             PrimitiveArray::from_iter([1i32, 2])
         );
 
         assert_arrays_eq!(
-            exact.list_elements_at(1)?,
+            exact.list_elements_at(1).unwrap(),
             PrimitiveArray::from_iter([3i32, 4])
-        );
-        Ok(())
-    }
-
-    /// Regression test for <https://github.com/vortex-data/vortex/issues/6773>.
-    /// u32 offsets exceed u16::MAX, so u16 sizes are widened to u32 for the add.
-    #[test]
-    fn test_rebuild_trim_elements_offsets_wider_than_sizes() -> VortexResult<()> {
-        let mut elems = vec![0i32; 70_005];
-        elems[70_000] = 10;
-        elems[70_001] = 20;
-        elems[70_002] = 30;
-        elems[70_003] = 40;
-        let elements = PrimitiveArray::from_iter(elems).into_array();
-        let offsets = PrimitiveArray::from_iter(vec![70_000u32, 70_002]).into_array();
-        let sizes = PrimitiveArray::from_iter(vec![2u16, 2]).into_array();
-
-        let listview = ListViewArray::new(elements, offsets, sizes, Validity::NonNullable);
-        let trimmed = listview.rebuild(ListViewRebuildMode::TrimElements)?;
-        assert_arrays_eq!(
-            trimmed.list_elements_at(1)?,
-            PrimitiveArray::from_iter([30i32, 40])
-        );
-        Ok(())
-    }
-
-    /// Regression test for <https://github.com/vortex-data/vortex/issues/6773>.
-    /// u32 sizes exceed u16::MAX, so u16 offsets are widened to u32 for the add.
-    #[test]
-    fn test_rebuild_trim_elements_sizes_wider_than_offsets() -> VortexResult<()> {
-        let mut elems = vec![0i32; 70_001];
-        elems[3] = 30;
-        elems[4] = 40;
-        let elements = PrimitiveArray::from_iter(elems).into_array();
-        let offsets = PrimitiveArray::from_iter(vec![1u16, 3]).into_array();
-        let sizes = PrimitiveArray::from_iter(vec![70_000u32, 2]).into_array();
-
-        let listview = ListViewArray::new(elements, offsets, sizes, Validity::NonNullable);
-        let trimmed = listview.rebuild(ListViewRebuildMode::TrimElements)?;
-        assert_arrays_eq!(
-            trimmed.list_elements_at(1)?,
-            PrimitiveArray::from_iter([30i32, 40])
         );
         Ok(())
     }
@@ -628,21 +554,5 @@ mod tests {
         assert!(ListViewArray::should_use_take(127_000, 1_000));
         // avg = 128 → LBL
         assert!(!ListViewArray::should_use_take(128_000, 1_000));
-    }
-
-    /// Regression test for <https://github.com/vortex-data/vortex/issues/6973>.
-    /// Both offsets and sizes are u8, and offset + size exceeds u8::MAX.
-    #[test]
-    fn test_rebuild_trim_elements_sum_overflows_type() -> VortexResult<()> {
-        let elements = PrimitiveArray::from_iter(vec![0i32; 261]).into_array();
-        let offsets = PrimitiveArray::from_iter(vec![215u8, 0]).into_array();
-        let sizes = PrimitiveArray::from_iter(vec![46u8, 10]).into_array();
-
-        let listview = ListViewArray::new(elements, offsets, sizes, Validity::NonNullable);
-        let trimmed = listview.rebuild(ListViewRebuildMode::TrimElements)?;
-
-        // min(offsets) = 0, so nothing to trim; output should equal input.
-        assert_arrays_eq!(trimmed, listview);
-        Ok(())
     }
 }

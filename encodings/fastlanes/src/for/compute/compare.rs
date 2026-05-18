@@ -4,8 +4,8 @@
 use std::ops::Shr;
 
 use num_traits::WrappingSub;
+use vortex_array::Array;
 use vortex_array::ArrayRef;
-use vortex_array::ArrayView;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::arrays::ConstantArray;
@@ -22,13 +22,13 @@ use vortex_error::VortexError;
 use vortex_error::VortexExpect as _;
 use vortex_error::VortexResult;
 
-use crate::FoR;
-use crate::r#for::array::FoRArrayExt;
+use crate::FoRArray;
+use crate::FoRVTable;
 
-impl CompareKernel for FoR {
+impl CompareKernel for FoRVTable {
     fn compare(
-        lhs: ArrayView<'_, Self>,
-        rhs: &ArrayRef,
+        lhs: &FoRArray,
+        rhs: &dyn Array,
         operator: CompareOperator,
         _ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
@@ -52,7 +52,7 @@ impl CompareKernel for FoR {
 }
 
 fn compare_constant<T>(
-    lhs: ArrayView<'_, FoR>,
+    lhs: &FoRArray,
     mut rhs: T,
     nullability: Nullability,
     operator: CompareOperator,
@@ -99,34 +99,24 @@ mod tests {
     use vortex_buffer::buffer;
 
     use super::*;
-    use crate::FoR;
-    use crate::FoRArray;
-
-    fn for_arr(encoded: ArrayRef, reference: Scalar) -> FoRArray {
-        FoR::try_new(encoded, reference).vortex_expect("FoR array construction should succeed")
-    }
 
     #[test]
     fn test_compare_constant() {
         let reference = Scalar::from(10);
         // 10, 30, 12
-        let lhs = for_arr(
+        let lhs = FoRArray::try_new(
             PrimitiveArray::new(buffer!(0i32, 20, 2), Validity::AllValid).into_array(),
             reference,
-        );
-
-        let result = compare_constant(
-            lhs.as_view(),
-            30i32,
-            Nullability::NonNullable,
-            CompareOperator::Eq,
         )
-        .unwrap()
         .unwrap();
+
+        let result = compare_constant(&lhs, 30i32, Nullability::NonNullable, CompareOperator::Eq)
+            .unwrap()
+            .unwrap();
         assert_arrays_eq!(result, BoolArray::from_iter([false, true, false].map(Some)));
 
         let result = compare_constant(
-            lhs.as_view(),
+            &lhs,
             12i32,
             Nullability::NonNullable,
             CompareOperator::NotEq,
@@ -142,7 +132,7 @@ mod tests {
             CompareOperator::Gte,
         ] {
             assert!(
-                compare_constant(lhs.as_view(), 30i32, Nullability::NonNullable, op)
+                compare_constant(&lhs, 30i32, Nullability::NonNullable, op)
                     .unwrap()
                     .is_none()
             );
@@ -153,33 +143,24 @@ mod tests {
     fn test_compare_nullable_constant() {
         let reference = Scalar::from(0);
         // 10, 30, 12
-        let lhs = for_arr(
+        let lhs = FoRArray::try_new(
             PrimitiveArray::new(buffer!(0i32, 20, 2), Validity::NonNullable).into_array(),
             reference,
-        );
+        )
+        .unwrap();
 
         assert_eq!(
-            compare_constant(
-                lhs.as_view(),
-                30i32,
-                Nullability::Nullable,
-                CompareOperator::Eq,
-            )
-            .unwrap()
-            .unwrap()
-            .dtype(),
+            compare_constant(&lhs, 30i32, Nullability::Nullable, CompareOperator::Eq)
+                .unwrap()
+                .unwrap()
+                .dtype(),
             &DType::Bool(Nullability::Nullable)
         );
         assert_eq!(
-            compare_constant(
-                lhs.as_view(),
-                30i32,
-                Nullability::NonNullable,
-                CompareOperator::Eq,
-            )
-            .unwrap()
-            .unwrap()
-            .dtype(),
+            compare_constant(&lhs, 30i32, Nullability::NonNullable, CompareOperator::Eq)
+                .unwrap()
+                .unwrap()
+                .dtype(),
             &DType::Bool(Nullability::NonNullable)
         );
     }
@@ -188,26 +169,22 @@ mod tests {
     fn compare_non_encodable_constant() {
         let reference = Scalar::from(10);
         // 10, 30, 12
-        let lhs = for_arr(
+        let lhs = FoRArray::try_new(
             PrimitiveArray::new(buffer!(0i32, 10, 1), Validity::AllValid).into_array(),
             reference,
-        );
-
-        let result = compare_constant(
-            lhs.as_view(),
-            -1i32,
-            Nullability::NonNullable,
-            CompareOperator::Eq,
         )
-        .unwrap()
         .unwrap();
+
+        let result = compare_constant(&lhs, -1i32, Nullability::NonNullable, CompareOperator::Eq)
+            .unwrap()
+            .unwrap();
         assert_arrays_eq!(
             result,
             BoolArray::from_iter([false, false, false].map(Some))
         );
 
         let result = compare_constant(
-            lhs.as_view(),
+            &lhs,
             -1i32,
             Nullability::NonNullable,
             CompareOperator::NotEq,
@@ -220,17 +197,19 @@ mod tests {
     #[test]
     fn compare_large_constant() {
         let reference = Scalar::from(-9219218377546224477i64);
-        let lhs = for_arr(
+        #[allow(clippy::cast_possible_truncation)]
+        let lhs = FoRArray::try_new(
             PrimitiveArray::new(
                 buffer![0i64, 9654309310445864926u64 as i64],
                 Validity::AllValid,
             )
             .into_array(),
             reference,
-        );
+        )
+        .unwrap();
 
         let result = compare_constant(
-            lhs.as_view(),
+            &lhs,
             435090932899640449i64,
             Nullability::Nullable,
             CompareOperator::Eq,
@@ -240,7 +219,7 @@ mod tests {
         assert_arrays_eq!(result, BoolArray::from_iter([Some(false), Some(true)]));
 
         let result = compare_constant(
-            lhs.as_view(),
+            &lhs,
             435090932899640449i64,
             Nullability::Nullable,
             CompareOperator::NotEq,

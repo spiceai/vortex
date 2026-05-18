@@ -4,77 +4,44 @@
 use vortex_error::VortexResult;
 
 use crate::ArrayRef;
-use crate::ExecutionCtx;
 use crate::IntoArray;
-use crate::array::ArrayView;
-use crate::arrays::List;
 use crate::arrays::ListArray;
-use crate::arrays::list::ListArrayExt;
+use crate::arrays::ListVTable;
 use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
-use crate::scalar_fn::fns::cast::CastKernel;
 use crate::scalar_fn::fns::cast::CastReduce;
+use crate::vtable::ValidityHelper;
 
-impl CastReduce for List {
-    fn cast(array: ArrayView<'_, List>, dtype: &DType) -> VortexResult<Option<ArrayRef>> {
-        let Some(target_element_type) = dtype.as_list_element_opt() else {
-            return Ok(None);
-        };
-
-        let Some(validity) = array
-            .validity()?
-            .trivial_cast_nullability(dtype.nullability(), array.len())?
-        else {
-            return Ok(None);
-        };
-
-        let new_elements = array.elements().cast((**target_element_type).clone())?;
-
-        Ok(Some(
-            unsafe { ListArray::new_unchecked(new_elements, array.offsets().clone(), validity) }
-                .into_array(),
-        ))
-    }
-}
-
-impl CastKernel for List {
-    fn cast(
-        array: ArrayView<'_, List>,
-        dtype: &DType,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<Option<ArrayRef>> {
+impl CastReduce for ListVTable {
+    fn cast(array: &ListArray, dtype: &DType) -> VortexResult<Option<ArrayRef>> {
         let Some(target_element_type) = dtype.as_list_element_opt() else {
             return Ok(None);
         };
 
         let validity = array
-            .validity()?
-            .cast_nullability(dtype.nullability(), array.len(), ctx)?;
+            .validity()
+            .clone()
+            .cast_nullability(dtype.nullability(), array.len())?;
 
-        let new_elements = array.elements().cast((**target_element_type).clone())?;
+        let new_elements = array
+            .elements()
+            .cast((**target_element_type).clone())?
+            .to_canonical()?
+            .into_array();
 
-        Ok(Some(
-            unsafe { ListArray::new_unchecked(new_elements, array.offsets().clone(), validity) }
-                .into_array(),
-        ))
+        ListArray::try_new(new_elements, array.offsets().clone(), validity)
+            .map(|a| Some(a.to_array()))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::LazyLock;
 
     use rstest::rstest;
-    use vortex_array::session::ArraySession;
     use vortex_buffer::buffer;
-    use vortex_session::VortexSession;
 
-    use crate::Canonical;
     use crate::IntoArray;
-    use crate::LEGACY_SESSION;
-    use crate::RecursiveCanonical;
-    use crate::VortexSessionExecute;
     use crate::arrays::BoolArray;
     use crate::arrays::ListArray;
     use crate::arrays::PrimitiveArray;
@@ -86,14 +53,11 @@ mod tests {
     use crate::dtype::PType;
     use crate::validity::Validity;
 
-    static SESSION: LazyLock<VortexSession> =
-        LazyLock::new(|| VortexSession::empty().with::<ArraySession>());
-
     #[test]
     fn test_cast_list_success() {
         let list = ListArray::try_new(
-            buffer![1i32, 2, 3, 4].into_array(),
-            buffer![0, 2, 3].into_array(),
+            buffer![1i32, 2, 3, 4].into_array().to_array(),
+            buffer![0, 2, 3].into_array().to_array(),
             Validity::NonNullable,
         )
         .unwrap();
@@ -103,11 +67,7 @@ mod tests {
             Nullability::Nullable,
         );
 
-        let result = list
-            .clone()
-            .into_array()
-            .cast(target_dtype.clone())
-            .unwrap();
+        let result = list.to_array().cast(target_dtype.clone()).unwrap();
         assert_eq!(result.dtype(), &target_dtype);
         assert_eq!(result.len(), list.len());
     }
@@ -115,8 +75,8 @@ mod tests {
     #[test]
     fn test_cast_to_wrong_type() {
         let list = ListArray::try_new(
-            buffer![0i32, 2, 3, 4].into_array(),
-            buffer![0, 2, 3].into_array(),
+            buffer![0i32, 2, 3, 4].into_array().to_array(),
+            buffer![0, 2, 3].into_array().to_array(),
             Validity::NonNullable,
         )
         .unwrap();
@@ -125,10 +85,9 @@ mod tests {
         // can't cast list to u64
 
         let result = list
-            .into_array()
+            .to_array()
             .cast(target_dtype)
-            .and_then(|a| a.execute::<Canonical>(&mut SESSION.create_execution_ctx()))
-            .map(|c| c.into_array());
+            .and_then(|a| a.to_canonical().map(|c| c.into_array()));
         assert!(result.is_err());
     }
 
@@ -138,9 +97,9 @@ mod tests {
 
         // Nulls in the list itself
         let list = ListArray::try_new(
-            buffer![0i32, 2, 3, 4].into_array(),
-            buffer![0, 2, 3].into_array(),
-            Validity::Array(BoolArray::from_iter(vec![false, true]).into_array()),
+            buffer![0i32, 2, 3, 4].into_array().to_array(),
+            buffer![0, 2, 3].into_array().to_array(),
+            Validity::Array(BoolArray::from_iter(vec![false, true]).to_array()),
         )
         .unwrap();
 
@@ -150,17 +109,15 @@ mod tests {
         );
 
         let result = list
-            .into_array()
+            .to_array()
             .cast(target_dtype)
-            .and_then(|a| a.execute::<Canonical>(&mut SESSION.create_execution_ctx()))
-            .map(|c| c.into_array());
+            .and_then(|a| a.to_canonical().map(|c| c.into_array()));
         assert!(result.is_err());
 
-        // Nulls in list element array — the inner cast error is deferred until
-        // the elements are executed.
+        // Nulls in list element array
         let list = ListArray::try_new(
-            PrimitiveArray::from_option_iter([Some(0i32), Some(2), None, None]).into_array(),
-            buffer![0, 2, 3].into_array(),
+            PrimitiveArray::from_option_iter([Some(0i32), Some(2), None, None]).to_array(),
+            buffer![0, 2, 3].into_array().to_array(),
             Validity::NonNullable,
         )
         .unwrap();
@@ -170,10 +127,10 @@ mod tests {
             Nullability::NonNullable,
         );
 
-        let result = list.into_array().cast(target_dtype).and_then(|a| {
-            a.execute::<RecursiveCanonical>(&mut LEGACY_SESSION.create_execution_ctx())
-                .map(|c| c.0.into_array())
-        });
+        let result = list
+            .to_array()
+            .cast(target_dtype)
+            .and_then(|a| a.to_canonical().map(|c| c.into_array()));
         assert!(result.is_err());
     }
 
@@ -184,7 +141,7 @@ mod tests {
     #[case(create_nested_list())]
     #[case(create_empty_lists())]
     fn test_cast_list_conformance(#[case] array: ListArray) {
-        test_cast_conformance(&array.into_array());
+        test_cast_conformance(array.as_ref());
     }
 
     fn create_simple_list() -> ListArray {
