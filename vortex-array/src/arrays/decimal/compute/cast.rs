@@ -81,12 +81,11 @@ impl CastKernel for Decimal {
         };
 
         if let DType::Primitive(to_ptype, to_nullability) = dtype {
-            let validity = array.validity()?;
             let new_validity =
-                validity
-                    .clone()
+                array
+                    .validity()?
                     .cast_nullability(*to_nullability, array.len(), ctx)?;
-            let mask = validity.execute_mask(array.len(), ctx)?;
+            let mask = new_validity.execute_mask(array.len(), ctx)?;
 
             return Ok(Some(match_each_native_ptype!(*to_ptype, |T| {
                 match_each_decimal_value_type!(array.values_type(), |F| {
@@ -468,6 +467,29 @@ mod tests {
         let values = casted.as_slice::<f64>();
         assert!((values[0] - 123.45).abs() < 0.000000000001);
         assert_eq!(values[2], -0.5);
+    }
+
+    #[test]
+    fn cast_nullable_decimal_to_non_nullable_f64_fails() {
+        let array = DecimalArray::from_option_iter(
+            [Some(12345i64), None, Some(-50)],
+            DecimalDType::new(15, 2),
+        );
+        let dtype = DType::Primitive(PType::F64, Nullability::NonNullable);
+
+        #[expect(deprecated)]
+        let result = array
+            .into_array()
+            .cast(dtype)
+            .and_then(|a| a.to_canonical().map(|c| c.into_array()));
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Cannot cast array with invalid values to non-nullable type")
+        );
     }
 
     #[test]
