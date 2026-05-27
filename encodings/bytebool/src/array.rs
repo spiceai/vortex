@@ -12,6 +12,7 @@ use vortex_array::ArrayHash;
 use vortex_array::ArrayId;
 use vortex_array::ArrayParts;
 use vortex_array::ArrayRef;
+use vortex_array::ArraySlots;
 use vortex_array::ArrayView;
 use vortex_array::ExecutionCtx;
 use vortex_array::ExecutionResult;
@@ -56,7 +57,7 @@ impl ArrayEq for ByteBoolData {
 }
 
 impl VTable for ByteBool {
-    type ArrayData = ByteBoolData;
+    type TypedArrayData = ByteBoolData;
 
     type OperationsVTable = Self;
     type ValidityVTable = Self;
@@ -68,7 +69,7 @@ impl VTable for ByteBool {
 
     fn validate(
         &self,
-        data: &Self::ArrayData,
+        data: &Self::TypedArrayData,
         dtype: &DType,
         len: usize,
         slots: &[Option<ArrayRef>],
@@ -263,8 +264,8 @@ impl ByteBoolData {
         Ok(())
     }
 
-    fn make_slots(validity: &Validity, len: usize) -> Vec<Option<ArrayRef>> {
-        vec![validity_to_child(validity, len)]
+    fn make_slots(validity: &Validity, len: usize) -> ArraySlots {
+        vec![validity_to_child(validity, len)].into()
     }
 
     pub fn new(buffer: BufferHandle) -> Self {

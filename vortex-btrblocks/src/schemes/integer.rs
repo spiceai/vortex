@@ -42,6 +42,7 @@ use vortex_runend::RunEnd;
 use vortex_runend::compress::runend_encode;
 use vortex_sequence::sequence_encode;
 use vortex_sparse::Sparse;
+use vortex_sparse::SparseExt as _;
 use vortex_zigzag::ZigZag;
 use vortex_zigzag::ZigZagArrayExt;
 use vortex_zigzag::zigzag_encode;
@@ -553,7 +554,7 @@ impl Scheme for SparseScheme {
                 .indices()
                 .clone()
                 .execute::<PrimitiveArray>(exec_ctx)?
-                .narrow()?;
+                .narrow(exec_ctx)?;
 
             let compressed_indices = compressor.compress_child(
                 &indices.into_array(),
@@ -848,7 +849,7 @@ pub(crate) fn rle_compress(
             .indices()
             .clone()
             .execute::<PrimitiveArray>(exec_ctx)?
-            .narrow()?;
+            .narrow(exec_ctx)?;
         try_compress_delta(
             compressor,
             &rle_indices_primitive.into_array(),
@@ -865,7 +866,7 @@ pub(crate) fn rle_compress(
             .indices()
             .clone()
             .execute::<PrimitiveArray>(exec_ctx)?
-            .narrow()?;
+            .narrow(exec_ctx)?;
         compressor.compress_child(
             &rle_indices_primitive.into_array(),
             &compress_ctx,
@@ -879,7 +880,7 @@ pub(crate) fn rle_compress(
         .values_idx_offsets()
         .clone()
         .execute::<PrimitiveArray>(exec_ctx)?
-        .narrow()?;
+        .narrow(exec_ctx)?;
     let compressed_offsets = compressor.compress_child(
         &rle_offsets_primitive.into_array(),
         &compress_ctx,
@@ -1192,15 +1193,15 @@ mod scheme_selection_tests {
         assert!(compressed.is::<BitPacked>());
         assert_eq!(
             compressed.statistics().get_as::<u64>(Stat::NullCount),
-            Some(Precision::exact(0u64))
+            Precision::exact(0u64)
         );
         assert_eq!(
             compressed.statistics().get_as::<u32>(Stat::Min),
-            Some(Precision::exact(0u32))
+            Precision::exact(0u32)
         );
         assert_eq!(
             compressed.statistics().get_as::<u32>(Stat::Max),
-            Some(Precision::exact(15u32))
+            Precision::exact(15u32)
         );
         Ok(())
     }

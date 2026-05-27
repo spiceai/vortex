@@ -43,6 +43,7 @@ use vortex_array::ArrayRef;
 use vortex_array::Canonical;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
+use vortex_array::aggregate_fn::fns::all_non_distinct::all_non_distinct;
 use vortex_array::aggregate_fn::fns::min_max::MinMaxResult;
 use vortex_array::aggregate_fn::fns::min_max::min_max;
 use vortex_array::aggregate_fn::fns::sum::sum;
@@ -463,20 +464,25 @@ fn actions_for_dtype(dtype: &DType) -> HashSet<ActionType> {
     use ActionType::*;
 
     match dtype {
-        DType::Struct(sdt, _) => {
-            // Struct supports: Compress, Slice, Take, Filter, MinMax, Mask, ScalarAt
-            // Does NOT support: SearchSorted (requires scalar comparison), Compare, Cast, Sum, FillNull
-            let struct_actions = [Compress, Slice, Take, Filter, MinMax, Mask, ScalarAt];
-            sdt.fields()
-                .map(|child| actions_for_dtype(&child))
-                .fold(struct_actions.into(), |acc, actions| {
-                    acc.intersection(&actions).copied().collect()
-                })
+        DType::Null => {
+            // Null arrays support most operations but not Sum or MinMax (return None for dtype)
+            [
+                Compress,
+                Slice,
+                Take,
+                SearchSorted,
+                Filter,
+                Compare,
+                Cast,
+                FillNull,
+                Mask,
+                ScalarAt,
+            ]
+            .into()
         }
-        DType::List(..) | DType::FixedSizeList(..) => {
-            // List supports: Compress, Slice, Take, Filter, MinMax, Mask, ScalarAt
-            // Does NOT support: SearchSorted, Compare, Cast, Sum, FillNull
-            [Compress, Slice, Take, Filter, MinMax, Mask, ScalarAt].into()
+        DType::Bool(_) | DType::Primitive(..) | DType::Decimal(..) => {
+            // These support all actions
+            ActionType::iter().collect()
         }
         DType::Utf8(_) | DType::Binary(_) => {
             // Utf8/Binary supports everything except Sum and FillNull
@@ -495,32 +501,28 @@ fn actions_for_dtype(dtype: &DType) -> HashSet<ActionType> {
             ]
             .into()
         }
-        DType::Bool(_) | DType::Primitive(..) | DType::Decimal(..) => {
-            // These support all actions
-            ActionType::iter().collect()
+        DType::List(..) | DType::FixedSizeList(..) => {
+            // List supports: Compress, Slice, Take, Filter, MinMax, Mask, ScalarAt
+            // Does NOT support: SearchSorted, Compare, Cast, Sum, FillNull
+            [Compress, Slice, Take, Filter, MinMax, Mask, ScalarAt].into()
         }
-        DType::Null => {
-            // Null arrays support most operations but not Sum or MinMax (return None for dtype)
-            [
-                Compress,
-                Slice,
-                Take,
-                SearchSorted,
-                Filter,
-                Compare,
-                Cast,
-                FillNull,
-                Mask,
-                ScalarAt,
-            ]
-            .into()
+        DType::Struct(sdt, _) => {
+            // Struct supports: Compress, Slice, Take, Filter, MinMax, Mask, ScalarAt
+            // Does NOT support: SearchSorted (requires scalar comparison), Compare, Cast, Sum, FillNull
+            let struct_actions = [Compress, Slice, Take, Filter, MinMax, Mask, ScalarAt];
+            sdt.fields()
+                .map(|child| actions_for_dtype(&child))
+                .fold(struct_actions.into(), |acc, actions| {
+                    acc.intersection(&actions).copied().collect()
+                })
         }
+        DType::Union(..) => todo!("TODO(connor)[Union]: unimplemented"),
+        // Currently, no support at all
+        DType::Variant(_) => unreachable!("Variant dtype shouldn't be fuzzed"),
         DType::Extension(_) => {
             // Extension types delegate to storage dtype, support most operations
             ActionType::iter().collect()
         }
-        // Currently, no support at all
-        DType::Variant(_) => unreachable!("Variant dtype shouldn't be fuzzed"),
     }
 }
 
@@ -722,6 +724,9 @@ fn assert_search_sorted(
 }
 
 /// Assert two arrays are equal.
+///
+/// Uses `all_non_distinct` for an efficient buffer-level comparison on the happy path.
+/// Falls back to element-wise scalar comparison only on mismatch to produce a detailed error.
 #[expect(clippy::result_large_err)]
 pub fn assert_array_eq(lhs: &ArrayRef, rhs: &ArrayRef, step: usize) -> VortexFuzzResult<()> {
     if lhs.dtype() != rhs.dtype() {
@@ -743,7 +748,17 @@ pub fn assert_array_eq(lhs: &ArrayRef, rhs: &ArrayRef, step: usize) -> VortexFuz
             Backtrace::capture(),
         ));
     }
+
     let mut ctx = SESSION.create_execution_ctx();
+
+    // Fast path: buffer-level comparison.
+    let identical = all_non_distinct(lhs, rhs, &mut ctx)
+        .map_err(|e| VortexFuzzError::VortexError(e, Backtrace::capture()))?;
+    if identical {
+        return Ok(());
+    }
+
+    // Slow path: find the first differing element for a detailed error message.
     for idx in 0..lhs.len() {
         let l = lhs.execute_scalar(idx, &mut ctx).vortex_expect("scalar_at");
         let r = rhs.execute_scalar(idx, &mut ctx).vortex_expect("scalar_at");

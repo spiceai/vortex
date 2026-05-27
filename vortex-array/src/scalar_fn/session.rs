@@ -26,8 +26,9 @@ use crate::scalar_fn::fns::not::Not;
 use crate::scalar_fn::fns::pack::Pack;
 use crate::scalar_fn::fns::root::Root;
 use crate::scalar_fn::fns::select::Select;
+use crate::scalar_fn::fns::stat::StatFn;
+use crate::scalar_fn::fns::variant_get::VariantGet;
 
-/// Registry of scalar function vtables.
 /// Registry of scalar function vtables.
 pub type ScalarFnRegistry = Registry<ScalarFnPluginRef>;
 
@@ -71,6 +72,8 @@ impl Default for ScalarFnSession {
         this.register(Pack);
         this.register(Root);
         this.register(Select);
+        this.register(StatFn);
+        this.register(VariantGet);
 
         this
     }

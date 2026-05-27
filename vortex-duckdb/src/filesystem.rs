@@ -31,8 +31,10 @@ use vortex::io::compat::Compat;
 use vortex::io::filesystem::FileListing;
 use vortex::io::filesystem::FileSystem;
 use vortex::io::filesystem::FileSystemRef;
+use vortex::io::object_store::DEFAULT_CONCURRENCY as OBJECT_STORE_DEFAULT_CONCURRENCY;
 use vortex::io::object_store::ObjectStoreFileSystem;
 use vortex::io::runtime::BlockingRuntime;
+use vortex::io::std_file::DEFAULT_CONCURRENCY as STD_FILE_DEFAULT_CONCURRENCY;
 
 use crate::RUNTIME;
 use crate::cpp;
@@ -94,10 +96,12 @@ fn object_store_fs(base_url: &Url) -> VortexResult<FileSystemRef> {
         );
     };
 
-    Ok(Arc::new(Compat::new(ObjectStoreFileSystem::new(
+    let object_store = Arc::new(Compat::new(object_store)) as Arc<dyn ObjectStore>;
+
+    Ok(Arc::new(ObjectStoreFileSystem::new(
         object_store,
         RUNTIME.handle(),
-    ))))
+    )))
 }
 
 struct DuckDbFileSystem {
@@ -275,9 +279,9 @@ impl VortexReadAt for DuckDbFsReader {
 
     fn concurrency(&self) -> usize {
         if self.is_local {
-            vortex::io::std_file::DEFAULT_CONCURRENCY
+            STD_FILE_DEFAULT_CONCURRENCY
         } else {
-            vortex::io::object_store::DEFAULT_CONCURRENCY
+            OBJECT_STORE_DEFAULT_CONCURRENCY
         }
     }
 

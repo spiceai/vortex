@@ -7,13 +7,18 @@ use std::sync::Arc;
 use arrow_schema::Schema;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
+use datafusion_common::DataFusionError;
 use datafusion_common::Result as DFResult;
 use datafusion_common::arrow::array::RecordBatch;
 use datafusion_common::arrow::array::RecordBatchOptions;
 use datafusion_common::exec_datafusion_err;
+use datafusion_common_runtime::JoinSet;
+use datafusion_common_runtime::SpawnedTask;
 use datafusion_datasource::ListingTableUrl;
+use datafusion_datasource::file_sink_config::FileSink;
 use datafusion_datasource::file_sink_config::FileSinkConfig;
 use datafusion_datasource::sink::DataSink;
+use datafusion_datasource::write::demux::DemuxedStreamReceiver;
 use datafusion_datasource::write::get_writer_schema;
 use datafusion_execution::SendableRecordBatchStream;
 use datafusion_execution::TaskContext;
@@ -21,17 +26,17 @@ use datafusion_physical_plan::DisplayAs;
 use datafusion_physical_plan::DisplayFormatType;
 use datafusion_physical_plan::metrics::MetricsSet;
 use futures::SinkExt;
+use futures::Stream;
 use futures::StreamExt;
 use object_store::ObjectStore;
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use tokio::task::JoinHandle;
+use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
-use vortex::array::ArrayRef;
-use vortex::array::arrow::FromArrowArray;
+use vortex::array::arrow::ArrowSessionExt;
 use vortex::array::stream::ArrayStreamAdapter;
 use vortex::dtype::DType;
-use vortex::dtype::arrow::FromArrowType;
 use vortex::file::WriteOptionsSessionExt;
 use vortex::file::WriteSummary;
 use vortex::io::VortexWrite;
@@ -46,6 +51,7 @@ struct WriteOutputOptions<'a> {
     write_id: &'a str,
     partition_column_names: &'a [String],
     keep_partition_by_columns: bool,
+    single_file_output: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -133,6 +139,15 @@ impl VortexSink {
             .first()
             .ok_or_else(|| exec_datafusion_err!("Vortex sink requires at least one table path"))
     }
+
+    fn writer_dtype(&self, writer_schema: &SchemaRef) -> DFResult<DType> {
+        self.session
+            .arrow()
+            .from_arrow_schema(writer_schema)
+            .map_err(|e| {
+                exec_datafusion_err!("Failed to derive Vortex DType from writer schema: {e}")
+            })
+    }
 }
 
 impl std::fmt::Debug for VortexSink {
@@ -173,11 +188,15 @@ impl DataSink for VortexSink {
         data: SendableRecordBatchStream,
         context: &Arc<TaskContext>,
     ) -> DFResult<u64> {
+        if !self.config.table_partition_cols.is_empty() {
+            return FileSink::write_all(self, data, context).await;
+        }
+
         let object_store = context
             .runtime_env()
             .object_store(&self.config.object_store_url)?;
         let writer_schema = get_writer_schema(&self.config);
-        let dtype = DType::from_arrow(writer_schema);
+        let dtype = self.writer_dtype(&writer_schema)?;
         let write_id = Uuid::now_v7().simple().to_string();
         let base_output_path = self.base_output_path()?;
         let partition_column_names = self
@@ -192,6 +211,7 @@ impl DataSink for VortexSink {
             object_store,
             dtype,
             data,
+            Arc::clone(&writer_schema),
             &WriteOutputOptions {
                 base_output_path,
                 target_file_size: self.target_file_size,
@@ -199,24 +219,109 @@ impl DataSink for VortexSink {
                 write_id: &write_id,
                 partition_column_names: &partition_column_names,
                 keep_partition_by_columns: self.config.keep_partition_by_columns,
+                single_file_output: self
+                    .config
+                    .file_output_mode
+                    .single_file_output(base_output_path),
             },
         )
         .await?;
 
-        let mut row_count = 0_u64;
-        for (path, summary) in summaries {
-            row_count = row_count.checked_add(summary.row_count()).ok_or_else(|| {
-                exec_datafusion_err!(
-                    "Row count overflow while aggregating sink summaries (current={}, file={})",
-                    row_count,
-                    summary.row_count()
+        aggregate_write_summaries(summaries)
+    }
+}
+
+#[async_trait]
+impl FileSink for VortexSink {
+    fn config(&self) -> &FileSinkConfig {
+        &self.config
+    }
+
+    async fn spawn_writer_tasks_and_join(
+        &self,
+        _context: &Arc<TaskContext>,
+        demux_task: SpawnedTask<DFResult<()>>,
+        mut file_stream_rx: DemuxedStreamReceiver,
+        object_store: Arc<dyn ObjectStore>,
+    ) -> DFResult<u64> {
+        let writer_schema = get_writer_schema(&self.config);
+        let dtype = self.writer_dtype(&writer_schema)?;
+        let mut file_write_tasks: JoinSet<DFResult<Vec<(Path, WriteSummary)>>> = JoinSet::new();
+
+        while let Some((path, rx)) = file_stream_rx.recv().await {
+            let session = self.session.clone();
+            let object_store = Arc::clone(&object_store);
+            let dtype = dtype.clone();
+            let import_schema = Arc::clone(&writer_schema);
+            let target_file_size = self.target_file_size;
+            let extension = self.config.file_extension.clone();
+
+            file_write_tasks.spawn(async move {
+                let stream = ReceiverStream::new(rx).map(Ok);
+                write_record_batch_stream_to_paths(
+                    session,
+                    object_store,
+                    dtype,
+                    stream,
+                    import_schema,
+                    target_file_size,
+                    |file_index| {
+                        if file_index == 0 {
+                            path.clone()
+                        } else {
+                            numbered_path(&path, file_index, &extension)
+                        }
+                    },
                 )
-            })?;
-            tracing::debug!(path = %path, "Successfully written file");
+                .await
+            });
         }
+
+        let mut row_count = 0_u64;
+        while let Some(result) = file_write_tasks.join_next().await {
+            match result {
+                Ok(summaries) => {
+                    row_count = row_count
+                        .checked_add(aggregate_write_summaries(summaries?)?)
+                        .ok_or_else(|| {
+                            exec_datafusion_err!(
+                                "Row count overflow while aggregating file writer tasks"
+                            )
+                        })?;
+                }
+                Err(e) => {
+                    if e.is_panic() {
+                        std::panic::resume_unwind(e.into_panic());
+                    } else {
+                        unreachable!();
+                    }
+                }
+            }
+        }
+
+        demux_task
+            .join_unwind()
+            .await
+            .map_err(|e| DataFusionError::ExecutionJoin(Box::new(e)))??;
 
         Ok(row_count)
     }
+}
+
+fn aggregate_write_summaries(summaries: Vec<(Path, WriteSummary)>) -> DFResult<u64> {
+    let mut row_count = 0_u64;
+    for (path, summary) in summaries {
+        row_count = row_count.checked_add(summary.row_count()).ok_or_else(|| {
+            exec_datafusion_err!(
+                "Row count overflow while aggregating sink summaries (current={}, file={})",
+                row_count,
+                summary.row_count()
+            )
+        })?;
+        tracing::debug!(path = %path, "Successfully written file");
+    }
+
+    Ok(row_count)
 }
 
 /// Write batches from a single input stream to one or more output files.
@@ -229,42 +334,72 @@ async fn write_record_batch_stream_to_files(
     session: VortexSession,
     object_store: Arc<dyn ObjectStore>,
     dtype: DType,
-    mut data: SendableRecordBatchStream,
+    data: SendableRecordBatchStream,
+    import_schema: SchemaRef,
     output_options: &WriteOutputOptions<'_>,
 ) -> DFResult<Vec<(Path, WriteSummary)>> {
-    let target = output_options.target_file_size.map(|t| t.max(1));
-    let single_file_output = !output_options.base_output_path.is_collection()
-        && output_options.base_output_path.file_extension().is_some();
+    let stream = data.map(|batch| {
+        let batch = batch?;
+        if output_options.keep_partition_by_columns
+            || output_options.partition_column_names.is_empty()
+        {
+            Ok(batch)
+        } else {
+            remove_partition_columns(&batch, output_options.partition_column_names)
+        }
+    });
 
+    write_record_batch_stream_to_paths(
+        session,
+        object_store,
+        dtype,
+        stream,
+        import_schema,
+        output_options.target_file_size,
+        |file_index| {
+            output_file_path(
+                output_options.base_output_path,
+                file_index,
+                output_options.extension,
+                output_options.single_file_output,
+                output_options.write_id,
+            )
+        },
+    )
+    .await
+}
+
+async fn write_record_batch_stream_to_paths<S, F>(
+    session: VortexSession,
+    object_store: Arc<dyn ObjectStore>,
+    dtype: DType,
+    data: S,
+    import_schema: SchemaRef,
+    target_file_size: Option<u64>,
+    mut output_path: F,
+) -> DFResult<Vec<(Path, WriteSummary)>>
+where
+    S: Stream<Item = DFResult<RecordBatch>>,
+    F: FnMut(usize) -> Path,
+{
+    let target = target_file_size.map(|t| t.max(1));
     let mut results: Vec<(Path, WriteSummary)> = Vec::new();
     let mut active_writer: Option<ActiveFileWriter> = None;
     let mut uncompressed_bytes_in_file = 0_u64;
     let mut file_index = 0_usize;
     let mut compression_estimate = CompressionEstimate::identity();
 
+    futures::pin_mut!(data);
+
     let write_result: DFResult<()> = async {
         while let Some(batch) = data.next().await.transpose()? {
-            let batch = if output_options.keep_partition_by_columns
-                || output_options.partition_column_names.is_empty()
-            {
-                batch
-            } else {
-                remove_partition_columns(&batch, output_options.partition_column_names)?
-            };
-
             if active_writer.is_none() {
-                let file_path = output_file_path(
-                    output_options.base_output_path,
-                    file_index,
-                    output_options.extension,
-                    single_file_output,
-                    output_options.write_id,
-                );
                 active_writer = Some(start_file_writer(
                     &session,
                     Arc::clone(&object_store),
-                    file_path,
+                    output_path(file_index),
                     dtype.clone(),
+                    Arc::clone(&import_schema),
                 ));
             }
 
@@ -343,13 +478,14 @@ fn numbered_path(original: &Path, index: usize, extension: &str) -> Path {
         Path::from(format!("{s}_{index:05}.{extension}"))
     }
 }
+
 fn start_file_writer(
     session: &VortexSession,
     object_store: Arc<dyn ObjectStore>,
     path: Path,
     dtype: DType,
+    import_schema: SchemaRef,
 ) -> ActiveFileWriter {
-    // Use a small bounded channel to enforce backpressure and avoid unbounded buffering.
     let (sender, receiver) = futures::channel::mpsc::channel::<RecordBatch>(1);
     let session = session.clone();
     let path_for_task = path.clone();
@@ -364,7 +500,12 @@ fn start_file_writer(
                 )
             })?;
 
-        let stream = receiver.map(|rb| ArrayRef::from_arrow(rb, false));
+        let arrow_session = session.clone();
+        let stream = receiver.map(move |rb| {
+            arrow_session
+                .arrow()
+                .from_arrow_record_batch(rb, &import_schema)
+        });
         let stream_adapter = ArrayStreamAdapter::new(dtype, stream);
 
         let summary = session
@@ -505,6 +646,7 @@ mod tests {
     use datafusion::logical_expr::LogicalPlan;
     use datafusion::logical_expr::LogicalPlanBuilder;
     use datafusion::logical_expr::Values;
+    use datafusion::logical_expr::dml::InsertOp;
     use datafusion_common::ScalarValue;
     use datafusion_common::exec_datafusion_err;
     use datafusion_datasource::ListingTableUrl;
@@ -604,7 +746,7 @@ mod tests {
             LogicalPlan::Values(values.clone()),
             "my_tbl",
             Arc::new(DefaultTableSource::new(Arc::clone(&tbl_provider))),
-            datafusion::logical_expr::dml::InsertOp::Append,
+            InsertOp::Append,
         )?
         .build()?;
 

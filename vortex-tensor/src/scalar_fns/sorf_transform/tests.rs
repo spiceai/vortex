@@ -36,6 +36,7 @@ use crate::encodings::turboquant::centroids::compute_centroid_boundaries;
 use crate::encodings::turboquant::centroids::compute_or_get_centroids;
 use crate::encodings::turboquant::centroids::find_nearest_centroid;
 use crate::tests::SESSION;
+use crate::types::vector::AnyVector;
 use crate::types::vector::Vector;
 
 /// Build a unit-normalized input vector array and forward-transform + quantize it, returning
@@ -65,8 +66,8 @@ fn forward_rotate_and_quantize(
         }
     }
 
-    let rotation = SorfMatrix::try_new(seed, dim, num_rounds)?;
-    let padded_dim = rotation.padded_dim();
+    let padded_dim = dim.next_power_of_two();
+    let rotation = SorfMatrix::try_new_padded(padded_dim, num_rounds, seed)?;
     let centroids = compute_or_get_centroids(padded_dim as u32, bit_width)?;
     let boundaries = compute_centroid_boundaries(&centroids);
 
@@ -300,10 +301,7 @@ fn return_dtype_is_vector_extension() -> VortexResult<()> {
     let ext = return_dtype
         .as_extension_opt()
         .expect("return dtype should be an extension type");
-    assert!(
-        ext.metadata_opt::<crate::types::vector::AnyVector>()
-            .is_some()
-    );
+    assert!(ext.metadata_opt::<AnyVector>().is_some());
 
     // Inner FSL should have the original (unpadded) dimension.
     let DType::FixedSizeList(_, inner_dim, _) = ext.storage_dtype() else {

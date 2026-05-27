@@ -184,10 +184,11 @@ impl SqlBenchmarkRunner {
         if let Some(expected_counts) = &self.expected_row_counts
             && query_idx < expected_counts.len()
         {
+            let expected = expected_counts[query_idx];
             assert_eq!(
                 row_count,
-                expected_counts[query_idx],
-                "Row count mismatch for query {query_idx} - {engine}:{format}",
+                expected,
+                "Row count mismatch for query {query_idx} - {engine}:{format}, expected {expected}, got {row_count}",
                 engine = self.engine,
             );
         }
@@ -258,6 +259,24 @@ impl SqlBenchmarkRunner {
             query_measurements: self.query_measurements,
             memory_measurements: self.memory_measurements,
         }
+    }
+
+    /// Build v3 `query_measurement` records from the runner's collected results.
+    ///
+    /// Each [`QueryMeasurement`] is paired with its matching [`MemoryMeasurement`]
+    /// (matched on `(query_idx, target)`); pairs collapse into one record. If
+    /// `--track-memory` was off, no memory pair exists and the memory fields are
+    /// omitted from the record.
+    pub fn v3_records(&self) -> Vec<crate::v3::V3Record> {
+        let mut records = Vec::with_capacity(self.query_measurements.len());
+        for qm in &self.query_measurements {
+            let memory = self
+                .memory_measurements
+                .iter()
+                .find(|m| m.query_idx == qm.query_idx && m.target == qm.target);
+            records.push(crate::v3::query_measurement_record(qm, memory));
+        }
+        records
     }
 
     /// Run (or explain) all queries for all formats synchronously.

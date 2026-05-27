@@ -3,8 +3,6 @@
 
 //! [`ScalarFnVTable`] implementation for [`SorfTransform`].
 
-use std::fmt;
-use std::fmt::Formatter;
 use std::sync::Arc;
 
 use num_traits::Float;
@@ -69,17 +67,6 @@ impl ScalarFnVTable for SorfTransform {
             0 => ChildName::from("rotated"),
             _ => unreachable!("SorfTransform must have exactly one child"),
         }
-    }
-
-    fn fmt_sql(
-        &self,
-        options: &Self::Options,
-        expr: &Expression,
-        f: &mut Formatter<'_>,
-    ) -> fmt::Result {
-        write!(f, "sorf_transform(")?;
-        expr.child(0).fmt_sql(f)?;
-        write!(f, ", {options})")
     }
 
     fn return_dtype(&self, options: &Self::Options, arg_dtypes: &[DType]) -> VortexResult<DType> {
@@ -164,7 +151,8 @@ impl ScalarFnVTable for SorfTransform {
         let f32_elements = elements_prim.into_buffer::<f32>();
 
         // Reconstruct the orthogonal transform matrix from the seed.
-        let rotation = SorfMatrix::try_new(options.seed, dim, options.num_rounds as usize)?;
+        let rotation =
+            SorfMatrix::try_new_padded(padded_dim, options.num_rounds as usize, options.seed)?;
 
         // Inverse transform each row, truncate to original dimension, cast to target type.
         match_each_float_ptype!(options.element_ptype, |T| {

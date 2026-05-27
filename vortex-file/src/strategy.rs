@@ -27,6 +27,7 @@ use vortex_array::arrays::Primitive;
 use vortex_array::arrays::Struct;
 use vortex_array::arrays::VarBin;
 use vortex_array::arrays::VarBinView;
+use vortex_array::arrays::Variant;
 use vortex_array::arrays::patched::use_experimental_patches;
 use vortex_array::dtype::FieldPath;
 use vortex_btrblocks::BtrBlocksCompressorBuilder;
@@ -91,6 +92,7 @@ pub static ALLOWED_ENCODINGS: LazyLock<HashSet<ArrayId>> = LazyLock::new(|| {
     allowed.insert(Constant.id());
     allowed.insert(Masked.id());
     allowed.insert(Dict.id());
+    allowed.insert(Variant.id());
 
     // Compressed encodings from encoding crates
     allowed.insert(ALP.id());

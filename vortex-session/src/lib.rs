@@ -15,6 +15,8 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use dashmap::Entry;
+use dashmap::mapref::one::MappedRef;
+use dashmap::mapref::one::MappedRefMut;
 use vortex_error::VortexExpect;
 use vortex_error::vortex_panic;
 
@@ -136,9 +138,16 @@ impl SessionExt for VortexSession {
 
     /// Returns the scope variable of type `V`, or inserts a default one if it does not exist.
     fn get<V: SessionVar + Default>(&self) -> Ref<'_, V> {
+        let type_id = TypeId::of::<V>();
+        if self.0.contains_key(&type_id) {
+            return self
+                .get_opt::<V>()
+                .vortex_expect("Session variable disappeared between lookup and get");
+        }
+
         Ref(self
             .0
-            .entry(TypeId::of::<V>())
+            .entry(type_id)
             .or_insert_with(|| Box::new(V::default()))
             .downgrade()
             .map(|v| {
@@ -224,7 +233,7 @@ pub trait SessionVar: Any + Send + Sync + Debug + 'static {
 
 // NOTE(ngates): we don't want to expose that the internals of a session is a DashMap, so we have
 // our own wrapped Ref type.
-pub struct Ref<'a, T>(dashmap::mapref::one::MappedRef<'a, TypeId, Box<dyn SessionVar>, T>);
+pub struct Ref<'a, T>(MappedRef<'a, TypeId, Box<dyn SessionVar>, T>);
 impl<'a, T> Deref for Ref<'a, T> {
     type Target = T;
 
@@ -242,7 +251,7 @@ impl<'a, T> Ref<'a, T> {
     }
 }
 
-pub struct RefMut<'a, T>(dashmap::mapref::one::MappedRefMut<'a, TypeId, Box<dyn SessionVar>, T>);
+pub struct RefMut<'a, T>(MappedRefMut<'a, TypeId, Box<dyn SessionVar>, T>);
 impl<'a, T> Deref for RefMut<'a, T> {
     type Target = T;
 

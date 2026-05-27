@@ -28,6 +28,7 @@ use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
 use vortex_array::require_child;
 use vortex_array::serde::ArrayChildren;
+use vortex_array::smallvec::smallvec;
 use vortex_array::vtable::VTable;
 use vortex_array::vtable::ValidityChild;
 use vortex_array::vtable::ValidityVTableFromChild;
@@ -89,7 +90,7 @@ impl DateTimePartsMetadata {
 }
 
 impl VTable for DateTimeParts {
-    type ArrayData = DateTimePartsData;
+    type TypedArrayData = DateTimePartsData;
 
     type OperationsVTable = Self;
     type ValidityVTable = ValidityVTableFromChild;
@@ -101,7 +102,7 @@ impl VTable for DateTimeParts {
 
     fn validate(
         &self,
-        _data: &Self::ArrayData,
+        _data: &Self::TypedArrayData,
         dtype: &DType,
         len: usize,
         slots: &[Option<ArrayRef>],
@@ -169,7 +170,7 @@ impl VTable for DateTimeParts {
             len,
         )?;
 
-        let slots = vec![Some(days), Some(seconds), Some(subseconds)];
+        let slots = smallvec![Some(days), Some(seconds), Some(subseconds)];
         let data = DateTimePartsData {};
         Ok(ArrayParts::new(self.clone(), dtype.clone(), len, data).with_slots(slots))
     }
@@ -275,7 +276,7 @@ impl DateTimeParts {
     ) -> VortexResult<DateTimePartsArray> {
         let len = days.len();
         DateTimePartsData::validate(&dtype, &days, &seconds, &subseconds, len)?;
-        let slots = vec![Some(days), Some(seconds), Some(subseconds)];
+        let slots = smallvec![Some(days), Some(seconds), Some(subseconds)];
         let data = DateTimePartsData {};
         Ok(unsafe {
             Array::from_parts_unchecked(

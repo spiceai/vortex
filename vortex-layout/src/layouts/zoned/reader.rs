@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use itertools::Itertools;
+use tracing::trace;
 use vortex_array::ArrayRef;
 use vortex_array::MaskFuture;
 use vortex_array::dtype::DType;
@@ -22,6 +23,7 @@ use vortex_session::VortexSession;
 use crate::LayoutReader;
 use crate::LayoutReaderRef;
 use crate::LazyReaderChildren;
+use crate::SplitRange;
 use crate::layouts::zoned::ZonedLayout;
 use crate::layouts::zoned::pruning::PruningState;
 use crate::layouts::zoned::schema::stats_table_dtype;
@@ -106,11 +108,11 @@ impl LayoutReader for ZonedReader {
     fn register_splits(
         &self,
         field_mask: &[FieldMask],
-        row_range: &Range<u64>,
+        split_range: &SplitRange,
         splits: &mut BTreeSet<u64>,
     ) -> VortexResult<()> {
         self.data_child()?
-            .register_splits(field_mask, row_range, splits)
+            .register_splits(field_mask, split_range, splits)
     }
 
     fn pruning_evaluation(
@@ -119,20 +121,18 @@ impl LayoutReader for ZonedReader {
         expr: &Expression,
         mask: Mask,
     ) -> VortexResult<MaskFuture> {
-        tracing::debug!("Stats pruning evaluation: {} - {}", &self.name, expr);
+        trace!("Stats pruning evaluation: {} - {}", &self.name, expr);
         let data_eval = self
             .data_child()?
             .pruning_evaluation(row_range, expr, mask.clone())?;
 
         if self.layout.zone_len == 0 {
-            tracing::debug!(
-                "Stats pruning evaluation: skipping zoned pruning for legacy zero-length zones"
-            );
+            trace!("Stats pruning evaluation: skipping zoned pruning for legacy zero-length zones");
             return Ok(data_eval);
         }
 
         let Some(pruning_mask_future) = self.pruning.pruning_mask_future(expr.clone()) else {
-            tracing::debug!("Stats pruning evaluation: not prune-able {expr}");
+            trace!("Stats pruning evaluation: not prune-able {expr}");
             return Ok(data_eval);
         };
 
@@ -159,7 +159,7 @@ impl LayoutReader for ZonedReader {
         let expr = expr.clone();
 
         Ok(MaskFuture::new(mask.len(), async move {
-            tracing::debug!("Invoking stats pruning evaluation {}: {}", name, expr);
+            trace!("Invoking stats pruning evaluation {}: {}", name, expr);
 
             let pruning_mask = pruning_mask_future.await?.mask()?;
 
@@ -180,7 +180,7 @@ impl LayoutReader for ZonedReader {
                 stats_mask = stats_mask.bitand(&data_mask);
             }
 
-            tracing::debug!(
+            trace!(
                 "Stats evaluation approx {} - {} (mask = {}) => {}",
                 name,
                 expr,

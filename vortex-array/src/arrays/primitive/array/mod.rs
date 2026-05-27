@@ -5,6 +5,7 @@ use std::fmt::Display;
 use std::fmt::Formatter;
 use std::iter;
 
+use smallvec::smallvec;
 use vortex_buffer::Alignment;
 use vortex_buffer::Buffer;
 use vortex_buffer::BufferMut;
@@ -15,10 +16,10 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
 
-use crate::LEGACY_SESSION;
+use crate::ArraySlots;
+use crate::ExecutionCtx;
 #[expect(deprecated)]
 use crate::ToCanonical as _;
-use crate::VortexSessionExecute;
 use crate::array::Array;
 use crate::array::ArrayParts;
 use crate::array::TypedArrayRef;
@@ -148,13 +149,12 @@ pub trait PrimitiveArrayExt: TypedArrayRef<Primitive> {
     }
 
     /// Narrow the array to the smallest possible integer type that can represent all values.
-    fn narrow(&self) -> VortexResult<PrimitiveArray> {
+    fn narrow(&self, ctx: &mut ExecutionCtx) -> VortexResult<PrimitiveArray> {
         if !self.ptype().is_int() {
             return Ok(self.to_owned());
         }
 
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
-        let Some(min_max) = min_max(self.as_ref(), &mut ctx)? else {
+        let Some(min_max) = min_max(self.as_ref(), ctx)? else {
             return Ok(PrimitiveArray::new(
                 Buffer::<u8>::zeroed(self.len()),
                 self.validity(),
@@ -183,57 +183,51 @@ pub trait PrimitiveArrayExt: TypedArrayRef<Primitive> {
         if min < 0 || max < 0 {
             // Signed
             if min >= i8::MIN as i64 && max <= i8::MAX as i64 {
-                #[expect(deprecated)]
                 let result = self
                     .as_ref()
                     .cast(DType::Primitive(PType::I8, nullability))?
-                    .to_primitive();
+                    .execute::<PrimitiveArray>(ctx)?;
                 return Ok(result);
             }
 
             if min >= i16::MIN as i64 && max <= i16::MAX as i64 {
-                #[expect(deprecated)]
                 let result = self
                     .as_ref()
                     .cast(DType::Primitive(PType::I16, nullability))?
-                    .to_primitive();
+                    .execute::<PrimitiveArray>(ctx)?;
                 return Ok(result);
             }
 
             if min >= i32::MIN as i64 && max <= i32::MAX as i64 {
-                #[expect(deprecated)]
                 let result = self
                     .as_ref()
                     .cast(DType::Primitive(PType::I32, nullability))?
-                    .to_primitive();
+                    .execute::<PrimitiveArray>(ctx)?;
                 return Ok(result);
             }
         } else {
             // Unsigned
             if max <= u8::MAX as i64 {
-                #[expect(deprecated)]
                 let result = self
                     .as_ref()
                     .cast(DType::Primitive(PType::U8, nullability))?
-                    .to_primitive();
+                    .execute::<PrimitiveArray>(ctx)?;
                 return Ok(result);
             }
 
             if max <= u16::MAX as i64 {
-                #[expect(deprecated)]
                 let result = self
                     .as_ref()
                     .cast(DType::Primitive(PType::U16, nullability))?
-                    .to_primitive();
+                    .execute::<PrimitiveArray>(ctx)?;
                 return Ok(result);
             }
 
             if max <= u32::MAX as i64 {
-                #[expect(deprecated)]
                 let result = self
                     .as_ref()
                     .cast(DType::Primitive(PType::U32, nullability))?
-                    .to_primitive();
+                    .execute::<PrimitiveArray>(ctx)?;
                 return Ok(result);
             }
         }
@@ -246,8 +240,8 @@ impl<T: TypedArrayRef<Primitive>> PrimitiveArrayExt for T {}
 // TODO(connor): There are a lot of places where we could be using `new_unchecked` in the codebase.
 impl PrimitiveData {
     /// Build the slots vector for this array.
-    pub(super) fn make_slots(validity: &Validity, len: usize) -> Vec<Option<ArrayRef>> {
-        vec![validity_to_child(validity, len)]
+    pub(super) fn make_slots(validity: &Validity, len: usize) -> ArraySlots {
+        smallvec![validity_to_child(validity, len)]
     }
 
     /// Create a new array from a buffer handle.
