@@ -12,6 +12,7 @@ use vortex_array::arrays::fixed_size_list::FixedSizeListArrayExt;
 use vortex_error::VortexResult;
 
 use super::*;
+use crate::encodings::turboquant::centroids::compute_or_get_centroids;
 
 /// Verify that the centroids stored in the DictArray match what `compute_or_get_centroids()` computes.
 #[test]
@@ -30,7 +31,7 @@ fn stored_centroids_match_computed() -> VortexResult<()> {
     let stored = centroids.as_slice::<f32>();
 
     // padded_dim for dim=128 is 128.
-    let computed = crate::encodings::turboquant::centroids::compute_or_get_centroids(128, 3)?;
+    let computed = compute_or_get_centroids(128, 3)?;
 
     assert_eq!(stored.len(), computed.len());
     for i in 0..stored.len() {
@@ -259,8 +260,8 @@ fn sorf_transform_roundtrip_isolation() -> VortexResult<()> {
     }
 
     // Forward transform + quantize (mimicking what turboquant_quantize_core does).
-    let rotation = SorfMatrix::try_new(seed, dim, num_rounds as usize)?;
-    let padded_dim = rotation.padded_dim();
+    let padded_dim = dim.next_power_of_two();
+    let rotation = SorfMatrix::try_new_padded(padded_dim, num_rounds as usize, seed)?;
     let centroids = compute_or_get_centroids(padded_dim as u32, 8)?;
     let boundaries = compute_centroid_boundaries(&centroids);
 

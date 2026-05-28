@@ -258,7 +258,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "apply() has a bug with null propagation from struct validity to non-nullable child fields"]
     fn get_nullable_field() {
         let st = StructArray::try_new(
             FieldNames::from(["a"]),

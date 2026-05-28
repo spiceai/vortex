@@ -27,6 +27,7 @@ use vortex_compressor::scheme::DescendantExclusion;
 use vortex_error::VortexResult;
 use vortex_error::vortex_panic;
 use vortex_sparse::Sparse;
+use vortex_sparse::SparseExt as _;
 
 use super::integer::SparseScheme as IntSparseScheme;
 use crate::ArrayAndStats;
@@ -267,7 +268,7 @@ impl Scheme for NullDominatedSparseScheme {
                 .indices()
                 .clone()
                 .execute::<PrimitiveArray>(exec_ctx)?
-                .narrow()?;
+                .narrow(exec_ctx)?;
             let compressed_indices = compressor.compress_child(
                 &indices.into_array(),
                 &compress_ctx,

@@ -49,7 +49,7 @@ impl Vector {
     /// # Errors
     ///
     /// Returns an error if the [`Vector`] extension dtype rejects the storage array.
-    pub(crate) fn try_new_vector_array(storage: ArrayRef) -> VortexResult<ArrayRef> {
+    pub fn try_new_vector_array(storage: ArrayRef) -> VortexResult<ArrayRef> {
         ExtensionArray::try_new_from_vtable(Vector, EmptyMetadata, storage)
             .map(|ext| ext.into_array())
     }
@@ -75,8 +75,10 @@ impl Vector {
     }
 }
 
+mod arrow;
 mod matcher;
 
+pub use arrow::ARROW_VECTOR_EXTENSION_NAME;
 pub use matcher::AnyVector;
 pub use matcher::VectorMatcherMetadata;
 

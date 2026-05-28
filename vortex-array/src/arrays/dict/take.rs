@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use smallvec::SmallVec;
 use vortex_error::VortexResult;
 
 use super::Dict;
@@ -150,7 +151,7 @@ pub(crate) fn propagate_take_stats(
     target.statistics().with_mut_typed_stats_set(|mut st| {
         if indices_all_valid {
             let is_constant = source.statistics().get_as::<bool>(Stat::IsConstant);
-            if is_constant == Some(Precision::Exact(true)) {
+            if matches!(is_constant, Precision::Exact(true)) {
                 // Any combination of elements from a constant array is still const
                 st.set(Stat::IsConstant, Precision::exact(true));
             }
@@ -162,14 +163,13 @@ pub(crate) fn propagate_take_stats(
             Stat::IsConstant,
         ]
         .into_iter()
-        .filter_map(|stat| {
-            source
-                .statistics()
-                .get(stat)
-                .and_then(|v| v.map(|s| s.into_value()).into_inexact().transpose())
-                .map(|sv| (stat, sv))
+        .filter_map(|stat| match source.statistics().get(stat).into_inexact() {
+            Precision::Exact(scalar) | Precision::Inexact(scalar) => {
+                scalar.into_value().map(|sv| (stat, Precision::Inexact(sv)))
+            }
+            Precision::Absent => None,
         })
-        .collect::<Vec<_>>();
+        .collect::<SmallVec<_>>();
         st.combine_sets(
             &(unsafe { StatsSet::new_unchecked(inexact_min_max) }).as_typed_ref(source.dtype()),
         )

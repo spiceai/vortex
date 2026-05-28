@@ -22,6 +22,7 @@ use crate::array::VTable;
 use crate::arrays::varbin::VarBinArrayExt;
 use crate::arrays::varbin::VarBinData;
 use crate::arrays::varbin::array::NUM_SLOTS;
+use crate::arrays::varbin::array::OFFSETS_SLOT;
 use crate::arrays::varbin::array::SLOT_NAMES;
 use crate::buffer::BufferHandle;
 use crate::dtype::DType;
@@ -65,7 +66,7 @@ impl ArrayEq for VarBinData {
 }
 
 impl VTable for VarBin {
-    type ArrayData = VarBinData;
+    type TypedArrayData = VarBinData;
 
     type OperationsVTable = Self;
     type ValidityVTable = Self;
@@ -90,7 +91,7 @@ impl VTable for VarBin {
             "VarBinArray expected {NUM_SLOTS} slots, found {}",
             slots.len()
         );
-        let offsets = slots[crate::arrays::varbin::array::OFFSETS_SLOT]
+        let offsets = slots[OFFSETS_SLOT]
             .as_ref()
             .vortex_expect("VarBinArray offsets slot");
         vortex_ensure!(

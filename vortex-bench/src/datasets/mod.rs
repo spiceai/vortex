@@ -37,6 +37,17 @@ pub(crate) fn normalize_benchmark_runner_id(benchmark_runner: &str) -> String {
 pub trait Dataset {
     fn name(&self) -> &str;
 
+    /// Map this dataset to the v3 `(dataset, dataset_variant)` pair emitted
+    /// in `compression_*` records.
+    ///
+    /// Default: `(name(), None)`. Override only when a suite needs a
+    /// different dataset name on the wire than its `name()` returns. The
+    /// query-side equivalent is documented on
+    /// [`crate::v3::benchmark_dataset_dims`].
+    fn v3_dataset_dims(&self) -> (&str, Option<&str>) {
+        (self.name(), None)
+    }
+
     async fn to_vortex_array(&self, ctx: &mut ExecutionCtx) -> Result<ArrayRef>;
 
     /// Get the path to the parquet file for this dataset.

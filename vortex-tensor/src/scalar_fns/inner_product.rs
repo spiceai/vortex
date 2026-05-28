@@ -3,8 +3,6 @@
 
 //! Inner product expression for tensor-like types.
 
-use std::fmt::Formatter;
-
 use num_traits::Float;
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
@@ -105,19 +103,6 @@ impl ScalarFnVTable for InnerProduct {
             1 => ChildName::from("rhs"),
             _ => unreachable!("InnerProduct must have exactly two children"),
         }
-    }
-
-    fn fmt_sql(
-        &self,
-        _options: &Self::Options,
-        expr: &Expression,
-        f: &mut Formatter<'_>,
-    ) -> std::fmt::Result {
-        write!(f, "inner_product(")?;
-        expr.child(0).fmt_sql(f)?;
-        write!(f, ", ")?;
-        expr.child(1).fmt_sql(f)?;
-        write!(f, ")")
     }
 
     fn return_dtype(&self, _options: &Self::Options, arg_dtypes: &[DType]) -> VortexResult<DType> {
@@ -366,7 +351,7 @@ impl InnerProduct {
         let mut padded_query = vec![0.0f32; padded_dim];
         padded_query[..dim].copy_from_slice(flat.as_slice::<f32>());
 
-        let rotation = SorfMatrix::try_new(seed, dim, num_rounds)?;
+        let rotation = SorfMatrix::try_new_padded(padded_dim, num_rounds, seed)?;
         let mut rotated_query = vec![0.0f32; padded_dim];
         rotation.rotate(&padded_query, &mut rotated_query);
 
@@ -930,7 +915,7 @@ mod tests {
             seed: u64,
             num_rounds: u8,
         ) -> VortexResult<Vec<f32>> {
-            let rotation = SorfMatrix::try_new(seed, dim, num_rounds as usize)?;
+            let rotation = SorfMatrix::try_new_padded(padded_dim, num_rounds as usize, seed)?;
             let mut padded = vec![0.0f32; padded_dim];
             let mut rotated = vec![0.0f32; padded_dim];
             let mut out = Vec::with_capacity(num_rows * dim);

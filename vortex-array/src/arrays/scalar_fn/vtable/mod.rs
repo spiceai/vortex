@@ -15,10 +15,12 @@ use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
+use vortex_session::registry::CachedId;
 
 use crate::ArrayEq;
 use crate::ArrayHash;
 use crate::ArrayRef;
+use crate::ArraySlots;
 use crate::IntoArray;
 use crate::Precision;
 use crate::array::Array;
@@ -66,7 +68,7 @@ impl ArrayEq for ScalarFnData {
 }
 
 impl VTable for ScalarFn {
-    type ArrayData = ScalarFnData;
+    type TypedArrayData = ScalarFnData;
     type OperationsVTable = Self;
     type ValidityVTable = Self;
 
@@ -191,7 +193,7 @@ pub trait ScalarFnFactoryExt: scalar_fn::ScalarFnVTable {
         Ok(unsafe {
             Array::from_parts_unchecked(
                 ArrayParts::new(vtable, dtype, len, data)
-                    .with_slots(children.into_iter().map(Some).collect()),
+                    .with_slots(children.into_iter().map(Some).collect::<ArraySlots>()),
             )
         }
         .into_array())
@@ -284,7 +286,8 @@ impl scalar_fn::ScalarFnVTable for ArrayExpr {
     type Options = FakeEq<ArrayRef>;
 
     fn id(&self) -> ScalarFnId {
-        ScalarFnId::new("vortex.array")
+        static ID: CachedId = CachedId::new("vortex.array");
+        *ID
     }
 
     fn arity(&self, _options: &Self::Options) -> Arity {
