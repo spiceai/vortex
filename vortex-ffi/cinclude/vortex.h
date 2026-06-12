@@ -161,6 +161,9 @@ typedef enum {
     PTYPE_F64 = 10,
 } vx_ptype;
 
+/**
+ * Validity representation for arrays constructed through the C FFI.
+ */
 typedef enum {
     /**
      * Items can't be null
@@ -417,9 +420,6 @@ typedef struct vx_array vx_array;
  * Once the iterator is finished (returns `null` from [`vx_array_iterator_next`]), it may panic
  * on subsequent calls to [`vx_array_iterator_next`].
  *
- * Even after the iterator is finished, an owned iterator must be released by calling
- * [`vx_array_iter_free`].
- *
  * Iterators may be passed between threads, but calls to [`vx_array_iterator_next`] should be
  * serialized and not invoked concurrently.
  */
@@ -533,7 +533,13 @@ typedef struct vx_struct_fields vx_struct_fields;
  */
 typedef struct vx_struct_fields_builder vx_struct_fields_builder;
 
+/**
+ * Array validity descriptor used by C FFI constructors.
+ */
 typedef struct {
+    /**
+     * The kind of validity represented by this descriptor.
+     */
     vx_validity_type type;
     /**
      * If type is not VX_VALIDITY_ARRAY, this is NULL.
@@ -673,7 +679,7 @@ void vx_array_get_validity(const vx_array *array, vx_validity *validity, vx_erro
 size_t vx_array_len(const vx_array *array);
 
 /**
- * Get the [`crate::vx_dtype`] of the array.
+ * Get the [`struct@crate::dtype::vx_dtype`] of the array.
  *
  * The returned pointer is valid as long as the array is valid.
  * Do NOT free the returned dtype pointer - it shares the lifetime of the array.
