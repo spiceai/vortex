@@ -9668,6 +9668,7 @@ dependencies = [
  "oneshot",
  "parking_lot",
  "pin-project-lite",
+ "rstest",
  "tokio",
  "tracing",
  "vortex-alp",
