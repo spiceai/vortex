@@ -305,13 +305,15 @@ struct StackFrame {
 #[derive(Debug, Clone)]
 pub struct ExecutionCtx {
     session: VortexSession,
-    /// Snapshot of the session's [`ArrayKernels`] resolved once at construction.
+    /// Snapshot of the session's [`ArrayKernels`] execute-parent kernels, resolved once at
+    /// construction.
     ///
-    /// `ArrayKernels` is a global, `TypeId`-keyed registry that is populated at session
-    /// construction and never mutated mid-scan, so it is invariant for the life of one
-    /// `ExecutionCtx`. Caching it here avoids a per-array-node session clone plus a sharded
-    /// `DashMap` `RwLock` probe in the hot `execute_until` loop. `None` mirrors the previous
-    /// `get_opt` behavior when the session has no kernels registered.
+    /// The registry is session-scoped and mutable through its public `register_*` methods, so
+    /// this context sees the kernels as registered when it was created; later registrations are
+    /// picked up by the next context (contexts are created per evaluation). Caching the snapshot
+    /// avoids a per-array-node session clone plus a sharded `DashMap` `RwLock` probe in the hot
+    /// `execute_until` loop, and avoids holding the session-variable read guard across kernel
+    /// invocation. `None` means the session had no [`ArrayKernels`] when the context was created.
     kernels: Option<KernelSnapshot>,
     #[cfg(debug_assertions)]
     id: usize,
@@ -342,7 +344,7 @@ impl ExecutionCtx {
     }
 
     /// Get the [`KernelSnapshot`] resolved once for this execution context, if the session had an
-    /// [`ArrayKernels`] registry. Cheap to clone (two `Arc` clones).
+    /// [`ArrayKernels`] registry. Cheap to clone (one `Arc` clone).
     pub(crate) fn kernels(&self) -> Option<&KernelSnapshot> {
         self.kernels.as_ref()
     }

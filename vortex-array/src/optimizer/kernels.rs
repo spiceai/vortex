@@ -201,38 +201,36 @@ impl ArrayKernels {
         self.execute_parent.load().get(&id).cloned()
     }
 
-    /// Capture an owned, cheaply-cloneable [`KernelSnapshot`] of the currently-registered kernels.
+    /// Capture an owned, cheaply-cloneable [`KernelSnapshot`] of the currently-registered
+    /// execute-parent kernels.
     ///
-    /// Each [`ArcSwap`] is loaded once into an [`Arc`], so the snapshot is a pair of `Arc` clones
-    /// (no map copy) and outlives the session-variable borrow. The snapshot is invariant for the
-    /// life of a single execution: kernels are registered at session construction, never mid-scan.
-    pub fn snapshot(&self) -> KernelSnapshot {
+    /// The [`ArcSwap`] is loaded once into an [`Arc`], so the snapshot is an `Arc` clone (no map
+    /// copy) that outlives the session-variable borrow. Registrations made after the snapshot is
+    /// taken are not visible through it.
+    pub(crate) fn snapshot(&self) -> KernelSnapshot {
         KernelSnapshot {
-            reduce_parent: self.reduce_parent.load_full(),
             execute_parent: self.execute_parent.load_full(),
         }
     }
 }
 
-/// An owned, point-in-time view of the kernels registered on an [`ArrayKernels`] registry.
+/// An owned, point-in-time view of the execute-parent kernels registered on an [`ArrayKernels`]
+/// registry.
 ///
-/// Holding the two registry maps directly (rather than re-probing the session per array node)
-/// lets the executor resolve [`ArrayKernels`] once per execution. Cloning is two [`Arc`] clones.
+/// Holding the registry map directly (rather than re-probing the session per array node) lets the
+/// executor resolve [`ArrayKernels`] once per execution context. Cloning is one [`Arc`] clone.
 #[derive(Debug, Clone)]
-pub struct KernelSnapshot {
-    reduce_parent: Arc<HashMap<ReduceParentFnId, Arc<[ReduceParentFn]>>>,
+pub(crate) struct KernelSnapshot {
     execute_parent: Arc<HashMap<ExecuteParentFnId, Arc<[ExecuteParentFn]>>>,
 }
 
 impl KernelSnapshot {
-    /// Look up the [`ReduceParentFn`]s registered for `(parent, child)`.
-    pub fn find_reduce_parent(&self, parent: Id, child: Id) -> Option<Arc<[ReduceParentFn]>> {
-        let id = hash_fn_id(parent, child);
-        self.reduce_parent.get(&id).cloned()
-    }
-
     /// Look up the [`ExecuteParentFn`]s registered for `(parent, child)`.
-    pub fn find_execute_parent(&self, parent: Id, child: Id) -> Option<Arc<[ExecuteParentFn]>> {
+    pub(crate) fn find_execute_parent(
+        &self,
+        parent: Id,
+        child: Id,
+    ) -> Option<Arc<[ExecuteParentFn]>> {
         let id = hash_fn_id(parent, child);
         self.execute_parent.get(&id).cloned()
     }

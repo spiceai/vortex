@@ -64,6 +64,7 @@ use vortex_buffer::buffer;
 use vortex_error::VortexResult;
 use vortex_io::session::RuntimeSession;
 use vortex_layout::Layout;
+use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
 use vortex_layout::scan::scan_builder::ScanBuilder;
 use vortex_layout::session::LayoutSession;
 use vortex_session::VortexSession;
@@ -1810,6 +1811,50 @@ fn assert_offsets_ordered(before: &[u64], after: &[u64], context: &str) {
              but max before = {max_before} >= min after = {min_after}"
         );
     }
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn test_large_flat_chunk_scan_subdivides_splits() -> VortexResult<()> {
+    // A single flat (unchunked) 250k-row layout spans the 100k sub-split threshold, so the scan
+    // must decode it as multiple row-range splits.
+    const N_ROWS: u64 = 250_000;
+    let values =
+        Buffer::from_iter((0..N_ROWS as i32).map(|i| if i % 2 == 0 { i } else { -i })).into_array();
+
+    let mut buf = ByteBufferMut::empty();
+    SESSION
+        .write_options()
+        .with_strategy(Arc::new(FlatLayoutStrategy::default()))
+        .write(&mut buf, values.to_array_stream())
+        .await?;
+
+    let file = SESSION.open_options().open_buffer(buf)?;
+
+    // Sub-division caps each split at 100k rows while tiling the file exactly.
+    let splits = file.splits()?;
+    assert!(splits.len() > 1, "expected sub-divided splits: {splits:?}");
+    assert!(splits.iter().all(|r| r.end - r.start <= 100_000));
+    assert_eq!(splits.first().map(|r| r.start), Some(0));
+    assert_eq!(splits.last().map(|r| r.end), Some(N_ROWS));
+    assert!(splits.windows(2).all(|w| w[0].end == w[1].start));
+
+    // A full scan across the sub-splits returns the original rows.
+    let result = file.scan()?.into_array_stream()?.read_all().await?;
+    assert_arrays_eq!(result, values);
+
+    // A filtered scan crossing sub-split boundaries selects exactly the matching rows.
+    let result = file
+        .scan()?
+        .with_filter(gt(root(), lit(0i32)))
+        .into_array_stream()?
+        .read_all()
+        .await?;
+    let expected =
+        Buffer::from_iter((0..N_ROWS as i32).filter(|i| i % 2 == 0 && *i > 0)).into_array();
+    assert_arrays_eq!(result, expected);
+
+    Ok(())
 }
 
 #[tokio::test]

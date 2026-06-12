@@ -25,7 +25,9 @@ const MAX_SPLIT_ROWS: u64 = IDEAL_SPLIT_SIZE;
 #[derive(Default, Copy, Clone, Debug)]
 pub enum SplitBy {
     #[default]
-    /// Splits any time there is a chunk boundary in the file.
+    /// Splits any time there is a chunk boundary in the file. Spans between adjacent boundaries
+    /// wider than `MAX_SPLIT_ROWS` are further sub-divided so that a file with few, large chunks
+    /// can still be decoded across multiple cores.
     Layout,
     /// Splits every n rows.
     RowCount(usize),
@@ -101,7 +103,8 @@ fn subdivide_large_spans(boundaries: Vec<u64>, max_span: u64) -> Vec<u64> {
             let mut point = lo + sub_size;
             while point < hi {
                 out.push(point);
-                point += sub_size;
+                // Saturating: a sum past u64::MAX can never be < `hi`, so the loop exits.
+                point = point.saturating_add(sub_size);
             }
         }
     }
@@ -279,15 +282,29 @@ mod test {
         // Gaps all <= max_span: boundaries returned unchanged.
         assert_eq!(subdivide_large_spans(vec![0, 5, 10], 100), vec![0, 5, 10]);
         assert_eq!(subdivide_large_spans(vec![0, 100], 100), vec![0, 100]);
-        assert_eq!(subdivide_large_spans(Vec::<u64>::new(), 100), Vec::<u64>::new());
+        assert_eq!(
+            subdivide_large_spans(Vec::<u64>::new(), 100),
+            Vec::<u64>::new()
+        );
         assert_eq!(subdivide_large_spans(vec![7], 100), vec![7]);
+    }
+
+    #[test]
+    fn subdivide_near_u64_max_does_not_overflow() {
+        // The increment past the last interior point would overflow without saturating math.
+        let hi = u64::MAX;
+        let out = subdivide_large_spans(vec![hi - 3, hi], 2);
+        assert_eq!(out, vec![hi - 3, hi - 1, hi]);
     }
 
     #[test]
     fn subdivide_splits_large_single_chunk() {
         // One large chunk [0, 1000) with max_span 100 -> 10 contiguous sub-splits.
         let out = subdivide_large_spans(vec![0, 1000], 100);
-        assert_eq!(out, vec![0, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000]);
+        assert_eq!(
+            out,
+            vec![0, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000]
+        );
     }
 
     #[test]
@@ -315,15 +332,24 @@ mod test {
             assert_eq!(out.first(), boundaries.first());
             assert_eq!(out.last(), boundaries.last());
             // (b) strictly increasing (sorted + deduped)
-            assert!(out.windows(2).all(|w| w[0] < w[1]), "not strictly increasing: {out:?}");
+            assert!(
+                out.windows(2).all(|w| w[0] < w[1]),
+                "not strictly increasing: {out:?}"
+            );
             // (c) exact coverage: ranges from `out` tile the same span with no gap/overlap, and
             // every original boundary is still present (so original ranges are sub-divided, never
             // merged or shifted).
             let total: u64 = out.windows(2).map(|w| w[1] - w[0]).sum();
             let expected_total = boundaries.last().unwrap() - boundaries.first().unwrap();
-            assert_eq!(total, expected_total, "coverage span changed for {boundaries:?}");
+            assert_eq!(
+                total, expected_total,
+                "coverage span changed for {boundaries:?}"
+            );
             for b in &boundaries {
-                assert!(out.contains(b), "original boundary {b} dropped from {out:?}");
+                assert!(
+                    out.contains(b),
+                    "original boundary {b} dropped from {out:?}"
+                );
             }
         }
     }
