@@ -379,4 +379,49 @@ mod test {
             assert_arrays_eq!(result, expected);
         })
     }
+
+    #[test]
+    fn array_future_memoizes_the_decode() {
+        block_on(|handle| async {
+            let session = SESSION.clone().with_handle(handle);
+            let ctx = ArrayContext::empty();
+            let segments = Arc::new(TestSegments::default());
+            let (ptr, eof) = SequenceId::root().split();
+            let array =
+                PrimitiveArray::new(buffer![1, 2, 3, 4, 5], Validity::AllValid).into_array();
+            let layout = FlatLayoutStrategy::default()
+                .write_stream(
+                    ctx,
+                    Arc::<TestSegments>::clone(&segments),
+                    array.to_array_stream().sequenced(ptr),
+                    eof,
+                    &session,
+                )
+                .await
+                .unwrap();
+
+            let reader = layout.new_reader("".into(), segments, &SESSION).unwrap();
+            let flat = reader
+                .as_any()
+                .downcast_ref::<super::FlatReader>()
+                .expect("flat layout must yield a FlatReader");
+
+            // The decoded array is not cached until the column is first touched.
+            assert!(flat.array.get().is_none(), "decode cache must start empty");
+
+            // First touch (e.g. the WHERE filter) decodes the chunk and memoizes it.
+            let a1 = flat.array_future().await.unwrap();
+            assert!(
+                flat.array.get().is_some(),
+                "decode must be memoized after the first array_future()"
+            );
+
+            // Second touch (e.g. the SELECT projection of the same column) reuses
+            // the cached decode instead of decoding the chunk again.
+            let a2 = flat.array_future().await.unwrap();
+
+            assert_arrays_eq!(a1, array.clone());
+            assert_arrays_eq!(a2, array);
+        })
+    }
 }
