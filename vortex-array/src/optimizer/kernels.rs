@@ -200,6 +200,40 @@ impl ArrayKernels {
         let id = hash_fn_id(parent, child);
         self.execute_parent.load().get(&id).cloned()
     }
+
+    /// Capture an owned, cheaply-cloneable [`KernelSnapshot`] of the currently-registered
+    /// execute-parent kernels.
+    ///
+    /// The [`ArcSwap`] is loaded once into an [`Arc`], so the snapshot is an `Arc` clone (no map
+    /// copy) that outlives the session-variable borrow. Registrations made after the snapshot is
+    /// taken are not visible through it.
+    pub(crate) fn snapshot(&self) -> KernelSnapshot {
+        KernelSnapshot {
+            execute_parent: self.execute_parent.load_full(),
+        }
+    }
+}
+
+/// An owned, point-in-time view of the execute-parent kernels registered on an [`ArrayKernels`]
+/// registry.
+///
+/// Holding the registry map directly (rather than re-probing the session per array node) lets the
+/// executor resolve [`ArrayKernels`] once per execution context. Cloning is one [`Arc`] clone.
+#[derive(Debug, Clone)]
+pub(crate) struct KernelSnapshot {
+    execute_parent: Arc<HashMap<ExecuteParentFnId, Arc<[ExecuteParentFn]>>>,
+}
+
+impl KernelSnapshot {
+    /// Look up the [`ExecuteParentFn`]s registered for `(parent, child)`.
+    pub(crate) fn find_execute_parent(
+        &self,
+        parent: Id,
+        child: Id,
+    ) -> Option<Arc<[ExecuteParentFn]>> {
+        let id = hash_fn_id(parent, child);
+        self.execute_parent.get(&id).cloned()
+    }
 }
 
 fn hash_fn_id(parent: Id, child: Id) -> u64 {
