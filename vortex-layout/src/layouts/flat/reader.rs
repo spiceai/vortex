@@ -4,6 +4,7 @@
 use std::ops::BitAnd;
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use futures::FutureExt;
 use futures::future::BoxFuture;
@@ -39,6 +40,14 @@ pub struct FlatReader {
     name: Arc<str>,
     segment_source: Arc<dyn SegmentSource>,
     session: VortexSession,
+    /// Memoized decoded array for this layout. A column referenced by both the
+    /// filter and the projection (the common filtered-scan-returning-the-filter-
+    /// column case) would otherwise decode twice; this caches the shared decode
+    /// so it happens once. The segment is still re-requested on every
+    /// `array_future()` call so the segment reader keeps prioritization
+    /// visibility (see there). Bounded by the reader's lifetime — readers are
+    /// held via `Weak` in the opener, mirroring `DictReader`'s `values_array`.
+    array: OnceLock<SharedArrayFuture>,
 }
 
 impl FlatReader {
@@ -53,38 +62,47 @@ impl FlatReader {
             name,
             segment_source,
             session,
+            array: OnceLock::new(),
         }
     }
 
     /// Register the segment request and return a future that would resolve into the deserialised array.
     fn array_future(&self) -> SharedArrayFuture {
-        let row_count =
-            usize::try_from(self.layout.row_count()).vortex_expect("row count must fit in usize");
-
-        // We create the segment_fut here to ensure we give the segment reader visibility into
-        // how to prioritize this segment, even if the `array` future has already been initialized.
-        // This is gross... see the function's TODO for a maybe better solution?
+        // We create the segment_fut here to ensure we give the segment reader visibility into how
+        // to prioritize this segment, even if the `array` future has already been initialized (it
+        // is, on the second of a filter+projection pair over the same column). This is gross... see
+        // the function's TODO for a maybe better solution?
         let segment_fut = self.segment_source.request(self.layout.segment_id());
 
-        let ctx = self.layout.array_ctx().clone();
-        let session = self.session.clone();
-        let dtype = self.layout.dtype().clone();
-        let array_tree = self.layout.array_tree().cloned();
-        async move {
-            let segment = segment_fut.await?;
-            let parts = if let Some(array_tree) = array_tree {
-                // Use the pre-stored flatbuffer from layout metadata combined with segment buffers.
-                SerializedArray::from_flatbuffer_and_segment(array_tree, segment)?
-            } else {
-                // Parse the flatbuffer from the segment itself.
-                SerializedArray::try_from(segment)?
-            };
-            parts
-                .decode(&dtype, row_count, &ctx, &session)
-                .map_err(Arc::new)
-        }
-        .boxed()
-        .shared()
+        // Memoize the decoded array so a column used by BOTH the filter and the projection decodes
+        // once instead of twice. On a cache hit the init closure is not run, so the just-requested
+        // `segment_fut` is dropped after registering its prioritization hint and the cached decode
+        // (which owns the first call's `segment_fut`) is reused.
+        self.array
+            .get_or_init(move || {
+                let row_count = usize::try_from(self.layout.row_count())
+                    .vortex_expect("row count must fit in usize");
+                let ctx = self.layout.array_ctx().clone();
+                let session = self.session.clone();
+                let dtype = self.layout.dtype().clone();
+                let array_tree = self.layout.array_tree().cloned();
+                async move {
+                    let segment = segment_fut.await?;
+                    let parts = if let Some(array_tree) = array_tree {
+                        // Use the pre-stored flatbuffer from layout metadata combined with segment buffers.
+                        SerializedArray::from_flatbuffer_and_segment(array_tree, segment)?
+                    } else {
+                        // Parse the flatbuffer from the segment itself.
+                        SerializedArray::try_from(segment)?
+                    };
+                    parts
+                        .decode(&dtype, row_count, &ctx, &session)
+                        .map_err(Arc::new)
+                }
+                .boxed()
+                .shared()
+            })
+            .clone()
     }
 }
 
@@ -360,6 +378,51 @@ mod test {
 
             let expected = PrimitiveArray::new(buffer![3i32, 4], Validity::AllValid).into_array();
             assert_arrays_eq!(result, expected);
+        })
+    }
+
+    #[test]
+    fn array_future_memoizes_the_decode() {
+        block_on(|handle| async {
+            let session = SESSION.clone().with_handle(handle);
+            let ctx = ArrayContext::empty();
+            let segments = Arc::new(TestSegments::default());
+            let (ptr, eof) = SequenceId::root().split();
+            let array =
+                PrimitiveArray::new(buffer![1, 2, 3, 4, 5], Validity::AllValid).into_array();
+            let layout = FlatLayoutStrategy::default()
+                .write_stream(
+                    ctx,
+                    Arc::<TestSegments>::clone(&segments),
+                    array.to_array_stream().sequenced(ptr),
+                    eof,
+                    &session,
+                )
+                .await
+                .unwrap();
+
+            let reader = layout.new_reader("".into(), segments, &SESSION).unwrap();
+            let flat = reader
+                .as_any()
+                .downcast_ref::<super::FlatReader>()
+                .expect("flat layout must yield a FlatReader");
+
+            // The decoded array is not cached until the column is first touched.
+            assert!(flat.array.get().is_none(), "decode cache must start empty");
+
+            // First touch (e.g. the WHERE filter) decodes the chunk and memoizes it.
+            let a1 = flat.array_future().await.unwrap();
+            assert!(
+                flat.array.get().is_some(),
+                "decode must be memoized after the first array_future()"
+            );
+
+            // Second touch (e.g. the SELECT projection of the same column) reuses
+            // the cached decode instead of decoding the chunk again.
+            let a2 = flat.array_future().await.unwrap();
+
+            assert_arrays_eq!(a1, array.clone());
+            assert_arrays_eq!(a2, array);
         })
     }
 }
