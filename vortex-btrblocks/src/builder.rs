@@ -135,7 +135,7 @@ impl BtrBlocksCompressorBuilder {
         self
     }
 
-    /// Adds compact encoding schemes (Zstd for strings, Pco for numerics).
+    /// Adds compact encoding schemes (Zstd for strings and binary, Pco for numerics).
     ///
     /// This provides better compression ratios than the default, especially for floating-point
     /// heavy datasets. Requires the `zstd` feature. When the `pco` feature is also enabled,
@@ -146,7 +146,9 @@ impl BtrBlocksCompressorBuilder {
     /// Panics if any of the compact schemes are already present.
     #[cfg(feature = "zstd")]
     pub fn with_compact(self) -> Self {
-        let builder = self.with_new_scheme(&string::ZstdScheme);
+        let builder = self
+            .with_new_scheme(&string::ZstdScheme)
+            .with_new_scheme(&binary::ZstdScheme);
 
         #[cfg(feature = "pco")]
         let builder = builder
@@ -156,23 +158,7 @@ impl BtrBlocksCompressorBuilder {
         builder
     }
 
-    /// Adds the TurboQuant lossy vector quantization scheme.
-    ///
-    /// When enabled, [`Vector`] extension arrays are compressed using the TurboQuant algorithm
-    /// with MSE-optimal scalar quantization.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the TurboQuant scheme is already present.
-    ///
-    /// [`Vector`]: vortex_tensor::vector::Vector
-    #[cfg(feature = "unstable_encodings")]
-    pub fn with_turboquant(self) -> Self {
-        use vortex_tensor::encodings::turboquant::TurboQuantScheme;
-        self.with_new_scheme(&TurboQuantScheme)
-    }
-
-    /// Excludes schemes without CUDA kernel support and adds Zstd for string compression.
+    /// Excludes schemes without CUDA kernel support and adds Zstd for string and binary compression.
     ///
     /// With the `unstable_encodings` feature, buffer-level Zstd compression is used which
     /// preserves the array buffer layout for zero-conversion GPU decompression. Without it,
@@ -197,9 +183,13 @@ impl BtrBlocksCompressorBuilder {
         let builder = self.exclude_schemes(excluded);
 
         #[cfg(all(feature = "zstd", feature = "unstable_encodings"))]
-        let builder = builder.with_new_scheme(&string::ZstdBuffersScheme);
+        let builder = builder
+            .with_new_scheme(&string::ZstdBuffersScheme)
+            .with_new_scheme(&binary::ZstdBuffersScheme);
         #[cfg(all(feature = "zstd", not(feature = "unstable_encodings")))]
-        let builder = builder.with_new_scheme(&string::ZstdScheme);
+        let builder = builder
+            .with_new_scheme(&string::ZstdScheme)
+            .with_new_scheme(&binary::ZstdScheme);
 
         builder
     }
