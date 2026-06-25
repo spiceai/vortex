@@ -35,6 +35,7 @@ use vortex_session::SessionExt;
 use vortex_session::SessionVar;
 use vortex_session::registry::Id;
 use vortex_utils::aliases::DefaultHashBuilder;
+use vortex_utils::aliases::hash_map::HashMap;
 
 use crate::ArrayRef;
 use crate::ExecutionCtx;

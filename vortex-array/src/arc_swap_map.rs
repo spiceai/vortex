@@ -50,6 +50,14 @@ impl<K, V> ArcSwapMap<K, V> {
         f(&self.inner.load())
     }
 
+    /// Load the current snapshot as an owned [`Arc`].
+    ///
+    /// This is zero-copy: a single `Arc` refcount bump returning the same map
+    /// instance held inside the [`ArcSwap`], with no allocation or map copy.
+    pub(crate) fn load_full(&self) -> Arc<HashMap<K, V>> {
+        self.inner.load_full()
+    }
+
     /// Replace the map with the result of applying `f` to a private copy.
     ///
     /// Writes are copy-on-write via [`ArcSwap::rcu`], so `f` may run more than
