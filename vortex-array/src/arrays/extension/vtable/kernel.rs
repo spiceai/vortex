@@ -11,6 +11,8 @@ use crate::optimizer::kernels::ArrayKernelsExt;
 use crate::scalar_fn::ScalarFnVTable;
 use crate::scalar_fn::fns::binary::Binary;
 use crate::scalar_fn::fns::binary::CompareExecuteAdaptor;
+use crate::scalar_fn::fns::cast::Cast;
+use crate::scalar_fn::fns::cast::CastExecuteAdaptor;
 
 pub(crate) fn initialize(session: &VortexSession) {
     let kernels = session.kernels();
@@ -19,5 +21,6 @@ pub(crate) fn initialize(session: &VortexSession) {
         Extension,
         CompareExecuteAdaptor(Extension),
     );
+    kernels.register_execute_parent_kernel(Cast.id(), Extension, CastExecuteAdaptor(Extension));
     kernels.register_execute_parent_kernel(Dict.id(), Extension, TakeExecuteAdaptor(Extension));
 }

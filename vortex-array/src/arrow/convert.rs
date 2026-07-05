@@ -722,9 +722,8 @@ mod tests {
     use crate::arrays::list::ListArrayExt;
     use crate::arrays::listview::ListViewArrayExt;
     use crate::arrays::struct_::StructArrayExt;
+    use crate::arrow::ArrowSessionExt;
     use crate::arrow::FromArrowArray as _;
-    #[allow(deprecated)]
-    use crate::arrow::executor::ArrowArrayExecutor as _;
     use crate::dtype::DType;
     use crate::dtype::Nullability;
     use crate::dtype::PType;
@@ -1574,9 +1573,6 @@ mod tests {
     }
 
     #[test]
-    // Exercises the Vortex<->Arrow Map round-trip through the deprecated ctx-based
-    // `execute_arrow`/`ArrowArrayExecutor` path; migrate to `ArrowSession` when the map helper does.
-    #[allow(deprecated)]
     fn test_map_array_conversion() {
         use arrow_array::MapArray;
         use arrow_array::builder::MapBuilder;
@@ -1612,13 +1608,14 @@ mod tests {
         let struct_elements = list_array.elements().as_::<Struct>();
         assert_eq!(struct_elements.names().len(), 2); // key and value fields
 
-        // Convert back to Arrow as a MapArray
+        // Convert back to Arrow as a MapArray via an ArrowSession.
         let map_dtype = arrow_map.data_type().clone();
-        let arrow_back = vortex_array
-            .execute_arrow(
-                Some(&map_dtype),
-                &mut crate::LEGACY_SESSION.create_execution_ctx(),
-            )
+        let session = crate::array_session();
+        let mut ctx = session.create_execution_ctx();
+        let target = Field::new("", map_dtype, vortex_array.dtype().is_nullable());
+        let arrow_back = session
+            .arrow()
+            .execute_arrow(vortex_array, Some(&target), &mut ctx)
             .unwrap();
         let map_back = arrow_back
             .as_any()
