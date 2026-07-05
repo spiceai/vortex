@@ -19,8 +19,9 @@ use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
-use vortex_session::registry::ReadContext;
+use vortex_session::registry::CachedId;
 
+use crate::LayoutBuildContext;
 use crate::LayoutChildType;
 use crate::LayoutEncodingRef;
 use crate::LayoutId;
@@ -40,7 +41,8 @@ impl VTable for Dict {
     type Metadata = ProstMetadata<DictLayoutMetadata>;
 
     fn id(_encoding: &Self::Encoding) -> LayoutId {
-        LayoutId::new("vortex.dict")
+        static ID: CachedId = CachedId::new("vortex.dict");
+        *ID
     }
 
     fn encoding(_layout: &Self::Layout) -> LayoutEncodingRef {
@@ -110,7 +112,7 @@ impl VTable for Dict {
         metadata: &<Self::Metadata as DeserializeMetadata>::Output,
         _segment_ids: Vec<SegmentId>,
         children: &dyn LayoutChildren,
-        _ctx: &ReadContext,
+        _build_ctx: &LayoutBuildContext<'_>,
     ) -> VortexResult<Self::Layout> {
         let values = children.child(0, dtype)?;
         let codes_nullable = metadata

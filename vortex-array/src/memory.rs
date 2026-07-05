@@ -16,10 +16,10 @@ use vortex_buffer::ByteBufferMut;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
-use vortex_session::Ref;
-use vortex_session::RefMut;
 use vortex_session::SessionExt;
+use vortex_session::SessionGuard;
 use vortex_session::SessionVar;
+use vortex_session::VortexSession;
 
 /// Mutable host buffer contract used by [`WritableHostBuffer`].
 pub trait HostBufferMut: Send + 'static {
@@ -173,7 +173,7 @@ pub trait HostAllocatorExt: HostAllocator {
 impl<A: HostAllocator + ?Sized> HostAllocatorExt for A {}
 
 /// Session-scoped memory configuration for Vortex arrays.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct MemorySession {
     allocator: HostAllocatorRef,
 }
@@ -214,7 +214,7 @@ impl SessionVar for MemorySession {
 /// Extension trait for accessing session-scoped memory configuration.
 pub trait MemorySessionExt: SessionExt {
     /// Returns the memory session for this execution/session context.
-    fn memory(&self) -> Ref<'_, MemorySession> {
+    fn memory(&self) -> SessionGuard<'_, MemorySession> {
         self.get::<MemorySession>()
     }
 
@@ -223,9 +223,12 @@ pub trait MemorySessionExt: SessionExt {
         self.memory().allocator()
     }
 
-    /// Returns mutable access to the memory session.
-    fn memory_mut(&self) -> RefMut<'_, MemorySession> {
-        self.get_mut::<MemorySession>()
+    /// Configures the session to use `allocator` as its host allocator, mutating it in place and
+    /// returning it for chaining.
+    fn with_allocator(self, allocator: HostAllocatorRef) -> VortexSession {
+        let session = self.session();
+        session.get_mut::<MemorySession>().set_allocator(allocator);
+        session
     }
 }
 

@@ -4,8 +4,8 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use vortex_session::Ref;
 use vortex_session::SessionExt;
+use vortex_session::SessionGuard;
 use vortex_session::SessionVar;
 use vortex_session::registry::Registry;
 
@@ -14,12 +14,14 @@ use crate::scalar_fn::ScalarFnVTable;
 use crate::scalar_fn::fns::between::Between;
 use crate::scalar_fn::fns::binary::Binary;
 use crate::scalar_fn::fns::cast::Cast;
+use crate::scalar_fn::fns::ext_storage::ExtStorage;
 use crate::scalar_fn::fns::fill_null::FillNull;
 use crate::scalar_fn::fns::get_item::GetItem;
 use crate::scalar_fn::fns::is_not_null::IsNotNull;
 use crate::scalar_fn::fns::is_null::IsNull;
 use crate::scalar_fn::fns::like::Like;
 use crate::scalar_fn::fns::list_contains::ListContains;
+use crate::scalar_fn::fns::list_length::ListLength;
 use crate::scalar_fn::fns::literal::Literal;
 use crate::scalar_fn::fns::merge::Merge;
 use crate::scalar_fn::fns::not::Not;
@@ -33,7 +35,7 @@ use crate::scalar_fn::fns::variant_get::VariantGet;
 pub type ScalarFnRegistry = Registry<ScalarFnPluginRef>;
 
 /// Session state for scalar function vtables and rewrite rules.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ScalarFnSession {
     registry: ScalarFnRegistry,
 }
@@ -60,12 +62,14 @@ impl Default for ScalarFnSession {
         this.register(Between);
         this.register(Binary);
         this.register(Cast);
+        this.register(ExtStorage);
         this.register(FillNull);
         this.register(GetItem);
         this.register(IsNotNull);
         this.register(IsNull);
         this.register(Like);
         this.register(ListContains);
+        this.register(ListLength);
         this.register(Literal);
         this.register(Merge);
         this.register(Not);
@@ -92,7 +96,7 @@ impl SessionVar for ScalarFnSession {
 /// Extension trait for accessing scalar function session data.
 pub trait ScalarFnSessionExt: SessionExt {
     /// Returns the scalar function vtable registry.
-    fn scalar_fns(&self) -> Ref<'_, ScalarFnSession> {
+    fn scalar_fns(&self) -> SessionGuard<'_, ScalarFnSession> {
         self.get::<ScalarFnSession>()
     }
 }

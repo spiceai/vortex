@@ -39,8 +39,8 @@ use tracing::trace;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
-use vortex_session::Ref;
 use vortex_session::SessionExt;
+use vortex_session::SessionGuard;
 use vortex_session::SessionVar;
 use vortex_session::registry::Id;
 
@@ -58,7 +58,7 @@ use crate::dtype::FieldName;
 use crate::dtype::FieldNames;
 use crate::dtype::Nullability;
 use crate::dtype::StructFields;
-use crate::dtype::arrow::FromArrowType;
+use crate::dtype::arrow::TryFromArrowType;
 use crate::dtype::arrow::to_data_type_naive;
 use crate::dtype::extension::ExtId;
 use crate::extension::datetime::AnyTemporal;
@@ -163,7 +163,7 @@ pub type ArrowImportVTableRef = Arc<dyn ArrowImportVTable>;
 /// keyed by Arrow extension name. The default session pre-registers the builtin UUID
 /// plugin; temporal extensions are handled by the canonical Arrow ↔ Vortex path and do not
 /// need plugins.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ArrowSession {
     exporters: ArcSwapMap<Id, Arc<[ArrowExportVTableRef]>>,
     exporters_by_vortex: ArcSwapMap<ExtId, Arc<[ArrowExportVTableRef]>>,
@@ -314,7 +314,8 @@ impl ArrowSession {
     /// match (or all return `None`), recurses into container types ([`DataType::List`]
     /// family, [`DataType::FixedSizeList`], [`DataType::Struct`]) so extension metadata
     /// on nested element/struct fields is preserved. Leaf types use the canonical
-    /// Arrow → Vortex mapping via [`DType::from_arrow`].
+    /// Arrow → Vortex mapping via [`DType::try_from_arrow`].
+    #[expect(clippy::disallowed_methods, reason = "interning a dynamic id")]
     pub fn from_arrow_field(&self, field: &Field) -> VortexResult<DType> {
         if let Some(name) = field.metadata().get(EXTENSION_TYPE_NAME_KEY) {
             for plugin in self.importers(&Id::new(name)).iter() {
@@ -346,7 +347,7 @@ impl ArrowSession {
                     .collect::<VortexResult<Vec<_>>>()?;
                 DType::Struct(StructFields::from_iter(entries), nullability)
             }
-            _ => DType::from_arrow(field),
+            _ => DType::try_from_arrow(field)?,
         })
     }
 
@@ -407,6 +408,7 @@ impl ArrowSession {
     ///
     /// With `target = None` the fallback path picks the array's preferred Arrow physical type
     /// and executes directly into that, ignoring extension types.
+    #[expect(clippy::disallowed_methods, reason = "interning a dynamic id")]
     pub fn execute_arrow(
         &self,
         array: ArrayRef,
@@ -475,6 +477,7 @@ impl ArrowSession {
     /// through to the canonical Arrow → Vortex array conversion.
     pub fn from_arrow_array(&self, array: ArrowArrayRef, field: &Field) -> VortexResult<ArrayRef> {
         if let Some(extension_name) = field.metadata().get(EXTENSION_TYPE_NAME_KEY) {
+            #[expect(clippy::disallowed_methods, reason = "interning a dynamic id")]
             let importers = self.importers(&Id::new(extension_name));
             if !importers.is_empty() {
                 let dtype = self.from_arrow_field(field)?;
@@ -610,11 +613,11 @@ impl SessionVar for ArrowSession {
 /// Extension trait for accessing the [`ArrowSession`] on a Vortex session.
 pub trait ArrowSessionExt: SessionExt {
     /// Get the Arrow session.
-    fn arrow(&self) -> Ref<'_, ArrowSession>;
+    fn arrow(&self) -> SessionGuard<'_, ArrowSession>;
 }
 
 impl<S: SessionExt> ArrowSessionExt for S {
-    fn arrow(&self) -> Ref<'_, ArrowSession> {
+    fn arrow(&self) -> SessionGuard<'_, ArrowSession> {
         self.get::<ArrowSession>()
     }
 }
@@ -631,8 +634,8 @@ mod tests {
     use vortex_error::VortexResult;
 
     use super::*;
-    use crate::LEGACY_SESSION;
     use crate::VortexSessionExecute;
+    use crate::array_session;
     use crate::dtype::DType;
     use crate::dtype::FieldName;
     use crate::dtype::Nullability;
@@ -765,8 +768,9 @@ mod tests {
 
     #[test]
     fn execute_arrow_target_none_preserves_top_level_uuid_metadata() -> VortexResult<()> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
-        let session = LEGACY_SESSION.arrow();
+        let vortex_session = array_session();
+        let mut ctx = vortex_session.create_execution_ctx();
+        let session = vortex_session.arrow();
 
         let mut field = Field::new("id", DataType::FixedSizeBinary(16), false);
         field.try_with_extension_type(ArrowUuid)?;

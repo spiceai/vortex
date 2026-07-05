@@ -37,7 +37,6 @@ use crate::FoRData;
 use crate::r#for::array::FoRArrayExt;
 use crate::r#for::array::SLOT_NAMES;
 use crate::r#for::array::for_decompress::decompress;
-use crate::r#for::vtable::kernels::PARENT_KERNELS;
 use crate::r#for::vtable::rules::PARENT_RULES;
 
 mod kernels;
@@ -48,6 +47,10 @@ mod validity;
 
 /// A [`FoR`]-encoded Vortex array.
 pub type FoRArray = Array<FoR>;
+
+pub(crate) fn initialize(session: &VortexSession) {
+    kernels::initialize(session);
+}
 
 impl ArrayHash for FoRData {
     fn array_hash<H: Hasher>(&self, state: &mut H, _accuracy: EqMode) {
@@ -93,6 +96,14 @@ impl VTable for FoR {
 
     fn buffer_name(_array: ArrayView<'_, Self>, _idx: usize) -> Option<String> {
         None
+    }
+
+    fn with_buffers(
+        &self,
+        array: ArrayView<'_, Self>,
+        buffers: &[BufferHandle],
+    ) -> VortexResult<ArrayParts<Self>> {
+        vortex_array::vtable::with_empty_buffers(self, array, buffers)
     }
 
     fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {
@@ -150,15 +161,6 @@ impl VTable for FoR {
     fn execute(array: Array<Self>, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
         Ok(ExecutionResult::done(decompress(&array, ctx)?.into_array()))
     }
-
-    fn execute_parent(
-        array: ArrayView<'_, Self>,
-        parent: &ArrayRef,
-        child_idx: usize,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<Option<ArrayRef>> {
-        PARENT_KERNELS.execute(array, parent, child_idx, ctx)
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -179,8 +181,8 @@ impl FoR {
     }
 
     /// Encode a primitive array using Frame of Reference encoding.
-    pub fn encode(array: PrimitiveArray) -> VortexResult<FoRArray> {
-        FoRData::encode(array)
+    pub fn encode(array: PrimitiveArray, ctx: &mut ExecutionCtx) -> VortexResult<FoRArray> {
+        FoRData::encode(array, ctx)
     }
 }
 

@@ -48,15 +48,17 @@ mod tests {
     use vortex_array::dtype::Nullability;
     use vortex_array::dtype::PType;
     use vortex_array::scalar::Scalar;
-    use vortex_array::session::ArraySession;
     use vortex_buffer::buffer;
     use vortex_session::VortexSession;
 
     use crate::Sparse;
     use crate::SparseArray;
 
-    static SESSION: LazyLock<VortexSession> =
-        LazyLock::new(|| VortexSession::empty().with::<ArraySession>());
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
+        let session = vortex_array::array_session();
+        crate::initialize(&session);
+        session
+    });
 
     #[test]
     fn test_cast_sparse_i32_to_i64() {
@@ -80,7 +82,7 @@ mod tests {
 
         let expected = PrimitiveArray::from_iter([0i64, 0, 100, 0, 0, 200, 0, 0, 300, 0]);
         let casted_primitive = casted.execute::<PrimitiveArray>(&mut ctx).unwrap();
-        assert_arrays_eq!(casted_primitive, expected);
+        assert_arrays_eq!(casted_primitive, expected, &mut ctx);
     }
 
     #[test]
@@ -142,7 +144,9 @@ mod tests {
         // zero fill, and keeps the result in the Sparse encoding.
         let sparse = Sparse::try_new(
             buffer![0u64, 1, 2, 3, 4].into_array(),
-            buffer![10u64, 20, 30, 40, 50].into_array(),
+            // Nullable values to match the null (nullable) fill.
+            PrimitiveArray::from_option_iter([Some(10u64), Some(20), Some(30), Some(40), Some(50)])
+                .into_array(),
             5,
             Scalar::null_native::<u64>(),
         )?;
@@ -158,7 +162,7 @@ mod tests {
 
         let expected = PrimitiveArray::from_iter([10u64, 20, 30, 40, 50]);
         let casted_primitive = casted.execute::<PrimitiveArray>(&mut ctx)?;
-        assert_arrays_eq!(casted_primitive, expected);
+        assert_arrays_eq!(casted_primitive, expected, &mut ctx);
         Ok(())
     }
 
@@ -169,7 +173,8 @@ mod tests {
         // non-nullable, which must not panic.
         let sparse = Sparse::try_new(
             buffer![1u64, 3].into_array(),
-            buffer![10u64, 20].into_array(),
+            // Nullable values to match the null (nullable) fill.
+            PrimitiveArray::from_option_iter([Some(10u64), Some(20)]).into_array(),
             5,
             Scalar::null_native::<u64>(),
         )?;

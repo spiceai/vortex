@@ -25,13 +25,13 @@ use crate::array::ArrayId;
 use crate::array::ArrayParts;
 use crate::array::ArrayView;
 use crate::array::VTable;
+use crate::array::with_empty_buffers;
 use crate::arrays::list::ListArrayExt;
 use crate::arrays::list::ListData;
 use crate::arrays::list::array::ELEMENTS_SLOT;
 use crate::arrays::list::array::NUM_SLOTS;
 use crate::arrays::list::array::OFFSETS_SLOT;
 use crate::arrays::list::array::SLOT_NAMES;
-use crate::arrays::list::compute::PARENT_KERNELS;
 use crate::arrays::list::compute::rules::PARENT_RULES;
 use crate::arrays::listview::list_view_from_list;
 use crate::buffer::BufferHandle;
@@ -83,6 +83,14 @@ impl VTable for List {
 
     fn buffer_name(_array: ArrayView<'_, Self>, idx: usize) -> Option<String> {
         vortex_panic!("ListArray buffer_name index {idx} out of bounds")
+    }
+
+    fn with_buffers(
+        &self,
+        array: ArrayView<'_, Self>,
+        buffers: &[BufferHandle],
+    ) -> VortexResult<ArrayParts<Self>> {
+        with_empty_buffers(self, array, buffers)
     }
 
     fn reduce_parent(
@@ -190,15 +198,6 @@ impl VTable for List {
         Ok(ExecutionResult::done(
             list_view_from_list(array, ctx)?.into_array(),
         ))
-    }
-
-    fn execute_parent(
-        array: ArrayView<'_, Self>,
-        parent: &ArrayRef,
-        child_idx: usize,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<Option<ArrayRef>> {
-        PARENT_KERNELS.execute(array, parent, child_idx, ctx)
     }
 }
 

@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use kernel::PARENT_KERNELS;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_panic;
 
+use crate::ArrayParts;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::ExecutionResult;
@@ -15,8 +15,11 @@ use crate::array::ArrayView;
 use crate::array::VTable;
 use crate::arrays::primitive::PrimitiveData;
 use crate::buffer::BufferHandle;
+use crate::builders::ArrayBuilder;
+use crate::builders::PrimitiveBuilder;
 use crate::dtype::DType;
 use crate::dtype::PType;
+use crate::match_each_native_ptype;
 use crate::serde::ArrayChildren;
 use crate::validity::Validity;
 mod kernel;
@@ -38,6 +41,10 @@ use crate::hash::ArrayHash;
 
 /// A [`Primitive`]-encoded Vortex array.
 pub type PrimitiveArray = Array<Primitive>;
+
+pub(crate) fn initialize(session: &VortexSession) {
+    kernel::initialize(session);
+}
 
 impl ArrayHash for PrimitiveData {
     fn array_hash<H: Hasher>(&self, state: &mut H, accuracy: EqMode) {
@@ -78,6 +85,24 @@ impl VTable for Primitive {
             0 => Some("values".to_string()),
             _ => None,
         }
+    }
+
+    fn with_buffers(
+        &self,
+        array: ArrayView<'_, Self>,
+        buffers: &[BufferHandle],
+    ) -> VortexResult<ArrayParts<Self>> {
+        vortex_ensure!(
+            buffers.len() == 1,
+            "Expected 1 buffer, got {}",
+            buffers.len()
+        );
+        let mut data = array.data().clone();
+        data.buffer = buffers[0].clone();
+        Ok(
+            ArrayParts::new(self.clone(), array.dtype().clone(), array.len(), data)
+                .with_slots(array.slots().iter().cloned().collect()),
+        )
     }
 
     fn serialize(
@@ -125,7 +150,7 @@ impl VTable for Primitive {
         buffers: &[BufferHandle],
         children: &dyn ArrayChildren,
         _session: &VortexSession,
-    ) -> VortexResult<crate::array::ArrayParts<Self>> {
+    ) -> VortexResult<ArrayParts<Self>> {
         if !metadata.is_empty() {
             vortex_bail!(
                 "PrimitiveArray expects empty metadata, got {} bytes",
@@ -173,7 +198,7 @@ impl VTable for Primitive {
         // SAFETY: checked ahead of time
         let slots = PrimitiveData::make_slots(&validity, len);
         let data = unsafe { PrimitiveData::new_unchecked_from_handle(buffer, ptype, validity) };
-        Ok(crate::array::ArrayParts::new(self.clone(), dtype.clone(), len, data).with_slots(slots))
+        Ok(ArrayParts::new(self.clone(), dtype.clone(), len, data).with_slots(slots))
     }
 
     fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {
@@ -184,21 +209,27 @@ impl VTable for Primitive {
         Ok(ExecutionResult::done(array))
     }
 
+    fn append_to_builder(
+        array: ArrayView<'_, Self>,
+        builder: &mut dyn ArrayBuilder,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<()> {
+        match_each_native_ptype!(array.ptype(), |P| {
+            if let Some(builder) = builder.as_any_mut().downcast_mut::<PrimitiveBuilder<P>>() {
+                return builder.append_primitive_array(&array.into_owned(), ctx);
+            }
+        });
+
+        builder.extend_from_array(array.as_ref());
+        Ok(())
+    }
+
     fn reduce_parent(
         array: ArrayView<'_, Self>,
         parent: &ArrayRef,
         child_idx: usize,
     ) -> VortexResult<Option<ArrayRef>> {
         RULES.evaluate(array, parent, child_idx)
-    }
-
-    fn execute_parent(
-        array: ArrayView<'_, Self>,
-        parent: &ArrayRef,
-        child_idx: usize,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<Option<ArrayRef>> {
-        PARENT_KERNELS.execute(array, parent, child_idx, ctx)
     }
 }
 
@@ -209,19 +240,24 @@ pub struct Primitive;
 mod tests {
     use vortex_buffer::ByteBufferMut;
     use vortex_buffer::buffer;
+    use vortex_error::VortexResult;
     use vortex_session::registry::ReadContext;
 
     use crate::ArrayContext;
     use crate::IntoArray;
-    use crate::LEGACY_SESSION;
+    use crate::VortexSessionExecute;
+    use crate::array_session;
     use crate::arrays::PrimitiveArray;
     use crate::assert_arrays_eq;
+    use crate::buffer::BufferHandle;
     use crate::serde::SerializeOptions;
     use crate::serde::SerializedArray;
     use crate::validity::Validity;
 
     #[test]
     fn test_nullable_primitive_serde_roundtrip() {
+        let session = array_session();
+        let mut ctx = session.create_execution_ctx();
         let array = PrimitiveArray::new(
             buffer![1i32, 2, 3, 4],
             Validity::from_iter([true, false, true, false]),
@@ -229,11 +265,11 @@ mod tests {
         let dtype = array.dtype().clone();
         let len = array.len();
 
-        let ctx = ArrayContext::empty();
+        let array_ctx = ArrayContext::empty();
         let serialized = array
             .clone()
             .into_array()
-            .serialize(&ctx, &LEGACY_SESSION, &SerializeOptions::default())
+            .serialize(&array_ctx, &session, &SerializeOptions::default())
             .unwrap();
 
         let mut concat = ByteBufferMut::empty();
@@ -242,14 +278,35 @@ mod tests {
         }
         let parts = SerializedArray::try_from(concat.freeze()).unwrap();
         let decoded = parts
-            .decode(
-                &dtype,
-                len,
-                &ReadContext::new(ctx.to_ids()),
-                &LEGACY_SESSION,
-            )
+            .decode(&dtype, len, &ReadContext::new(array_ctx.to_ids()), &session)
             .unwrap();
 
-        assert_arrays_eq!(decoded, array);
+        assert_arrays_eq!(decoded, array, &mut ctx);
+    }
+
+    #[test]
+    fn test_with_buffers_replaces_primitive_buffer_with_equivalent_contents() -> VortexResult<()> {
+        let session = array_session();
+        let mut ctx = session.create_execution_ctx();
+
+        let array = PrimitiveArray::from_iter([1i32, 2, 3, 4]).into_array();
+        let replacement = BufferHandle::new_host(buffer![1i32, 2, 3, 4].into_byte_buffer());
+        // SAFETY: the replacement buffer contains the same logical values as the original array;
+        // only the buffer handle changes.
+        let rewritten = unsafe { array.with_buffers([replacement]) }?;
+        let expected = PrimitiveArray::from_iter([1i32, 2, 3, 4]);
+
+        assert_arrays_eq!(rewritten, expected, &mut ctx);
+        Ok(())
+    }
+
+    #[test]
+    fn test_with_buffers_rejects_length_change() {
+        let array = PrimitiveArray::from_iter([1i32, 2, 3, 4]).into_array();
+        let replacement = BufferHandle::new_host(buffer![10i32, 20, 30].into_byte_buffer());
+
+        // SAFETY: this call is expected to fail the checked buffer length invariant before any
+        // rewritten array is returned or observed.
+        assert!(unsafe { array.with_buffers([replacement]) }.is_err());
     }
 }

@@ -11,8 +11,9 @@ use vortex_array::EmptyMetadata;
 use vortex_array::dtype::DType;
 use vortex_error::VortexResult;
 use vortex_session::VortexSession;
-use vortex_session::registry::ReadContext;
+use vortex_session::registry::CachedId;
 
+use crate::LayoutBuildContext;
 use crate::LayoutChildType;
 use crate::LayoutEncodingRef;
 use crate::LayoutId;
@@ -35,7 +36,8 @@ impl VTable for Chunked {
     type Metadata = EmptyMetadata;
 
     fn id(_encoding: &Self::Encoding) -> LayoutId {
-        LayoutId::new("vortex.chunked")
+        static ID: CachedId = CachedId::new("vortex.chunked");
+        *ID
     }
 
     fn encoding(_layout: &Self::Layout) -> LayoutEncodingRef {
@@ -93,7 +95,7 @@ impl VTable for Chunked {
         _metadata: &<Self::Metadata as DeserializeMetadata>::Output,
         _segment_ids: Vec<SegmentId>,
         children: &dyn LayoutChildren,
-        _ctx: &ReadContext,
+        _build_ctx: &LayoutBuildContext<'_>,
     ) -> VortexResult<Self::Layout> {
         Ok(ChunkedLayout::new(
             row_count,

@@ -4,8 +4,8 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use vortex_session::Ref;
 use vortex_session::SessionExt;
+use vortex_session::SessionGuard;
 use vortex_session::SessionVar;
 
 use crate::aggregate_fn::AggregateFnId;
@@ -50,7 +50,7 @@ use crate::arrays::dict::compute::min_max::DictMinMaxKernel;
 /// The default session registers the built-in aggregate functions and kernels. Additional
 /// aggregate functions and kernels may be registered by extensions when they are added to a
 /// [`VortexSession`](vortex_session::VortexSession).
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct AggregateFnSession {
     registry: ArcSwapMap<AggregateFnId, AggregateFnPluginRef>,
 
@@ -222,7 +222,7 @@ impl AggregateFnSession {
 /// Extension trait for accessing aggregate function session data.
 pub trait AggregateFnSessionExt: SessionExt {
     /// Returns the aggregate function session data.
-    fn aggregate_fns(&self) -> Ref<'_, AggregateFnSession> {
+    fn aggregate_fns(&self) -> SessionGuard<'_, AggregateFnSession> {
         self.get::<AggregateFnSession>()
     }
 }

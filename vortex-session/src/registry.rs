@@ -19,10 +19,12 @@ use lasso::Spur;
 use lasso::ThreadedRodeo;
 use parking_lot::RwLock;
 use vortex_error::VortexExpect;
+use vortex_utils::aliases::DefaultHashBuilder;
 use vortex_utils::aliases::dash_map::DashMap;
 
 /// Global string interner for [`Id`] values.
-static INTERNER: LazyLock<ThreadedRodeo> = LazyLock::new(ThreadedRodeo::new);
+static INTERNER: LazyLock<ThreadedRodeo<Spur, DefaultHashBuilder>> =
+    LazyLock::new(|| ThreadedRodeo::with_hasher(DefaultHashBuilder::default()));
 
 /// A lightweight, copyable identifier backed by a global string interner.
 ///
@@ -53,6 +55,7 @@ impl Id {
 }
 
 impl From<&str> for Id {
+    #[expect(clippy::disallowed_methods, reason = "interning a dynamic id")]
     fn from(s: &str) -> Self {
         Self::new(s)
     }
@@ -134,8 +137,12 @@ impl CachedId {
 impl Deref for CachedId {
     type Target = Id;
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "CachedId interns its static id once here"
+    )]
     fn deref(&self) -> &Id {
-        self.cached.get_or_init(|| Id::new(self.s))
+        self.cached.get_or_init(|| Id::new_static(self.s))
     }
 }
 

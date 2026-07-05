@@ -43,7 +43,6 @@ use vortex_session::registry::CachedId;
 
 use crate::canonical::canonicalize_onpair;
 use crate::canonical::onpair_decode_views;
-use crate::kernel::PARENT_KERNELS;
 use crate::rules::RULES;
 
 /// An [`OnPair`]-encoded Vortex array.
@@ -368,6 +367,24 @@ impl VTable for OnPair {
         }
     }
 
+    fn with_buffers(
+        &self,
+        array: ArrayView<'_, Self>,
+        buffers: &[BufferHandle],
+    ) -> VortexResult<ArrayParts<Self>> {
+        vortex_ensure!(
+            buffers.len() == 1,
+            "Expected 1 buffer, got {}",
+            buffers.len()
+        );
+        let mut data = array.data().clone();
+        data.dict_bytes = buffers[0].clone();
+        Ok(
+            ArrayParts::new(self.clone(), array.dtype().clone(), array.len(), data)
+                .with_slots(array.slots().iter().cloned().collect()),
+        )
+    }
+
     fn serialize(
         array: ArrayView<'_, Self>,
         _session: &VortexSession,
@@ -497,15 +514,6 @@ impl VTable for OnPair {
                 .execute_mask(array.array().len(), ctx)?,
         );
         Ok(())
-    }
-
-    fn execute_parent(
-        array: ArrayView<'_, Self>,
-        parent: &ArrayRef,
-        child_idx: usize,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<Option<ArrayRef>> {
-        PARENT_KERNELS.execute(array, parent, child_idx, ctx)
     }
 
     fn reduce_parent(

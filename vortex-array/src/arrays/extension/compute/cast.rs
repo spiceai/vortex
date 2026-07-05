@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+// The extension date->timestamp cast runs through `CastReduce::cast`, whose signature exposes no
+// `ExecutionCtx`. It therefore relies on the ctx-free canonicalization helpers (`to_primitive`,
+// `to_extension`, `to_canonical`, `scalar_at`) that upstream deprecated in favour of the ctx-based
+// `execute::<T>(ctx)` APIs. TODO(spiceai): thread an `ExecutionCtx` through the cast path so these
+// deprecated helpers can be dropped.
+#![allow(deprecated)]
+
 use vortex_buffer::BufferMut;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
@@ -214,10 +221,8 @@ mod tests {
     use crate::extension::datetime::Date;
     use crate::extension::datetime::TimeUnit;
     use crate::extension::datetime::Timestamp;
-    use crate::session::ArraySession;
 
-    static SESSION: LazyLock<VortexSession> =
-        LazyLock::new(|| VortexSession::empty().with::<ArraySession>());
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(crate::array_session);
 
     #[test]
     fn cast_same_ext_dtype() {
@@ -325,6 +330,7 @@ mod tests {
 
     #[test]
     fn cast_timestamp_to_i64() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
         let ext_dtype = Timestamp::new_with_tz(
             TimeUnit::Nanoseconds,
             Some("UTC".into()),
@@ -339,7 +345,7 @@ mod tests {
             result.dtype(),
             &DType::Primitive(PType::I64, Nullability::NonNullable)
         );
-        assert_arrays_eq!(result, buffer![1i64, 2, 3].into_array());
+        assert_arrays_eq!(result, buffer![1i64, 2, 3].into_array(), &mut ctx);
         Ok(())
     }
 

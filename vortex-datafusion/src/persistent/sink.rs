@@ -14,6 +14,7 @@ use datafusion_common::exec_datafusion_err;
 use datafusion_common_runtime::JoinSet;
 use datafusion_common_runtime::SpawnedTask;
 use datafusion_datasource::ListingTableUrl;
+use datafusion_datasource::display::FileGroupDisplay;
 use datafusion_datasource::file_sink_config::FileSink;
 use datafusion_datasource::file_sink_config::FileSinkConfig;
 use datafusion_datasource::sink::DataSink;
@@ -27,6 +28,7 @@ use datafusion_physical_plan::metrics::MetricsSet;
 use futures::SinkExt;
 use futures::Stream;
 use futures::StreamExt;
+use futures::channel::mpsc;
 use object_store::ObjectStore;
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
@@ -106,10 +108,11 @@ impl CompressionEstimate {
 
 struct ActiveFileWriter {
     path: Path,
-    sender: futures::channel::mpsc::Sender<RecordBatch>,
+    sender: mpsc::Sender<RecordBatch>,
     task: JoinHandle<DFResult<WriteSummary>>,
 }
 
+/// Implements [`DataSink`] for writing Vortex files.
 pub struct VortexSink {
     config: FileSinkConfig,
     schema: SchemaRef,
@@ -118,6 +121,7 @@ pub struct VortexSink {
 }
 
 impl VortexSink {
+    /// Creates a new [`VortexSink`] instance.
     pub fn new(
         config: FileSinkConfig,
         schema: SchemaRef,
@@ -158,9 +162,12 @@ impl std::fmt::Debug for VortexSink {
 impl DisplayAs for VortexSink {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match t {
-            DisplayFormatType::Default
-            | DisplayFormatType::Verbose
-            | DisplayFormatType::TreeRender => {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(f, "VortexSink(file_groups=")?;
+                FileGroupDisplay(&self.config.file_group).fmt_as(t, f)?;
+                write!(f, ")")
+            }
+            DisplayFormatType::TreeRender => {
                 write!(f, "VortexSink")
             }
         }
@@ -481,7 +488,7 @@ fn start_file_writer(
     dtype: DType,
     import_schema: SchemaRef,
 ) -> ActiveFileWriter {
-    let (sender, receiver) = futures::channel::mpsc::channel::<RecordBatch>(1);
+    let (sender, receiver) = mpsc::channel::<RecordBatch>(1);
     let session = session.clone();
     let path_for_task = path.clone();
 
@@ -645,29 +652,37 @@ mod tests {
     use datafusion_common::ScalarValue;
     use datafusion_common::exec_datafusion_err;
     use datafusion_datasource::ListingTableUrl;
+    use datafusion_datasource::TableSchema;
     use datafusion_datasource::file_format::format_as_file_type;
+    use datafusion_datasource::file_groups::FileGroup;
+    use datafusion_datasource::file_sink_config::FileOutputMode;
+    use datafusion_datasource::sink::DataSinkExec;
+    use datafusion_execution::object_store::ObjectStoreUrl;
+    use datafusion_physical_plan::DefaultDisplay;
+    use datafusion_physical_plan::VerboseDisplay;
+    use datafusion_physical_plan::display::DisplayableExecutionPlan;
+    use datafusion_physical_plan::empty::EmptyExec;
     use futures::TryStreamExt;
     use rstest::rstest;
     use tokio::sync::oneshot;
     use tokio::time::Duration;
+    use vortex::file::VORTEX_FILE_EXTENSION;
+    use vortex::session::VortexSession;
 
+    use super::*;
     use crate::common_tests::TestSessionContext;
     use crate::persistent::VortexFormatFactory;
     use crate::persistent::VortexTableOptions;
     use crate::persistent::sink::ActiveFileWriter;
     use crate::persistent::sink::finish_file_writer;
 
-    fn split_path(
-        base_path: &object_store::path::Path,
-        file_index: usize,
-        extension: &str,
-    ) -> object_store::path::Path {
+    fn split_path(base_path: &Path, file_index: usize, extension: &str) -> Path {
         let mut base = base_path.to_string();
         if !base.ends_with('/') {
             base.push('/');
         }
         let filename = format!("part-{file_index:05}.{extension}");
-        object_store::path::Path::from(format!("{base}{filename}"))
+        Path::from(format!("{base}{filename}"))
     }
 
     #[tokio::test]
@@ -914,7 +929,7 @@ mod tests {
         let table = ctx.session.table("my_tbl").await?;
         assert_eq!(table.count().await?, 3);
 
-        let location = object_store::path::Path::parse("table/")?;
+        let location = Path::parse("table/")?;
         let file_metas = ctx
             .store
             .list(Some(&location))
@@ -934,7 +949,7 @@ mod tests {
 
     #[test]
     fn test_split_path_basic() {
-        let path = object_store::path::Path::from("data/output");
+        let path = Path::from("data/output");
         assert_eq!(
             split_path(&path, 0, "vortex").to_string(),
             "data/output/part-00000.vortex"
@@ -947,7 +962,7 @@ mod tests {
 
     #[test]
     fn test_split_path_preserves_trailing_slash() {
-        let path = object_store::path::Path::from("nested/path/");
+        let path = Path::from("nested/path/");
         assert_eq!(
             split_path(&path, 3, "vx").to_string(),
             "nested/path/part-00003.vx"
@@ -958,7 +973,7 @@ mod tests {
     fn test_numbered_path() {
         use super::numbered_path;
 
-        let path = object_store::path::Path::from("table/c1=alpha/abc123.vortex");
+        let path = Path::from("table/c1=alpha/abc123.vortex");
         assert_eq!(
             numbered_path(&path, 0, "vortex").to_string(),
             "table/c1=alpha/abc123_00000.vortex"
@@ -973,7 +988,7 @@ mod tests {
     fn test_numbered_path_no_extension() {
         use super::numbered_path;
 
-        let path = object_store::path::Path::from("table/output");
+        let path = Path::from("table/output");
         assert_eq!(
             numbered_path(&path, 0, "vortex").to_string(),
             "table/output_00000.vortex"
@@ -1003,13 +1018,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_finish_file_writer_waits_for_task_completion() -> anyhow::Result<()> {
-        let (sender, receiver) = futures::channel::mpsc::channel::<RecordBatch>(1);
+        let (sender, receiver) = mpsc::channel::<RecordBatch>(1);
         drop(receiver);
 
         let (gate_tx, gate_rx) = oneshot::channel::<()>();
 
         let writer = ActiveFileWriter {
-            path: object_store::path::Path::from("table/pending.vortex"),
+            path: Path::from("table/pending.vortex"),
             sender,
             task: tokio::spawn(async move {
                 let _ = gate_rx.await;
@@ -1366,7 +1381,7 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await?;
 
-        let unique_write_ids: vortex_utils::aliases::hash_set::HashSet<_> = file_metas
+        let unique_write_ids: HashSet<_> = file_metas
             .iter()
             .filter_map(|m| {
                 m.location
@@ -1469,7 +1484,7 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await?;
 
-        let unique_write_ids: vortex_utils::aliases::hash_set::HashSet<_> = file_metas
+        let unique_write_ids: HashSet<_> = file_metas
             .iter()
             .filter_map(|m| {
                 m.location
@@ -1556,7 +1571,7 @@ mod tests {
 
         let all_files = ctx.store.list(None).try_collect::<Vec<_>>().await?;
 
-        let unique_write_ids: vortex_utils::aliases::hash_set::HashSet<_> = all_files
+        let unique_write_ids: HashSet<_> = all_files
             .iter()
             .filter_map(|m| {
                 m.location
@@ -1618,10 +1633,7 @@ mod tests {
                 &self.schema
             }
 
-            fn execute(
-                &self,
-                _ctx: Arc<datafusion::execution::TaskContext>,
-            ) -> datafusion::physical_plan::SendableRecordBatchStream {
+            fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
                 let schema = Arc::clone(&self.schema);
                 let batch = self.batch.clone();
                 Box::pin(RecordBatchStreamAdapter::new(
@@ -1674,7 +1686,7 @@ mod tests {
 
         let all_files = ctx.store.list(None).try_collect::<Vec<_>>().await?;
 
-        let unique_write_ids: vortex_utils::aliases::hash_set::HashSet<_> = all_files
+        let unique_write_ids: HashSet<_> = all_files
             .iter()
             .filter_map(|m| {
                 m.location
@@ -1735,10 +1747,7 @@ mod tests {
                 &self.schema
             }
 
-            fn execute(
-                &self,
-                _ctx: Arc<datafusion::execution::TaskContext>,
-            ) -> datafusion::physical_plan::SendableRecordBatchStream {
+            fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
                 let schema = Arc::clone(&self.schema);
                 let batch = self.batch.clone();
                 Box::pin(RecordBatchStreamAdapter::new(
@@ -1797,7 +1806,7 @@ mod tests {
 
         let all_files = ctx.store.list(None).try_collect::<Vec<_>>().await?;
 
-        let unique_write_ids: vortex_utils::aliases::hash_set::HashSet<_> = all_files
+        let unique_write_ids: HashSet<_> = all_files
             .iter()
             .filter_map(|m| {
                 m.location
@@ -1858,10 +1867,7 @@ mod tests {
                 &self.schema
             }
 
-            fn execute(
-                &self,
-                _ctx: Arc<datafusion::execution::TaskContext>,
-            ) -> datafusion::physical_plan::SendableRecordBatchStream {
+            fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
                 let schema = Arc::clone(&self.schema);
                 let batch = self.batch.clone();
                 Box::pin(RecordBatchStreamAdapter::new(
@@ -1920,7 +1926,7 @@ mod tests {
 
         let all_files = ctx.store.list(None).try_collect::<Vec<_>>().await?;
 
-        let unique_write_ids: vortex_utils::aliases::hash_set::HashSet<_> = all_files
+        let unique_write_ids: HashSet<_> = all_files
             .iter()
             .filter_map(|m| {
                 m.location
@@ -1956,5 +1962,51 @@ mod tests {
         assert_eq!(count, expected_total_rows, "Total row count mismatch");
 
         Ok(())
+    }
+
+    #[test]
+    fn test_display_as() {
+        let session = VortexSession::empty();
+        let table_schema = TableSchema::new(Arc::new(Schema::empty()), Vec::new());
+
+        let config = FileSinkConfig {
+            original_url: "".to_owned(),
+            object_store_url: ObjectStoreUrl::local_filesystem(),
+            file_group: FileGroup::new(Vec::new()),
+            table_paths: Vec::new(),
+            output_schema: Arc::new(Schema::empty()),
+            table_partition_cols: Vec::new(),
+            insert_op: InsertOp::Overwrite,
+            keep_partition_by_columns: false,
+            file_extension: VORTEX_FILE_EXTENSION.to_owned(),
+            file_output_mode: FileOutputMode::SingleFile,
+        };
+
+        let get_sink = || VortexSink {
+            config: config.clone(),
+            schema: Arc::clone(table_schema.file_schema()),
+            session: session.clone(),
+            target_file_size: None,
+        };
+
+        insta::assert_snapshot!(DefaultDisplay(get_sink()).to_string(), @"VortexSink(file_groups=[])");
+        insta::assert_snapshot!(VerboseDisplay(get_sink()).to_string(), @"VortexSink(file_groups=[])");
+
+        let plan = DataSinkExec::new(
+            Arc::new(EmptyExec::new(Arc::new(Schema::empty()))),
+            Arc::new(get_sink()),
+            None,
+        );
+
+        insta::assert_snapshot!(DisplayableExecutionPlan::new(&plan).tree_render().to_string(), @r"
+        ┌───────────────────────────┐
+        │        DataSinkExec       │
+        │    --------------------   │
+        │         VortexSink        │
+        └─────────────┬─────────────┘
+        ┌─────────────┴─────────────┐
+        │         EmptyExec         │
+        └───────────────────────────┘
+        ");
     }
 }

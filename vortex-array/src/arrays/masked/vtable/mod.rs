@@ -18,6 +18,7 @@ use vortex_session::registry::CachedId;
 use crate::AnyCanonical;
 use crate::ArrayEq;
 use crate::ArrayHash;
+use crate::ArrayParts;
 use crate::ArrayRef;
 use crate::Canonical;
 use crate::EqMode;
@@ -29,6 +30,7 @@ use crate::array::ArrayId;
 use crate::array::ArrayView;
 use crate::array::VTable;
 use crate::array::validity_to_child;
+use crate::array::with_empty_buffers;
 use crate::arrays::ConstantArray;
 use crate::arrays::masked::MaskedArrayExt;
 use crate::arrays::masked::MaskedArraySlotsExt;
@@ -105,6 +107,14 @@ impl VTable for Masked {
         None
     }
 
+    fn with_buffers(
+        &self,
+        array: ArrayView<'_, Self>,
+        buffers: &[BufferHandle],
+    ) -> VortexResult<ArrayParts<Self>> {
+        with_empty_buffers(self, array, buffers)
+    }
+
     fn serialize(
         _array: ArrayView<'_, Self>,
         _session: &VortexSession,
@@ -121,7 +131,7 @@ impl VTable for Masked {
         buffers: &[BufferHandle],
         children: &dyn ArrayChildren,
         _session: &VortexSession,
-    ) -> VortexResult<crate::array::ArrayParts<Self>> {
+    ) -> VortexResult<ArrayParts<Self>> {
         if !metadata.is_empty() {
             vortex_bail!(
                 "MaskedArray expects empty metadata, got {} bytes",
@@ -153,10 +163,8 @@ impl VTable for Masked {
             child.all_valid(&mut LEGACY_SESSION.create_execution_ctx())?,
             validity,
         )?;
-        Ok(
-            crate::array::ArrayParts::new(self.clone(), dtype.clone(), len, data)
-                .with_slots(smallvec![Some(child), validity_slot]),
-        )
+        Ok(ArrayParts::new(self.clone(), dtype.clone(), len, data)
+            .with_slots(smallvec![Some(child), validity_slot]))
     }
 
     fn execute(array: Array<Self>, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
@@ -165,7 +173,7 @@ impl VTable for Masked {
         let validity = array.masked_validity();
 
         // Fast path: all masked means result is all nulls.
-        if matches!(validity, Validity::AllInvalid) {
+        if validity.definitely_all_null() {
             return Ok(ExecutionResult::done(
                 ConstantArray::new(Scalar::null(array.dtype().as_nullable()), array.len())
                     .into_array(),
@@ -206,8 +214,8 @@ mod tests {
     use crate::ArrayContext;
     use crate::Canonical;
     use crate::IntoArray;
-    use crate::LEGACY_SESSION;
     use crate::VortexSessionExecute;
+    use crate::array_session;
     use crate::arrays::Masked;
     use crate::arrays::MaskedArray;
     use crate::arrays::PrimitiveArray;
@@ -243,7 +251,7 @@ mod tests {
         let serialized = array
             .clone()
             .into_array()
-            .serialize(&ctx, &LEGACY_SESSION, &SerializeOptions::default())
+            .serialize(&ctx, &array_session(), &SerializeOptions::default())
             .unwrap();
 
         // Concat into a single buffer.
@@ -259,7 +267,7 @@ mod tests {
                 &dtype,
                 len,
                 &ReadContext::new(ctx.to_ids()),
-                &LEGACY_SESSION,
+                &array_session(),
             )
             .unwrap();
 
@@ -287,7 +295,7 @@ mod tests {
         assert_eq!(array.dtype().nullability(), Nullability::Nullable);
 
         // Execute the array. This should produce a Canonical with Nullable dtype.
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = array_session().create_execution_ctx();
         let result: Canonical = array.into_array().execute(&mut ctx)?;
 
         assert_eq!(

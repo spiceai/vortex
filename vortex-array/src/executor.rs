@@ -15,6 +15,7 @@
 use std::env::VarError;
 use std::fmt;
 use std::fmt::Display;
+use std::sync::Arc;
 use std::sync::LazyLock;
 #[cfg(debug_assertions)]
 use std::sync::atomic::AtomicUsize;
@@ -26,7 +27,6 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_panic;
-use vortex_session::SessionExt;
 use vortex_session::VortexSession;
 
 use crate::AnyCanonical;
@@ -41,8 +41,9 @@ use crate::matcher::Matcher;
 use crate::memory::HostAllocatorRef;
 use crate::memory::MemorySessionExt;
 use crate::optimizer::ArrayOptimizer;
-use crate::optimizer::kernels::ArrayKernels;
-use crate::optimizer::kernels::KernelSnapshot;
+use crate::optimizer::kernels::ArrayKernelsExt;
+use crate::optimizer::kernels::ParentExecutionKernels;
+use crate::optimizer::kernels::execute_parent_key;
 use crate::stats::ArrayStats;
 use crate::stats::StatsSet;
 
@@ -140,12 +141,16 @@ impl ArrayRef {
     ///     - yes -> skip Step 2a / 2b
     ///     - no  -> try parent kernels
     ///
-    ///   Step 2a: current_array.execute_parent(stack.top.parent_array)
-    ///     child looks up at the suspended parent from ExecuteSlot
+    ///   Step 2a: if stack.top exists:
+    ///               parent = stack.top.parent_array
+    ///               child = current_array
+    ///               kernels[(parent.encoding_id(), child.encoding_id())]
+    ///                 .try_execute_parent(child, parent, stack.top.slot_idx)
     ///
     ///   Step 2b: for child in current_array.children():
-    ///               child.execute_parent(current_array)
-    ///     each child looks up at current_array
+    ///               parent = current_array
+    ///               kernels[(parent.encoding_id(), child.encoding_id())]
+    ///                 .try_execute_parent(child, parent, child.slot_idx)
     ///
     ///   Step 3: match current_array.execute()
     ///     ExecuteSlot(i, pred) -> push parent on stack, focus child `i`
@@ -162,6 +167,8 @@ impl ArrayRef {
         let mut current_array = self;
         let mut current_builder: Option<Box<dyn ArrayBuilder>> = None;
         let mut stack: Vec<StackFrame> = Vec::new();
+        let execute_parent_kernels = Arc::clone(&ctx.execute_parent_kernels);
+        let kernels = execute_parent_kernels.as_ref();
         let max_iterations = max_iterations();
 
         for _ in 0..max_iterations {
@@ -198,8 +205,15 @@ impl ArrayRef {
             // would be lost when we restore frame.parent_builder.
             if current_builder.is_none()
                 && let Some(frame) = stack.last()
-                && let Some(result) =
-                    current_array.execute_parent(&frame.parent_array, frame.slot_idx, ctx)?
+                && let Some(result) = {
+                    execute_parent_for_child(
+                        &frame.parent_array,
+                        &current_array,
+                        frame.slot_idx,
+                        kernels,
+                        ctx,
+                    )?
+                }
             {
                 ctx.log(format_args!(
                     "execute_parent (stack) rewrote {} -> {}",
@@ -213,7 +227,7 @@ impl ArrayRef {
 
             // Step 2b: execute_parent against current_array's own children.
             if current_builder.is_none()
-                && let Some(rewritten) = try_execute_parent(&current_array, ctx)?
+                && let Some(rewritten) = try_execute_parent(&current_array, kernels, ctx)?
             {
                 ctx.log(format_args!(
                     "execute_parent rewrote {} -> {}",
@@ -305,16 +319,7 @@ struct StackFrame {
 #[derive(Debug, Clone)]
 pub struct ExecutionCtx {
     session: VortexSession,
-    /// Snapshot of the session's [`ArrayKernels`] execute-parent kernels, resolved once at
-    /// construction.
-    ///
-    /// The registry is session-scoped and mutable through its public `register_*` methods, so
-    /// this context sees the kernels as registered when it was created; later registrations are
-    /// picked up by the next context (contexts are created per evaluation). Caching the snapshot
-    /// avoids a per-array-node session clone plus a sharded `DashMap` `RwLock` probe in the hot
-    /// `execute_until` loop, and avoids holding the session-variable read guard across kernel
-    /// invocation. `None` means the session had no [`ArrayKernels`] when the context was created.
-    kernels: Option<KernelSnapshot>,
+    execute_parent_kernels: Arc<ParentExecutionKernels>,
     #[cfg(debug_assertions)]
     id: usize,
     #[cfg(debug_assertions)]
@@ -323,11 +328,15 @@ pub struct ExecutionCtx {
 
 impl ExecutionCtx {
     /// Create a new execution context with the given session.
+    ///
+    /// This captures a snapshot of the session's execute-parent kernel registry. Kernels
+    /// registered after this context is created are not visible to it; create a new
+    /// [`ExecutionCtx`] after registration to use newly registered kernels.
     pub fn new(session: VortexSession) -> Self {
-        let kernels = session.get_opt::<ArrayKernels>().map(|k| k.snapshot());
+        let execute_parent_kernels = session.kernels().execute_parent_snapshot();
         Self {
             session,
-            kernels,
+            execute_parent_kernels,
             #[cfg(debug_assertions)]
             id: {
                 static EXEC_CTX_ID: AtomicUsize = AtomicUsize::new(0);
@@ -343,12 +352,6 @@ impl ExecutionCtx {
         &self.session
     }
 
-    /// Get the [`KernelSnapshot`] resolved once for this execution context, if the session had an
-    /// [`ArrayKernels`] registry. Cheap to clone (one `Arc` clone).
-    pub(crate) fn kernels(&self) -> Option<&KernelSnapshot> {
-        self.kernels.as_ref()
-    }
-
     /// Get the session-scoped host allocator for this execution context.
     pub fn allocator(&self) -> HostAllocatorRef {
         self.session.allocator()
@@ -362,7 +365,7 @@ impl ExecutionCtx {
     /// Use the [`format_args!`] macro to create the `msg` argument.
     pub fn log(&mut self, msg: fmt::Arguments<'_>) {
         #[cfg(debug_assertions)]
-        if tracing::enabled!(tracing::Level::DEBUG) {
+        if tracing::enabled!(tracing::Level::TRACE) {
             let formatted = format!(" - {msg}");
             tracing::trace!("exec[{}]: {formatted}", self.id);
             self.ops.push(formatted);
@@ -442,12 +445,13 @@ impl Executable for ArrayRef {
             }
         }
 
-        let kernels = ctx.kernels().cloned();
+        let execute_parent_kernels = Arc::clone(&ctx.execute_parent_kernels);
+        let kernels = execute_parent_kernels.as_ref();
 
         for (slot_idx, slot) in array.slots().iter().enumerate() {
             let Some(child) = slot else { continue };
             if let Some(executed_parent) =
-                execute_parent_for_child(&array, child, slot_idx, kernels.as_ref(), ctx)?
+                execute_parent_for_child(&array, child, slot_idx, kernels, ctx)?
             {
                 ctx.log(format_args!(
                     "execute_parent: slot[{}]({}) rewrote {} -> {}",
@@ -474,7 +478,9 @@ impl Executable for ArrayRef {
             ExecutionStep::ExecuteSlot(i, _) => {
                 let child = array.slots()[i].clone().vortex_expect("valid slot index");
                 let executed_child = child.execute::<ArrayRef>(ctx)?;
-                array.with_slot(i, executed_child)
+                // SAFETY: execution of a child slot produces a logically equivalent array in a
+                // different physical representation, preserving parent values and statistics.
+                unsafe { array.with_slot(i, executed_child) }
             }
             ExecutionStep::AppendChild(_) => {
                 // Single-step: build the entire parent via the builder path.
@@ -559,31 +565,41 @@ fn execute_parent_for_child(
     parent: &ArrayRef,
     child: &ArrayRef,
     slot_idx: usize,
-    kernels: Option<&KernelSnapshot>,
+    kernels: &ParentExecutionKernels,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<Option<ArrayRef>> {
-    if let Some(kernels) = kernels
-        && let Some(plugins) =
-            kernels.find_execute_parent(parent.encoding_id(), child.encoding_id())
-    {
+    let key = execute_parent_key(parent.encoding_id(), child.encoding_id());
+    if let Some(plugins) = kernels.get(&key) {
         for plugin in plugins.as_ref() {
-            if let Some(result) = plugin(child, parent, slot_idx, ctx)? {
+            if let Some(result) = plugin.execute_parent(child, parent, slot_idx, ctx)? {
+                if cfg!(debug_assertions) {
+                    vortex_ensure!(
+                        result.len() == parent.len(),
+                        "Executed parent canonical length mismatch"
+                    );
+                    vortex_ensure!(
+                        result.dtype() == parent.dtype(),
+                        "Executed parent canonical dtype mismatch"
+                    );
+                }
                 return Ok(Some(result));
             }
         }
     }
 
-    child.execute_parent(parent, slot_idx, ctx)
+    Ok(None)
 }
 
 /// Try execute_parent on each occupied slot of the array.
-fn try_execute_parent(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Option<ArrayRef>> {
-    let kernels = ctx.kernels().cloned();
-
+fn try_execute_parent(
+    array: &ArrayRef,
+    kernels: &ParentExecutionKernels,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<Option<ArrayRef>> {
     for (slot_idx, slot) in array.slots().iter().enumerate() {
         let Some(child) = slot else { continue };
         if let Some(executed_parent) =
-            execute_parent_for_child(array, child, slot_idx, kernels.as_ref(), ctx)?
+            execute_parent_for_child(array, child, slot_idx, kernels, ctx)?
         {
             ctx.log(format_args!(
                 "execute_parent: slot[{}]({}) rewrote {} -> {}",
@@ -832,5 +848,57 @@ pub trait VortexSessionExecute {
 impl VortexSessionExecute for VortexSession {
     fn create_execution_ctx(&self) -> ExecutionCtx {
         ExecutionCtx::new(self.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use vortex_session::VortexSession;
+
+    use super::*;
+    use crate::VTable as _;
+    use crate::VortexSessionExecute;
+    use crate::arrays::Bool;
+    use crate::arrays::Primitive;
+    use crate::optimizer::kernels::ExecuteParentFn;
+    use crate::optimizer::kernels::KernelSession;
+    use crate::optimizer::kernels::execute_parent_key;
+
+    fn noop_execute_parent(
+        _child: &ArrayRef,
+        _parent: &ArrayRef,
+        _child_idx: usize,
+        _ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<ArrayRef>> {
+        Ok(None)
+    }
+
+    #[test]
+    fn execution_ctx_snapshots_execute_parent_kernels_at_creation() {
+        let session = VortexSession::empty().with_some(KernelSession::empty());
+        let key = execute_parent_key(Bool.id(), Primitive.id());
+
+        let before_registration = session.create_execution_ctx();
+        assert!(
+            !before_registration
+                .execute_parent_kernels
+                .contains_key(&key)
+        );
+
+        let kernels = session.kernels();
+        kernels.register_execute_parent(
+            Bool.id(),
+            Primitive.id(),
+            &[noop_execute_parent as ExecuteParentFn],
+        );
+
+        assert!(
+            !before_registration
+                .execute_parent_kernels
+                .contains_key(&key)
+        );
+
+        let after_registration = session.create_execution_ctx();
+        assert!(after_registration.execute_parent_kernels.contains_key(&key));
     }
 }

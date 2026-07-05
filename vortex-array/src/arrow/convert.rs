@@ -723,6 +723,7 @@ mod tests {
     use crate::arrays::listview::ListViewArrayExt;
     use crate::arrays::struct_::StructArrayExt;
     use crate::arrow::FromArrowArray as _;
+    #[allow(deprecated)]
     use crate::arrow::executor::ArrowArrayExecutor as _;
     use crate::dtype::DType;
     use crate::dtype::Nullability;
@@ -1573,6 +1574,9 @@ mod tests {
     }
 
     #[test]
+    // Exercises the Vortex<->Arrow Map round-trip through the deprecated ctx-based
+    // `execute_arrow`/`ArrowArrayExecutor` path; migrate to `ArrowSession` when the map helper does.
+    #[allow(deprecated)]
     fn test_map_array_conversion() {
         use arrow_array::MapArray;
         use arrow_array::builder::MapBuilder;

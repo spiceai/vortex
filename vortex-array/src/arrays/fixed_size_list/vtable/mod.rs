@@ -15,6 +15,7 @@ use vortex_session::registry::CachedId;
 
 use crate::ArrayEq;
 use crate::ArrayHash;
+use crate::ArrayParts;
 use crate::ArrayRef;
 use crate::EqMode;
 use crate::ExecutionCtx;
@@ -23,6 +24,7 @@ use crate::array::Array;
 use crate::array::ArrayId;
 use crate::array::ArrayView;
 use crate::array::VTable;
+use crate::array::with_empty_buffers;
 use crate::arrays::fixed_size_list::FixedSizeListData;
 use crate::arrays::fixed_size_list::array::ELEMENTS_SLOT;
 use crate::arrays::fixed_size_list::array::NUM_SLOTS;
@@ -38,6 +40,10 @@ mod validity;
 
 /// A [`FixedSizeList`]-encoded Vortex array.
 pub type FixedSizeListArray = Array<FixedSizeList>;
+
+pub(crate) fn initialize(session: &VortexSession) {
+    kernel::initialize(session);
+}
 
 #[derive(Clone, Debug)]
 pub struct FixedSizeList;
@@ -76,21 +82,20 @@ impl VTable for FixedSizeList {
         vortex_panic!("FixedSizeListArray buffer_name index {idx} out of bounds")
     }
 
+    fn with_buffers(
+        &self,
+        array: ArrayView<'_, Self>,
+        buffers: &[BufferHandle],
+    ) -> VortexResult<ArrayParts<Self>> {
+        with_empty_buffers(self, array, buffers)
+    }
+
     fn reduce_parent(
         array: ArrayView<'_, Self>,
         parent: &ArrayRef,
         child_idx: usize,
     ) -> VortexResult<Option<ArrayRef>> {
         PARENT_RULES.evaluate(array, parent, child_idx)
-    }
-
-    fn execute_parent(
-        array: ArrayView<'_, Self>,
-        parent: &ArrayRef,
-        child_idx: usize,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<Option<ArrayRef>> {
-        Self::PARENT_KERNELS.execute(array, parent, child_idx, ctx)
     }
 
     fn serialize(
@@ -150,7 +155,7 @@ impl VTable for FixedSizeList {
         buffers: &[BufferHandle],
         children: &dyn ArrayChildren,
         _session: &VortexSession,
-    ) -> VortexResult<crate::array::ArrayParts<Self>> {
+    ) -> VortexResult<ArrayParts<Self>> {
         if !metadata.is_empty() {
             vortex_bail!(
                 "FixedSizeListArray expects empty metadata, got {} bytes",
@@ -186,7 +191,7 @@ impl VTable for FixedSizeList {
         let data =
             FixedSizeListData::try_build(elements.clone(), *list_size, validity.clone(), len)?;
         let slots = FixedSizeListData::make_slots(&elements, &validity, len);
-        Ok(crate::array::ArrayParts::new(self.clone(), dtype.clone(), len, data).with_slots(slots))
+        Ok(ArrayParts::new(self.clone(), dtype.clone(), len, data).with_slots(slots))
     }
 
     fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {

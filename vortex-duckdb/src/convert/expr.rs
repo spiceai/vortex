@@ -4,7 +4,9 @@
 use std::sync::Arc;
 
 use tracing::debug;
+use vortex::dtype::DType;
 use vortex::dtype::Nullability;
+use vortex::dtype::PType;
 use vortex::error::VortexError;
 use vortex::error::VortexExpect;
 use vortex::error::VortexResult;
@@ -13,14 +15,18 @@ use vortex::error::vortex_ensure;
 use vortex::error::vortex_err;
 use vortex::expr::Expression;
 use vortex::expr::and_collect;
+use vortex::expr::byte_length;
+use vortex::expr::cast;
 use vortex::expr::col;
 use vortex::expr::get_item;
 use vortex::expr::is_not_null;
 use vortex::expr::is_null;
 use vortex::expr::list_contains;
+use vortex::expr::list_length;
 use vortex::expr::lit;
 use vortex::expr::not;
 use vortex::expr::or_collect;
+use vortex::expr::root;
 use vortex::scalar::Scalar;
 use vortex::scalar_fn::ScalarFnVTableExt;
 use vortex::scalar_fn::fns::between::Between;
@@ -32,6 +38,7 @@ use vortex::scalar_fn::fns::like::LikeOptions;
 use vortex::scalar_fn::fns::literal::Literal;
 use vortex::scalar_fn::fns::operators::Operator;
 
+use crate::cpp::DUCKDB_TYPE;
 use crate::cpp::DUCKDB_VX_EXPR_TYPE;
 use crate::duckdb;
 use crate::duckdb::BoundFunction;
@@ -43,6 +50,7 @@ use crate::duckdb::ExpressionClass::BoundComparison;
 use crate::duckdb::ExpressionClass::BoundConjunction;
 use crate::duckdb::ExpressionClass::BoundConstant;
 use crate::duckdb::ExpressionClass::BoundRef;
+use crate::projection::DuckdbField;
 
 fn from_bound_str(value: &duckdb::ExpressionRef) -> VortexResult<String> {
     match value.as_class().vortex_expect("unknown class") {
@@ -51,11 +59,39 @@ fn from_bound_str(value: &duckdb::ExpressionRef) -> VortexResult<String> {
     }
 }
 
+/// Whether the expression's return type is a `LIST` or fixed-size `ARRAY`.
+fn returns_a_list(expr: &duckdb::ExpressionRef) -> bool {
+    matches!(
+        expr.return_type().as_type_id(),
+        DUCKDB_TYPE::DUCKDB_TYPE_LIST | DUCKDB_TYPE::DUCKDB_TYPE_ARRAY
+    )
+}
+
+/// Wrap `expr` in `list_length`. Since vortex `list_length` returns u64 but duckdb equivalents
+/// return i64, we must cast as well.
+fn build_list_length(expr: Expression, nullability: Nullability) -> Expression {
+    cast(list_length(expr), DType::Primitive(PType::I64, nullability))
+}
+
 fn try_from_bound_function(
     func: &BoundFunction,
     col_sub: Option<&Expression>,
 ) -> VortexResult<Option<Expression>> {
     let expr = match func.scalar_function.name() {
+        "strlen" => {
+            let children: Vec<_> = func.children().collect();
+            vortex_ensure!(children.len() == 1);
+            let Some(col) = try_from_expression_inner(children[0], col_sub)? else {
+                return Ok(None);
+            };
+            let col = byte_length(col);
+            // byte_length returns u64, strlen expects i64.
+            // At this point we don't know column's dtype so we ultimately
+            // set it to be nullable. For non-nullable column the nullability
+            // will be AllValid so it's a marginal cost.
+            let dtype = DType::Primitive(PType::I64, Nullability::Nullable);
+            cast(col, dtype)
+        }
         "struct_extract" => {
             let children: Vec<_> = func.children().collect();
             vortex_ensure!(children.len() == 2);
@@ -95,6 +131,37 @@ fn try_from_bound_function(
             };
             Like.new_expr(LikeOptions::default(), [value, lit(pattern)])
         }
+        "array_length" => {
+            let children = func.children().collect::<Vec<_>>();
+            // Only accept array_length(expr) rather than array_length(expr, dim).
+            if children.len() != 1 {
+                return Ok(None);
+            }
+            let Some(col) = try_from_expression_inner(children[0], col_sub)? else {
+                return Ok(None);
+            };
+
+            // We don't know the column's nullability here, so we set it to nullable.
+            build_list_length(col, Nullability::Nullable)
+        }
+        // len/length semantics depend on the return type of underlying expr.
+        "len" | "length" => {
+            let children: Vec<_> = func.children().collect();
+            vortex_ensure!(children.len() == 1);
+            let child = children[0];
+
+            if returns_a_list(child) {
+                let Some(col) = try_from_expression_inner(child, col_sub)? else {
+                    return Ok(None);
+                };
+
+                // Same nullability rationale as in "array_length" branch.
+                let list_len_expr = build_list_length(col, Nullability::Nullable);
+                return Ok(Some(list_len_expr));
+            } else {
+                return Ok(None);
+            }
+        }
         _ => {
             debug!("bound function {}", func.scalar_function.name());
             return Ok(None);
@@ -117,20 +184,23 @@ pub(super) fn try_from_bound_expression_with_col_sub(
     try_from_expression_inner(value, Some(col_sub))
 }
 
-/*
- * Called before pushdown_complex_filter or a table filter expression call.
- * As we support complex filter pushdown, Duckdb pushes expressions to Vortex.
- * However, it doesn't know what type of expressions we can handle. Here we list
- * all expressions that are quaranteed to be converted to Vortex expressions.
- *
- * If we return true here, and expression is in the list for
- * pushdown_complex_filter, we must handle it, or query engine will break.
- *
- * Example: we don't support substr() expression so we tell Duckdb we can't
- * push it.
- * Example: optional filters may fail to parse on our side (we return
- * Ok(None)), so we don't allow pushing these.
- */
+fn is_supported_length_alias(func: &BoundFunction) -> bool {
+    let children: Vec<_> = func.children().collect();
+    children.len() == 1 && returns_a_list(children[0])
+}
+
+// Called before pushdown_complex_filter or a table filter expression call.
+// As we support complex filter pushdown, Duckdb pushes expressions to Vortex.
+// However, it doesn't know what type of expressions we can handle. Here we list
+// all expressions that are quaranteed to be converted to Vortex expressions.
+//
+// If we return true here, and expression is in the list for
+// pushdown_complex_filter, we must handle it, or query engine will break.
+//
+// Example: we don't support substr() expression so we tell Duckdb we can't
+// push it.
+// Example: optional filters may fail to parse on our side (we return
+// Ok(None)), so we don't allow pushing these.
 pub fn can_push_expression(value: &duckdb::ExpressionRef) -> bool {
     let Some(value) = value.as_class() else {
         return false;
@@ -154,6 +224,9 @@ pub fn can_push_expression(value: &duckdb::ExpressionRef) -> bool {
                 || name == "suffix"
                 || name == "~~"
                 || name == "!~~"
+                || name == "strlen"
+                || name == "array_length"
+                || (matches!(name, "len" | "length") && is_supported_length_alias(&func))
         }
         ExpressionClass::BoundOperator(op) => {
             if !matches!(
@@ -169,6 +242,42 @@ pub fn can_push_expression(value: &duckdb::ExpressionRef) -> bool {
             op.children().all(can_push_expression)
         }
     }
+}
+
+/// Applies `list_length` expression to a duckdb field
+fn list_length_on_field(field: &DuckdbField) -> Expression {
+    let col = get_item(field.name.as_str(), root());
+
+    build_list_length(col, field.dtype.nullability())
+}
+
+pub fn try_from_projection_expression(
+    value: &duckdb::ExpressionRef,
+    field: &DuckdbField,
+) -> VortexResult<Option<Expression>> {
+    let Some(value) = value.as_class() else {
+        return Ok(None);
+    };
+    let ExpressionClass::BoundFunction(func) = value else {
+        return Ok(None);
+    };
+    Ok(match func.scalar_function.name() {
+        "strlen" => {
+            let col = byte_length(get_item(field.name.as_str(), root()));
+            // byte_length returns u64, strlen expects i64
+            let dtype = DType::Primitive(PType::I64, field.dtype.nullability());
+            let col = cast(col, dtype);
+            Some(col)
+        }
+        "array_length" => {
+            // Only accept array_length(expr) rather than array_length(expr, dim).
+            (func.children().count() == 1).then(|| list_length_on_field(field))
+        }
+        // len/length have different semantics depending on field dtype.
+        "len" | "length" => matches!(field.dtype, DType::List(..) | DType::FixedSizeList(..))
+            .then(|| list_length_on_field(field)),
+        _ => None,
+    })
 }
 
 // If you want to add support for other expressions, also change

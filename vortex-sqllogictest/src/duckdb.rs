@@ -9,7 +9,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bigdecimal::BigDecimal;
 use datafusion_sqllogictest::DFColumnType;
-use indicatif::ProgressBar;
+use regex::RegexBuilder;
 use sqllogictest::DBOutput;
 use sqllogictest::Normalizer;
 use sqllogictest::runner::AsyncDB;
@@ -25,17 +25,10 @@ use vortex_duckdb::initialize;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DuckDBTestError {
+    #[error("Other: {0}")]
     Other(String),
+    #[error("Vortex: {0}")]
     Vortex(#[from] VortexError),
-}
-
-impl std::fmt::Display for DuckDBTestError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DuckDBTestError::Other(msg) => write!(f, "Other: {msg}"),
-            DuckDBTestError::Vortex(inner) => write!(f, "Vortex: {inner}"),
-        }
-    }
 }
 
 struct Inner {
@@ -43,16 +36,16 @@ struct Inner {
     _db: Database,
 }
 
-unsafe impl Send for Inner {}
 unsafe impl Sync for Inner {}
+
+unsafe impl Send for Inner {}
 
 pub struct DuckDB {
     inner: Arc<Inner>,
-    pb: ProgressBar,
 }
 
 impl DuckDB {
-    pub fn try_new(pb: ProgressBar) -> Result<Self, DuckDBTestError> {
+    pub fn try_new() -> Result<Self, DuckDBTestError> {
         let db = Database::open_in_memory()?;
         db.register_vortex_scan_replacement()?;
         initialize(&db)?;
@@ -60,7 +53,6 @@ impl DuckDB {
         let conn = db.connect()?;
 
         Ok(Self {
-            pb,
             inner: Arc::new(Inner { conn, _db: db }),
         })
     }
@@ -73,6 +65,7 @@ impl DuckDB {
 
         if type_id == LogicalType::int32().as_type_id()
             || type_id == LogicalType::int64().as_type_id()
+            || type_id == LogicalType::uint32().as_type_id()
             || type_id == LogicalType::uint64().as_type_id()
             || type_id == LogicalType::int128().as_type_id()
             || type_id == LogicalType::uint128().as_type_id()
@@ -99,20 +92,59 @@ impl DuckDB {
     }
 }
 
+// Regex matching for output inspired by Duckdb's .test files. Rows joined
+// by newline are matched against positive or negative match.
+const REGEX_MARKER: &str = "<REGEX>:";
+const NEG_REGEX_MARKER: &str = "<!REGEX>:";
+
+/// Compiles `pattern` and tests it against `text`.
+///
+/// Returns `None` when the pattern fails to compile so callers can fail the
+/// assertion. A malformed `<REGEX>` directive is a test authoring error; it
+/// must not panic and abort the whole test binary.
+fn try_regex_match(pattern: &str, text: &str) -> Option<bool> {
+    match RegexBuilder::new(pattern)
+        .dot_matches_new_line(true)
+        .build()
+    {
+        Ok(regex) => Some(regex.is_match(text)),
+        Err(e) => {
+            eprintln!("invalid <REGEX> pattern '{pattern}': {e}");
+            None
+        }
+    }
+}
+
 pub fn duckdb_validator(
     normalizer: Normalizer,
     actual: &[Vec<String>],
     expected: &[String],
 ) -> bool {
-    let actual = actual.iter().flat_map(|strings| {
-        strings
-            .join(" ")
-            .trim_end()
-            .split('\n')
-            .map(|line| line.trim_end().to_string())
-            .collect::<Vec<_>>()
-    });
-    Iterator::eq(actual, expected.iter().map(normalizer))
+    let actual = actual
+        .iter()
+        .flat_map(|strings| {
+            strings
+                .join(" ")
+                .trim_end()
+                .split('\n')
+                .map(|line| line.trim_end().to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let expected = expected.iter().map(normalizer).collect::<Vec<_>>();
+
+    if let [line] = expected.as_slice() {
+        // An invalid pattern yields `None`, which fails validation regardless of
+        // the marker direction (so a bad `<!REGEX>` cannot spuriously pass).
+        if let Some(pattern) = line.strip_prefix(NEG_REGEX_MARKER) {
+            return try_regex_match(pattern, &actual.join("\n")).is_some_and(|matched| !matched);
+        }
+        if let Some(pattern) = line.strip_prefix(REGEX_MARKER) {
+            return try_regex_match(pattern, &actual.join("\n")).unwrap_or(false);
+        }
+    }
+
+    Iterator::eq(actual.iter(), expected.iter())
 }
 
 #[async_trait]
@@ -121,46 +153,39 @@ impl AsyncDB for DuckDB {
     type ColumnType = DFColumnType;
 
     async fn run(&mut self, sql: &str) -> Result<DBOutput<Self::ColumnType>, Self::Error> {
-        let result = {
-            let r = self.inner.conn.query(sql)?;
+        let r = self.inner.conn.query(sql)?;
 
-            if r.column_count() == 0 && r.row_count() == 0 {
-                Ok(DBOutput::StatementComplete(0))
-            } else {
-                let mut types = Vec::default();
-                let mut rows = Vec::default();
+        if r.column_count() == 0 && r.row_count() == 0 {
+            Ok(DBOutput::StatementComplete(0))
+        } else {
+            let mut types = Vec::default();
+            let mut rows = Vec::default();
 
-                for col_idx in 0..r.column_count() {
-                    let col_idx = usize::try_from(col_idx).map_err(VortexError::from)?;
-                    let dtype = r.column_type(col_idx);
-                    types.push(Self::normalize_column_type(&dtype));
-                }
+            for col_idx in 0..r.column_count() {
+                let col_idx = usize::try_from(col_idx).map_err(VortexError::from)?;
+                let dtype = r.column_type(col_idx);
+                types.push(Self::normalize_column_type(&dtype));
+            }
 
-                for chunk in r.into_iter() {
-                    for row_idx in 0..chunk.len() {
-                        let mut current_row = Vec::new();
-                        for col_idx in 0..chunk.column_count() {
-                            let vector = chunk.get_vector(col_idx);
-                            match vector.get_value(row_idx, chunk.len()) {
-                                Some(value) => {
-                                    current_row.push(ValueDisplayAdapter(value).to_string())
-                                }
-                                None => current_row
-                                    .push(Value::null(&vector.logical_type()).to_string()),
+            for chunk in r.into_iter() {
+                for row_idx in 0..chunk.len() {
+                    let mut current_row = Vec::new();
+                    for col_idx in 0..chunk.column_count() {
+                        let vector = chunk.get_vector(col_idx);
+                        match vector.get_value(row_idx, chunk.len()) {
+                            Some(value) => current_row.push(ValueDisplayAdapter(value).to_string()),
+                            None => {
+                                current_row.push(Value::null(&vector.logical_type()).to_string())
                             }
                         }
-
-                        rows.push(current_row);
                     }
+
+                    rows.push(current_row);
                 }
-
-                Ok(DBOutput::Rows { types, rows })
             }
-        };
 
-        self.pb.inc(1);
-
-        result
+            Ok(DBOutput::Rows { types, rows })
+        }
     }
 
     async fn shutdown(&mut self) {}
@@ -270,13 +295,126 @@ impl std::fmt::Display for ValueDisplayAdapter {
 
 #[cfg(test)]
 mod tests {
+    use datafusion_sqllogictest::DFColumnType;
     use rstest::rstest;
+    use vortex_duckdb::duckdb::LogicalType;
     use vortex_duckdb::duckdb::Value;
 
+    use super::DuckDB;
     use super::ValueDisplayAdapter;
+    use super::duckdb_validator;
+    use super::try_regex_match;
 
     fn display(value: Value) -> String {
         ValueDisplayAdapter(value).to_string()
+    }
+
+    #[rstest]
+    #[case("foo", "foo", Some(true))]
+    #[case("foo", "xfooy", Some(true))]
+    #[case("foo", "bar", Some(false))]
+    #[case("^foo$", "foo", Some(true))]
+    #[case("^foo$", "xfoo", Some(false))]
+    #[case("a.*b", "axxxb", Some(true))]
+    #[case("a.*b", "a\nxx\nb", Some(true))]
+    #[case("needle", "line1\nneedle here\nline3", Some(true))]
+    #[case("missing", "line1\nline2\nline3", Some(false))]
+    // An invalid pattern returns `None` instead of panicking.
+    #[case("(unclosed", "anything", None)]
+    fn test_try_regex_match(
+        #[case] pattern: &str,
+        #[case] text: &str,
+        #[case] expected: Option<bool>,
+    ) {
+        assert_eq!(try_regex_match(pattern, text), expected);
+    }
+
+    #[rstest]
+    #[case(LogicalType::int32(), DFColumnType::Integer)]
+    #[case(LogicalType::int64(), DFColumnType::Integer)]
+    #[case(LogicalType::uint32(), DFColumnType::Integer)]
+    #[case(LogicalType::uint64(), DFColumnType::Integer)]
+    #[case(LogicalType::int128(), DFColumnType::Integer)]
+    #[case(LogicalType::uint128(), DFColumnType::Integer)]
+    #[case(LogicalType::varchar(), DFColumnType::Text)]
+    #[case(LogicalType::bool(), DFColumnType::Boolean)]
+    #[case(LogicalType::float32(), DFColumnType::Float)]
+    #[case(LogicalType::float64(), DFColumnType::Float)]
+    #[case(LogicalType::date(), DFColumnType::DateTime)]
+    #[case(LogicalType::timestamp(), DFColumnType::Timestamp)]
+    #[case(LogicalType::timestamp_tz(), DFColumnType::Timestamp)]
+    fn test_normalize_column_type(
+        #[case] logical_type: LogicalType,
+        #[case] expected: DFColumnType,
+    ) {
+        assert_eq!(DuckDB::normalize_column_type(&logical_type), expected);
+    }
+
+    #[test]
+    fn validator_invalid_regex_pattern_fails_without_panicking() {
+        let actual = vec![vec!["anything".to_string()]];
+        // Both directions must fail (return false) on a malformed pattern.
+        assert!(!duckdb_validator(
+            identity,
+            &actual,
+            &["<REGEX>:(unclosed".to_string()]
+        ));
+        assert!(!duckdb_validator(
+            identity,
+            &actual,
+            &["<!REGEX>:(unclosed".to_string()]
+        ));
+    }
+
+    // clippy: Signature must match sqllogictest::Normalizer
+    #[expect(clippy::ptr_arg)]
+    fn identity(s: &String) -> String {
+        s.clone()
+    }
+
+    #[test]
+    fn validator_regex_directive_spans_multiple_lines() {
+        let actual = vec![vec![
+            "physical_plan".to_string(),
+            "[\n  {\n    \"SELECT projections\": \"str\"\n  }\n]".to_string(),
+        ]];
+
+        assert!(duckdb_validator(
+            identity,
+            &actual,
+            &["<REGEX>:SELECT projections".to_string()]
+        ));
+        assert!(!duckdb_validator(
+            identity,
+            &actual,
+            &["<REGEX>:NOT PRESENT".to_string()]
+        ));
+
+        assert!(duckdb_validator(
+            identity,
+            &actual,
+            &["<!REGEX>:NOT PRESENT".to_string()]
+        ));
+        assert!(!duckdb_validator(
+            identity,
+            &actual,
+            &["<!REGEX>:SELECT projections".to_string()]
+        ));
+    }
+
+    #[test]
+    fn validator_without_marker_requires_exact_match() {
+        let actual = vec![vec!["5".to_string()], vec!["3".to_string()]];
+        assert!(duckdb_validator(
+            identity,
+            &actual,
+            &["5".to_string(), "3".to_string()]
+        ));
+        assert!(!duckdb_validator(
+            identity,
+            &actual,
+            &["5".to_string(), "2".to_string()]
+        ));
     }
 
     #[test]

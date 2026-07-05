@@ -33,6 +33,7 @@ use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
+use vortex_array::array_session;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::VarBinArray;
 use vortex_array::arrays::VarBinViewArray;
@@ -41,7 +42,6 @@ use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::NativePType;
 use vortex_array::dtype::Nullability;
-use vortex_array::session::ArraySession;
 use vortex_buffer::Buffer;
 use vortex_buffer::ByteBuffer;
 use vortex_mask::Mask;
@@ -80,8 +80,11 @@ impl DecodeInputs {
 use vortex_onpair::onpair_compress;
 use vortex_session::VortexSession;
 
-static SESSION: LazyLock<VortexSession> =
-    LazyLock::new(|| VortexSession::empty().with::<ArraySession>());
+static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
+    let session = array_session();
+    vortex_onpair::initialize(&session);
+    session
+});
 
 #[derive(Copy, Clone, Debug)]
 enum Shape {
@@ -151,13 +154,13 @@ fn corpus(n: usize, shape: Shape) -> Vec<String> {
     out
 }
 
-fn compress(n: usize, shape: Shape) -> OnPairArray {
+fn compress(n: usize, shape: Shape, ctx: &mut ExecutionCtx) -> OnPairArray {
     let strings = corpus(n, shape);
     let varbin = VarBinArray::from_iter(
         strings.iter().map(|s| Some(s.as_bytes())),
         DType::Utf8(Nullability::NonNullable),
     );
-    onpair_compress(&varbin, varbin.len(), varbin.dtype(), DEFAULT_DICT12_CONFIG)
+    onpair_compress(varbin.as_array(), DEFAULT_DICT12_CONFIG, ctx)
         .unwrap_or_else(|e| panic!("onpair_compress failed: {e}"))
 }
 
@@ -170,13 +173,12 @@ fn widen<T: NativePType>(arr: &ArrayRef, ctx: &mut ExecutionCtx) -> Buffer<T> {
         .into_buffer::<T>()
 }
 
-fn materialise(arr: &OnPairArray) -> (DecodeInputs, usize) {
-    let mut ctx = SESSION.create_execution_ctx();
+fn materialise(arr: &OnPairArray, ctx: &mut ExecutionCtx) -> (DecodeInputs, usize) {
     let view = arr.as_view();
     let inputs = DecodeInputs {
         dict_bytes: view.dict_bytes().clone(),
-        dict_offsets: widen::<u32>(view.dict_offsets(), &mut ctx),
-        codes: widen::<u16>(view.codes(), &mut ctx),
+        dict_offsets: widen::<u32>(view.dict_offsets(), ctx),
+        codes: widen::<u16>(view.codes(), ctx),
         bits: view.bits(),
     };
     let total = inputs.decompressed_len();
@@ -195,9 +197,10 @@ const CASES: &[(Shape, usize)] = &[
 /// Hits `onpair::decompress_into` directly.
 #[divan::bench(args = CASES)]
 fn decompress_into_bench(bencher: Bencher, case: (Shape, usize)) {
+    let mut ctx = SESSION.create_execution_ctx();
     let (shape, n) = case;
-    let arr = compress(n, shape);
-    let (inputs, total) = materialise(&arr);
+    let arr = compress(n, shape, &mut ctx);
+    let (inputs, total) = materialise(&arr, &mut ctx);
     bencher.bench_local(|| {
         let mut out: Vec<u8> = Vec::with_capacity(total);
         let written = inputs.decompress_into(out.spare_capacity_mut());
@@ -210,8 +213,9 @@ fn decompress_into_bench(bencher: Bencher, case: (Shape, usize)) {
 /// building the view buffer + `BinaryView` list, etc.
 #[divan::bench(args = CASES)]
 fn canonicalize_to_varbinview(bencher: Bencher, case: (Shape, usize)) {
+    let mut ctx = SESSION.create_execution_ctx();
     let (shape, n) = case;
-    let arr = compress(n, shape);
+    let arr = compress(n, shape, &mut ctx);
     bencher
         .with_inputs(|| (arr.clone().into_array(), SESSION.create_execution_ctx()))
         .bench_local_values(|(arr, mut ctx)| {
@@ -230,8 +234,9 @@ const COMPUTE_CASES: &[(Shape, usize)] = &[(Shape::UrlLog, 100_000), (Shape::Url
 /// rows; the cost is dominated by the `codes` segment copy + offsets.
 #[divan::bench(args = COMPUTE_CASES)]
 fn filter_share_dict(bencher: Bencher, case: (Shape, usize)) {
+    let mut ctx = SESSION.create_execution_ctx();
     let (shape, n) = case;
-    let arr = compress(n, shape);
+    let arr = compress(n, shape, &mut ctx);
     let mask = Mask::from_iter((0..n).map(|i| i % 7 == 0));
     bencher
         .with_inputs(|| SESSION.create_execution_ctx())

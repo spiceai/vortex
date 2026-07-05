@@ -3,7 +3,7 @@
 
 use std::fmt::Display;
 use std::fmt::Formatter;
-use std::iter;
+use std::iter::repeat;
 
 use smallvec::smallvec;
 use vortex_buffer::Alignment;
@@ -18,11 +18,10 @@ use vortex_error::vortex_panic;
 
 use crate::ArraySlots;
 use crate::ExecutionCtx;
-#[expect(deprecated)]
-use crate::ToCanonical as _;
 use crate::array::Array;
 use crate::array::ArrayParts;
 use crate::array::TypedArrayRef;
+use crate::arrays::BoolArray;
 use crate::arrays::Primitive;
 use crate::arrays::PrimitiveArray;
 use crate::dtype::DType;
@@ -32,7 +31,6 @@ use crate::dtype::PType;
 use crate::match_each_native_ptype;
 use crate::validity::Validity;
 
-mod accessor;
 mod cast;
 mod conversion;
 mod patch;
@@ -42,6 +40,7 @@ pub use patch::chunk_range;
 pub use patch::patch_chunk;
 
 use crate::ArrayRef;
+use crate::aggregate_fn::NumericalAggregateOpts;
 use crate::aggregate_fn::fns::min_max::min_max;
 use crate::array::child_to_validity;
 use crate::array::validity_to_child;
@@ -70,7 +69,7 @@ pub(super) const SLOT_NAMES: [&str; NUM_SLOTS] = ["validity"];
 /// ```
 /// # fn main() -> vortex_error::VortexResult<()> {
 /// use vortex_array::arrays::PrimitiveArray;
-/// use vortex_array::{LEGACY_SESSION, VortexSessionExecute};
+/// use vortex_array::{VortexSessionExecute, array_session};
 ///
 /// // Create from iterator using FromIterator impl
 /// let array: PrimitiveArray = [1i32, 2, 3, 4, 5].into_iter().collect();
@@ -79,7 +78,7 @@ pub(super) const SLOT_NAMES: [&str; NUM_SLOTS] = ["validity"];
 /// let sliced = array.slice(1..3)?;
 ///
 /// // Access individual values
-/// let mut ctx = LEGACY_SESSION.create_execution_ctx();
+/// let mut ctx = array_session().create_execution_ctx();
 /// let value = sliced.execute_scalar(0, &mut ctx).unwrap();
 /// assert_eq!(value, 2i32.into());
 ///
@@ -154,7 +153,7 @@ pub trait PrimitiveArrayExt: TypedArrayRef<Primitive> {
             return Ok(self.to_owned());
         }
 
-        let Some(min_max) = min_max(self.as_ref(), ctx)? else {
+        let Some(min_max) = min_max(self.as_ref(), ctx, NumericalAggregateOpts::default())? else {
             return Ok(PrimitiveArray::new(
                 Buffer::<u8>::zeroed(self.len()),
                 self.validity(),
@@ -446,12 +445,18 @@ impl Array<Primitive> {
         ptype: PType,
         validity: Validity,
         n_rows: usize,
+        ctx: &mut ExecutionCtx,
     ) -> Self {
         let dtype = DType::Primitive(ptype, validity.nullability());
         let len = n_rows;
         let slots = PrimitiveData::make_slots(&validity, len);
-        let data =
-            PrimitiveData::from_values_byte_buffer(valid_elems_buffer, ptype, validity, n_rows);
+        let data = PrimitiveData::from_values_byte_buffer(
+            valid_elems_buffer,
+            ptype,
+            validity,
+            n_rows,
+            ctx,
+        );
         unsafe {
             Array::from_parts_unchecked(
                 ArrayParts::new(Primitive, dtype, len, data).with_slots(slots),
@@ -475,7 +480,7 @@ impl Array<Primitive> {
         }
     }
 
-    pub fn map_each_with_validity<T, R, F>(self, f: F) -> VortexResult<Self>
+    pub fn map_each_with_validity<T, R, F>(self, ctx: &mut ExecutionCtx, f: F) -> VortexResult<Self>
     where
         T: NativePType,
         R: NativePType,
@@ -487,18 +492,17 @@ impl Array<Primitive> {
 
         let buffer = match &validity {
             Validity::NonNullable | Validity::AllValid => {
-                BufferMut::<R>::from_iter(buf_iter.zip(iter::repeat(true)).map(f))
+                Buffer::<R>::from_trusted_len_iter(buf_iter.zip(repeat(true)).map(f))
             }
             Validity::AllInvalid => {
-                BufferMut::<R>::from_iter(buf_iter.zip(iter::repeat(false)).map(f))
+                Buffer::<R>::from_trusted_len_iter(buf_iter.zip(repeat(false)).map(f))
             }
             Validity::Array(val) => {
-                #[expect(deprecated)]
-                let val = val.to_bool().into_bit_buffer();
-                BufferMut::<R>::from_iter(buf_iter.zip(val.iter()).map(f))
+                let val = val.clone().execute::<BoolArray>(ctx)?.into_bit_buffer();
+                Buffer::<R>::from_trusted_len_iter(buf_iter.zip(val.iter()).map(f))
             }
         };
-        Ok(PrimitiveArray::new(buffer.freeze(), validity))
+        Ok(PrimitiveArray::new(buffer, validity))
     }
 }
 
@@ -540,6 +544,7 @@ impl PrimitiveData {
         ptype: PType,
         validity: Validity,
         n_rows: usize,
+        ctx: &mut ExecutionCtx,
     ) -> Self {
         let byte_width = ptype.byte_width();
         let alignment = Alignment::new(byte_width);
@@ -547,8 +552,10 @@ impl PrimitiveData {
             Validity::AllValid | Validity::NonNullable => valid_elems_buffer.aligned(alignment),
             Validity::AllInvalid => ByteBuffer::zeroed_aligned(n_rows * byte_width, alignment),
             Validity::Array(is_valid) => {
-                #[expect(deprecated)]
-                let bool_array = is_valid.to_bool();
+                let bool_array = is_valid
+                    .clone()
+                    .execute::<BoolArray>(ctx)
+                    .vortex_expect("must be a bool array");
                 let bool_buffer = bool_array.bit_buffer_view();
                 let mut bytes = ByteBufferMut::zeroed_aligned(n_rows * byte_width, alignment);
                 for (i, valid_i) in bool_buffer.set_indices().enumerate() {
@@ -596,6 +603,9 @@ impl PrimitiveData {
     }
 
     /// Try to extract a mutable buffer from the PrimitiveData with zero copy.
+    ///
+    /// # Panic
+    /// If the buffer is not of type T this will panic
     pub fn try_into_buffer_mut<T: NativePType>(self) -> Result<BufferMut<T>, Buffer<T>> {
         if T::PTYPE != self.ptype() {
             vortex_panic!(

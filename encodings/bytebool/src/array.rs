@@ -39,8 +39,6 @@ use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
-use crate::kernel::PARENT_KERNELS;
-
 /// A [`ByteBool`]-encoded Vortex array.
 pub type ByteBoolArray = Array<ByteBool>;
 
@@ -94,6 +92,23 @@ impl VTable for ByteBool {
             0 => Some("values".to_string()),
             _ => vortex_panic!("ByteBoolArray buffer_name index {idx} out of bounds"),
         }
+    }
+
+    fn with_buffers(
+        &self,
+        array: ArrayView<'_, Self>,
+        buffers: &[BufferHandle],
+    ) -> VortexResult<ArrayParts<Self>> {
+        vortex_ensure!(
+            buffers.len() == 1,
+            "Expected 1 buffer, got {}",
+            buffers.len()
+        );
+        let data = ByteBoolData::new(buffers[0].clone());
+        Ok(
+            ArrayParts::new(self.clone(), array.dtype().clone(), array.len(), data)
+                .with_slots(array.slots().iter().cloned().collect()),
+        )
     }
 
     fn serialize(
@@ -156,15 +171,6 @@ impl VTable for ByteBool {
         Ok(ExecutionResult::done(
             BoolArray::new(boolean_buffer, validity).into_array(),
         ))
-    }
-
-    fn execute_parent(
-        array: ArrayView<'_, Self>,
-        parent: &ArrayRef,
-        child_idx: usize,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<Option<ArrayRef>> {
-        PARENT_KERNELS.execute(array, parent, child_idx, ctx)
     }
 }
 
@@ -315,20 +321,25 @@ impl OperationsVTable<ByteBool> for ByteBool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use vortex_array::ArrayContext;
     use vortex_array::IntoArray;
-    use vortex_array::LEGACY_SESSION;
     use vortex_array::VortexSessionExecute;
     use vortex_array::assert_arrays_eq;
     use vortex_array::serde::SerializeOptions;
     use vortex_array::serde::SerializedArray;
-    use vortex_array::session::ArraySession;
     use vortex_array::session::ArraySessionExt;
     use vortex_buffer::ByteBufferMut;
-    use vortex_session::VortexSession;
     use vortex_session::registry::ReadContext;
 
     use super::*;
+
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
+        let session = vortex_array::array_session();
+        crate::initialize(&session);
+        session
+    });
 
     #[test]
     fn test_validity_construction() {
@@ -338,7 +349,7 @@ mod tests {
         let arr = ByteBool::from_vec(v, Validity::AllValid);
         assert_eq!(v_len, arr.len());
 
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         for idx in 0..arr.len() {
             assert!(arr.is_valid(idx, &mut ctx).unwrap());
         }
@@ -367,7 +378,7 @@ mod tests {
         let array = ByteBool::from_option_vec(vec![Some(true), None, Some(false), None]);
         let dtype = array.dtype().clone();
         let len = array.len();
-        let session = VortexSession::empty().with::<ArraySession>();
+        let session = vortex_array::array_session();
         session.arrays().register(ByteBool);
 
         let ctx = ArrayContext::empty();
@@ -387,6 +398,6 @@ mod tests {
             .decode(&dtype, len, &ReadContext::new(ctx.to_ids()), &session)
             .unwrap();
 
-        assert_arrays_eq!(decoded, array);
+        assert_arrays_eq!(decoded, array, &mut SESSION.create_execution_ctx());
     }
 }
