@@ -89,6 +89,7 @@ impl DType {
             DtypeType::Union(u) => Ok(Self::Union(u.nullable.into())),
             DtypeType::Variant(v) => Ok(Self::Variant(v.nullable.into())),
             DtypeType::Extension(e) => {
+                #[expect(clippy::disallowed_methods, reason = "interning a dynamic id")]
                 let id = ExtId::new(e.id.as_str());
                 let storage_dtype = DType::from_proto(
                     e.storage_dtype
@@ -228,8 +229,6 @@ impl TryFrom<&pb::FieldPath> for FieldPath {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-
-    use vortex_session::VortexSession;
 
     use super::*;
     use crate::dtype::DType;
@@ -503,7 +502,7 @@ mod tests {
 
     #[test]
     fn test_unknown_extension_allow_unknown() {
-        let session = VortexSession::empty().allow_unknown();
+        let session = crate::array_session().allow_unknown();
         let proto = pb::DType {
             dtype_type: Some(DtypeType::Extension(Box::new(pb::Extension {
                 id: "vortex.test.foreign_ext".to_string(),

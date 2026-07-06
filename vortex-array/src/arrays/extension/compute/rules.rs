@@ -111,10 +111,8 @@ mod tests {
     use crate::scalar::ScalarValue;
     use crate::scalar_fn::fns::binary::Binary;
     use crate::scalar_fn::fns::operators::Operator;
-    use crate::session::ArraySession;
 
-    static SESSION: LazyLock<VortexSession> =
-        LazyLock::new(|| VortexSession::empty().with::<ArraySession>());
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(crate::array_session);
 
     #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
     struct TestExt;
@@ -122,6 +120,7 @@ mod tests {
         type Metadata = EmptyMetadata;
         type NativeValue<'a> = &'a str;
 
+        #[expect(clippy::disallowed_methods, reason = "test-only id")]
         fn id(&self) -> ExtId {
             ExtId::new("test_ext")
         }
@@ -246,6 +245,7 @@ mod tests {
             type Metadata = EmptyMetadata;
             type NativeValue<'a> = &'a str;
 
+            #[expect(clippy::disallowed_methods, reason = "test-only id")]
             fn id(&self) -> ExtId {
                 ExtId::new("test_ext_2")
             }

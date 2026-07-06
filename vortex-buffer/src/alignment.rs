@@ -8,26 +8,33 @@ use vortex_error::VortexError;
 use vortex_error::VortexExpect;
 use vortex_error::vortex_err;
 
-/// Default alignment for device-to-host buffer copies.
-pub const ALIGNMENT_TO_HOST_COPY: Alignment = Alignment::new(256);
-
 /// The alignment of a buffer.
 ///
-/// This type is a wrapper around `usize` that ensures the alignment is a power of 2 and fits into
-/// a `u16`.
+/// This type is a wrapper around `usize` that ensures the alignment is a non-zero power of 2.
 #[derive(Clone, Debug, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Alignment(usize);
 
 impl Alignment {
+    /// Default alignment for device-to-host buffer copies.
+    pub const HOST_COPY: Self = Alignment::new(256);
+
+    /// Default alignment for all buffers.
+    ///
+    /// Chosen to be larger than any SIMD register (e.g. AVX-512's 64-byte
+    /// registers) so that buffers can be processed with vectorized loads/stores
+    /// without alignment fixups, and to match the alignment guarantees of the
+    /// CUDA allocator (256 bytes) so host buffers can be copied to/from device
+    /// memory without re-alignment.
+    pub const DEFAULT_ALIGNMENT: Self = Alignment::new(256);
+
     /// Create a new alignment.
     ///
     /// ## Panics
     ///
-    /// Panics if `align` is not a power of 2, or is greater than `u16::MAX`.
+    /// Panics if `align` is zero or is not a power of 2.
     #[inline]
     pub const fn new(align: usize) -> Self {
         assert!(align > 0, "Alignment must be greater than 0");
-        assert!(align <= u16::MAX as usize, "Alignment must fit into u16");
         assert!(align.is_power_of_two(), "Alignment must be a power of 2");
         Self(align)
     }
@@ -54,6 +61,9 @@ impl Alignment {
         Self::new(align_of::<T>())
     }
 
+    /// The largest valid alignment: the greatest power of 2 representable in a `usize`.
+    pub const MAX: Alignment = Alignment::new(1 << (usize::BITS - 1));
+
     /// Check if `self` alignment is a "larger" than `other` alignment.
     ///
     /// ## Example
@@ -67,23 +77,45 @@ impl Alignment {
     /// assert!(!b.is_aligned_to(a));
     /// ```
     #[inline]
-    pub fn is_aligned_to(&self, other: Alignment) -> bool {
-        // Since we know alignments are powers of 2, we can compare them by checking if the number
-        // of trailing zeros in the binary representation of the alignment is greater or equal.
-        self.0.trailing_zeros() >= other.0.trailing_zeros()
+    pub const fn is_aligned_to(&self, other: Alignment) -> bool {
+        // Since both alignments are powers of 2, divisibility is equivalent to ordering.
+        self.0 >= other.0
+    }
+
+    /// Check if the given byte offset (or length) is a multiple of this alignment.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use vortex_buffer::Alignment;
+    ///
+    /// let a = Alignment::new(4);
+    /// assert!(a.is_offset_aligned(8));
+    /// assert!(!a.is_offset_aligned(2));
+    /// ```
+    #[inline]
+    pub const fn is_offset_aligned(&self, offset: usize) -> bool {
+        // Alignment is always a power of 2, so a mask test is equivalent to `offset % self == 0`.
+        offset & (self.0 - 1) == 0
+    }
+
+    /// Check if the given pointer is aligned to this alignment.
+    #[inline]
+    pub fn is_ptr_aligned<T>(&self, ptr: *const T) -> bool {
+        self.is_offset_aligned(ptr.addr())
     }
 
     /// Returns the log2 of the alignment.
     pub fn exponent(&self) -> u8 {
         u8::try_from(self.0.trailing_zeros())
-            .vortex_expect("alignment fits into u16, so exponent fits in u7")
+            .vortex_expect("alignment is a power of 2 within usize, so its exponent fits in u8")
     }
 
     /// Create from the log2 exponent of the alignment.
     ///
     /// ## Panics
     ///
-    /// Panics if `alignment` is not a power of 2, or is greater than `u16::MAX`.
+    /// Panics if `1 << exponent` overflows `usize`.
     #[inline]
     pub const fn from_exponent(exponent: u8) -> Self {
         Self::new(1 << exponent)
@@ -126,13 +158,6 @@ impl From<Alignment> for usize {
     }
 }
 
-impl From<Alignment> for u16 {
-    #[inline]
-    fn from(value: Alignment) -> Self {
-        u16::try_from(value.0).vortex_expect("Alignment must fit into u16")
-    }
-}
-
 impl From<Alignment> for u32 {
     #[inline]
     fn from(value: Alignment) -> Self {
@@ -149,9 +174,6 @@ impl TryFrom<u32> for Alignment {
 
         if value == 0 {
             return Err(vortex_err!("Alignment must be greater than 0"));
-        }
-        if value > u16::MAX as usize {
-            return Err(vortex_err!("Alignment must fit into u16, got {value}"));
         }
         if !value.is_power_of_two() {
             return Err(vortex_err!("Alignment must be a power of 2, got {value}"));
@@ -172,9 +194,11 @@ mod test {
     }
 
     #[test]
-    #[should_panic]
-    fn alignment_overflow() {
-        Alignment::new(u16::MAX as usize + 1);
+    fn alignment_above_u16() {
+        // 64KiB alignment (one past `u16::MAX`) is valid — common on ARM with 64K pages.
+        let alignment = Alignment::new(u16::MAX as usize + 1);
+        assert_eq!(*alignment, 1 << 16);
+        assert_eq!(alignment, Alignment::from_exponent(16));
     }
 
     #[test]
@@ -203,6 +227,10 @@ mod test {
         match Alignment::try_from(8u32) {
             Ok(alignment) => assert_eq!(alignment, Alignment::new(8)),
             Err(err) => panic!("unexpected error for valid alignment: {err}"),
+        }
+        match Alignment::try_from(1u32 << 16) {
+            Ok(alignment) => assert_eq!(alignment, Alignment::new(1 << 16)),
+            Err(err) => panic!("64KiB alignment should be valid: {err}"),
         }
         assert!(Alignment::try_from(0u32).is_err());
         assert!(Alignment::try_from(3u32).is_err());

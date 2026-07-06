@@ -9,12 +9,16 @@ use crate::EqMode;
 use crate::IntoArray;
 use crate::array::ArrayView;
 use crate::array::VTable;
+use crate::arrays::Chunked;
+use crate::arrays::ChunkedArray;
 use crate::arrays::Constant;
 use crate::arrays::ConstantArray;
 use crate::arrays::Dict;
 use crate::arrays::DictArray;
 use crate::arrays::ScalarFn;
 use crate::arrays::ScalarFnArray;
+use crate::arrays::chunked::ChunkedArrayExt;
+use crate::arrays::dict::DictArrayExt;
 use crate::arrays::dict::DictArraySlotsExt;
 use crate::arrays::filter::FilterReduceAdaptor;
 use crate::arrays::scalar_fn::AnyScalarFn;
@@ -36,10 +40,58 @@ pub(crate) const PARENT_RULES: ParentRuleSet<Dict> = ParentRuleSet::new(&[
     ParentRuleSet::lift(&CastReduceAdaptor(Dict)),
     ParentRuleSet::lift(&MaskReduceAdaptor(Dict)),
     ParentRuleSet::lift(&LikeReduceAdaptor(Dict)),
+    ParentRuleSet::lift(&DictionaryChunkedValuesPullUpRule),
     ParentRuleSet::lift(&DictionaryScalarFnValuesPushDownRule),
     ParentRuleSet::lift(&DictionaryScalarFnCodesPullUpRule),
     ParentRuleSet::lift(&SliceReduceAdaptor(Dict)),
 ]);
+
+/// Pull a common dictionary values array above chunked dictionary codes.
+///
+/// Rewrites `Chunked<Dict<codes_i, values>>` into `Dict<Chunked<codes_i>, values>` only when
+/// every child dictionary shares the exact same values array allocation.
+#[derive(Debug)]
+struct DictionaryChunkedValuesPullUpRule;
+
+impl ArrayParentReduceRule<Dict> for DictionaryChunkedValuesPullUpRule {
+    type Parent = Chunked;
+
+    fn reduce_parent(
+        &self,
+        array: ArrayView<'_, Dict>,
+        parent: ArrayView<'_, Chunked>,
+        _child_idx: usize,
+    ) -> VortexResult<Option<ArrayRef>> {
+        let values = array.values();
+        let codes_dtype = array.codes().dtype().clone();
+        let mut code_chunks = Vec::with_capacity(parent.nchunks());
+        let mut all_values_referenced = array.has_all_values_referenced();
+
+        for chunk in parent.iter_chunks() {
+            let Some(dict) = chunk.as_opt::<Dict>() else {
+                return Ok(None);
+            };
+            if dict.codes().dtype() != &codes_dtype {
+                return Ok(None);
+            }
+            if !ArrayRef::ptr_eq(dict.values(), values) {
+                return Ok(None);
+            }
+            all_values_referenced |= dict.has_all_values_referenced();
+            code_chunks.push(dict.codes().clone());
+        }
+
+        let codes = ChunkedArray::try_new(code_chunks, codes_dtype)?.into_array();
+        let dict = DictArray::try_new(codes, values.clone())?;
+        let dict = if all_values_referenced {
+            unsafe { dict.set_all_values_referenced(true) }
+        } else {
+            dict
+        };
+
+        Ok(Some(dict.into_array()))
+    }
+}
 
 /// Push down a scalar function to run only over the values of a dictionary array.
 #[derive(Debug)]
@@ -136,13 +188,19 @@ impl ArrayParentReduceRule<Dict> for DictionaryScalarFnValuesPushDownRule {
         // back to nullable if needed.
         if sig.is_null_sensitive() && array.codes().dtype().is_nullable() {
             let new_codes = array.codes().cast(array.codes().dtype().as_nonnullable())?;
-            let new_dict = unsafe { DictArray::new_unchecked(new_codes, new_values) }.into_array();
+            let new_dict = unsafe {
+                DictArray::new_unchecked(new_codes, new_values)
+                    .set_all_values_referenced(array.has_all_values_referenced())
+            }
+            .into_array();
             return Ok(Some(new_dict.cast(parent.dtype().clone())?));
         }
 
-        Ok(Some(
-            unsafe { DictArray::new_unchecked(array.codes().clone(), new_values) }.into_array(),
-        ))
+        Ok(Some(unsafe {
+            DictArray::new_unchecked(array.codes().clone(), new_values)
+                .set_all_values_referenced(array.has_all_values_referenced())
+                .into_array()
+        }))
     }
 }
 
@@ -199,5 +257,98 @@ impl ArrayParentReduceRule<Dict> for DictionaryScalarFnCodesPullUpRule {
             unsafe { DictArray::new_unchecked(array.codes().clone(), new_values) }.into_array();
 
         Ok(Some(new_dict))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use vortex_buffer::buffer;
+    use vortex_error::VortexResult;
+
+    use crate::ArrayRef;
+    use crate::IntoArray;
+    use crate::arrays::BoolArray;
+    use crate::arrays::Chunked;
+    use crate::arrays::ChunkedArray;
+    use crate::arrays::Dict;
+    use crate::arrays::DictArray;
+    use crate::arrays::PrimitiveArray;
+    use crate::arrays::chunked::ChunkedArrayExt;
+    use crate::arrays::dict::DictArrayExt;
+    use crate::arrays::dict::DictArraySlotsExt;
+    use crate::arrays::scalar_fn::ScalarFnFactoryExt;
+    use crate::assert_arrays_eq;
+    use crate::executor::VortexSessionExecute;
+    use crate::optimizer::ArrayOptimizer;
+    use crate::scalar_fn::EmptyOptions;
+    use crate::scalar_fn::fns::not::Not;
+
+    #[test]
+    fn chunked_dict_with_shared_values_pulls_values_up() -> VortexResult<()> {
+        let values = buffer![10u32, 20, 30].into_array();
+        let chunk0 = DictArray::try_new(buffer![0u8, 1].into_array(), values.clone())?.into_array();
+        let chunk1 =
+            DictArray::try_new(buffer![2u8, 0, 1].into_array(), values.clone())?.into_array();
+        let array =
+            ChunkedArray::try_new(vec![chunk0, chunk1], values.dtype().clone())?.into_array();
+
+        let optimized = array.optimize()?;
+        let dict = optimized.as_::<Dict>();
+        let codes = dict.codes().as_::<Chunked>();
+
+        assert!(ArrayRef::ptr_eq(dict.values(), &values));
+        assert_eq!(codes.nchunks(), 2);
+        let mut ctx = crate::LEGACY_SESSION.create_execution_ctx();
+        assert_arrays_eq!(
+            optimized,
+            PrimitiveArray::from_iter([10u32, 20, 30, 10, 20]),
+            &mut ctx
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn chunked_dict_with_distinct_values_stays_chunked() -> VortexResult<()> {
+        let values0 = buffer![10u32, 20, 30].into_array();
+        let values1 = buffer![10u32, 20, 30].into_array();
+        let chunk0 =
+            DictArray::try_new(buffer![0u8, 1].into_array(), values0.clone())?.into_array();
+        let chunk1 = DictArray::try_new(buffer![2u8, 0, 1].into_array(), values1)?.into_array();
+        let array =
+            ChunkedArray::try_new(vec![chunk0, chunk1], values0.dtype().clone())?.into_array();
+
+        let optimized = array.optimize()?;
+
+        assert!(optimized.is::<Chunked>());
+        let mut ctx = crate::LEGACY_SESSION.create_execution_ctx();
+        assert_arrays_eq!(
+            optimized,
+            PrimitiveArray::from_iter([10u32, 20, 30, 10, 20]),
+            &mut ctx
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn scalar_fn_values_pushdown_preserves_all_values_referenced() -> VortexResult<()> {
+        let dict = unsafe {
+            DictArray::try_new(
+                buffer![0u8, 1, 0, 1].into_array(),
+                BoolArray::from_iter([true, false]).into_array(),
+            )?
+            .set_all_values_referenced(true)
+        }
+        .into_array();
+
+        let result = Not
+            .try_new_array(dict.len(), EmptyOptions, [dict])?
+            .optimize()?;
+        let result = result.as_::<Dict>();
+
+        assert!(result.has_all_values_referenced());
+
+        Ok(())
     }
 }

@@ -127,6 +127,9 @@ pub(crate) trait DynArrayData: 'static + private::Sealed + Send + Sync + Debug {
     /// Returns a new array with the given slots.
     fn with_slots(&self, this: &ArrayRef, slots: ArraySlots) -> VortexResult<ArrayRef>;
 
+    /// Returns a new array with the given buffers.
+    fn with_buffers(&self, this: &ArrayRef, buffers: Vec<BufferHandle>) -> VortexResult<ArrayRef>;
+
     /// Returns a new array with the given slots, bypassing encoding-level validation.
     ///
     /// Used by the executor to temporarily carry an array that has had one of its child slots
@@ -177,15 +180,6 @@ pub(crate) trait DynArrayData: 'static + private::Sealed + Send + Sync + Debug {
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<ExecutionResult>;
 
-    /// Attempt to execute the parent of this array.
-    fn execute_parent(
-        &self,
-        this: &ArrayRef,
-        parent: &ArrayRef,
-        child_idx: usize,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<Option<ArrayRef>>;
-
     /// Execute the scalar at the given index.
     ///
     /// This method panics if the index is out of bounds for the array.
@@ -199,6 +193,7 @@ pub(crate) trait DynArrayData: 'static + private::Sealed + Send + Sync + Debug {
 
 /// Trait for converting a type into a Vortex [`ArrayRef`].
 pub trait IntoArray {
+    /// Convert this value into the erased array handle used by generic APIs.
     fn into_array(self) -> ArrayRef;
 }
 
@@ -371,6 +366,16 @@ impl<V: VTable> DynArrayData for ArrayData<V> {
         .into_array())
     }
 
+    fn with_buffers(&self, this: &ArrayRef, buffers: Vec<BufferHandle>) -> VortexResult<ArrayRef> {
+        let view = unsafe { ArrayView::new_unchecked(this, &self.data) };
+        let stats = this.statistics().to_owned();
+        Ok(
+            Array::<V>::try_from_parts(V::with_buffers(&self.vtable, view, &buffers)?)?
+                .with_stats_set(stats)
+                .into_array(),
+        )
+    }
+
     unsafe fn with_slots_unchecked(&self, this: &ArrayRef, slots: ArraySlots) -> ArrayRef {
         // SAFETY: we intentionally skip `V::validate` here. Caller guarantees that the resulting
         // array is either repaired or not externally observed.
@@ -472,32 +477,6 @@ impl<V: VTable> DynArrayData for ArrayData<V> {
             .map_err(|_| vortex_err!("Failed to downcast array for execute"))
             .vortex_expect("Failed to downcast array for execute");
         V::execute(typed, ctx)
-    }
-
-    fn execute_parent(
-        &self,
-        this: &ArrayRef,
-        parent: &ArrayRef,
-        child_idx: usize,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<Option<ArrayRef>> {
-        let view = unsafe { ArrayView::new_unchecked(this, &self.data) };
-        let Some(result) = V::execute_parent(view, parent, child_idx, ctx)? else {
-            return Ok(None);
-        };
-
-        if cfg!(debug_assertions) {
-            vortex_ensure!(
-                result.len() == parent.len(),
-                "Executed parent canonical length mismatch"
-            );
-            vortex_ensure!(
-                result.dtype() == parent.dtype(),
-                "Executed parent canonical dtype mismatch"
-            );
-        }
-
-        Ok(Some(result))
     }
 
     fn execute_scalar(

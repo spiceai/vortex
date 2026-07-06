@@ -18,6 +18,9 @@ use crate::arrays::varbinview::Ref;
 use crate::builders::ArrayBuilder;
 use crate::builders::VarBinViewBuilder;
 
+const DEFAULT_COMPACTION_THRESHOLD: f64 = 0.5;
+const MIN_RETAINED_BYTES_PER_ROW_TO_CHECK_COMPACTION: u64 = 128;
+
 impl VarBinViewArray {
     /// Returns a compacted copy of the input array, where all wasted space has been cleaned up. This
     /// operation can be very expensive, in the worst case copying all existing string data into
@@ -33,8 +36,7 @@ impl VarBinViewArray {
             return Ok(self.clone());
         }
 
-        // Use selective compaction with threshold of 1.0 (compact any buffer with any waste)
-        self.compact_with_threshold(1.0)
+        self.compact_with_threshold(DEFAULT_COMPACTION_THRESHOLD)
     }
 
     fn should_compact(&self) -> VortexResult<bool> {
@@ -50,12 +52,18 @@ impl VarBinViewArray {
             return Ok(true);
         }
 
-        let bytes_referenced: u64 = self.count_referenced_bytes()?;
         let buffer_total_bytes: u64 = self.buffers.iter().map(|buf| buf.len() as u64).sum();
+        if buffer_total_bytes == 0 {
+            return Ok(true);
+        }
 
-        // If there is any wasted space, we want to repack.
-        // This is very aggressive.
-        Ok(bytes_referenced < buffer_total_bytes || buffer_total_bytes == 0)
+        let len = u64::try_from(self.len()).unwrap_or(u64::MAX);
+        if len > 0 && buffer_total_bytes / len <= MIN_RETAINED_BYTES_PER_ROW_TO_CHECK_COMPACTION {
+            return Ok(false);
+        }
+
+        let bytes_referenced: u64 = self.count_referenced_bytes()?;
+        Ok((bytes_referenced as f64 / buffer_total_bytes as f64) < DEFAULT_COMPACTION_THRESHOLD)
     }
 
     /// Iterates over all valid, non-inlined views, calling the provided
@@ -193,8 +201,8 @@ mod tests {
     use vortex_buffer::buffer;
 
     use crate::IntoArray;
-    use crate::LEGACY_SESSION;
     use crate::VortexSessionExecute;
+    use crate::array_session;
     use crate::arrays::VarBinArray;
     use crate::arrays::VarBinViewArray;
     use crate::assert_arrays_eq;
@@ -202,6 +210,7 @@ mod tests {
     use crate::dtype::Nullability;
     #[test]
     fn test_optimize_compacts_buffers() {
+        let mut ctx = array_session().create_execution_ctx();
         // Create a VarBinViewArray with some long strings that will create multiple buffers
         let original = VarBinViewArray::from_iter_nullable_str([
             Some("short"),
@@ -219,7 +228,7 @@ mod tests {
         let indices = buffer![0u32, 4u32].into_array();
         let taken = original.take(indices).unwrap();
         let taken = taken
-            .execute::<VarBinViewArray>(&mut LEGACY_SESSION.create_execution_ctx())
+            .execute::<VarBinViewArray>(&mut array_session().create_execution_ctx())
             .unwrap();
         // The taken array should still have the same number of buffers
         assert_eq!(taken.data_buffers().len(), original_buffers);
@@ -235,12 +244,14 @@ mod tests {
         // Verify the data is still correct
         assert_arrays_eq!(
             optimized_array,
-            <VarBinArray as FromIterator<_>>::from_iter([Some("short"), Some("tiny")])
+            <VarBinArray as FromIterator<_>>::from_iter([Some("short"), Some("tiny")]),
+            &mut ctx
         );
     }
 
     #[test]
     fn test_optimize_with_long_strings() {
+        let mut ctx = array_session().create_execution_ctx();
         // Create strings that are definitely longer than 12 bytes
         let long_string_1 = "this is definitely a very long string that exceeds the inline limit";
         let long_string_2 = "another extremely long string that also needs external buffer storage";
@@ -258,11 +269,10 @@ mod tests {
         let indices = buffer![0u32, 2u32].into_array();
         let taken = original.take(indices).unwrap();
         let taken_array = taken
-            .execute::<VarBinViewArray>(&mut LEGACY_SESSION.create_execution_ctx())
+            .execute::<VarBinViewArray>(&mut array_session().create_execution_ctx())
             .unwrap();
 
-        // Optimize the taken array
-        let optimized_array = taken_array.compact_buffers().unwrap();
+        let optimized_array = taken_array.compact_with_threshold(1.0).unwrap();
 
         // The optimized array should have exactly 1 buffer (consolidated)
         assert_eq!(optimized_array.data_buffers().len(), 1);
@@ -270,12 +280,14 @@ mod tests {
         // Verify the data is still correct
         assert_arrays_eq!(
             optimized_array,
-            VarBinArray::from(vec![long_string_1, long_string_3])
+            VarBinArray::from(vec![long_string_1, long_string_3]),
+            &mut ctx
         );
     }
 
     #[test]
     fn test_optimize_no_buffers() {
+        let mut ctx = array_session().create_execution_ctx();
         // Create an array with only short strings (all inlined)
         let original = VarBinViewArray::from_iter_str(["a", "bb", "ccc", "dddd"]);
 
@@ -287,11 +299,12 @@ mod tests {
 
         assert_eq!(optimized_array.data_buffers().len(), 0);
 
-        assert_arrays_eq!(optimized_array, original);
+        assert_arrays_eq!(optimized_array, original, &mut ctx);
     }
 
     #[test]
     fn test_optimize_single_buffer() {
+        let mut ctx = array_session().create_execution_ctx();
         // Create an array that naturally has only one buffer
         let str1 = "this is a long string that goes into a buffer";
         let str2 = "another long string in the same buffer";
@@ -306,11 +319,12 @@ mod tests {
 
         assert_eq!(optimized_array.data_buffers().len(), 1);
 
-        assert_arrays_eq!(optimized_array, original);
+        assert_arrays_eq!(optimized_array, original, &mut ctx);
     }
 
     #[test]
     fn test_selective_compaction_with_threshold_zero() {
+        let mut ctx = array_session().create_execution_ctx();
         // threshold=0 should keep all buffers (no compaction)
         let original = VarBinViewArray::from_iter_str([
             "this is a longer string that will be stored in a buffer",
@@ -324,7 +338,7 @@ mod tests {
         let indices = buffer![0u32].into_array();
         let taken = original.take(indices).unwrap();
         let taken = taken
-            .execute::<VarBinViewArray>(&mut LEGACY_SESSION.create_execution_ctx())
+            .execute::<VarBinViewArray>(&mut array_session().create_execution_ctx())
             .unwrap();
         // Compact with threshold=0 (should not compact)
         let compacted = taken.compact_with_threshold(0.0).unwrap();
@@ -333,11 +347,12 @@ mod tests {
         assert_eq!(compacted.data_buffers().len(), taken.data_buffers().len());
 
         // Verify correctness
-        assert_arrays_eq!(compacted, taken);
+        assert_arrays_eq!(compacted, taken, &mut ctx);
     }
 
     #[test]
     fn test_selective_compaction_with_high_threshold() {
+        let mut ctx = array_session().create_execution_ctx();
         // threshold=1.0 should compact any buffer with waste
         let original = VarBinViewArray::from_iter_str([
             "this is a longer string that will be stored in a buffer",
@@ -349,7 +364,7 @@ mod tests {
         let indices = buffer![0u32, 2u32].into_array();
         let taken = original.take(indices).unwrap();
         let taken = taken
-            .execute::<VarBinViewArray>(&mut LEGACY_SESSION.create_execution_ctx())
+            .execute::<VarBinViewArray>(&mut array_session().create_execution_ctx())
             .unwrap();
 
         let original_buffers = taken.data_buffers().len();
@@ -361,11 +376,12 @@ mod tests {
         assert!(compacted.data_buffers().len() <= original_buffers);
 
         // Verify correctness
-        assert_arrays_eq!(compacted, taken);
+        assert_arrays_eq!(compacted, taken, &mut ctx);
     }
 
     #[test]
     fn test_selective_compaction_preserves_well_utilized_buffers() {
+        let mut ctx = array_session().create_execution_ctx();
         // Create an array with multiple strings in one buffer (well-utilized)
         let str1 = "first long string that needs external buffer storage";
         let str2 = "second long string also in buffer";
@@ -383,11 +399,12 @@ mod tests {
         assert_eq!(compacted.data_buffers().len(), 1);
 
         // Verify all data is correct
-        assert_arrays_eq!(compacted, original);
+        assert_arrays_eq!(compacted, original, &mut ctx);
     }
 
     #[test]
     fn test_selective_compaction_with_mixed_utilization() {
+        let mut ctx = array_session().create_execution_ctx();
         // Create array with some long strings
         let strings: Vec<String> = (0..10)
             .map(|i| {
@@ -404,7 +421,7 @@ mod tests {
         let indices_array = buffer![0u32, 2u32, 4u32, 6u32, 8u32].into_array();
         let taken = original.take(indices_array).unwrap();
         let taken = taken
-            .execute::<VarBinViewArray>(&mut LEGACY_SESSION.create_execution_ctx())
+            .execute::<VarBinViewArray>(&mut array_session().create_execution_ctx())
             .unwrap();
 
         // Compact with moderate threshold
@@ -414,11 +431,12 @@ mod tests {
             [0, 2, 4, 6, 8].map(|i| Some(strings[i].as_str())),
             DType::Utf8(Nullability::NonNullable),
         );
-        assert_arrays_eq!(expected, compacted);
+        assert_arrays_eq!(expected, compacted, &mut ctx);
     }
 
     #[test]
     fn test_slice_strategy_with_contiguous_range() {
+        let mut ctx = array_session().create_execution_ctx();
         // Create array with strings that will be in one buffer
         let strings: Vec<String> = (0..20)
             .map(|i| format!("this is a long string number {} for slice test", i))
@@ -430,7 +448,7 @@ mod tests {
         let indices_array = buffer![0u32, 1u32, 2u32, 3u32, 4u32].into_array();
         let taken = original.take(indices_array).unwrap();
         let taken = taken
-            .execute::<VarBinViewArray>(&mut LEGACY_SESSION.create_execution_ctx())
+            .execute::<VarBinViewArray>(&mut array_session().create_execution_ctx())
             .unwrap();
         // Get buffer stats before compaction
         let utils_before = taken.buffer_utilizations().unwrap();
@@ -447,7 +465,7 @@ mod tests {
         );
 
         // Verify correctness
-        assert_arrays_eq!(&compacted, taken);
+        assert_arrays_eq!(&compacted, taken, &mut ctx);
 
         // Verify that if there was only one buffer, the compacted version also has one
         // (it was sliced, not rewritten into multiple buffers)

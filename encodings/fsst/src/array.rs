@@ -57,7 +57,6 @@ use vortex_session::registry::CachedId;
 
 use crate::canonical::canonicalize_fsst;
 use crate::canonical::fsst_decode_views;
-use crate::kernel::PARENT_KERNELS;
 use crate::rules::RULES;
 
 /// A [`FSST`]-encoded Vortex array.
@@ -147,6 +146,25 @@ impl VTable for FSST {
             2 => Some("compressed_codes".to_string()),
             _ => vortex_panic!("FSSTArray buffer_name index {idx} out of bounds"),
         }
+    }
+
+    fn with_buffers(
+        &self,
+        array: ArrayView<'_, Self>,
+        buffers: &[BufferHandle],
+    ) -> VortexResult<ArrayParts<Self>> {
+        vortex_ensure!(
+            buffers.len() == 3,
+            "Expected 3 buffers, got {}",
+            buffers.len()
+        );
+        let symbols = Buffer::<Symbol>::from_byte_buffer(buffers[0].clone().try_to_host_sync()?);
+        let symbol_lengths = Buffer::<u8>::from_byte_buffer(buffers[1].clone().try_to_host_sync()?);
+        let data = FSSTData::try_new(symbols, symbol_lengths, buffers[2].clone(), array.len())?;
+        Ok(
+            ArrayParts::new(self.clone(), array.dtype().clone(), array.len(), data)
+                .with_slots(array.slots().iter().cloned().collect()),
+        )
     }
 
     fn serialize(
@@ -311,15 +329,6 @@ impl VTable for FSST {
                 .execute_mask(array.array().len(), ctx)?,
         );
         Ok(())
-    }
-
-    fn execute_parent(
-        array: ArrayView<'_, Self>,
-        parent: &ArrayRef,
-        child_idx: usize,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<Option<ArrayRef>> {
-        PARENT_KERNELS.execute(array, parent, child_idx, ctx)
     }
 
     fn reduce_parent(
@@ -849,9 +858,8 @@ mod test {
     use prost::Message;
     use vortex_array::ArrayPlugin;
     use vortex_array::IntoArray;
-    use vortex_array::LEGACY_SESSION;
     use vortex_array::VortexSessionExecute;
-    use vortex_array::accessor::ArrayAccessor;
+    use vortex_array::array_session;
     use vortex_array::arrays::VarBinViewArray;
     use vortex_array::buffer::BufferHandle;
     use vortex_array::dtype::DType;
@@ -859,14 +867,13 @@ mod test {
     use vortex_array::dtype::PType;
     use vortex_array::test_harness::check_metadata;
     use vortex_buffer::Buffer;
-    use vortex_error::VortexError;
     use vortex_error::VortexResult;
     use vortex_error::vortex_err;
 
     use crate::FSST;
     use crate::array::FSSTArrayExt;
     use crate::array::FSSTMetadata;
-    use crate::fsst_compress_iter;
+    use crate::fsst_compress;
 
     #[test]
     fn slice_reuses_initialized_compressor() -> VortexResult<()> {
@@ -877,19 +884,9 @@ mod test {
         let symbol_lengths = Buffer::<u8>::copy_from([3, 8]);
 
         let compressor = Compressor::rebuild_from(symbols.as_slice(), symbol_lengths.as_slice());
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
-        let fsst_array = fsst_compress_iter(
-            [
-                Some(b"abcabcab".as_ref()),
-                Some(b"defghijk".as_ref()),
-                Some(b"abcxyz".as_ref()),
-            ]
-            .into_iter(),
-            3,
-            DType::Utf8(Nullability::NonNullable),
-            &compressor,
-            &mut ctx,
-        );
+        let mut ctx = array_session().create_execution_ctx();
+        let strings = VarBinViewArray::from_iter_str(["abcabcab", "defghijk", "abcxyz"]);
+        let fsst_array = fsst_compress(&strings.into_array(), &compressor, &mut ctx)?;
 
         let compressor_ptr = fsst_array.compressor() as *const Compressor;
         let sliced = fsst_array
@@ -923,7 +920,7 @@ mod test {
     /// This test manually constructs an old-style FSST array and ensures that it can still be
     /// deserialized.
     #[test]
-    fn test_back_compat() {
+    fn test_back_compat() -> VortexResult<()> {
         let symbols = Buffer::<Symbol>::copy_from([
             Symbol::from_slice(b"abc00000"),
             Symbol::from_slice(b"defghijk"),
@@ -931,14 +928,9 @@ mod test {
         let symbol_lengths = Buffer::<u8>::copy_from([3, 8]);
 
         let compressor = Compressor::rebuild_from(symbols.as_slice(), symbol_lengths.as_slice());
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
-        let fsst_array = fsst_compress_iter(
-            [Some(b"abcabcab".as_ref()), Some(b"defghijk".as_ref())].into_iter(),
-            2,
-            DType::Utf8(Nullability::NonNullable),
-            &compressor,
-            &mut ctx,
-        );
+        let mut ctx = array_session().create_execution_ctx();
+        let input = VarBinViewArray::from_iter_str(["abcabcab", "defghijk"]);
+        let fsst_array = fsst_compress(&input.into_array(), &compressor, &mut ctx)?;
 
         let compressed_codes = fsst_array.codes();
 
@@ -974,19 +966,18 @@ mod test {
             .encode_to_vec(),
             &buffers,
             &children.as_slice(),
-            &LEGACY_SESSION,
-        )
-        .unwrap();
+            &array_session(),
+        )?;
 
-        let decompressed = fsst
-            .execute::<VarBinViewArray>(&mut LEGACY_SESSION.create_execution_ctx())
-            .unwrap();
-        decompressed
-            .with_iterator(|it| {
-                assert_eq!(it.next().unwrap(), Some(b"abcabcab".as_ref()));
-                assert_eq!(it.next().unwrap(), Some(b"defghijk".as_ref()));
-                Ok::<_, VortexError>(())
-            })
-            .unwrap()
+        let decompressed =
+            fsst.execute::<VarBinViewArray>(&mut array_session().create_execution_ctx())?;
+        let mask = decompressed
+            .validity()?
+            .execute_mask(decompressed.len(), &mut ctx)?;
+        assert!(mask.value(0));
+        assert_eq!(decompressed.bytes_at(0).as_slice(), b"abcabcab".as_ref());
+        assert!(mask.value(1));
+        assert_eq!(decompressed.bytes_at(1).as_slice(), b"defghijk".as_ref());
+        Ok(())
     }
 }

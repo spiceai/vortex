@@ -14,17 +14,12 @@
 use std::fmt::Display;
 use std::fmt::Formatter;
 
-use vortex_array::ArrayRef;
-use vortex_array::ExecutionCtx;
-use vortex_array::arrays::ExtensionArray;
-use vortex_array::arrays::PrimitiveArray;
-use vortex_array::arrays::StructArray;
-use vortex_array::arrays::extension::ExtensionArrayExt;
-use vortex_array::arrays::struct_::StructArrayExt;
+use geoarrow::datatypes::Dimension as GeoArrowDimension;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::FieldNames;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
+use vortex_array::dtype::StructFields;
 use vortex_array::scalar::Scalar;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
@@ -62,6 +57,38 @@ impl Dimension {
             ["x", "y", "z", "m"] => Dimension::Xyzm,
             _ => vortex_bail!("not a valid GeoArrow coordinate dimension: {names:?}"),
         })
+    }
+
+    /// The coordinate field names of this dimension, in GeoArrow order.
+    pub(crate) fn field_names(self) -> &'static [&'static str] {
+        match self {
+            Dimension::Xy => &["x", "y"],
+            Dimension::Xyz => &["x", "y", "z"],
+            Dimension::Xym => &["x", "y", "m"],
+            Dimension::Xyzm => &["x", "y", "z", "m"],
+        }
+    }
+}
+
+impl From<GeoArrowDimension> for Dimension {
+    fn from(dim: GeoArrowDimension) -> Self {
+        match dim {
+            GeoArrowDimension::XY => Dimension::Xy,
+            GeoArrowDimension::XYZ => Dimension::Xyz,
+            GeoArrowDimension::XYM => Dimension::Xym,
+            GeoArrowDimension::XYZM => Dimension::Xyzm,
+        }
+    }
+}
+
+impl From<Dimension> for GeoArrowDimension {
+    fn from(dim: Dimension) -> Self {
+        match dim {
+            Dimension::Xy => GeoArrowDimension::XY,
+            Dimension::Xyz => GeoArrowDimension::XYZ,
+            Dimension::Xym => GeoArrowDimension::XYM,
+            Dimension::Xyzm => GeoArrowDimension::XYZM,
+        }
     }
 }
 
@@ -122,6 +149,21 @@ pub(crate) fn coordinate_dimension(dtype: &DType) -> VortexResult<Dimension> {
     Dimension::from_field_names(fields.names())
 }
 
+/// The canonical storage dtype for `dim`: a `Struct` of non-nullable `f64` coordinate fields,
+/// with `nullability` at the struct (per-point) level. Inverse of [`coordinate_dimension`].
+pub(crate) fn coordinate_storage_dtype(dim: Dimension, nullability: Nullability) -> DType {
+    let names = dim.field_names();
+    let fields = std::iter::repeat_n(
+        DType::Primitive(PType::F64, Nullability::NonNullable),
+        names.len(),
+    )
+    .collect::<Vec<_>>();
+    DType::Struct(
+        StructFields::new(FieldNames::from(names), fields),
+        nullability,
+    )
+}
+
 /// Decode a [`Coordinate`] from a coordinate `Struct<x, y[, z][, m]>` scalar (`z`/`m` read iff
 /// present, so the same decoder serves every dimension).
 pub(crate) fn coordinate_from_struct(scalar: &Scalar) -> VortexResult<Coordinate> {
@@ -147,111 +189,46 @@ pub(crate) fn coordinate_from_struct(scalar: &Scalar) -> VortexResult<Coordinate
     })
 }
 
-/// Decode a [`Coordinate`] from an extension-typed point scalar (unwrapped to its coordinate
-/// storage) or a bare coordinate `Struct` scalar. The per-row decode used by the distance fns.
-pub(crate) fn coordinate_from_scalar(scalar: &Scalar) -> VortexResult<Coordinate> {
-    match scalar.as_extension_opt() {
-        Some(ext_scalar) => coordinate_from_struct(&ext_scalar.to_storage_scalar()),
-        None => coordinate_from_struct(scalar),
-    }
-}
-
-/// Validated, executed `x`/`y` columns of a point array. The bulk counterpart to [`Coordinate`];
-/// `z`/`m` are not executed.
-pub(crate) struct ParsedCoordinates {
-    /// The flat `f64` `x` column.
-    pub(crate) xs: PrimitiveArray,
-    /// The flat `f64` `y` column.
-    pub(crate) ys: PrimitiveArray,
-}
-
-/// Validate a point column's coordinate storage (layout and non-nullability) and execute its
-/// `x`/`y` columns.
-pub(crate) fn parse_storage(
-    points: &ArrayRef,
-    ctx: &mut ExecutionCtx,
-) -> VortexResult<ParsedCoordinates> {
-    let storage = points
-        .clone()
-        .execute::<ExtensionArray>(ctx)?
-        .storage_array()
-        .clone()
-        .execute::<StructArray>(ctx)?;
-    coordinate_dimension(storage.dtype())?;
-    vortex_ensure!(
-        !storage.dtype().is_nullable(),
-        "coordinate storage must be non-nullable to read unmasked ordinates, was {}",
-        storage.dtype()
-    );
-    let xs = storage
-        .unmasked_field_by_name("x")?
-        .clone()
-        .execute::<PrimitiveArray>(ctx)?;
-    let ys = storage
-        .unmasked_field_by_name("y")?
-        .clone()
-        .execute::<PrimitiveArray>(ctx)?;
-    Ok(ParsedCoordinates { xs, ys })
-}
-
 #[cfg(test)]
 mod tests {
-    use vortex_array::IntoArray;
-    use vortex_array::VortexSessionExecute;
-    use vortex_array::arrays::ExtensionArray;
-    use vortex_array::arrays::PrimitiveArray;
-    use vortex_array::arrays::StructArray;
-    use vortex_array::dtype::FieldNames;
-    use vortex_array::dtype::extension::ExtDType;
-    use vortex_array::session::ArraySession;
-    use vortex_array::validity::Validity;
+    use rstest::rstest;
+    use vortex_array::dtype::Nullability;
     use vortex_error::VortexResult;
-    use vortex_session::VortexSession;
 
     use super::Coordinate;
-    use super::parse_storage;
-    use crate::extension::GeoMetadata;
-    use crate::extension::Point;
+    use super::Dimension;
+    use super::coordinate_dimension;
+    use super::coordinate_storage_dtype;
+
+    /// Each dimension round-trips through its field names and canonical storage dtype.
+    #[rstest]
+    #[case::xy(Dimension::Xy, &["x", "y"])]
+    #[case::xyz(Dimension::Xyz, &["x", "y", "z"])]
+    #[case::xym(Dimension::Xym, &["x", "y", "m"])]
+    #[case::xyzm(Dimension::Xyzm, &["x", "y", "z", "m"])]
+    fn storage_dtype_roundtrips_dimension(
+        #[case] dim: Dimension,
+        #[case] names: &[&str],
+    ) -> VortexResult<()> {
+        assert_eq!(dim.field_names(), names);
+        let dtype = coordinate_storage_dtype(dim, Nullability::NonNullable);
+        assert_eq!(coordinate_dimension(&dtype)?, dim);
+        Ok(())
+    }
 
     /// Display emits WKT, including `z`/`m` when present.
-    #[test]
-    fn display_is_wkt() {
-        let coordinate = |z, m| Coordinate {
+    #[rstest]
+    #[case::xy(None, None, "POINT(1 2)")]
+    #[case::xyz(Some(3.0), None, "POINT Z (1 2 3)")]
+    #[case::xym(None, Some(4.0), "POINT M (1 2 4)")]
+    #[case::xyzm(Some(3.0), Some(4.0), "POINT ZM (1 2 3 4)")]
+    fn display_is_wkt(#[case] z: Option<f64>, #[case] m: Option<f64>, #[case] expected: &str) {
+        let coordinate = Coordinate {
             x: 1.0,
             y: 2.0,
             z,
             m,
         };
-        assert_eq!(coordinate(None, None).to_string(), "POINT(1 2)");
-        assert_eq!(coordinate(Some(3.0), None).to_string(), "POINT Z (1 2 3)");
-        assert_eq!(coordinate(None, Some(4.0)).to_string(), "POINT M (1 2 4)");
-        assert_eq!(
-            coordinate(Some(3.0), Some(4.0)).to_string(),
-            "POINT ZM (1 2 3 4)"
-        );
-    }
-
-    /// [`parse_storage`] reads the coordinate fields unmasked, so a nullable point column must
-    /// be rejected at parse time rather than decoding null rows as garbage ordinates.
-    #[test]
-    fn parse_rejects_nullable_points() -> VortexResult<()> {
-        let session = VortexSession::empty().with::<ArraySession>();
-        let mut ctx = session.create_execution_ctx();
-
-        let storage = StructArray::try_new(
-            FieldNames::from(["x", "y"]),
-            vec![
-                PrimitiveArray::from_iter(vec![1.0f64]).into_array(),
-                PrimitiveArray::from_iter(vec![2.0f64]).into_array(),
-            ],
-            1,
-            Validity::AllValid,
-        )?
-        .into_array();
-        let dtype = ExtDType::<Point>::try_new(GeoMetadata { crs: None }, storage.dtype().clone())?;
-        let points = ExtensionArray::new(dtype.erased(), storage).into_array();
-
-        assert!(parse_storage(&points, &mut ctx).is_err());
-        Ok(())
+        assert_eq!(coordinate.to_string(), expected);
     }
 }

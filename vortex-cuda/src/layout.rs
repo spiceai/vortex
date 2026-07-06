@@ -40,6 +40,7 @@ use vortex::error::VortexResult;
 use vortex::error::vortex_bail;
 use vortex::error::vortex_panic;
 use vortex::layout::IntoLayout;
+use vortex::layout::LayoutBuildContext;
 use vortex::layout::LayoutChildType;
 use vortex::layout::LayoutChildren;
 use vortex::layout::LayoutEncodingRef;
@@ -64,6 +65,7 @@ use vortex::scalar::ScalarTruncation;
 use vortex::scalar::lower_bound;
 use vortex::scalar::upper_bound;
 use vortex::session::VortexSession;
+use vortex::session::registry::CachedId;
 use vortex::session::registry::ReadContext;
 use vortex::utils::aliases::hash_map::HashMap;
 use vortex::utils::aliases::hash_set::HashSet;
@@ -130,7 +132,8 @@ impl VTable for CudaFlat {
     type Metadata = ProstMetadata<CudaFlatLayoutMetadata>;
 
     fn id(_encoding: &Self::Encoding) -> LayoutId {
-        LayoutId::new("vortex.cuda_flat")
+        static ID: CachedId = CachedId::new("vortex.cuda_flat");
+        *ID
     }
 
     fn encoding(_layout: &Self::Layout) -> LayoutEncodingRef {
@@ -198,7 +201,7 @@ impl VTable for CudaFlat {
         metadata: &<Self::Metadata as DeserializeMetadata>::Output,
         segment_ids: Vec<SegmentId>,
         _children: &dyn LayoutChildren,
-        ctx: &ReadContext,
+        build_ctx: &LayoutBuildContext<'_>,
     ) -> VortexResult<Self::Layout> {
         if segment_ids.len() != 1 {
             vortex_bail!("CudaFlatLayout must have exactly one segment ID");
@@ -212,7 +215,7 @@ impl VTable for CudaFlat {
             row_count,
             dtype: dtype.clone(),
             segment_id: segment_ids[0],
-            ctx: ctx.clone(),
+            ctx: build_ctx.array_read_ctx.clone(),
             array_tree: ByteBuffer::from(metadata.array_encoding_tree.clone()),
             host_buffers: Arc::new(host_buffers),
         })
@@ -331,12 +334,12 @@ impl LayoutReader for CudaFlatReader {
                 let array = array.apply(&expr)?;
                 let array = array.filter(mask.clone())?;
                 let mut ctx = session.create_execution_ctx();
-                let array_mask = array.execute::<Mask>(&mut ctx)?;
+                let array_mask = array.null_as_false().execute(&mut ctx)?;
                 mask.intersect_by_rank(&array_mask)
             } else {
                 let array = array.apply(&expr)?;
                 let mut ctx = session.create_execution_ctx();
-                let array_mask = array.execute::<Mask>(&mut ctx)?;
+                let array_mask = array.null_as_false().execute(&mut ctx)?;
                 mask.bitand(&array_mask)
             };
 

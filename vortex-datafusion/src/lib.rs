@@ -88,7 +88,7 @@ use std::fmt::Debug;
 use datafusion_common::stats::Precision as DFPrecision;
 use vortex::expr::stats::Precision;
 
-mod convert;
+pub mod convert;
 mod persistent;
 pub mod v2;
 

@@ -20,8 +20,9 @@ use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
 use vortex_session::SessionExt;
 use vortex_session::VortexSession;
-use vortex_session::registry::ReadContext;
+use vortex_session::registry::CachedId;
 
+use crate::LayoutBuildContext;
 use crate::LayoutChildType;
 use crate::LayoutEncodingRef;
 use crate::LayoutId;
@@ -42,7 +43,8 @@ impl VTable for Struct {
     type Metadata = EmptyMetadata;
 
     fn id(_encoding: &Self::Encoding) -> LayoutId {
-        LayoutId::new("vortex.struct")
+        static ID: CachedId = CachedId::new("vortex.struct");
+        *ID
     }
 
     fn encoding(_layout: &Self::Layout) -> LayoutEncodingRef {
@@ -132,7 +134,7 @@ impl VTable for Struct {
         _metadata: &<Self::Metadata as DeserializeMetadata>::Output,
         _segment_ids: Vec<SegmentId>,
         children: &dyn LayoutChildren,
-        _ctx: &ReadContext,
+        _build_ctx: &LayoutBuildContext<'_>,
     ) -> VortexResult<Self::Layout> {
         let struct_dt = dtype
             .as_struct_fields_opt()

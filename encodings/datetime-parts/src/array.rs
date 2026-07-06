@@ -42,7 +42,6 @@ use vortex_session::registry::CachedId;
 
 use crate::TemporalParts;
 use crate::canonical::decode_to_temporal;
-use crate::compute::kernel::PARENT_KERNELS;
 use crate::compute::rules::PARENT_RULES;
 use crate::split_temporal;
 
@@ -123,6 +122,14 @@ impl VTable for DateTimeParts {
         vortex_panic!("DateTimePartsArray buffer_name index {idx} out of bounds")
     }
 
+    fn with_buffers(
+        &self,
+        array: ArrayView<'_, Self>,
+        buffers: &[BufferHandle],
+    ) -> VortexResult<ArrayParts<Self>> {
+        vortex_array::vtable::with_empty_buffers(self, array, buffers)
+    }
+
     fn serialize(
         array: ArrayView<'_, Self>,
         _session: &VortexSession,
@@ -199,15 +206,6 @@ impl VTable for DateTimeParts {
         child_idx: usize,
     ) -> VortexResult<Option<ArrayRef>> {
         PARENT_RULES.evaluate(array, parent, child_idx)
-    }
-
-    fn execute_parent(
-        array: ArrayView<'_, Self>,
-        parent: &ArrayRef,
-        child_idx: usize,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<Option<ArrayRef>> {
-        PARENT_KERNELS.execute(array, parent, child_idx, ctx)
     }
 }
 

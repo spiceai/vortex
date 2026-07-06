@@ -16,6 +16,7 @@ use vortex_session::registry::CachedId;
 
 use crate::ArrayEq;
 use crate::ArrayHash;
+use crate::ArrayParts;
 use crate::ArrayRef;
 use crate::EqMode;
 use crate::ExecutionCtx;
@@ -24,6 +25,7 @@ use crate::array::Array;
 use crate::array::ArrayId;
 use crate::array::ArrayView;
 use crate::array::VTable;
+use crate::array::with_empty_buffers;
 use crate::arrays::listview::ListViewArrayExt;
 use crate::arrays::listview::ListViewData;
 use crate::arrays::listview::array::ELEMENTS_SLOT;
@@ -32,7 +34,6 @@ use crate::arrays::listview::array::OFFSETS_SLOT;
 use crate::arrays::listview::array::SIZES_SLOT;
 use crate::arrays::listview::array::SLOT_NAMES;
 use crate::arrays::listview::compute::rules::PARENT_RULES;
-use crate::arrays::listview::vtable::kernel::PARENT_KERNELS;
 use crate::buffer::BufferHandle;
 use crate::dtype::DType;
 use crate::dtype::Nullability;
@@ -44,6 +45,10 @@ mod operations;
 mod validity;
 /// A [`ListView`]-encoded Vortex array.
 pub type ListViewArray = Array<ListView>;
+
+pub(crate) fn initialize(session: &VortexSession) {
+    kernel::initialize(session);
+}
 
 #[derive(Clone, Debug)]
 pub struct ListView;
@@ -90,6 +95,14 @@ impl VTable for ListView {
 
     fn buffer_name(_array: ArrayView<'_, Self>, idx: usize) -> Option<String> {
         vortex_panic!("ListViewArray buffer_name index {idx} out of bounds")
+    }
+
+    fn with_buffers(
+        &self,
+        array: ArrayView<'_, Self>,
+        buffers: &[BufferHandle],
+    ) -> VortexResult<ArrayParts<Self>> {
+        with_empty_buffers(self, array, buffers)
     }
 
     fn serialize(
@@ -154,7 +167,7 @@ impl VTable for ListView {
         buffers: &[BufferHandle],
         children: &dyn ArrayChildren,
         _session: &VortexSession,
-    ) -> VortexResult<crate::array::ArrayParts<Self>> {
+    ) -> VortexResult<ArrayParts<Self>> {
         let metadata = ListViewMetadata::decode(metadata)?;
         vortex_ensure!(
             buffers.is_empty(),
@@ -201,7 +214,7 @@ impl VTable for ListView {
         ListViewData::validate(&elements, &offsets, &sizes, &validity)?;
         let data = ListViewData::try_new()?;
         let slots = ListViewData::make_slots(&elements, &offsets, &sizes, &validity, len);
-        Ok(crate::array::ArrayParts::new(self.clone(), dtype.clone(), len, data).with_slots(slots))
+        Ok(ArrayParts::new(self.clone(), dtype.clone(), len, data).with_slots(slots))
     }
 
     fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {
@@ -218,14 +231,5 @@ impl VTable for ListView {
         child_idx: usize,
     ) -> VortexResult<Option<ArrayRef>> {
         PARENT_RULES.evaluate(array, parent, child_idx)
-    }
-
-    fn execute_parent(
-        array: ArrayView<'_, Self>,
-        parent: &ArrayRef,
-        child_idx: usize,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<Option<ArrayRef>> {
-        PARENT_KERNELS.execute(array, parent, child_idx, ctx)
     }
 }

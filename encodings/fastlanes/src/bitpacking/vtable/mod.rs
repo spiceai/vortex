@@ -35,6 +35,7 @@ use vortex_array::vtable::validity_to_child;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
+use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
@@ -48,7 +49,6 @@ use crate::bitpack_decompress::unpack_into_primitive_builder;
 use crate::bitpacking::array::BitPackedSlots;
 use crate::bitpacking::array::BitPackedSlotsView;
 use crate::bitpacking::array::PATCH_SLOTS;
-use crate::bitpacking::vtable::kernels::PARENT_KERNELS;
 use crate::bitpacking::vtable::rules::RULES;
 mod kernels;
 mod operations;
@@ -57,6 +57,10 @@ mod validity;
 
 /// A [`BitPacked`]-encoded Vortex array.
 pub type BitPackedArray = Array<BitPacked>;
+
+pub(crate) fn initialize(session: &VortexSession) {
+    kernels::initialize(session);
+}
 
 #[derive(Clone, prost::Message)]
 pub struct BitPackedMetadata {
@@ -136,6 +140,24 @@ impl VTable for BitPacked {
             0 => Some("packed".to_string()),
             _ => None,
         }
+    }
+
+    fn with_buffers(
+        &self,
+        array: ArrayView<'_, Self>,
+        buffers: &[BufferHandle],
+    ) -> VortexResult<ArrayParts<Self>> {
+        vortex_ensure!(
+            buffers.len() == 1,
+            "Expected 1 buffer, got {}",
+            buffers.len()
+        );
+        let mut data = array.data().clone();
+        data.packed = buffers[0].clone();
+        Ok(
+            ArrayParts::new(self.clone(), array.dtype().clone(), array.len(), data)
+                .with_slots(array.slots().iter().cloned().collect()),
+        )
     }
 
     fn serialize(
@@ -266,15 +288,6 @@ impl VTable for BitPacked {
         Ok(ExecutionResult::done(
             unpack_array(array.as_view(), ctx)?.into_array(),
         ))
-    }
-
-    fn execute_parent(
-        array: ArrayView<'_, Self>,
-        parent: &ArrayRef,
-        child_idx: usize,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<Option<ArrayRef>> {
-        PARENT_KERNELS.execute(array, parent, child_idx, ctx)
     }
 
     fn reduce_parent(

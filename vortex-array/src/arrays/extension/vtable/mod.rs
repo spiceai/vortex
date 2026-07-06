@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use kernel::PARENT_KERNELS;
 use smallvec::smallvec;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
@@ -22,6 +21,7 @@ use crate::array::ArrayParts;
 use crate::array::ArrayView;
 use crate::array::VTable;
 use crate::array::ValidityVTableFromChild;
+use crate::array::with_empty_buffers;
 use crate::arrays::extension::array::SLOT_NAMES;
 use crate::arrays::extension::array::STORAGE_SLOT;
 use crate::arrays::extension::compute::rules::PARENT_RULES;
@@ -78,6 +78,10 @@ pub struct Extension;
 /// A [`Extension`]-encoded Vortex array.
 pub type ExtensionArray = Array<Extension>;
 
+pub(crate) fn initialize(session: &VortexSession) {
+    kernel::initialize(session);
+}
+
 impl VTable for Extension {
     type TypedArrayData = EmptyArrayData;
 
@@ -132,6 +136,14 @@ impl VTable for Extension {
         None
     }
 
+    fn with_buffers(
+        &self,
+        array: ArrayView<'_, Self>,
+        buffers: &[BufferHandle],
+    ) -> VortexResult<ArrayParts<Self>> {
+        with_empty_buffers(self, array, buffers)
+    }
+
     fn serialize(
         _array: ArrayView<'_, Self>,
         _session: &VortexSession,
@@ -174,15 +186,6 @@ impl VTable for Extension {
 
     fn execute(array: Array<Self>, _ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
         Ok(ExecutionResult::done(array))
-    }
-
-    fn execute_parent(
-        array: ArrayView<'_, Self>,
-        parent: &ArrayRef,
-        child_idx: usize,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<Option<ArrayRef>> {
-        PARENT_KERNELS.execute(array, parent, child_idx, ctx)
     }
 
     fn reduce(array: ArrayView<'_, Self>) -> VortexResult<Option<ArrayRef>> {
