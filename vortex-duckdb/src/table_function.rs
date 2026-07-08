@@ -4,13 +4,19 @@
 use std::cmp::max;
 use std::fmt::Formatter;
 use std::fmt::{self};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::task::Context;
+use std::task::Poll;
 
 use custom_labels::CURRENT_LABELSET;
+use futures::FutureExt;
+use futures::Stream;
 use futures::StreamExt;
+use futures::future::BoxFuture;
 use itertools::Itertools;
 use num_traits::AsPrimitive;
 use static_assertions::assert_impl_all;
@@ -108,7 +114,8 @@ impl<'a> TableInitInput<'a> {
     }
 }
 
-type DataSourceIterator = ThreadSafeIterator<VortexResult<(ArrayRef, Arc<ConversionCache>)>>;
+type ScanItem = VortexResult<(ArrayRef, Arc<ConversionCache>)>;
+type DataSourceIterator = ThreadSafeIterator<ScanItem>;
 
 pub struct TableFunctionGlobal {
     iterator: DataSourceIterator,
@@ -268,10 +275,7 @@ pub fn init_global(init_input: &TableInitInput) -> VortexResult<TableFunctionGlo
         })
         .buffer_unordered(num_workers);
 
-    // Spawn a task to drive the partition stream and push array chunks into the channel.
-    RUNTIME.handle().spawn(stream.collect::<()>()).detach();
-
-    let iterator = RUNTIME.block_on_stream_thread_safe(|_handle| rx.into_stream());
+    let iterator = RUNTIME.block_on_stream_thread_safe(|_handle| scan_driver_stream(stream, rx));
 
     Ok(TableFunctionGlobal {
         iterator,
@@ -281,6 +285,39 @@ pub fn init_global(init_input: &TableInitInput) -> VortexResult<TableFunctionGlo
         file_index_column_pos,
         file_row_number_column_pos,
     })
+}
+
+fn scan_driver_stream<S>(stream: S, rx: kanal::AsyncReceiver<ScanItem>) -> ScanDriverStream
+where
+    S: Stream<Item = ()> + Send + 'static,
+{
+    ScanDriverStream {
+        driver: Some(stream.collect::<()>().boxed()),
+        rx: rx.into_stream().boxed(),
+    }
+}
+
+struct ScanDriverStream {
+    driver: Option<BoxFuture<'static, ()>>,
+    rx: futures::stream::BoxStream<'static, ScanItem>,
+}
+
+impl Stream for ScanDriverStream {
+    type Item = ScanItem;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if let Some(driver) = this.driver.as_mut()
+            && driver.as_mut().poll(cx).is_ready()
+        {
+            this.driver = None;
+        }
+
+        match this.rx.as_mut().poll_next(cx) {
+            Poll::Ready(None) if this.driver.is_some() => Poll::Pending,
+            poll => poll,
+        }
+    }
 }
 
 pub fn init_local(global: &TableFunctionGlobal) -> TableFunctionLocal {
@@ -545,8 +582,11 @@ fn progress(bytes_read: &AtomicU64, bytes_total: &AtomicU64) -> f64 {
 mod tests {
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering::Relaxed;
+    use std::task::Poll;
 
+    use crate::RUNTIME;
     use crate::table_function::progress;
+    use crate::table_function::scan_driver_stream;
 
     #[test]
     fn test_table_scan_progress() {
@@ -560,5 +600,27 @@ mod tests {
 
         bytes_total.fetch_add(100, Relaxed);
         assert!((progress(&bytes_read, &bytes_total) - 50.).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn scan_driver_panic_propagates_through_iterator() {
+        let (tx, rx) = kanal::bounded_async(1);
+        let _tx = tx;
+        let stream = futures::stream::poll_fn(|_| -> Poll<Option<()>> {
+            panic!("duckdb scan driver panic");
+        });
+
+        let mut iter =
+            RUNTIME.block_on_stream_thread_safe(|_handle| scan_driver_stream(stream, rx));
+        let panic = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| iter.next())) {
+            Ok(_) => panic!("driver panic must propagate through iterator"),
+            Err(panic) => panic,
+        };
+        let message = panic
+            .downcast_ref::<&'static str>()
+            .copied()
+            .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("<unknown panic>");
+        assert!(message.contains("duckdb scan driver panic"));
     }
 }
