@@ -37,7 +37,7 @@ prost = { workspace = true }
 rustc-hash = { workspace = true }
 sketches-ddsketch = { workspace = true }
 termtree = { workspace = true }
-tokio = { workspace = true, features = ["rt"], optional = true }
+tokio = { workspace = true, features = ["rt", "sync"] }
 tracing = { workspace = true }
 vortex-array = { workspace = true }
 vortex-btrblocks = { workspace = true }
@@ -63,7 +63,7 @@ vortex-io = { path = "../vortex-io", features = ["tokio"] }
 
 [features]
 _test-harness = []
-tokio = ["dep:tokio", "vortex-error/tokio"]
+tokio = ["vortex-error/tokio"]
 
 [lints]
 workspace = true

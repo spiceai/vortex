@@ -35,7 +35,6 @@ use vortex_error::VortexError;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
-use vortex_io::kanal_ext::KanalExt;
 use vortex_io::session::RuntimeSessionExt;
 use vortex_session::VortexSession;
 
@@ -52,6 +51,8 @@ use crate::sequence::SequencePointer;
 use crate::sequence::SequentialStream;
 use crate::sequence::SequentialStreamAdapter;
 use crate::sequence::SequentialStreamExt;
+use tokio::sync::mpsc;
+use tokio::sync::oneshot as tokio_oneshot;
 
 /// Constraints for dictionary layout encoding.
 ///
@@ -393,9 +394,9 @@ type SequencedChunk = VortexResult<(SequenceId, ArrayRef)>;
 
 struct DictionaryTransformer {
     input: DictionaryStream,
-    active_codes_tx: Option<kanal::AsyncSender<SequencedChunk>>,
-    active_values_tx: Option<oneshot::Sender<SequencedChunk>>,
-    pending_send: Option<BoxFuture<'static, Result<(), kanal::SendError<SequencedChunk>>>>,
+    active_codes_tx: Option<mpsc::Sender<SequencedChunk>>,
+    active_values_tx: Option<tokio_oneshot::Sender<SequencedChunk>>,
+    pending_send: Option<BoxFuture<'static, Result<(), mpsc::error::SendError<SequencedChunk>>>>,
 }
 
 impl DictionaryTransformer {
@@ -443,8 +444,8 @@ impl Stream for DictionaryTransformer {
                 }))) => {
                     if self.active_codes_tx.is_none() {
                         // Start a new group
-                        let (codes_tx, codes_rx) = kanal::bounded_async::<SequencedChunk>(1);
-                        let (values_tx, values_rx) = oneshot::channel();
+                        let (codes_tx, mut codes_rx) = mpsc::channel::<SequencedChunk>(1);
+                        let (values_tx, values_rx) = tokio_oneshot::channel();
 
                         self.active_codes_tx = Some(codes_tx.clone());
                         self.active_values_tx = Some(values_tx);
@@ -461,7 +462,7 @@ impl Stream for DictionaryTransformer {
                         // Create output streams.
                         let codes_stream = SequentialStreamAdapter::new(
                             codes_dtype,
-                            codes_rx.into_stream().boxed(),
+                            futures::stream::poll_fn(move |cx| codes_rx.poll_recv(cx)).boxed(),
                         )
                         .sendable();
 

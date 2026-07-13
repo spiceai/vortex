@@ -16,15 +16,16 @@ use vortex_layout::segments::SegmentSink;
 use vortex_layout::sequence::SequenceId;
 
 use crate::footer::SegmentSpec;
+use tokio::sync::mpsc;
 
 pub struct BufferedSegmentSink {
-    buffers: kanal::AsyncSender<ByteBuffer>,
+    buffers: mpsc::Sender<ByteBuffer>,
     byte_offset: AtomicU64,
     segment_specs: Mutex<Vec<SegmentSpec>>,
 }
 
 impl BufferedSegmentSink {
-    pub fn new(send: kanal::AsyncSender<ByteBuffer>, byte_offset: u64) -> Self {
+    pub fn new(send: mpsc::Sender<ByteBuffer>, byte_offset: u64) -> Self {
         Self {
             buffers: send,
             byte_offset: AtomicU64::new(byte_offset),

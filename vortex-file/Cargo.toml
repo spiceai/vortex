@@ -28,7 +28,7 @@ object_store = { workspace = true, optional = true }
 oneshot.workspace = true
 parking_lot = { workspace = true }
 pin-project-lite = { workspace = true }
-tokio = { workspace = true, features = ["rt"], optional = true }
+tokio = { workspace = true, features = ["rt", "sync"] }
 tracing = { workspace = true }
 vortex-alp = { workspace = true }
 vortex-array = { workspace = true }
@@ -72,7 +72,6 @@ workspace = true
 [features]
 object_store = ["dep:object_store", "vortex-io/object_store", "tokio"]
 tokio = [
-    "dep:tokio",
     "vortex-error/tokio",
     "vortex-io/tokio",
     "vortex-layout/tokio",

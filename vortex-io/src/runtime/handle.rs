@@ -14,6 +14,7 @@ use vortex_error::vortex_panic;
 
 use crate::runtime::AbortHandleRef;
 use crate::runtime::Executor;
+use tokio::sync::oneshot as tokio_oneshot;
 
 /// A handle to an active Vortex runtime.
 ///
@@ -67,7 +68,7 @@ impl Handle {
         Fut: Future<Output = R> + Send + 'static,
         R: Send + 'static,
     {
-        let (send, recv) = oneshot::channel();
+        let (send, recv) = tokio_oneshot::channel();
         // Instrument with a dedicated, named span on its own target rather than
         // re-entering `Span::current()`. `Instrumented::poll` enters and exits the
         // span on every poll, so re-entering the caller's span makes its cost scale
@@ -84,7 +85,7 @@ impl Handle {
             .boxed(),
         );
         Task {
-            recv: recv.into_future(),
+            recv,
             abort_handle: Some(abort_handle),
         }
     }
@@ -108,7 +109,7 @@ impl Handle {
         Fut: Future<Output = R> + Send + 'static,
         R: Send + 'static,
     {
-        let (send, recv) = oneshot::channel();
+        let (send, recv) = tokio_oneshot::channel();
         // See `spawn` above: a dedicated target rather than `Span::current()` so
         // subscribers can filter these spans in or out. I/O futures are polled
         // frequently, so disabling the span (the default for an unconfigured
@@ -123,7 +124,7 @@ impl Handle {
             .boxed(),
         );
         Task {
-            recv: recv.into_future(),
+            recv,
             abort_handle: Some(abort_handle),
         }
     }
@@ -142,7 +143,7 @@ impl Handle {
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
-        let (send, recv) = oneshot::channel();
+        let (send, recv) = tokio_oneshot::channel();
         let span = tracing::Span::current();
         let abort_handle = self.runtime().spawn_cpu(Box::new(move || {
             let _guard = span.enter();
@@ -153,7 +154,7 @@ impl Handle {
             }
         }));
         Task {
-            recv: recv.into_future(),
+            recv,
             abort_handle: Some(abort_handle),
         }
     }
@@ -164,7 +165,7 @@ impl Handle {
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
-        let (send, recv) = oneshot::channel();
+        let (send, recv) = tokio_oneshot::channel();
         let span = tracing::Span::current();
         let abort_handle = self.runtime().spawn_blocking_io(Box::new(move || {
             let _guard = span.enter();
@@ -175,7 +176,7 @@ impl Handle {
             }
         }));
         Task {
-            recv: recv.into_future(),
+            recv,
             abort_handle: Some(abort_handle),
         }
     }
@@ -187,7 +188,7 @@ impl Handle {
 /// continue running in the background, call [`Task::detach`].
 #[must_use = "When a Task is dropped without being awaited, it is cancelled"]
 pub struct Task<T> {
-    recv: oneshot::AsyncReceiver<T>,
+    recv: tokio_oneshot::Receiver<T>,
     abort_handle: Option<AbortHandleRef>,
 }
 

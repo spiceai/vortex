@@ -27,7 +27,6 @@ use vortex_array::dtype::Nullability;
 use vortex_error::VortexError;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
-use vortex_io::kanal_ext::KanalExt;
 use vortex_io::session::RuntimeSessionExt;
 use vortex_session::VortexSession;
 use vortex_utils::aliases::DefaultHashBuilder;
@@ -44,6 +43,7 @@ use crate::sequence::SequenceId;
 use crate::sequence::SequencePointer;
 use crate::sequence::SequentialStreamAdapter;
 use crate::sequence::SequentialStreamExt;
+use tokio::sync::mpsc;
 
 /// A configurable strategy for writing tables with nested field columns, allowing
 /// overrides for specific leaf columns.
@@ -264,7 +264,7 @@ impl LayoutStrategy for TableStrategy {
         }
 
         let (column_streams_tx, column_streams_rx): (Vec<_>, Vec<_>) =
-            (0..stream_count).map(|_| kanal::bounded_async(1)).unzip();
+            (0..stream_count).map(|_| mpsc::channel(1)).unzip();
 
         // Spawn a task to fan out column chunks to their respective transposed streams
         let handle = session.handle();
@@ -313,10 +313,12 @@ impl LayoutStrategy for TableStrategy {
             .zip_eq(column_streams_rx)
             .zip_eq(column_names)
             .enumerate()
-            .map(move |(index, ((dtype, recv), name))| {
-                let column_stream =
-                    SequentialStreamAdapter::new(dtype.clone(), recv.into_stream().boxed())
-                        .sendable();
+            .map(move |(index, ((dtype, mut recv), name))| {
+                let column_stream = SequentialStreamAdapter::new(
+                    dtype.clone(),
+                    futures::stream::poll_fn(move |cx| recv.poll_recv(cx)).boxed(),
+                )
+                .sendable();
                 let child_eof = eof.split_off();
                 let field = Field::Name(name.clone());
                 let session = session.clone();
