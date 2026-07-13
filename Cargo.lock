@@ -1071,6 +1071,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "branches"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e426eb5cc1900033930ec955317b302e68f19f326cc7bb0c8a86865a826cdf0c"
+dependencies = [
+ "rustc_version",
+]
+
+[[package]]
 name = "brotli"
 version = "8.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1195,6 +1204,12 @@ checksum = "f3a53fac24f34a81bc9954b5d6cfce0c21e18ec6959f44f56e8e90e4bb7c346c"
 dependencies = [
  "libbz2-rs-sys",
 ]
+
+[[package]]
+name = "cacheguard"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2dbbe48daefc2575b7dfdc8227f4724582080ae48b0482191f6eb91e4cd2f405"
 
 [[package]]
 name = "camino"
@@ -5170,10 +5185,11 @@ dependencies = [
 
 [[package]]
 name = "kanal"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e3953adf0cd667798b396c2fa13552d6d9b3269d7dd1154c4c416442d1ff574"
+version = "0.2.0-beta1"
+source = "git+https://github.com/fereidani/kanal.git?rev=89a1a3c75d4d8cdf7d624afd1c593f11da6c0047#89a1a3c75d4d8cdf7d624afd1c593f11da6c0047"
 dependencies = [
+ "branches",
+ "cacheguard",
  "futures-core",
  "lock_api",
 ]
