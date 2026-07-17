@@ -120,68 +120,95 @@ impl VortexReadAt for ObjectStoreReadAt {
         // Requires to deal with borrowed lifetimes
         let io_handle = handle.clone();
 
+        // DIAG (cold-stall): correlate every physical read's lifecycle so a "start"
+        // with no matching "end" names the hung read (uri + byte range) and the
+        // last phase it reached. Also track in-flight reads to see if all
+        // buffer_unordered slots are occupied by never-completing reads.
+        let uri = self.uri.clone();
+        let seq = READ_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let inflight = READ_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        tracing::info!(target: "vortex::readat", seq, uri = %uri, offset, length, inflight, "read_at start");
+
         handle
                 .spawn_io(async move {
-                    let mut buffer = allocator.allocate(length, alignment)?;
+                    let result: VortexResult<BufferHandle> = async {
+                        let mut buffer = allocator.allocate(length, alignment)?;
 
-                    let response = store
-                        .get_opts(
-                            &path,
-                            GetOptions {
-                                range: Some(GetRange::Bounded(range.clone())),
-                                ..Default::default()
-                            },
-                        )
-                        .await?;
+                        tracing::debug!(target: "vortex::readat", seq, offset, "read_at get_opts begin");
+                        let response = store
+                            .get_opts(
+                                &path,
+                                GetOptions {
+                                    range: Some(GetRange::Bounded(range.clone())),
+                                    ..Default::default()
+                                },
+                            )
+                            .await?;
+                        tracing::debug!(target: "vortex::readat", seq, offset, "read_at get_opts ok; reading payload");
 
-                    let buffer = match response.payload {
-                        #[cfg(not(target_arch = "wasm32"))]
-                        GetResultPayload::File(file, _) => {
-                            io_handle
-                                .spawn_blocking(move || {
-                                    read_exact_at(&file, buffer.as_mut_slice(), range.start)?;
-                                    Ok::<_, io::Error>(buffer)
-                                })
-                                .await
-                                .map_err(io::Error::other)?
-                        }
-                        #[cfg(target_arch = "wasm32")]
-                        GetResultPayload::File(..) => {
-                            unreachable!("File payload not supported on wasm32")
-                        }
-                        GetResultPayload::Stream(mut byte_stream) => {
-                            let mut written = 0usize;
-                            while let Some(bytes) = byte_stream.next().await {
-                                let bytes = bytes?;
-                                let end = written + bytes.len();
+                        let buffer = match response.payload {
+                            #[cfg(not(target_arch = "wasm32"))]
+                            GetResultPayload::File(file, _) => {
+                                io_handle
+                                    .spawn_blocking(move || {
+                                        read_exact_at(&file, buffer.as_mut_slice(), range.start)?;
+                                        Ok::<_, io::Error>(buffer)
+                                    })
+                                    .await
+                                    .map_err(io::Error::other)?
+                            }
+                            #[cfg(target_arch = "wasm32")]
+                            GetResultPayload::File(..) => {
+                                unreachable!("File payload not supported on wasm32")
+                            }
+                            GetResultPayload::Stream(mut byte_stream) => {
+                                let mut written = 0usize;
+                                while let Some(bytes) = byte_stream.next().await {
+                                    let bytes = bytes?;
+                                    let end = written + bytes.len();
+                                    vortex_ensure!(
+                                        end <= length,
+                                        "Object store stream returned too many bytes: {} > expected {} (range: {:?})",
+                                        end,
+                                        length,
+                                        range
+                                    );
+                                    buffer.as_mut_slice()[written..end].copy_from_slice(&bytes);
+                                    written = end;
+                                }
+
                                 vortex_ensure!(
-                                    end <= length,
-                                    "Object store stream returned too many bytes: {} > expected {} (range: {:?})",
-                                    end,
+                                    written == length,
+                                    "Object store stream returned {} bytes but expected {} bytes (range: {:?})",
+                                    written,
                                     length,
                                     range
                                 );
-                                buffer.as_mut_slice()[written..end].copy_from_slice(&bytes);
-                                written = end;
+
+                                buffer
                             }
+                        };
 
-                            vortex_ensure!(
-                                written == length,
-                                "Object store stream returned {} bytes but expected {} bytes (range: {:?})",
-                                written,
-                                length,
-                                range
-                            );
+                        Ok(BufferHandle::new_host(buffer.freeze()))
+                    }
+                    .await;
 
-                            buffer
-                        }
-                    };
-
-                    Ok(BufferHandle::new_host(buffer.freeze()))
+                    let inflight =
+                        READ_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) - 1;
+                    match &result {
+                        Ok(_) => tracing::info!(target: "vortex::readat", seq, uri = %uri, offset, length, inflight, "read_at end ok"),
+                        Err(e) => tracing::warn!(target: "vortex::readat", seq, uri = %uri, offset, length, inflight, error = %e, "read_at end error"),
+                    }
+                    result
                 })
         .boxed()
     }
 }
+
+/// DIAG (cold-stall): monotonic id per physical read + count of reads currently
+/// in flight, so a hung read is identifiable and slot saturation is visible.
+static READ_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static READ_INFLIGHT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(test)]
 mod tests {

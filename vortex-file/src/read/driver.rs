@@ -24,6 +24,16 @@ use crate::read::request::IoRequest;
 use crate::segments::ReadEvent;
 use crate::segments::RequestMetrics;
 
+// DIAG (cold-stall): cumulative driver counters. Comparing REQUESTED vs POLLED
+// vs ISSUED vs DROPPED near a freeze localizes the stall: REQUESTED>>POLLED ⇒
+// consumers aren't polling their read futures; POLLED>>ISSUED ⇒ polled requests
+// aren't being fetched (driver stuck). Logged from the park path below.
+static REQUESTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static POLLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ISSUED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PARK_GATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pin_project! {
     /// A stream that performs coalescing and prioritization of I/O requests.
     ///
@@ -91,12 +101,34 @@ where
 
         // Try to get a coalesced request
         if let Some(coalesced) = this.state.next(this.coalesce_window.as_ref()) {
+            ISSUED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Poll::Ready(Some(coalesced));
         }
 
         // If the inner stream is done, and we have no more _polled_ requests, we're done
         if *this.inner_done && this.state.polled_requests.is_empty() {
             return Poll::Ready(None);
+        }
+
+        // DIAG (cold-stall): the driver is about to park. Log queue state +
+        // cumulative counters, rate-limited (~every 1024 parks) so the LAST line
+        // before silence shows whether polled requests are stranded (POLLED>ISSUED
+        // with polled_requests non-empty ⇒ the stuck read is here). Cheap; only
+        // emits when the `vortex::driver` target is enabled.
+        let gate = PARK_GATE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if gate % 1024 == 0 {
+            tracing::info!(
+                target: "vortex::driver",
+                requested = REQUESTED.load(std::sync::atomic::Ordering::Relaxed),
+                polled = POLLED.load(std::sync::atomic::Ordering::Relaxed),
+                issued = ISSUED.load(std::sync::atomic::Ordering::Relaxed),
+                dropped = DROPPED.load(std::sync::atomic::Ordering::Relaxed),
+                q_requests = this.state.requests.len(),
+                q_polled = this.state.polled_requests.len(),
+                q_by_offset = this.state.requests_by_offset.len(),
+                inner_done = *this.inner_done,
+                "driver parking (waiting for events)"
+            );
         }
 
         // Otherwise, we need more data from the inner stream
@@ -139,6 +171,7 @@ impl State {
         trace!(?event, "Received ReadEvent");
         match event {
             ReadEvent::Request(req) => {
+                REQUESTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if req.callback.is_closed() {
                     trace!(?req, "ReadRequest dropped before registration");
                     return;
@@ -147,6 +180,7 @@ impl State {
                 self.requests.insert(req.id, req);
             }
             ReadEvent::Polled(req_id) => {
+                POLLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if let Some(req) = self.requests.remove(&req_id) {
                     if req.callback.is_closed() {
                         self.requests_by_offset.remove(&(req.offset, req_id));
@@ -157,6 +191,7 @@ impl State {
                 }
             }
             ReadEvent::Dropped(req_id) => {
+                DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if let Some(req) = self.requests.remove(&req_id) {
                     self.requests_by_offset.remove(&(req.offset, req_id));
                     trace!(?req, "ReadRequest dropped before poll");

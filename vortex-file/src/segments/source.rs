@@ -121,8 +121,15 @@ impl FileSegmentSource {
                 .map(move |req| {
                     let reader = reader.clone();
                     async move {
+                        // DIAG (cold-stall): log each buffer_unordered read's
+                        // dispatch and completion. A "dispatch" with no matching
+                        // "complete" (and the read_at "start"/no-"end" in
+                        // vortex-io) names the buffer_unordered slot stuck on a
+                        // never-resolving read.
+                        let (off, len) = (req.offset(), req.len());
+                        tracing::debug!(target: "vortex::driver", offset = off, len, "buffer_unordered dispatch read");
                         let result = reader
-                            .read_at(req.offset(), req.len(), req.alignment())
+                            .read_at(off, len, req.alignment())
                             .await;
                         let result = result.and_then(|buffer| {
                             if req.len() != buffer.len() {
@@ -135,6 +142,7 @@ impl FileSegmentSource {
                             }
                             Ok(buffer)
                         });
+                        tracing::debug!(target: "vortex::driver", offset = off, len, ok = result.is_ok(), "buffer_unordered read complete");
 
                         req.resolve(result);
                     }
