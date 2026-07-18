@@ -427,7 +427,7 @@ impl FileOpener for VortexOpener {
                     let seq = DECODE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let inflight =
                         DECODE_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    tracing::debug!(target: "vortex::decode", seq, inflight, "chunk decode begin");
+                    tracing::info!(target: "vortex::decode", seq, inflight, "chunk decode begin");
                     let mut ctx = session.create_execution_ctx();
                     let arrow_session = ctx.session().clone();
                     let result = arrow_session
@@ -437,7 +437,7 @@ impl FileOpener for VortexOpener {
                     let inflight =
                         DECODE_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) - 1;
                     match &result {
-                        Ok(rb) => tracing::debug!(target: "vortex::decode", seq, inflight, rows = rb.num_rows(), "chunk decode end"),
+                        Ok(rb) => tracing::info!(target: "vortex::decode", seq, inflight, rows = rb.num_rows(), "chunk decode end"),
                         Err(e) => tracing::warn!(target: "vortex::decode", seq, inflight, error = %e, "chunk decode error"),
                     }
                     result
