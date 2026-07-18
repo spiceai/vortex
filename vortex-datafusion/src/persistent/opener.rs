@@ -63,6 +63,12 @@ use crate::persistent::cache::CachedVortexMetadata;
 use crate::persistent::reader::VortexReaderFactory;
 use crate::persistent::stream::PrunableStream;
 
+// DIAG (cold-stall): per-chunk synchronous-decode counters (see the `.map` decode
+// closure below). `DECODE_INFLIGHT` staying > 0 with no matching "decode end"
+// pinpoints a chunk whose `execute_arrow` never returns.
+static DECODE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DECODE_INFLIGHT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[derive(Clone)]
 pub(crate) struct VortexOpener {
     /// The partition this opener is assigned to. Only used for labeling metrics.
@@ -413,14 +419,28 @@ impl FileOpener for VortexOpener {
                 .with_some_filter(filter)
                 .with_ordered(has_output_ordering)
                 .map(move |chunk| {
+                    // DIAG (cold-stall): the per-chunk decode (`execute_arrow`) runs
+                    // SYNCHRONOUSLY inside this poll. A "decode begin" with no matching
+                    // "decode end" (in_flight stuck > 0) names the chunk whose
+                    // synchronous decode never returns — the parked-scan frame the
+                    // task dump can't capture ("outside an await point").
+                    let seq = DECODE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let inflight =
+                        DECODE_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    tracing::debug!(target: "vortex::decode", seq, inflight, "chunk decode begin");
                     let mut ctx = session.create_execution_ctx();
                     let arrow_session = ctx.session().clone();
-                    let arrow = arrow_session.arrow().execute_arrow(
-                        chunk,
-                        Some(&stream_target_field),
-                        &mut ctx,
-                    )?;
-                    Ok(RecordBatch::from(arrow.as_struct().clone()))
+                    let result = arrow_session
+                        .arrow()
+                        .execute_arrow(chunk, Some(&stream_target_field), &mut ctx)
+                        .map(|arrow| RecordBatch::from(arrow.as_struct().clone()));
+                    let inflight =
+                        DECODE_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) - 1;
+                    match &result {
+                        Ok(rb) => tracing::debug!(target: "vortex::decode", seq, inflight, rows = rb.num_rows(), "chunk decode end"),
+                        Err(e) => tracing::warn!(target: "vortex::decode", seq, inflight, error = %e, "chunk decode error"),
+                    }
+                    result
                 })
                 .into_stream()
                 .map_err(|e| exec_datafusion_err!("Failed to create Vortex stream: {e}"))?
