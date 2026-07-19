@@ -5,6 +5,8 @@ use std::cmp;
 use std::iter;
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use futures::Stream;
 use futures::future::BoxFuture;
@@ -30,6 +32,16 @@ use crate::scan::filter::FilterExpr;
 use crate::scan::splits::Splits;
 use crate::scan::tasks::TaskContext;
 use crate::scan::tasks::split_exec;
+
+// DIAG (cold-stall): scan-park counters. The spawned split-read tasks run independently on the
+// runtime, so `COMPLETED` advances even while the `buffer_unordered` consumer is parked. A growing
+// (COMPLETED - YIELDED) backlog during a stall proves split-reads finish but are NOT drained ⇒ the
+// wake to the buffer_unordered consumer was lost (structural lost-wake, not a stuck read). If
+// COMPLETED stops advancing instead, the task bodies themselves are stuck. Global across scans;
+// during a freeze only the wedged promotions are active, so the tail is attributable.
+static SCAN_SPAWNED: AtomicU64 = AtomicU64::new(0);
+static SCAN_COMPLETED: AtomicU64 = AtomicU64::new(0);
+static SCAN_YIELDED: AtomicU64 = AtomicU64::new(0);
 
 /// A projected subset (by indices, range, and filter) of rows from a Vortex data source.
 ///
@@ -204,8 +216,28 @@ impl<A: 'static + Send> RepeatedScan<A> {
         let concurrency = self.concurrency * num_workers;
         let handle = self.session.handle();
 
-        let stream =
-            futures::stream::iter(self.execute(row_range)?).map(move |task| handle.spawn(task));
+        let stream = futures::stream::iter(self.execute(row_range)?).map(move |task| {
+            SCAN_SPAWNED.fetch_add(1, Ordering::Relaxed);
+            handle.spawn(async move {
+                let result = task.await;
+                let completed = SCAN_COMPLETED.fetch_add(1, Ordering::Relaxed) + 1;
+                let yielded = SCAN_YIELDED.load(Ordering::Relaxed);
+                let backlog = completed.saturating_sub(yielded);
+                // Fires from the independently-scheduled task body, so it emits even while the
+                // consumer is parked: a growing backlog names a lost consumer-wake.
+                if backlog >= 8 && completed % 8 == 0 {
+                    tracing::info!(
+                        target: "vortex::scanpark",
+                        spawned = SCAN_SPAWNED.load(Ordering::Relaxed),
+                        completed,
+                        yielded,
+                        backlog,
+                        "scan split-read completed but consumer backlog growing (possible lost wake to buffer_unordered consumer)"
+                    );
+                }
+                result
+            })
+        });
 
         let stream = if self.ordered {
             stream.buffered(concurrency).boxed()
@@ -213,7 +245,10 @@ impl<A: 'static + Send> RepeatedScan<A> {
             stream.buffer_unordered(concurrency).boxed()
         };
 
-        Ok(stream.filter_map(|chunk| async move { chunk.transpose() }))
+        Ok(stream.filter_map(|chunk| async move {
+            SCAN_YIELDED.fetch_add(1, Ordering::Relaxed);
+            chunk.transpose()
+        }))
     }
 }
 
