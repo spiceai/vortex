@@ -4,6 +4,8 @@
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
 use std::task::ready;
@@ -382,6 +384,15 @@ impl<A: 'static + Send> LazyScanStream<A> {
 
 impl<A: 'static + Send> Unpin for LazyScanStream<A> {}
 
+// DIAG (cold-stall): scan-park counters for the LazyScanStream Stream-state driver (the path the
+// DataFusion opener actually uses). Split-read task bodies run independently of buffer_unordered,
+// so COMPLETED advances even while the consumer is parked: COMPLETED advancing with YIELDED frozen
+// ⇒ lost wake to the buffer_unordered consumer; COMPLETED frozen ⇒ task bodies stuck. Logged
+// rate-limited (every 16th completion) on target vortex::scanpark so the tail names the mode.
+static LAZY_SCAN_SPAWNED: AtomicU64 = AtomicU64::new(0);
+static LAZY_SCAN_COMPLETED: AtomicU64 = AtomicU64::new(0);
+static LAZY_SCAN_YIELDED: AtomicU64 = AtomicU64::new(0);
+
 impl<A: 'static + Send> Stream for LazyScanStream<A> {
     type Item = VortexResult<A>;
 
@@ -410,15 +421,36 @@ impl<A: 'static + Send> Stream for LazyScanStream<A> {
                             let ordered = preparing.ordered;
                             let concurrency = preparing.concurrency;
                             let handle = preparing.handle.clone();
-                            let stream =
-                                futures::stream::iter(tasks).map(move |task| handle.spawn(task));
+                            let stream = futures::stream::iter(tasks).map(move |task| {
+                                LAZY_SCAN_SPAWNED.fetch_add(1, Ordering::Relaxed);
+                                handle.spawn(async move {
+                                    let result = task.await;
+                                    let completed =
+                                        LAZY_SCAN_COMPLETED.fetch_add(1, Ordering::Relaxed) + 1;
+                                    if completed % 16 == 0 {
+                                        let yielded = LAZY_SCAN_YIELDED.load(Ordering::Relaxed);
+                                        tracing::info!(
+                                            target: "vortex::scanpark",
+                                            spawned = LAZY_SCAN_SPAWNED.load(Ordering::Relaxed),
+                                            completed,
+                                            yielded,
+                                            backlog = completed.saturating_sub(yielded),
+                                            "lazyscan split-read completed"
+                                        );
+                                    }
+                                    result
+                                })
+                            });
                             let stream = if ordered {
                                 stream.buffered(concurrency).boxed()
                             } else {
                                 stream.buffer_unordered(concurrency).boxed()
                             };
                             let stream = stream
-                                .filter_map(|chunk| async move { chunk.transpose() })
+                                .filter_map(|chunk| async move {
+                                    LAZY_SCAN_YIELDED.fetch_add(1, Ordering::Relaxed);
+                                    chunk.transpose()
+                                })
                                 .boxed();
                             self.state = LazyScanState::Stream(stream);
                         }
