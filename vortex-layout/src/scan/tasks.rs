@@ -138,12 +138,17 @@ pub fn split_exec<A: 'static + Send>(
 
     let mapper = Arc::clone(&ctx.mapper);
     let array_fut = async move {
+        // DIAG (cold-stall): phase counters so the scan-park dumper can localize a stuck task body.
+        use std::sync::atomic::Ordering;
+        crate::scan::scanpark::TASK_STARTED.fetch_add(1, Ordering::Relaxed);
         let mask = filter_mask.await?;
+        crate::scan::scanpark::TASK_FILTER_DONE.fetch_add(1, Ordering::Relaxed);
         if mask.all_false() {
             return Ok(None);
         }
 
         let array = projection_future.await?;
+        crate::scan::scanpark::TASK_PROJECT_DONE.fetch_add(1, Ordering::Relaxed);
         mapper(array).map(Some)
     };
 

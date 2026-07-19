@@ -1,0 +1,104 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright the Vortex contributors
+
+//! DIAG (cold-stall): steady-state scan-park counters + a side-thread dumper.
+//!
+//! The cold-tier promotion scan (`LazyScanStream` -> `buffer_unordered` over `handle.spawn`ed
+//! split-read tasks) intermittently hangs: the scan returns `Pending` and never re-wakes its
+//! consumer (the promotion's SortExec), which holds the table write_lock and wedges ingest.
+//!
+//! Completion-triggered logging can't see the *frozen steady-state* (once parked, nothing is
+//! polled, so no completion fires). This module instead runs a dedicated OS thread that samples the
+//! counters every few seconds — so it emits DURING the stall — and distinguishes the two failure
+//! modes plus localizes a stuck task body:
+//!   * `in_flight = spawned - completed` frozen > 0  => split-read task BODIES are stuck (never
+//!     complete). The phase counters say where: stuck before `filter_done` = filter/pruning read;
+//!     stuck between `filter_done` and `project_done` = projection read+decode.
+//!   * `backlog = completed - yielded` frozen > 0     => tasks complete but the `buffer_unordered`
+//!     consumer is never drained => a drain-side lost wake.
+
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+
+/// Split-read tasks handed to `buffer_unordered` (incremented as each is spawned).
+pub(crate) static SPAWNED: AtomicU64 = AtomicU64::new(0);
+/// Split-read task bodies that finished (about to send their result on the join channel).
+pub(crate) static COMPLETED: AtomicU64 = AtomicU64::new(0);
+/// Results drained downstream by the consumer (incremented in the scan stream's terminal map).
+pub(crate) static YIELDED: AtomicU64 = AtomicU64::new(0);
+/// Task bodies that entered execution.
+pub(crate) static TASK_STARTED: AtomicU64 = AtomicU64::new(0);
+/// Task bodies past the filter/pruning await.
+pub(crate) static TASK_FILTER_DONE: AtomicU64 = AtomicU64::new(0);
+/// Task bodies past the projection (read+decode) await.
+pub(crate) static TASK_PROJECT_DONE: AtomicU64 = AtomicU64::new(0);
+
+/// Start the sampler thread exactly once. Cheap no-op on every call after the first.
+pub(crate) fn ensure_dumper() {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if STARTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("vortex-scanpark-dump".to_string())
+        .spawn(|| {
+            let mut last = (0u64, 0u64, 0u64);
+            let mut stalled_ticks = 0u64;
+            loop {
+                std::thread::sleep(Duration::from_secs(5));
+                let spawned = SPAWNED.load(Ordering::Relaxed);
+                let completed = COMPLETED.load(Ordering::Relaxed);
+                let yielded = YIELDED.load(Ordering::Relaxed);
+                let started = TASK_STARTED.load(Ordering::Relaxed);
+                let filter_done = TASK_FILTER_DONE.load(Ordering::Relaxed);
+                let project_done = TASK_PROJECT_DONE.load(Ordering::Relaxed);
+                let in_flight = spawned.saturating_sub(completed);
+                let backlog = completed.saturating_sub(yielded);
+                let cur = (spawned, completed, yielded);
+                let outstanding = in_flight > 0 || backlog > 0;
+
+                if cur == last && outstanding {
+                    stalled_ticks += 1;
+                    // Frozen with outstanding work = the stall. `in_flight` vs `backlog`
+                    // discriminates stuck-bodies vs drain-lost-wake; the phase gaps
+                    // (started/filter_done/project_done) localize a stuck body.
+                    tracing::warn!(
+                        target: "vortex::scanpark",
+                        stalled_ticks,
+                        spawned,
+                        completed,
+                        yielded,
+                        in_flight,
+                        backlog,
+                        task_started = started,
+                        task_filter_done = filter_done,
+                        task_project_done = project_done,
+                        stuck_before_filter = started.saturating_sub(filter_done),
+                        stuck_before_project = filter_done.saturating_sub(project_done),
+                        "SCAN STALLED: counters frozen with outstanding work"
+                    );
+                } else {
+                    if cur != last {
+                        stalled_ticks = 0;
+                    }
+                    if outstanding {
+                        tracing::info!(
+                            target: "vortex::scanpark",
+                            spawned,
+                            completed,
+                            yielded,
+                            in_flight,
+                            backlog,
+                            "scan progressing"
+                        );
+                    }
+                }
+                last = cur;
+            }
+        });
+    if let Err(error) = spawned {
+        tracing::warn!(target: "vortex::scanpark", %error, "failed to start scan-park dumper thread");
+    }
+}

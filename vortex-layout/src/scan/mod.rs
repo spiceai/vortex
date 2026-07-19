@@ -7,6 +7,7 @@ pub mod layout;
 pub mod multi;
 pub mod repeated_scan;
 pub mod scan_builder;
+pub(crate) mod scanpark;
 pub mod split_by;
 mod splits;
 mod tasks;
