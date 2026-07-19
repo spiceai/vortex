@@ -17,6 +17,31 @@ use vortex_error::vortex_panic;
 use crate::runtime::AbortHandleRef;
 use crate::runtime::Executor;
 
+// FIX (cold-stall): mirror PR #9's `single.rs` oneshot swap here in the general `Task`. The
+// `oneshot` crate's `Receiver` mishandles a stored `Arc<FuturesUnordered::Task>` waker on drop
+// (#6221); on the scan's `buffer_unordered`-over-`handle.spawn` path a completing/dropped sibling
+// Task can then drop another pending Task's wake, hanging the scan. Prefer `tokio::sync::oneshot`
+// when the tokio feature is enabled, exactly as `single.rs` already does.
+#[cfg(not(feature = "tokio"))]
+use oneshot;
+#[cfg(feature = "tokio")]
+use tokio::sync::oneshot;
+
+// The receiver type and its into-pollable conversion differ between the two oneshot crates.
+#[cfg(feature = "tokio")]
+type TaskReceiver<T> = oneshot::Receiver<T>;
+#[cfg(not(feature = "tokio"))]
+type TaskReceiver<T> = oneshot::AsyncReceiver<T>;
+
+#[cfg(feature = "tokio")]
+fn task_receiver<T>(recv: oneshot::Receiver<T>) -> TaskReceiver<T> {
+    recv
+}
+#[cfg(not(feature = "tokio"))]
+fn task_receiver<T>(recv: oneshot::Receiver<T>) -> TaskReceiver<T> {
+    recv.into_future()
+}
+
 /// A handle to an active Vortex runtime.
 ///
 /// Users should obtain a handle from one of the Vortex runtime's and use it to spawn new async
@@ -89,7 +114,7 @@ impl Handle {
             .boxed(),
         );
         Task {
-            recv: recv.into_future(),
+            recv: task_receiver(recv),
             abort_handle: Some(abort_handle),
         }
     }
@@ -130,7 +155,7 @@ impl Handle {
             .boxed(),
         );
         Task {
-            recv: recv.into_future(),
+            recv: task_receiver(recv),
             abort_handle: Some(abort_handle),
         }
     }
@@ -162,7 +187,7 @@ impl Handle {
             }
         }));
         Task {
-            recv: recv.into_future(),
+            recv: task_receiver(recv),
             abort_handle: Some(abort_handle),
         }
     }
@@ -186,7 +211,7 @@ impl Handle {
             }
         }));
         Task {
-            recv: recv.into_future(),
+            recv: task_receiver(recv),
             abort_handle: Some(abort_handle),
         }
     }
@@ -215,7 +240,7 @@ pub enum JoinOutcome<T> {
 /// continue running in the background, call [`Task::detach`].
 #[must_use = "When a Task is dropped without being awaited, it is cancelled"]
 pub struct Task<T> {
-    recv: oneshot::AsyncReceiver<TaskOutput<T>>,
+    recv: TaskReceiver<TaskOutput<T>>,
     abort_handle: Option<AbortHandleRef>,
 }
 
@@ -292,7 +317,7 @@ mod tests {
         drop(send);
 
         let mut task = Task::<()> {
-            recv: recv.into_future(),
+            recv: task_receiver(recv),
             abort_handle: None,
         };
 
@@ -312,7 +337,7 @@ mod tests {
         drop(send.send(Ok(7)));
 
         let mut task = Task::<u32> {
-            recv: recv.into_future(),
+            recv: task_receiver(recv),
             abort_handle: None,
         };
 
