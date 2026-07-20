@@ -20,14 +20,18 @@ geo = { workspace = true }
 geo-traits = { workspace = true }
 geo-types = { workspace = true }
 geoarrow = { workspace = true }
+geoarrow-cast = { workspace = true }
 prost = { workspace = true }
 vortex-array = { workspace = true }
+vortex-arrow = { workspace = true }
 vortex-error = { workspace = true }
 vortex-session = { workspace = true }
 wkb = { workspace = true }
 
 [dev-dependencies]
 rstest = { workspace = true }
+vortex-array = { workspace = true, features = ["_test-harness"] }
+vortex-layout = { workspace = true }
 
 [lints]
 workspace = true

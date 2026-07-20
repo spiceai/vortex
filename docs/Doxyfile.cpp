@@ -5,7 +5,7 @@ PROJECT_NAME           = "Vortex C++"
 OUTPUT_DIRECTORY       = _build/doxygen-cpp
 
 # Input sources
-INPUT                  = ../vortex-cxx/cpp/include/vortex
+INPUT                  = ../lang/cpp/include/vortex
 FILE_PATTERNS          = *.hpp
 RECURSIVE              = NO
 
@@ -26,6 +26,3 @@ MACRO_EXPANSION        = NO
 
 # Suppress warnings about undocumented members (WIP API)
 WARN_IF_UNDOCUMENTED   = NO
-
-# Exclude cxx bridge internals from documentation
-EXCLUDE_SYMBOLS        = ffi::*

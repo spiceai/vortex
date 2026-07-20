@@ -90,4 +90,15 @@ impl DatabaseRef {
         );
         Ok(())
     }
+
+    /// Shadow the spatial functions that block filter pushdown with pushable copies; see
+    /// cpp/spatial_overrides.cpp for the list. Call after `LOAD spatial`; does nothing when
+    /// spatial is not loaded.
+    pub fn register_spatial_overrides(&self) -> VortexResult<()> {
+        duckdb_try!(
+            unsafe { cpp::duckdb_vx_register_spatial_overrides(self.as_ptr()) },
+            "Failed to register the spatial function overrides"
+        );
+        Ok(())
+    }
 }

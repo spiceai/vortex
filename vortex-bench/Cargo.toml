@@ -23,6 +23,7 @@ vortex = { workspace = true, features = [
     "tokio",
     "zstd",
 ] }
+vortex-arrow = { workspace = true }
 vortex-geo = { workspace = true }
 vortex-tensor = { workspace = true } # TODO(connor): In the future, this might be inside vortex.
 
@@ -34,6 +35,10 @@ async-trait = { workspace = true }
 bzip2 = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 futures = { workspace = true }
+geo = { workspace = true }
+geo-traits = { workspace = true }
+geoarrow = { workspace = true }
+geoarrow-cast = { workspace = true }
 get_dir = { workspace = true }
 glob = { workspace = true }
 humansize = { workspace = true }
@@ -69,6 +74,7 @@ tracing-subscriber = { workspace = true, features = [
 ] }
 url = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
+wkb = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true }

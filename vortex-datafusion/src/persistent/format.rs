@@ -46,7 +46,6 @@ use futures::stream;
 use object_store::ObjectMeta;
 use object_store::ObjectStore;
 use vortex::VortexSessionDefault;
-use vortex::array::arrow::ArrowSessionExt;
 use vortex::array::memory::MemorySessionExt;
 use vortex::dtype::DType;
 use vortex::dtype::Nullability;
@@ -65,6 +64,7 @@ use vortex::io::session::RuntimeSessionExt;
 use vortex::scalar::Scalar;
 use vortex::scalar::ScalarValue as VortexScalarValue;
 use vortex::session::VortexSession;
+use vortex_arrow::ArrowSessionExt;
 
 use super::cache::CachedVortexMetadata;
 use super::sink::VortexSink;

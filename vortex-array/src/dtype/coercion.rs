@@ -79,6 +79,10 @@ impl DType {
     /// The core primitive — what type can hold both `self` and `other`?
     /// Returns `None` if no common supertype exists.
     pub fn least_supertype(&self, other: &DType) -> Option<DType> {
+        if let (DType::Union(lhs, lhs_null), DType::Union(rhs, rhs_null)) = (self, other) {
+            return (lhs == rhs).then(|| DType::Union(lhs.clone(), *lhs_null | *rhs_null));
+        }
+
         let union_null = self.nullability() | other.nullability();
 
         if let (
@@ -308,6 +312,7 @@ mod tests {
 
     use crate::dtype::DType;
     use crate::dtype::PType;
+    use crate::dtype::UnionVariants;
     use crate::dtype::decimal::DecimalDType;
     use crate::dtype::nullability::Nullability::NonNullable;
     use crate::dtype::nullability::Nullability::Nullable;
@@ -347,6 +352,52 @@ mod tests {
             i32_nn.least_supertype(&DType::Null).unwrap(),
             DType::Primitive(PType::I32, Nullable)
         );
+    }
+
+    #[test]
+    fn least_supertype_union_requires_identical_variants() {
+        let nonnullable = DType::Union(
+            UnionVariants::new(
+                ["value"].into(),
+                vec![DType::Primitive(PType::I32, NonNullable)],
+            )
+            .unwrap(),
+            NonNullable,
+        );
+        let nullable = DType::Union(
+            UnionVariants::new(
+                ["value"].into(),
+                vec![DType::Primitive(PType::I32, Nullable)],
+            )
+            .unwrap(),
+            NonNullable,
+        );
+
+        assert_eq!(
+            nonnullable.least_supertype(&nonnullable),
+            Some(nonnullable.clone())
+        );
+        assert!(nonnullable.least_supertype(&nullable).is_none());
+        assert!(nullable.least_supertype(&nonnullable).is_none());
+    }
+
+    #[test]
+    fn least_supertype_null_makes_union_outer_nullable() {
+        let nonnullable = DType::Union(
+            UnionVariants::new(
+                ["value"].into(),
+                vec![DType::Primitive(PType::I32, NonNullable)],
+            )
+            .unwrap(),
+            NonNullable,
+        );
+        let nullable = nonnullable.as_nullable();
+
+        assert_eq!(
+            DType::Null.least_supertype(&nonnullable),
+            Some(nullable.clone())
+        );
+        assert_eq!(nonnullable.least_supertype(&DType::Null), Some(nullable));
     }
 
     #[test]

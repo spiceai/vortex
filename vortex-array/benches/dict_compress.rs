@@ -6,11 +6,13 @@
 use std::sync::LazyLock;
 
 use divan::Bencher;
+use mimalloc::MiMalloc;
 use rand::distr::Distribution;
 use rand::distr::StandardUniform;
 use vortex_array::Canonical;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
+use vortex_array::array_session;
 use vortex_array::arrays::VarBinArray;
 use vortex_array::arrays::VarBinViewArray;
 use vortex_array::arrays::dict_test::gen_primitive_for_dict;
@@ -19,7 +21,11 @@ use vortex_array::builders::dict::dict_encode;
 use vortex_array::dtype::NativePType;
 use vortex_session::VortexSession;
 
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 fn main() {
+    LazyLock::force(&SESSION);
     divan::main();
 }
 
@@ -37,7 +43,7 @@ const BENCH_ARGS: &[(usize, usize)] = &[
     (10_000, 512),
 ];
 
-static SESSION: LazyLock<VortexSession> = LazyLock::new(vortex_array::array_session);
+static SESSION: LazyLock<VortexSession> = LazyLock::new(array_session);
 
 #[divan::bench(types = [u8, f32, i64], args = BENCH_ARGS)]
 fn encode_primitives<T>(bencher: Bencher, (len, unique_values): (usize, usize))

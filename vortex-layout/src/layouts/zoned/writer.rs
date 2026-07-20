@@ -26,6 +26,7 @@ use vortex_array::aggregate_fn::fns::min::Min;
 use vortex_array::aggregate_fn::fns::nan_count::NanCount;
 use vortex_array::aggregate_fn::fns::null_count::NullCount;
 use vortex_array::aggregate_fn::fns::sum::Sum;
+use vortex_array::aggregate_fn::session::AggregateFnSessionExt;
 use vortex_array::dtype::DType;
 use vortex_error::VortexError;
 use vortex_error::VortexResult;
@@ -109,7 +110,7 @@ impl LayoutStrategy for ZonedStrategy {
             .options
             .aggregate_fns
             .clone()
-            .unwrap_or_else(|| default_zoned_aggregate_fns(stream.dtype()));
+            .unwrap_or_else(|| default_zoned_aggregate_fns(stream.dtype(), session));
         let compute_session = session.clone();
 
         let stats_accumulator = Arc::new(Mutex::new(AggregateStatsAccumulator::new(
@@ -164,7 +165,10 @@ impl LayoutStrategy for ZonedStrategy {
             )
             .await?;
 
-        let Some((stats_array, aggregate_fns)) = stats_accumulator.lock().as_array()? else {
+        let mut exec_ctx = session.create_execution_ctx();
+        let Some((stats_array, aggregate_fns)) =
+            stats_accumulator.lock().as_array(&mut exec_ctx)?
+        else {
             // If we have no stats (e.g. the DType doesn't support them), then we just return the
             // child layout.
             return Ok(data_layout);
@@ -192,7 +196,7 @@ impl LayoutStrategy for ZonedStrategy {
     }
 }
 
-fn default_zoned_aggregate_fns(dtype: &DType) -> Arc<[AggregateFnRef]> {
+fn default_zoned_aggregate_fns(dtype: &DType, session: &VortexSession) -> Arc<[AggregateFnRef]> {
     let (max, min) = match dtype {
         DType::Utf8(_) | DType::Binary(_) => (
             BoundedMax.bind(BoundedMaxOptions {
@@ -218,6 +222,9 @@ fn default_zoned_aggregate_fns(dtype: &DType) -> Arc<[AggregateFnRef]> {
     aggregate_fns.push(NanCount.bind(EmptyOptions));
     aggregate_fns.push(NullCount.bind(EmptyOptions));
 
+    // Stats from geo extension types are discovered from the registry at runtime instead.
+    aggregate_fns.extend(session.aggregate_fns().zone_stat_defaults(dtype));
+
     aggregate_fns.into()
 }
 
@@ -237,7 +244,10 @@ mod tests {
 
     #[test]
     fn default_aggregates_bound_variable_length_min_max() {
-        let aggregate_fns = default_zoned_aggregate_fns(&DType::Utf8(Nullability::NonNullable));
+        let aggregate_fns = default_zoned_aggregate_fns(
+            &DType::Utf8(Nullability::NonNullable),
+            &vortex_array::array_session(),
+        );
 
         assert_eq!(
             aggregate_fns[0].as_::<BoundedMax>().max_bytes,
@@ -251,7 +261,8 @@ mod tests {
 
     #[test]
     fn default_aggregates_keep_fixed_width_min_max_exact() {
-        let aggregate_fns = default_zoned_aggregate_fns(&PType::I32.into());
+        let aggregate_fns =
+            default_zoned_aggregate_fns(&PType::I32.into(), &vortex_array::array_session());
 
         assert!(aggregate_fns[0].is::<Max>());
         assert!(aggregate_fns[1].is::<Min>());
@@ -263,7 +274,7 @@ mod tests {
         let dtype = DType::Extension(
             Timestamp::new(TimeUnit::Microseconds, Nullability::Nullable).erased(),
         );
-        let aggregate_fns = default_zoned_aggregate_fns(&dtype);
+        let aggregate_fns = default_zoned_aggregate_fns(&dtype, &vortex_array::array_session());
 
         assert!(
             aggregate_fns

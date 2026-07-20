@@ -49,6 +49,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::default);
 
 fn main() {
+    LazyLock::force(&SESSION);
     divan::main();
 }
 

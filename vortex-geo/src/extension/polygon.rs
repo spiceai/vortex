@@ -24,20 +24,21 @@ use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::arrays::ExtensionArray;
 use vortex_array::arrays::extension::ExtensionArrayExt;
-use vortex_array::arrow::ArrowExport;
-use vortex_array::arrow::ArrowExportVTable;
-use vortex_array::arrow::ArrowImport;
-use vortex_array::arrow::ArrowImportVTable;
-use vortex_array::arrow::ArrowSession;
-use vortex_array::arrow::ArrowSessionExt;
-use vortex_array::arrow::FromArrowArray;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
-use vortex_array::dtype::arrow::FromArrowType;
 use vortex_array::dtype::extension::ExtDType;
 use vortex_array::dtype::extension::ExtId;
 use vortex_array::dtype::extension::ExtVTable;
 use vortex_array::scalar::ScalarValue;
+use vortex_arrow::ArrowExport;
+use vortex_arrow::ArrowExportVTable;
+use vortex_arrow::ArrowImport;
+use vortex_arrow::ArrowImportVTable;
+use vortex_arrow::ArrowSession;
+use vortex_arrow::ArrowSessionExt;
+use vortex_arrow::FromArrowArray;
+use vortex_arrow::FromArrowType;
+use vortex_error::VortexError;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
@@ -51,6 +52,7 @@ use super::coordinate::coordinate_dimension;
 use super::coordinate::coordinate_storage_dtype;
 use super::geo_metadata_from_arrow;
 use super::geoarrow_metadata;
+use super::geoarrow_to_wkb;
 
 /// A polygon: `geoarrow.polygon`, stored as `List<List<Struct<x, y[, z][, m]>>>` (rings of vertices).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
@@ -118,12 +120,7 @@ pub(crate) fn polygon_geometries(
     storage: &ArrayRef,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<Vec<Geometry<f64>>> {
-    let polygon_type = polygon_type(&GeoMetadata::default(), polygon_dimension(storage.dtype())?);
-    let session = ctx.session().clone();
-    let arrow = session.arrow().execute_arrow(storage.clone(), None, ctx)?;
-    let polygons = PolygonArray::try_from((arrow.as_ref(), polygon_type))
-        .map_err(|e| vortex_err!("failed to construct PolygonArray: {e}"))?;
-    polygons
+    polygon_array(storage, ctx)?
         .iter()
         .map(|geometry| -> VortexResult<Geometry<f64>> {
             Ok(geometry
@@ -132,6 +129,37 @@ pub(crate) fn polygon_geometries(
                 .to_geometry())
         })
         .collect()
+}
+
+/// Build a geoarrow `PolygonArray` from a `Polygon`'s `List<List<coordinate>>` storage.
+fn polygon_array(storage: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<PolygonArray> {
+    let polygon_type = polygon_type(&GeoMetadata::default(), polygon_dimension(storage.dtype())?);
+    let session = ctx.session().clone();
+    let arrow = session.arrow().execute_arrow(storage.clone(), None, ctx)?;
+    PolygonArray::try_from((arrow.as_ref(), polygon_type))
+        .map_err(|e| vortex_err!("failed to construct PolygonArray: {e}"))
+}
+
+/// A validated `Polygon` array (`try_from` checks the extension type).
+pub struct PolygonData(ExtensionArray);
+
+impl TryFrom<ExtensionArray> for PolygonData {
+    type Error = VortexError;
+
+    fn try_from(ext: ExtensionArray) -> Result<Self, Self::Error> {
+        vortex_ensure!(
+            ext.ext_dtype().is::<Polygon>(),
+            "expected a Polygon extension array"
+        );
+        Ok(PolygonData(ext))
+    }
+}
+
+impl PolygonData {
+    /// Serialize polygons to WKB (a view array) — the form DuckDB `GEOMETRY` takes.
+    pub fn to_wkb(&self, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
+        geoarrow_to_wkb(&polygon_array(self.0.storage_array(), ctx)?)
+    }
 }
 
 impl ArrowExportVTable for Polygon {
