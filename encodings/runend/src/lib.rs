@@ -9,18 +9,17 @@ pub use array::*;
 pub use iter::trimmed_ends_iter;
 
 mod array;
-#[cfg(feature = "arrow")]
-mod arrow;
 pub mod compress;
 mod compute;
 pub mod decompress_bool;
 mod iter;
 mod kernel;
-mod ops;
+pub mod ops;
 mod rules;
 
 #[doc(hidden)]
 pub mod _benchmarking {
+    pub use compute::filter::filter_run_end_primitive;
     pub use compute::take::take_indices_unchecked;
 
     use super::*;

@@ -33,9 +33,10 @@ use pyo3::pyclass;
 use pyo3::pymethods;
 use pyo3::types::PyType;
 use pyo3::wrap_pyfunction;
-use vortex::array::arrow::ArrowSessionExt;
 use vortex::dtype::DType;
-use vortex::dtype::arrow::TryFromArrowType;
+use vortex_arrow::ArrowSessionExt;
+use vortex_arrow::ToArrowType;
+use vortex_arrow::TryFromArrowType;
 
 use crate::arrow::FromPyArrow;
 use crate::arrow::ToPyArrow;
@@ -188,6 +189,11 @@ impl PyDType {
 
     fn __repr__(&self) -> String {
         self.0.python_repr().to_string()
+    }
+
+    /// Return whether this data type allows null values.
+    fn is_nullable(&self) -> bool {
+        self.0.is_nullable()
     }
 
     /// Construct a Vortex data type from an Arrow data type.

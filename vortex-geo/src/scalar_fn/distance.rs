@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! `ST_Distance`: planar (Euclidean) distance between two native geometries via the `geo` crate.
+//! `ST_Distance`: planar (Euclidean) distance between two native geometries.
 
 use geo::Distance;
 use geo::Euclidean;
@@ -24,15 +24,16 @@ use vortex_array::scalar_fn::ScalarFnId;
 use vortex_array::scalar_fn::ScalarFnVTable;
 use vortex_array::scalar_fn::TypedScalarFnInstance;
 use vortex_error::VortexResult;
-use vortex_error::vortex_ensure;
+use vortex_error::vortex_ensure_eq;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
 use crate::extension::geometries;
 use crate::extension::single_geometry;
+use crate::extension::validate_geometry_operands;
 
-/// Planar (Euclidean) `ST_Distance` (no geodesic correction) between two native geometry operands.
-/// Each is a column or a constant literal; `geo` computes the distance between each pair.
+/// Planar (Euclidean) `ST_Distance` (no geodesic correction) between two native geometry
+/// operands, each a column or a constant literal.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct GeoDistance;
 
@@ -75,7 +76,8 @@ impl ScalarFnVTable for GeoDistance {
         }
     }
 
-    fn return_dtype(&self, _: &Self::Options, _: &[DType]) -> VortexResult<DType> {
+    fn return_dtype(&self, _: &Self::Options, dtypes: &[DType]) -> VortexResult<DType> {
+        validate_geometry_operands(dtypes)?;
         Ok(DType::Primitive(PType::F64, Nullability::NonNullable))
     }
 
@@ -101,14 +103,15 @@ impl ScalarFnVTable for GeoDistance {
             (Some(query), None) => distances_to_constant(&b, query.scalar(), ctx),
             (None, Some(query)) => distances_to_constant(&a, query.scalar(), ctx),
             (None, None) => {
+                vortex_ensure_eq!(
+                    a.len(),
+                    b.len(),
+                    "geo distance: operand length mismatch {} vs {}",
+                    a.len(),
+                    b.len()
+                );
                 let ag = geometries(&a, ctx)?;
                 let bg = geometries(&b, ctx)?;
-                vortex_ensure!(
-                    ag.len() == bg.len(),
-                    "geo distance: operand length mismatch {} vs {}",
-                    ag.len(),
-                    bg.len()
-                );
                 let distances = ag.iter().zip(&bg).map(|(x, y)| Euclidean.distance(x, y));
                 Ok(PrimitiveArray::from_iter(distances).into_array())
             }
@@ -116,8 +119,8 @@ impl ScalarFnVTable for GeoDistance {
     }
 }
 
-/// Distance from each row of `operand` to a constant `query` geometry, decoded once and broadcast.
-/// Distance is symmetric, so this serves a constant on either side.
+/// Distance from each row of `operand` to the constant `query` geometry. Distance is symmetric,
+/// so this serves a constant on either side.
 fn distances_to_constant(
     operand: &ArrayRef,
     query: &Scalar,
@@ -137,6 +140,11 @@ mod tests {
     use vortex_array::IntoArray;
     use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::ConstantArray;
+    use vortex_array::dtype::DType;
+    use vortex_array::dtype::Nullability;
+    use vortex_array::dtype::PType;
+    use vortex_array::scalar_fn::EmptyOptions;
+    use vortex_array::scalar_fn::ScalarFnVTable;
     use vortex_error::VortexResult;
 
     use super::GeoDistance;
@@ -216,6 +224,25 @@ mod tests {
         let distance = GeoDistance::try_new_array(a, b)?.into_array();
 
         assert_eq!(distances(distance, &mut ctx)?, vec![5.0, 5.0, 5.0]);
+        Ok(())
+    }
+
+    /// Geometry arrays are never nullable, so a nullable operand dtype is rejected.
+    #[test]
+    fn nullable_operand_is_rejected() -> VortexResult<()> {
+        let dtype = point_column(vec![0.0], vec![0.0])?.dtype().clone();
+        let result = GeoDistance.return_dtype(&EmptyOptions, &[dtype.as_nullable(), dtype]);
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    /// A non-geometry operand dtype is rejected up front, before execution.
+    #[test]
+    fn non_geometry_operand_is_rejected() -> VortexResult<()> {
+        let geo = point_column(vec![0.0], vec![0.0])?.dtype().clone();
+        let numeric = DType::Primitive(PType::I32, Nullability::NonNullable);
+        let result = GeoDistance.return_dtype(&EmptyOptions, &[geo, numeric]);
+        assert!(result.is_err());
         Ok(())
     }
 }

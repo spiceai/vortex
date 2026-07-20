@@ -4,6 +4,7 @@
 use std::sync::LazyLock;
 
 use divan::Bencher;
+use mimalloc::MiMalloc;
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::prelude::StdRng;
@@ -11,6 +12,7 @@ use vortex_array::ArrayRef;
 use vortex_array::Canonical;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
+use vortex_array::array_session;
 use vortex_array::arrays::BoolArray;
 use vortex_array::arrays::ChunkedArray;
 use vortex_array::arrays::ConstantArray;
@@ -21,7 +23,11 @@ use vortex_array::dtype::DType;
 use vortex_error::VortexExpect;
 use vortex_session::VortexSession;
 
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 fn main() {
+    LazyLock::force(&SESSION);
     divan::main();
 }
 
@@ -32,7 +38,7 @@ const BENCH_ARGS: &[(usize, usize)] = &[
     (1000, 10),
 ];
 
-static SESSION: LazyLock<VortexSession> = LazyLock::new(vortex_array::array_session);
+static SESSION: LazyLock<VortexSession> = LazyLock::new(array_session);
 
 #[divan::bench(args = BENCH_ARGS)]
 fn chunked_bool_canonical_into(bencher: Bencher, (len, chunk_count): (usize, usize)) {

@@ -15,6 +15,7 @@ use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::array_session;
+use vortex_array::arrays::BoolArray;
 use vortex_array::arrays::ChunkedArray;
 use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::DecimalArray;
@@ -58,6 +59,9 @@ use vortex_array::stats::PRUNING_STATS;
 use vortex_array::stream::ArrayStreamAdapter;
 use vortex_array::stream::ArrayStreamExt;
 use vortex_array::validity::Validity;
+use vortex_btrblocks::BtrBlocksCompressorBuilder;
+use vortex_btrblocks::SchemeExt;
+use vortex_btrblocks::schemes::string::StringDictScheme;
 use vortex_buffer::Buffer;
 use vortex_buffer::ByteBufferMut;
 use vortex_buffer::buffer;
@@ -237,12 +241,14 @@ async fn test_read_simple_with_spawn() {
             vec![vec![11, 12], vec![21, 22], vec![31, 32], vec![41, 42]],
             Arc::new(I32.into()),
         )
-        .unwrap(),
+        .unwrap()
+        .into_array(),
         ListArray::from_iter_slow::<i8, _>(
             vec![vec![51, 52], vec![61, 62], vec![71, 72], vec![81, 82]],
             Arc::new(I32.into()),
         )
-        .unwrap(),
+        .unwrap()
+        .into_array(),
     ])
     .into_array();
 
@@ -1666,6 +1672,75 @@ async fn test_writer_with_complex_types() -> VortexResult<()> {
     Ok(())
 }
 
+/// Write `array` with list decomposition forced on (through the full compress/zone pipeline) and
+/// read the whole thing back.
+async fn write_read_roundtrip(array: ArrayRef) -> VortexResult<ArrayRef> {
+    let strategy = crate::strategy::WriteStrategyBuilder::default()
+        .with_list_layout()
+        .build();
+    let mut buf = ByteBufferMut::empty();
+    SESSION
+        .write_options()
+        .with_strategy(strategy)
+        .write(&mut buf, array.to_array_stream())
+        .await?;
+    SESSION
+        .open_options()
+        .open_buffer(buf)?
+        .scan()?
+        .into_array_stream()?
+        .read_all()
+        .await
+}
+
+/// A `list<list<i32>>` column round-trips through the `TableStrategy` dispatcher, exercising list
+/// decomposition recursing into itself (the outer list's `elements` are themselves lists).
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn nested_list_of_list_roundtrip() -> VortexResult<()> {
+    let inner = ListArray::try_new(
+        buffer![1i32, 2, 3, 4, 5, 6].into_array(),
+        buffer![0u32, 2, 5, 5, 6].into_array(),
+        Validity::NonNullable,
+    )?
+    .into_array();
+    let outer = ListArray::try_new(
+        inner,
+        buffer![0u32, 2, 4].into_array(),
+        Validity::NonNullable,
+    )?
+    .into_array();
+    let st = StructArray::from_fields(&[("nested", outer)])?.into_array();
+
+    let result = write_read_roundtrip(st.clone()).await?;
+    assert_arrays_eq!(result, st, &mut SESSION.create_execution_ctx());
+    Ok(())
+}
+
+/// A `struct<{ items: list<struct<{a,b}>>? }>` column round-trips, exercising list decomposition
+/// recursing into struct decomposition (list `elements` are structs) plus a nullable list validity
+/// child.
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn nested_struct_list_struct_roundtrip() -> VortexResult<()> {
+    let inner_struct = StructArray::from_fields(&[
+        ("a", buffer![1i32, 2, 3, 4, 5].into_array()),
+        ("b", buffer![10i32, 20, 30, 40, 50].into_array()),
+    ])?
+    .into_array();
+    let items = ListArray::try_new(
+        inner_struct,
+        buffer![0u32, 2, 5, 5].into_array(),
+        Validity::Array(BoolArray::from_iter([true, false, true]).into_array()),
+    )?
+    .into_array();
+    let st = StructArray::from_fields(&[("items", items)])?.into_array();
+
+    let result = write_read_roundtrip(st.clone()).await?;
+    assert_arrays_eq!(result, st, &mut SESSION.create_execution_ctx());
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_writer_with_statistics() -> VortexResult<()> {
     let array = StructArray::from_fields(&[("numbers", buffer![1u32, 2, 3, 4, 5].into_array())])?
@@ -1728,15 +1803,12 @@ async fn timestamp_unit_mismatch() -> Result<(), Box<dyn std::error::Error>> {
 /// Regression test: filtering a milliseconds timestamp column with a seconds scalar should
 /// always error, regardless of how the internal children of `DateTimePartsArray` are encoded.
 ///
-/// This test forces `ConstantArray` encoding for the seconds/subseconds children by using a
-/// compressor with Dict excluded (which triggers distinct-value computation, letting
-/// `ConstantScheme` win for `[0, 0, 0]`). The scanner should still detect the time unit
+/// The compressor's built-in constant detection encodes the seconds/subseconds children
+/// (`[0, 0, 0]`) as `ConstantArray`s. The scanner should still detect the time unit
 /// mismatch and error, not silently return wrong results.
 #[tokio::test]
 async fn timestamp_unit_mismatch_errors_with_constant_children()
 -> Result<(), Box<dyn std::error::Error>> {
-    // Build a compressor where ConstantScheme wins for [0, 0, 0] by including Dict
-    // (which enables distinct-value computation).
     let compressor = vortex_btrblocks::BtrBlocksCompressor::default();
 
     // Write file with MILLISECONDS timestamps using this compressor.
@@ -1816,6 +1888,16 @@ fn assert_offsets_ordered(before: &[u64], after: &[u64], context: &str) {
              but max before = {max_before} >= min after = {min_after}"
         );
     }
+}
+
+/// Whether any node in the layout tree is a dict layout.
+fn layout_has_dict(layout: &dyn Layout) -> bool {
+    layout.encoding_id().as_ref() == "vortex.dict"
+        || layout
+            .children()
+            .unwrap()
+            .iter()
+            .any(|child| layout_has_dict(child.as_ref()))
 }
 
 /// Mirrors the (private) `IDEAL_SPLIT_SIZE` that `SplitBy::Layout` uses to sub-divide wide
@@ -2000,6 +2082,75 @@ async fn test_segment_ordering_dict_codes_before_values() -> VortexResult<()> {
     }
 
     check_dict_ordering(root.as_ref(), segment_specs);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn dict_probe_honours_configured_compressor() -> VortexResult<()> {
+    // Low-cardinality strings so the default cascade picks a dictionary.
+    let n = 32_768;
+    let values: Vec<&str> = (0..n).map(|i| ["alpha", "beta", "gamma"][i % 3]).collect();
+    let strings = VarBinArray::from(values).into_array();
+
+    let mut buf = ByteBufferMut::empty();
+    let summary = SESSION
+        .write_options()
+        .with_strategy(crate::strategy::WriteStrategyBuilder::default().build())
+        .write(&mut buf, strings.clone().to_array_stream())
+        .await?;
+    assert!(
+        layout_has_dict(summary.footer().layout().as_ref()),
+        "default builder should produce a dict layout for low-cardinality strings"
+    );
+
+    let no_string_dict =
+        BtrBlocksCompressorBuilder::default().exclude_schemes([StringDictScheme.id()]);
+    let mut buf = ByteBufferMut::empty();
+    let summary = SESSION
+        .write_options()
+        .with_strategy(
+            crate::strategy::WriteStrategyBuilder::default()
+                .with_btrblocks_builder(no_string_dict)
+                .build(),
+        )
+        .write(&mut buf, strings.to_array_stream())
+        .await?;
+    assert!(
+        !layout_has_dict(summary.footer().layout().as_ref()),
+        "excluding StringDict from the configured compressor should disable the dict layout"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn probe_compressor_override_is_independent() -> VortexResult<()> {
+    // Low-cardinality strings the default cascade would dict-encode.
+    let n = 32_768;
+    let values: Vec<&str> = (0..n).map(|i| ["alpha", "beta", "gamma"][i % 3]).collect();
+    let strings = VarBinArray::from(values).into_array();
+
+    let probe_without_dict = BtrBlocksCompressorBuilder::default()
+        .exclude_schemes([StringDictScheme.id()])
+        .build();
+
+    let mut buf = ByteBufferMut::empty();
+    let summary = SESSION
+        .write_options()
+        .with_strategy(
+            crate::strategy::WriteStrategyBuilder::default()
+                .with_probe_compressor(probe_without_dict)
+                .build(),
+        )
+        .write(&mut buf, strings.to_array_stream())
+        .await?;
+    assert!(
+        !layout_has_dict(summary.footer().layout().as_ref()),
+        "probe override should disable the dict layout independently of the data/stats compressor"
+    );
 
     Ok(())
 }

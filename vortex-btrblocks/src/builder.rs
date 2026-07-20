@@ -11,7 +11,6 @@ use crate::Scheme;
 use crate::SchemeExt;
 use crate::SchemeId;
 use crate::schemes::binary;
-use crate::schemes::bool;
 use crate::schemes::decimal;
 use crate::schemes::float;
 use crate::schemes::integer;
@@ -24,13 +23,8 @@ use crate::schemes::temporal;
 /// the final scheme list, so that tie-breaking is deterministic.
 pub const ALL_SCHEMES: &[&dyn Scheme] = &[
     ////////////////////////////////////////////////////////////////////////////////////////////////
-    // Bool schemes.
-    ////////////////////////////////////////////////////////////////////////////////////////////////
-    &bool::BoolConstantScheme,
-    ////////////////////////////////////////////////////////////////////////////////////////////////
     // Integer schemes.
     ////////////////////////////////////////////////////////////////////////////////////////////////
-    &integer::IntConstantScheme,
     // NOTE: FoR must precede BitPacking to avoid unnecessary patches.
     &integer::FoRScheme,
     // NOTE: ZigZag should precede BitPacking because we don't want negative numbers.
@@ -47,7 +41,6 @@ pub const ALL_SCHEMES: &[&dyn Scheme] = &[
     ////////////////////////////////////////////////////////////////////////////////////////////////
     // Float schemes.
     ////////////////////////////////////////////////////////////////////////////////////////////////
-    &float::FloatConstantScheme,
     &float::ALPScheme,
     &float::ALPRDScheme,
     &float::FloatDictScheme,
@@ -62,13 +55,11 @@ pub const ALL_SCHEMES: &[&dyn Scheme] = &[
     &string::FSSTScheme,
     #[cfg(feature = "unstable_encodings")]
     &string::OnPairScheme,
-    &string::StringConstantScheme,
     &string::NullDominatedSparseScheme,
     ////////////////////////////////////////////////////////////////////////////////////////////////
     // Binary schemes.
     ////////////////////////////////////////////////////////////////////////////////////////////////
     &binary::BinaryDictScheme,
-    &binary::BinaryConstantScheme,
     // Decimal schemes.
     &decimal::DecimalScheme,
     // Temporal schemes.
@@ -174,10 +165,14 @@ impl BtrBlocksCompressorBuilder {
         // dictionary expansion at decode time, which is incompatible with
         // pure-GPU decompression paths. Strip whichever string-fragment
         // scheme is enabled by feature.
-        #[cfg_attr(not(feature = "unstable_encodings"), allow(unused_mut))]
+        #[cfg_attr(
+            not(any(feature = "pco", feature = "unstable_encodings")),
+            allow(unused_mut)
+        )]
         let mut excluded: Vec<SchemeId> = vec![
             integer::SparseScheme.id(),
             integer::IntRLEScheme.id(),
+            float::ALPRDScheme.id(),
             float::FloatRLEScheme.id(),
             float::NullDominatedSparseScheme.id(),
             string::StringDictScheme.id(),
@@ -190,6 +185,8 @@ impl BtrBlocksCompressorBuilder {
         // is incompatible with pure-GPU decompression paths.
         #[cfg(feature = "unstable_encodings")]
         excluded.push(integer::DeltaScheme::default().id());
+        #[cfg(feature = "pco")]
+        excluded.extend([integer::PcoScheme.id(), float::PcoScheme.id()]);
         let builder = self.exclude_schemes(excluded);
 
         #[cfg(all(feature = "zstd", feature = "unstable_encodings"))]
@@ -231,5 +228,28 @@ mod tests {
     fn default_includes_all_schemes() {
         let builder = BtrBlocksCompressorBuilder::default();
         assert_eq!(builder.schemes.len(), ALL_SCHEMES.len());
+    }
+
+    #[test]
+    fn cuda_compatible_excludes_alprd() {
+        let builder = BtrBlocksCompressorBuilder::default().only_cuda_compatible();
+        assert!(
+            !builder
+                .schemes
+                .iter()
+                .any(|s| s.id() == float::ALPRDScheme.id())
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "pco")]
+    fn cuda_compatible_excludes_pco() {
+        let builder = BtrBlocksCompressorBuilder::default()
+            .with_new_scheme(&integer::PcoScheme)
+            .with_new_scheme(&float::PcoScheme)
+            .only_cuda_compatible();
+        for scheme in [integer::PcoScheme.id(), float::PcoScheme.id()] {
+            assert!(!builder.schemes.iter().any(|s| s.id() == scheme));
+        }
     }
 }

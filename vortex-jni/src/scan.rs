@@ -19,7 +19,6 @@ use arrow_array::RecordBatch;
 use arrow_array::cast::AsArray;
 use arrow_array::ffi_stream::FFI_ArrowArrayStream;
 use arrow_schema::ArrowError;
-use arrow_schema::DataType;
 use arrow_schema::Field;
 use futures::StreamExt;
 use jni::EnvUnowned;
@@ -29,7 +28,6 @@ use jni::objects::JLongArray;
 use jni::sys::jboolean;
 use jni::sys::jlong;
 use vortex::array::VortexSessionExecute;
-use vortex::array::arrow::ArrowSessionExt;
 use vortex::array::stream::SendableArrayStream;
 use vortex::buffer::Buffer;
 use vortex::error::VortexResult;
@@ -44,11 +42,13 @@ use vortex::scan::PartitionRef;
 use vortex::scan::PartitionStream;
 use vortex::scan::ScanRequest;
 use vortex::scan::selection::Selection;
+use vortex_arrow::ArrowSessionExt;
+use vortex_arrow::ToArrowType;
 
 use crate::POOL;
 use crate::RUNTIME;
 use crate::data_source::NativeDataSource;
-use crate::dtype::strip_views;
+use crate::dtype::export_dtype_to_arrow;
 use crate::errors::try_or_throw;
 use crate::session::session_ref;
 
@@ -215,7 +215,7 @@ pub extern "system" fn Java_dev_vortex_jni_NativeScan_arrowSchema(
         let NativeScan::Pending(scan) = scan else {
             throw_runtime!("schema unavailable: scan already started");
         };
-        crate::dtype::export_dtype_to_arrow(scan.dtype(), schema_addr)?;
+        export_dtype_to_arrow(scan.dtype(), schema_addr)?;
         Ok(())
     });
 }
@@ -343,13 +343,7 @@ pub extern "system" fn Java_dev_vortex_jni_NativePartition_scanArrow(
         let array_stream = partition.execute()?;
         let dtype = array_stream.dtype().clone();
 
-        let raw_schema = dtype.to_arrow_schema()?;
-        let viewless = strip_views(DataType::Struct(raw_schema.fields().clone()));
-        let fields = match viewless {
-            DataType::Struct(fields) => fields,
-            _ => unreachable!("Vortex DType always exports as a struct"),
-        };
-        let schema = Arc::new(arrow_schema::Schema::new(fields));
+        let schema = Arc::new(dtype.to_arrow_schema()?);
         let target = Arc::new(Field::new_struct("", schema.fields().clone(), false));
 
         let session = unsafe { session_ref(session_ptr) };

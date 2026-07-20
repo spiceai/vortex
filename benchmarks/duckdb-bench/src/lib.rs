@@ -78,6 +78,12 @@ impl DuckClient {
         for stmt in &statements {
             self.connection().query(stmt)?;
         }
+        // After `LOAD spatial`, shadow the overridden spatial functions so that their filters
+        // push down. No-op without it.
+        self.db
+            .as_ref()
+            .vortex_expect("DuckClient database accessed after close")
+            .register_spatial_overrides()?;
         self.init_sql = statements;
         Ok(())
     }
@@ -127,6 +133,11 @@ impl DuckClient {
                 .vortex_expect("connection just opened")
                 .query(stmt)?;
         }
+        // Re-shadow the overridden spatial functions against the fresh instance.
+        self.db
+            .as_ref()
+            .vortex_expect("database just opened")
+            .register_spatial_overrides()?;
 
         Ok(())
     }
@@ -169,7 +180,10 @@ impl DuckClient {
         file_format: Format,
     ) -> Result<()> {
         let object_type = match file_format {
-            Format::Parquet | Format::OnDiskVortex | Format::VortexCompact => "VIEW",
+            Format::Parquet
+            | Format::OnDiskVortex
+            | Format::VortexCompact
+            | Format::VortexNative => "VIEW",
             Format::OnDiskDuckDB => "TABLE",
             Format::Lance => {
                 anyhow::bail!(

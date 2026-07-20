@@ -57,7 +57,7 @@ impl ZipKernel for VarBinView {
         let true_validity = if_true.varbinview_validity().execute_mask(len, ctx)?;
         let false_validity = if_false.varbinview_validity().execute_mask(len, ctx)?;
 
-        let mask = mask.try_to_mask_fill_null_false(ctx)?;
+        let mask = mask.clone().null_as_false().execute(ctx)?;
         let if_false_view = if_false;
         match mask.slices() {
             AllOr::All => push_range(
@@ -217,8 +217,6 @@ mod tests {
     use crate::array_session;
     use crate::arrays::VarBinViewArray;
     use crate::builtins::ArrayBuiltins;
-    #[expect(deprecated)]
-    use crate::canonical::ToCanonical as _;
     use crate::dtype::DType;
     use crate::dtype::Nullability;
 
@@ -250,12 +248,12 @@ mod tests {
 
         let mask = Mask::from_iter([true, false, true, false, false, true]);
 
-        #[expect(deprecated)]
+        let mut ctx = array_session().create_execution_ctx();
         let zipped = mask
             .clone()
             .into_array()
             .zip(a.into_array(), b.into_array())?
-            .to_varbinview();
+            .execute::<VarBinViewArray>(&mut ctx)?;
 
         let mut ctx = array_session().create_execution_ctx();
         let validity_mask = zipped.validity()?.execute_mask(zipped.len(), &mut ctx)?;

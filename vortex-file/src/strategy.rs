@@ -51,9 +51,11 @@ use vortex_layout::layouts::compressed::CompressingStrategy;
 use vortex_layout::layouts::compressed::CompressorPlugin;
 use vortex_layout::layouts::dict::writer::DictStrategy;
 use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
+use vortex_layout::layouts::list::writer::ListLayoutStrategy;
 use vortex_layout::layouts::repartition::RepartitionStrategy;
 use vortex_layout::layouts::repartition::RepartitionWriterOptions;
 use vortex_layout::layouts::table::TableStrategy;
+use vortex_layout::layouts::table::use_experimental_list_layout;
 use vortex_layout::layouts::zoned::writer::ZonedLayoutOptions;
 use vortex_layout::layouts::zoned::writer::ZonedStrategy;
 #[cfg(feature = "unstable_encodings")]
@@ -169,6 +171,11 @@ pub struct WriteStrategyBuilder {
     field_writers: HashMap<FieldPath, Arc<dyn LayoutStrategy>>,
     allow_encodings: Option<HashSet<ArrayId>>,
     flat_strategy: Option<Arc<dyn LayoutStrategy>>,
+    probe_compressor: Option<Arc<dyn CompressorPlugin>>,
+    /// Whether to write list fields using [`ListLayoutStrategy`].
+    ///
+    /// [`ListLayoutStrategy`]: vortex_layout::layouts::list::writer::ListLayoutStrategy
+    use_list_layout: bool,
 }
 
 impl std::fmt::Debug for WriteStrategyBuilder {
@@ -204,6 +211,8 @@ impl Default for WriteStrategyBuilder {
             field_writers: HashMap::new(),
             allow_encodings: Some(ALLOWED_ENCODINGS.clone()),
             flat_strategy: None,
+            probe_compressor: None,
+            use_list_layout: use_experimental_list_layout(),
         }
     }
 }
@@ -215,6 +224,17 @@ impl WriteStrategyBuilder {
     /// random-access locality.
     pub fn with_row_block_size(mut self, row_block_size: usize) -> Self {
         self.row_block_size = row_block_size;
+        self
+    }
+
+    /// Enable writing list fields with [`ListLayoutStrategy`].
+    ///
+    /// **Note**: this is an unstable and experimental layout that is expected to change.
+    /// Using it may lead to unreadable files in the future.
+    ///
+    /// [`ListLayoutStrategy`]: vortex_layout::layouts::list::writer::ListLayoutStrategy
+    pub fn with_list_layout(mut self) -> Self {
+        self.use_list_layout = true;
         self
     }
 
@@ -264,6 +284,12 @@ impl WriteStrategyBuilder {
     /// compressor is already fully configured and should not be modified by the builder.
     pub fn with_compressor<C: CompressorPlugin>(mut self, compressor: C) -> Self {
         self.compressor = CompressorConfig::Opaque(Arc::new(compressor));
+        self
+    }
+
+    /// Override the compressor used to probe whether a column is dict-eligible.
+    pub fn with_probe_compressor<C: CompressorPlugin>(mut self, compressor: C) -> Self {
+        self.probe_compressor = Some(Arc::new(compressor));
         self
     }
 
@@ -320,22 +346,30 @@ impl WriteStrategyBuilder {
             CompressorConfig::BtrBlocks(builder) => Arc::new(builder.build()),
             CompressorConfig::Opaque(compressor) => compressor,
         };
-        let compress_then_flat = CompressingStrategy::new(flat, stats_compressor);
+        let compress_then_flat = CompressingStrategy::new(flat, Arc::clone(&stats_compressor));
 
         // 3. apply dict encoding or fallback
+        let probe_compressor = if let Some(probe_compressor) = self.probe_compressor {
+            probe_compressor
+        } else {
+            Arc::clone(&stats_compressor)
+        };
         let dict = DictStrategy::new(
             coalescing.clone(),
             compress_then_flat.clone(),
             coalescing,
             Default::default(),
+            probe_compressor,
         );
+
+        let row_block_size = NonZeroUsize::new(self.row_block_size).vortex_expect("must be non 0");
 
         // 2. calculate stats for each row group
         let stats = ZonedStrategy::new(
             dict,
             compress_then_flat.clone(),
             ZonedLayoutOptions {
-                block_size: NonZeroUsize::new(self.row_block_size).vortex_expect("must be non 0"),
+                block_size: row_block_size,
                 ..Default::default()
             },
         );
@@ -354,11 +388,37 @@ impl WriteStrategyBuilder {
         );
 
         // 0. start with splitting columns
-        let validity_strategy = CollectStrategy::new(compress_then_flat);
+        let validity_strategy = CollectStrategy::new(compress_then_flat.clone());
 
         // Take any field overrides from the builder and apply them to the final strategy.
-        let table_strategy = TableStrategy::new(Arc::new(validity_strategy), Arc::new(repartition))
-            .with_field_writers(self.field_writers);
+        let mut table_strategy =
+            TableStrategy::new(Arc::new(validity_strategy), Arc::new(repartition))
+                .with_field_writers(self.field_writers);
+
+        if self.use_list_layout {
+            // We need a closure here to enable recursive application of list layout.
+            table_strategy = table_strategy.with_list_layout_factory(
+                move |list_layout: ListLayoutStrategy| -> Arc<dyn LayoutStrategy> {
+                    let zoned = ZonedStrategy::new(
+                        list_layout,
+                        compress_then_flat.clone(),
+                        ZonedLayoutOptions {
+                            block_size: row_block_size,
+                            ..Default::default()
+                        },
+                    );
+                    Arc::new(RepartitionStrategy::new(
+                        zoned,
+                        RepartitionWriterOptions {
+                            block_size_minimum: 0,
+                            block_len_multiple: row_block_size.get(),
+                            block_size_target: None,
+                            canonicalize: false,
+                        },
+                    ))
+                },
+            );
+        }
 
         Arc::new(table_strategy)
     }
