@@ -414,11 +414,19 @@ impl<A: 'static + Send> Stream for LazyScanStream<A> {
                             let concurrency = preparing.concurrency;
                             let handle = preparing.handle.clone();
                             super::scanpark::ensure_dumper();
+                            // DIAG (cold-stall): per-scan counters isolate THIS scan from other
+                            // concurrent scans, so a freeze resolves Mode X (drain lost-wake) vs
+                            // Mode Y (stuck task bodies) for this specific scan.
+                            let sc = super::scanpark::register_scan();
+                            let sc_spawn = Arc::clone(&sc);
                             let stream = futures::stream::iter(tasks).map(move |task| {
                                 super::scanpark::SPAWNED.fetch_add(1, Ordering::Relaxed);
+                                sc_spawn.spawned.fetch_add(1, Ordering::Relaxed);
+                                let sc_task = Arc::clone(&sc_spawn);
                                 handle.spawn(async move {
                                     let result = task.await;
                                     super::scanpark::COMPLETED.fetch_add(1, Ordering::Relaxed);
+                                    sc_task.completed.fetch_add(1, Ordering::Relaxed);
                                     result
                                 })
                             });
@@ -427,10 +435,15 @@ impl<A: 'static + Send> Stream for LazyScanStream<A> {
                             } else {
                                 stream.buffer_unordered(concurrency).boxed()
                             };
+                            let sc_yield = sc;
                             let stream = stream
-                                .filter_map(|chunk| async move {
-                                    super::scanpark::YIELDED.fetch_add(1, Ordering::Relaxed);
-                                    chunk.transpose()
+                                .filter_map(move |chunk| {
+                                    let sc_y = Arc::clone(&sc_yield);
+                                    async move {
+                                        super::scanpark::YIELDED.fetch_add(1, Ordering::Relaxed);
+                                        sc_y.yielded.fetch_add(1, Ordering::Relaxed);
+                                        chunk.transpose()
+                                    }
                                 })
                                 .boxed();
                             self.state = LazyScanState::Stream(stream);
