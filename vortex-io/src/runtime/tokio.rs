@@ -43,17 +43,11 @@ impl From<tokio::runtime::Handle> for TokioRuntime {
 
 impl Executor for tokio::runtime::Handle {
     fn spawn(&self, fut: BoxFuture<'static, ()>) -> AbortHandleRef {
-        #[cfg(unix)]
-        {
-            use custom_labels::asynchronous::Label;
-
-            let fut = fut.with_current_labels();
-            Box::new(tokio::runtime::Handle::spawn(self, fut).abort_handle())
-        }
-        #[cfg(not(unix))]
-        {
-            Box::new(tokio::runtime::Handle::spawn(self, fut).abort_handle())
-        }
+        // DIAG(cold-stall): bypass `custom_labels::with_current_labels()` on the async spawn path
+        // (the one used by the scan's split-read tasks via `handle.spawn`). Tests whether the
+        // per-poll label wrapper strands the spawned task's waker (chain step 9). If the never-ready
+        // freeze vanishes with this bypass, custom_labels is the cause. REVERT before merge.
+        Box::new(tokio::runtime::Handle::spawn(self, fut).abort_handle())
     }
 
     fn spawn_cpu(&self, cpu: Box<dyn FnOnce() + Send + 'static>) -> AbortHandleRef {
