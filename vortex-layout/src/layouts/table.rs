@@ -276,13 +276,13 @@ impl LayoutStrategy for TableStrategy {
                         Ok(columns) => {
                             for (tx, column) in column_streams_tx.iter().zip_eq(columns.into_iter())
                             {
-                                let _ = tx.send(Ok(column)).await;
+                                drop(tx.send(Ok(column)).await);
                             }
                         }
                         Err(e) => {
                             let e: Arc<VortexError> = Arc::new(e);
                             for tx in column_streams_tx.iter() {
-                                let _ = tx.send(Err(VortexError::from(Arc::clone(&e)))).await;
+                                drop(tx.send(Err(VortexError::from(Arc::clone(&e)))).await);
                             }
                             break;
                         }

@@ -351,7 +351,7 @@ impl Writer<'_> {
             while let Some(chunk) = stream.next().await {
                 arrays.send(chunk).await?;
             }
-            Ok::<_, kanal::SendError>(())
+            Ok::<_, kanal::SendError<VortexResult<ArrayRef>>>(())
         }
         .fuse();
         pin_mut!(stream_fut);

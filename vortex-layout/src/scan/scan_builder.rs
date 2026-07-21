@@ -9,8 +9,10 @@ use std::task::Context;
 use std::task::Poll;
 use std::task::ready;
 
+use futures::SinkExt;
 use futures::Stream;
 use futures::StreamExt;
+use futures::channel::mpsc;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use itertools::Itertools;
@@ -419,24 +421,52 @@ impl<A: 'static + Send> Stream for LazyScanStream<A> {
                             // Mode Y (stuck task bodies) for this specific scan.
                             let sc = super::scanpark::register_scan();
                             let sc_spawn = Arc::clone(&sc);
-                            let stream = futures::stream::iter(tasks).map(move |task| {
-                                super::scanpark::SPAWNED.fetch_add(1, Ordering::Relaxed);
-                                sc_spawn.spawned.fetch_add(1, Ordering::Relaxed);
-                                let sc_task = Arc::clone(&sc_spawn);
-                                handle.spawn(async move {
-                                    let result = task.await;
-                                    super::scanpark::COMPLETED.fetch_add(1, Ordering::Relaxed);
-                                    sc_task.completed.fetch_add(1, Ordering::Relaxed);
-                                    result
-                                })
+                            // FIX (cold-stall Mode-1 drain lost-wake): instead of the consumer
+                            // polling `buffer_unordered(handle.spawn(..))` directly, a dedicated
+                            // driver task owns the buffer_unordered/buffered over the spawned
+                            // split-reads and forwards each result into a bounded futures::mpsc that
+                            // the consumer reads. The confirmed freeze is a drain-side lost-wake in
+                            // FuturesUnordered's parent-wake: a completed spawned read fails to
+                            // re-wake the cross-runtime consumer, and the final completion has
+                            // nothing left to re-trigger it -> permanent Pending -> promotion holds
+                            // write_lock -> never-ready. Driving the FuturesUnordered on the SAME
+                            // runtime as the spawned reads keeps its parent-wake local + robust, and
+                            // the mpsc receiver has a single robust waker (no FU cross-runtime
+                            // parent-wake). The bounded channel (capacity = concurrency) preserves
+                            // backpressure. Order is preserved on the `ordered` path (buffered ->
+                            // in-order forward -> in-order receive).
+                            let (mut tx, rx) =
+                                mpsc::channel::<VortexResult<Option<A>>>(concurrency.max(1));
+                            let driver_handle = handle.clone();
+                            let driver = handle.spawn(async move {
+                                let inner = futures::stream::iter(tasks).map(move |task| {
+                                    super::scanpark::SPAWNED.fetch_add(1, Ordering::Relaxed);
+                                    sc_spawn.spawned.fetch_add(1, Ordering::Relaxed);
+                                    let sc_task = Arc::clone(&sc_spawn);
+                                    driver_handle.spawn(async move {
+                                        let result = task.await;
+                                        super::scanpark::COMPLETED
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        sc_task.completed.fetch_add(1, Ordering::Relaxed);
+                                        result
+                                    })
+                                });
+                                let mut inner = if ordered {
+                                    inner.buffered(concurrency).boxed()
+                                } else {
+                                    inner.buffer_unordered(concurrency).boxed()
+                                };
+                                while let Some(chunk) = inner.next().await {
+                                    // `Err` => the consumer dropped the stream; stop draining
+                                    // (dropping `inner` aborts any still-spawned reads).
+                                    if tx.send(chunk).await.is_err() {
+                                        break;
+                                    }
+                                }
                             });
-                            let stream = if ordered {
-                                stream.buffered(concurrency).boxed()
-                            } else {
-                                stream.buffer_unordered(concurrency).boxed()
-                            };
+                            driver.detach();
                             let sc_yield = sc;
-                            let stream = stream
+                            let stream = rx
                                 .filter_map(move |chunk| {
                                     let sc_y = Arc::clone(&sc_yield);
                                     async move {

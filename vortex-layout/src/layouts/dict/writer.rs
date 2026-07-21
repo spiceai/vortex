@@ -395,7 +395,7 @@ struct DictionaryTransformer {
     input: DictionaryStream,
     active_codes_tx: Option<kanal::AsyncSender<SequencedChunk>>,
     active_values_tx: Option<oneshot::Sender<SequencedChunk>>,
-    pending_send: Option<BoxFuture<'static, Result<(), kanal::SendError>>>,
+    pending_send: Option<BoxFuture<'static, Result<(), kanal::SendError<SequencedChunk>>>>,
 }
 
 impl DictionaryTransformer {
