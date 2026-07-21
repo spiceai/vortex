@@ -11,6 +11,11 @@ use std::task::Poll;
 use std::task::ready;
 
 use futures::FutureExt;
+// DIAG(cold-stall): the spawned-task result channel uses `tokio::sync::oneshot` rather than the
+// raw `oneshot` crate. The raw crate has a receiver-waker drop bug (#6221/#8830 class) that can
+// strand a completed task's wake inside the `buffer_unordered(handle.spawn(..))` scan composition
+// (never-ready freeze). This `use` shadows the raw `oneshot` extern crate within this file only.
+use tokio::sync::oneshot;
 use tracing::Instrument;
 use vortex_error::vortex_panic;
 
@@ -89,7 +94,7 @@ impl Handle {
             .boxed(),
         );
         Task {
-            recv: recv.into_future(),
+            recv,
             abort_handle: Some(abort_handle),
         }
     }
@@ -130,7 +135,7 @@ impl Handle {
             .boxed(),
         );
         Task {
-            recv: recv.into_future(),
+            recv,
             abort_handle: Some(abort_handle),
         }
     }
@@ -162,7 +167,7 @@ impl Handle {
             }
         }));
         Task {
-            recv: recv.into_future(),
+            recv,
             abort_handle: Some(abort_handle),
         }
     }
@@ -186,7 +191,7 @@ impl Handle {
             }
         }));
         Task {
-            recv: recv.into_future(),
+            recv,
             abort_handle: Some(abort_handle),
         }
     }
@@ -215,7 +220,7 @@ pub enum JoinOutcome<T> {
 /// continue running in the background, call [`Task::detach`].
 #[must_use = "When a Task is dropped without being awaited, it is cancelled"]
 pub struct Task<T> {
-    recv: oneshot::AsyncReceiver<TaskOutput<T>>,
+    recv: oneshot::Receiver<TaskOutput<T>>,
     abort_handle: Option<AbortHandleRef>,
 }
 
@@ -292,7 +297,7 @@ mod tests {
         drop(send);
 
         let mut task = Task::<()> {
-            recv: recv.into_future(),
+            recv,
             abort_handle: None,
         };
 
@@ -312,7 +317,7 @@ mod tests {
         drop(send.send(Ok(7)));
 
         let mut task = Task::<u32> {
-            recv: recv.into_future(),
+            recv,
             abort_handle: None,
         };
 
