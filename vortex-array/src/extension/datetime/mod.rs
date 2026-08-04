@@ -7,10 +7,12 @@ mod date;
 mod matcher;
 mod time;
 mod timestamp;
+mod timezone;
 mod unit;
 
 pub use date::*;
 pub use matcher::*;
 pub use time::*;
 pub use timestamp::*;
+pub use timezone::*;
 pub use unit::*;
