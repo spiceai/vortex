@@ -13,6 +13,7 @@ use crate::extension::datetime::Date;
 use crate::extension::datetime::Time;
 use crate::extension::datetime::TimeUnit;
 use crate::extension::datetime::Timestamp;
+use crate::extension::datetime::resolve_timezone;
 
 /// Matcher for temporal extension data types.
 pub struct AnyTemporal;
@@ -74,7 +75,7 @@ impl TemporalMetadata<'_> {
                 Some(tz) => Ok(TemporalJiff::Zoned(
                     jiff::Timestamp::UNIX_EPOCH
                         .checked_add(unit.to_jiff_span(v)?)?
-                        .in_tz(tz.as_ref())?,
+                        .to_zoned(resolve_timezone(tz.as_ref())?),
                 )),
             },
         }
@@ -101,5 +102,41 @@ impl Display for TemporalJiff {
             TemporalJiff::Unzoned(dt) => write!(f, "{dt}"),
             TemporalJiff::Zoned(z) => write!(f, "{z}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use rstest::rstest;
+    use vortex_error::VortexResult;
+
+    use crate::extension::datetime::TemporalMetadata;
+    use crate::extension::datetime::TimeUnit;
+
+    /// Arrow allows a fixed UTC offset in place of an IANA name, and Iceberg maps every
+    /// `timestamptz` column to `+00:00`.
+    #[rstest]
+    // A zero offset resolves to UTC, which `jiff` annotates by name.
+    #[case("+00:00", "1970-01-01T00:00:01+00:00[UTC]")]
+    #[case("-05:30", "1969-12-31T18:30:01-05:30[-05:30]")]
+    #[case("+09:00", "1970-01-01T09:00:01+09:00[+09:00]")]
+    #[case("America/New_York", "1969-12-31T19:00:01-05:00[America/New_York]")]
+    fn to_jiff_resolves_timezone(
+        #[case] timezone: &str,
+        #[case] expected: &str,
+    ) -> VortexResult<()> {
+        let tz = Some(Arc::from(timezone));
+        let metadata = TemporalMetadata::Timestamp(&TimeUnit::Seconds, &tz);
+        assert_eq!(metadata.to_jiff(1)?.to_string(), expected);
+        Ok(())
+    }
+
+    #[test]
+    fn to_jiff_rejects_unknown_timezone() {
+        let tz = Some(Arc::from("Not/A/Timezone"));
+        let metadata = TemporalMetadata::Timestamp(&TimeUnit::Seconds, &tz);
+        assert!(metadata.to_jiff(1).is_err());
     }
 }

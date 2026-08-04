@@ -18,11 +18,17 @@ pub(super) fn accumulate_extension(
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<()> {
     let non_nullable_ext_dtype = array.ext_dtype().with_nullability(Nullability::NonNullable);
-    let local =
-        min_max(array.storage_array(), ctx)?.map(|MinMaxResult { min, max }| MinMaxResult {
-            min: Scalar::extension_ref(non_nullable_ext_dtype.clone(), min),
-            max: Scalar::extension_ref(non_nullable_ext_dtype, max),
-        });
+    // Build the extension scalars fallibly: an extension type whose metadata the storage value
+    // cannot satisfy (an unresolvable timezone, say) must fail the aggregation rather than abort
+    // the process, since this runs on the write path when building zone maps.
+    let local = min_max(array.storage_array(), ctx)?
+        .map(|MinMaxResult { min, max }| -> VortexResult<MinMaxResult> {
+            Ok(MinMaxResult {
+                min: Scalar::try_extension_ref(non_nullable_ext_dtype.clone(), min)?,
+                max: Scalar::try_extension_ref(non_nullable_ext_dtype, max)?,
+            })
+        })
+        .transpose()?;
     partial.merge(local);
     Ok(())
 }
