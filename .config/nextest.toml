@@ -4,3 +4,7 @@ slow-timeout = { period = "30s", terminate-after = 5 }
 [[profile.default.overrides]]
 filter = 'test(compress_large_int | fsst_compress_offsets_overflow_i32)'
 priority = 100
+# These two are already singled out here for being slow. Under coverage
+# instrumentation, and on a runner without a compile cache, they run long enough
+# to hit the default cap and be terminated, so give them a longer one.
+slow-timeout = { period = "60s", terminate-after = 10 }
