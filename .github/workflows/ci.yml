@@ -679,12 +679,20 @@ jobs:
           git status --porcelain
           test -z "$(git status --porcelain)"
 
-      - name: "Checkout develop flatbuffers"
+      # Compare against the branch being merged into, not always develop. A
+      # release branch is behind develop by construction, so conforming a release
+      # branch against develop reports every field develop has added since as a
+      # deleted field. Comparing against the base ref asks the question that
+      # matters for any branch: does this change stay compatible with what it is
+      # being merged into.
+      - name: "Checkout base flatbuffers"
         working-directory: vortex-flatbuffers/
+        env:
+          BASE_REF: ${{ github.base_ref || github.ref_name }}
         run: |
           cp -R flatbuffers flatbuffers.HEAD
-          git fetch origin develop --depth 1
-          git checkout origin/develop -- flatbuffers
+          git fetch origin "$BASE_REF" --depth 1
+          git checkout "origin/$BASE_REF" -- flatbuffers
       - name: "Verify flatbuffer back-compat"
         working-directory: vortex-flatbuffers/
         run: |

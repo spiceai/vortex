@@ -43,6 +43,10 @@ jobs:
               - ".github/workflows/**"
 
   bench-codspeed:
+    # Reporting a benchmark run needs CODSPEED_TOKEN, which only upstream holds,
+    # so these shards cannot produce a result anywhere else. The CUDA benchmark
+    # job below is already restricted the same way.
+    if: github.repository == 'vortex-data/vortex'
     strategy:
       matrix:
         include:
