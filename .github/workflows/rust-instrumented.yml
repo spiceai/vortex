@@ -172,7 +172,9 @@ jobs:
       ${{ github.repository == 'vortex-data/vortex'
           && format('runs-on={0}/pool=amd64-medium-pre-v2/tag=rust-test-sanitizer', github.run_id)
           || 'ubuntu-latest' }}
-    timeout-minutes: 30
+    # -Zbuild-std with a sanitizer rebuilds core and std, which overran thirty
+    # minutes on a fork runner with no compile cache.
+    timeout-minutes: ${{ github.repository == 'vortex-data/vortex' && 30 || 90 }}
     env:
       ASAN_OPTIONS: "symbolize=1:check_initialization_order=1:detect_leaks=1:leak_check_at_exit=1"
       LSAN_OPTIONS: "report_objects=1"
@@ -236,7 +238,9 @@ jobs:
           - sanitizer: tsan
             sanitizer_flags: "-Zsanitizer=thread"
     name: "Rust/C++ FFI tests (${{ matrix.sanitizer }})"
-    timeout-minutes: 5
+    # Sanitizer builds of vortex-ffi plus the C++ tests are built from scratch on a
+    # fork, which does not fit in the upstream prebuild budget.
+    timeout-minutes: ${{ github.repository == 'vortex-data/vortex' && 5 || 45 }}
     env:
       ASAN_OPTIONS: "symbolize=1:check_initialization_order=1:detect_leaks=1:leak_check_at_exit=1"
       LSAN_OPTIONS: "report_objects=1"
