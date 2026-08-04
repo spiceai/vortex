@@ -85,6 +85,12 @@ jobs:
           fi
           echo "Found llvm-profdata at $LLVM_PROFDATA"
 
+      - name: Install grcov
+        if: github.repository != 'vortex-data/vortex'
+        uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9  # v2
+        with:
+          tool: grcov
+
       - name: Rust Tests
         if: ${{ matrix.suite == 'tests' }}
         run: |

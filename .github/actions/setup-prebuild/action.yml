@@ -47,3 +47,11 @@ runs:
         components: ${{ inputs.components }}
         targets: ${{ inputs.targets }}
         enable-sccache: "false"
+
+    # The prebuild AMIs ship these; install them wherever the AMI is not available
+    # so a job does not have to remember to do it itself.
+    - name: Install common cargo tools
+      if: github.repository != 'vortex-data/vortex'
+      uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9  # v2
+      with:
+        tool: cargo-hack,cargo-nextest
