@@ -173,7 +173,9 @@ mod tests {
     #[case("+00:00", true)]
     #[case("-00:00", true)]
     #[case("+0000", true)]
+    #[case("-0000", true)]
     #[case("+00", true)]
+    #[case("-00", true)]
     // So do the IANA names that are zero-offset for all time.
     #[case("UTC", true)]
     #[case("Etc/UTC", true)]

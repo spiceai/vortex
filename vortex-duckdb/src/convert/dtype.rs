@@ -577,7 +577,7 @@ mod tests {
 
         // Every spelling of a zero UTC offset maps to TIMESTAMP_TZ. Iceberg and `arrow-rs` emit
         // the offset form rather than the IANA name.
-        for tz in ["UTC", "+00:00", "-00:00", "+0000", "+00"] {
+        for tz in ["UTC", "+00:00", "-00:00", "+0000", "-0000", "+00", "-00"] {
             let dtype = DType::Extension(
                 Timestamp::new_with_tz(
                     TimeUnit::Microseconds,
