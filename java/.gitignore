@@ -4,8 +4,12 @@
 # Ignore Gradle build output directory
 build
 
-# Ignore IDE (Eclipse/VS Code Java) class output directory
+# Ignore IDE class output directories (Eclipse/VS Code use bin/, IntelliJ uses out/)
 bin/
+out/
+
+# Compiled class files are never tracked; Gradle writes them under build/
+*.class
 
 # generated source directories
 generated_src/
