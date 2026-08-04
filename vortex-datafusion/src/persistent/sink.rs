@@ -109,7 +109,22 @@ impl CompressionEstimate {
 struct ActiveFileWriter {
     path: Path,
     sender: mpsc::Sender<RecordBatch>,
-    task: JoinHandle<DFResult<WriteSummary>>,
+    /// `None` once the task has been joined, or once it has been taken to be
+    /// aborted. Joining leaves the handle in place so that a cancelled join
+    /// still aborts the task.
+    task: Option<JoinHandle<DFResult<WriteSummary>>>,
+}
+
+impl Drop for ActiveFileWriter {
+    /// Aborts a writer that was neither finished nor cleaned up. A bare
+    /// [`JoinHandle`] keeps running when dropped, so a cancelled write would
+    /// otherwise let the task complete its multipart upload and publish a file
+    /// that nothing accounts for.
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
 }
 
 /// Implements [`DataSink`] for writing Vortex files.
@@ -387,6 +402,10 @@ where
     let target = target_file_size.map(|t| t.max(1));
     let mut results: Vec<(Path, WriteSummary)> = Vec::new();
     let mut active_writer: Option<ActiveFileWriter> = None;
+    // Every path a writer was opened for. A file that fails while being
+    // finalized is already out of `active_writer` and never reaches `results`,
+    // so cleanup has to work from this rather than from either of those.
+    let mut attempted_paths: Vec<Path> = Vec::new();
     let mut uncompressed_bytes_in_file = 0_u64;
     let mut file_index = 0_usize;
     let mut compression_estimate = CompressionEstimate::identity();
@@ -396,10 +415,12 @@ where
     let write_result: DFResult<()> = async {
         while let Some(batch) = data.next().await.transpose()? {
             if active_writer.is_none() {
+                let path = output_path(file_index);
+                attempted_paths.push(path.clone());
                 active_writer = Some(start_file_writer(
                     &session,
                     Arc::clone(&object_store),
-                    output_path(file_index),
+                    path,
                     dtype.clone(),
                     Arc::clone(&import_schema),
                 ));
@@ -458,7 +479,7 @@ where
         cleanup_failed_write(
             object_store,
             active_writer.into_iter().collect(),
-            results.iter().map(|(path, _)| path.clone()).collect(),
+            attempted_paths,
         )
         .await;
         return Err(err);
@@ -525,23 +546,32 @@ fn start_file_writer(
         Ok(summary)
     });
 
-    ActiveFileWriter { path, sender, task }
+    ActiveFileWriter {
+        path,
+        sender,
+        task: Some(task),
+    }
 }
 
 async fn cleanup_failed_write(
     object_store: Arc<dyn ObjectStore>,
     active_writers: Vec<ActiveFileWriter>,
-    finished_paths: Vec<Path>,
+    // Every path a writer was opened for, not just the ones that finished: a
+    // file that failed while being finalized is in neither `active_writers`
+    // nor the caller's results.
+    attempted_paths: Vec<Path>,
 ) {
     let mut cleanup_paths = HashSet::new();
 
-    for writer in active_writers {
+    for mut writer in active_writers {
         cleanup_paths.insert(writer.path.clone());
-        writer.task.abort();
-        drop(writer.task.await);
+        if let Some(task) = writer.task.take() {
+            task.abort();
+            drop(task.await);
+        }
     }
 
-    for path in finished_paths {
+    for path in attempted_paths {
         cleanup_paths.insert(path);
     }
 
@@ -566,7 +596,23 @@ async fn send_batch_to_active_writer(
 
 async fn finish_file_writer(mut writer: ActiveFileWriter) -> DFResult<WriteSummary> {
     writer.sender.close_channel();
-    match writer.task.await {
+    // Join through the handle still owned by `writer` so that cancelling this
+    // future drops `writer` and aborts the task. Taking the handle out first
+    // would leave a bare JoinHandle, which detaches instead of aborting, and
+    // this is the window in which the file is published.
+    let joined = {
+        let task = writer.task.as_mut().ok_or_else(|| {
+            exec_datafusion_err!(
+                "Vortex writer task for '{}' was already consumed",
+                writer.path
+            )
+        })?;
+        task.await
+    };
+    // Completed, so there is nothing left for the drop guard to abort.
+    writer.task = None;
+
+    match joined {
         Ok(result) => result,
         Err(e) => Err(exec_datafusion_err!(
             "Vortex writer task for '{}' failed to join: {e}",
@@ -1017,6 +1063,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_dropping_active_writer_aborts_its_task() -> anyhow::Result<()> {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
+
+        struct AbortSignal(Arc<AtomicBool>);
+
+        impl Drop for AbortSignal {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = mpsc::channel::<RecordBatch>(1);
+        drop(receiver);
+        let (_gate_tx, gate_rx) = oneshot::channel::<()>();
+
+        let signal = AbortSignal(Arc::clone(&dropped));
+        let writer = ActiveFileWriter {
+            path: Path::from("table/cancelled.vortex"),
+            sender,
+            task: Some(tokio::spawn(async move {
+                // Held across the await so aborting drops it.
+                let _signal = signal;
+                let _ = gate_rx.await;
+                Err(exec_datafusion_err!("writer task should have been aborted"))
+            })),
+        };
+
+        // Let the task reach its await before cancelling.
+        tokio::task::yield_now().await;
+        drop(writer);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !dropped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("dropping ActiveFileWriter did not abort its writer task"))?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_finish_file_writer_waits_for_task_completion() -> anyhow::Result<()> {
         let (sender, receiver) = mpsc::channel::<RecordBatch>(1);
         drop(receiver);
@@ -1026,12 +1117,12 @@ mod tests {
         let writer = ActiveFileWriter {
             path: Path::from("table/pending.vortex"),
             sender,
-            task: tokio::spawn(async move {
+            task: Some(tokio::spawn(async move {
                 let _ = gate_rx.await;
                 Err(exec_datafusion_err!(
                     "synthetic writer failure after completion gate"
                 ))
-            }),
+            })),
         };
 
         let mut finish_fut = Box::pin(finish_file_writer(writer));
