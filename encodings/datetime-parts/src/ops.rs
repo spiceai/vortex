@@ -65,9 +65,10 @@ impl OperationsVTable<DateTimeParts> for DateTimeParts {
             options.unit,
         );
 
-        Ok(Scalar::extension::<Timestamp>(
-            options.clone(),
-            Scalar::primitive(ts, ext.storage_dtype().nullability()),
-        ))
+        // Build the extension scalar fallibly: an extension type whose metadata the storage value
+        // cannot satisfy (an unresolvable timezone, say) must surface as an error rather than abort
+        // the process, since this runs while reading values on the write path.
+        let storage = Scalar::primitive(ts, ext.storage_dtype().nullability());
+        Scalar::try_extension_ref(ext, storage)
     }
 }

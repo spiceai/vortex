@@ -101,11 +101,12 @@ impl fmt::Display for TimestampValue<'_> {
 
         match tz {
             None => write!(f, "{ts}"),
-            Some(tz) => {
-                let zone = resolve_timezone(tz.as_ref()).vortex_expect("unknown timezone");
-                let adjusted_ts = ts.to_zoned(zone);
-                write!(f, "{adjusted_ts}",)
-            }
+            // A timezone that does not resolve must not abort a `Display` impl, which has no way to
+            // report the failure. Render the underlying UTC timestamp instead.
+            Some(tz) => match resolve_timezone(tz.as_ref()) {
+                Ok(zone) => write!(f, "{}", ts.to_zoned(zone)),
+                Err(_) => write!(f, "{ts}"),
+            },
         }
     }
 }
@@ -271,6 +272,7 @@ mod tests {
     use crate::dtype::Nullability::Nullable;
     use crate::extension::datetime::TimeUnit;
     use crate::extension::datetime::Timestamp;
+    use crate::extension::datetime::TimestampValue;
     use crate::scalar::PValue;
     use crate::scalar::Scalar;
     use crate::scalar::ScalarValue;
@@ -405,5 +407,30 @@ mod tests {
         // but only 3 bytes of timezone data instead of the declared 10.
         let data = [0x00u8, 0x0A, 0x00, b'U', b'T', b'C'];
         assert!(vtable.deserialize_metadata(&data).is_err());
+    }
+
+    /// A fixed UTC offset renders at that offset. Iceberg emits `+00:00` for every `timestamptz`.
+    #[test]
+    fn display_renders_fixed_offset() {
+        let utc = Arc::from("+00:00");
+        assert_eq!(
+            TimestampValue::Seconds(1, Some(&utc)).to_string(),
+            "1970-01-01T00:00:01+00:00[UTC]"
+        );
+
+        let tokyo = Arc::from("+09:00");
+        assert_eq!(
+            TimestampValue::Seconds(1, Some(&tokyo)).to_string(),
+            "1970-01-01T09:00:01+09:00[+09:00]"
+        );
+    }
+
+    /// `Display` has no way to report a failure, so a timezone that does not resolve falls back to
+    /// rendering the underlying UTC timestamp rather than aborting the process.
+    #[test]
+    fn display_falls_back_on_unresolvable_timezone() {
+        let bad = Arc::from("Not/A/Timezone");
+        let unzoned = TimestampValue::Seconds(1, None).to_string();
+        assert_eq!(TimestampValue::Seconds(1, Some(&bad)).to_string(), unzoned);
     }
 }
