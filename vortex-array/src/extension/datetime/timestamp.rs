@@ -22,6 +22,7 @@ use crate::dtype::extension::ExtDType;
 use crate::dtype::extension::ExtId;
 use crate::dtype::extension::ExtVTable;
 use crate::extension::datetime::TimeUnit;
+use crate::extension::datetime::resolve_timezone;
 use crate::scalar::ScalarValue;
 
 /// Timestamp DType.
@@ -102,7 +103,8 @@ impl fmt::Display for TimestampValue<'_> {
         match tz {
             None => write!(f, "{ts}"),
             Some(tz) => {
-                let adjusted_ts = ts.in_tz(tz.as_ref()).vortex_expect("unknown timezone");
+                let zone = resolve_timezone(tz.as_ref()).vortex_expect("unknown timezone");
+                let adjusted_ts = ts.to_zoned(zone);
                 write!(f, "{adjusted_ts}",)
             }
         }
@@ -247,12 +249,13 @@ impl ExtVTable for Timestamp {
         };
 
         // Validate the storage value is within the valid range for Timestamp.
-        let ts = jiff::Timestamp::UNIX_EPOCH
+        jiff::Timestamp::UNIX_EPOCH
             .checked_add(span)
             .map_err(|e| vortex_err!("Invalid timestamp scalar: {}", e))?;
 
+        // Validate the timezone resolves, accepting both IANA names and fixed UTC offsets.
         if let Some(tz) = tz {
-            ts.in_tz(tz.as_ref())
+            resolve_timezone(tz.as_ref())
                 .map_err(|e| vortex_err!("Invalid timezone for timestamp scalar: {}", e))?;
         }
 

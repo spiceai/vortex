@@ -38,6 +38,7 @@ use vortex::extension::datetime::Time;
 use vortex::extension::datetime::TimeUnit;
 use vortex::extension::datetime::Timestamp;
 use vortex::extension::datetime::TimestampOptions;
+use vortex::extension::datetime::is_utc_timezone;
 use vortex::scalar::BinaryScalar;
 use vortex::scalar::BoolScalar;
 use vortex::scalar::DecimalScalar;
@@ -207,7 +208,7 @@ impl ToDuckDBScalar for ExtScalar<'_> {
         Ok(match temporal {
             TemporalMetadata::Timestamp(unit, tz) => {
                 if let Some(tz) = tz.as_ref() {
-                    if tz.as_ref() != "UTC" {
+                    if !is_utc_timezone(tz.as_ref()) {
                         // TODO(ngates): we should convert into UTC as DuckDB does internally.
                         //  I'm sure we can expose their timezone conversion functions to do this.
                         vortex_bail!(
