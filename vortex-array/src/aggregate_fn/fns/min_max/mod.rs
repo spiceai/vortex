@@ -441,6 +441,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::LazyLock;
 
+    use rstest::rstest;
     use vortex_buffer::BitBuffer;
     use vortex_buffer::buffer;
     use vortex_error::VortexExpect;
@@ -461,6 +462,7 @@ mod tests {
     use crate::arrays::ChunkedArray;
     use crate::arrays::ConstantArray;
     use crate::arrays::DecimalArray;
+    use crate::arrays::ExtensionArray;
     use crate::arrays::FixedSizeListArray;
     use crate::arrays::ListArray;
     use crate::arrays::NullArray;
@@ -472,6 +474,8 @@ mod tests {
     use crate::dtype::PType;
     use crate::expr::stats::Precision;
     use crate::expr::stats::Stat;
+    use crate::extension::datetime::TimeUnit;
+    use crate::extension::datetime::Timestamp;
     use crate::scalar::DecimalValue;
     use crate::scalar::Scalar;
     use crate::scalar::ScalarValue;
@@ -1086,6 +1090,95 @@ mod tests {
             )?,
             None
         );
+        Ok(())
+    }
+
+    /// Zone-map min/max over a timestamp column whose timezone is a fixed UTC offset rather than an
+    /// IANA name. Arrow permits both forms, and Iceberg maps every `timestamptz` column to
+    /// `+00:00`, so building the extension scalars must resolve the offset instead of panicking.
+    #[rstest]
+    // A zero offset resolves to UTC, which `jiff` annotates by name.
+    #[case(
+        "+00:00",
+        "1969-12-31T23:59:59+00:00[UTC]",
+        "1970-01-01T00:00:01+00:00[UTC]"
+    )]
+    #[case(
+        "-05:30",
+        "1969-12-31T18:29:59-05:30[-05:30]",
+        "1969-12-31T18:30:01-05:30[-05:30]"
+    )]
+    #[case(
+        "+09:00",
+        "1970-01-01T08:59:59+09:00[+09:00]",
+        "1970-01-01T09:00:01+09:00[+09:00]"
+    )]
+    fn test_extension_min_max_fixed_offset_timezone(
+        #[case] timezone: &str,
+        #[case] expected_min: &str,
+        #[case] expected_max: &str,
+    ) -> VortexResult<()> {
+        let ext_dtype = Timestamp::new_with_tz(
+            TimeUnit::Microseconds,
+            Some(Arc::from(timezone)),
+            Nullability::NonNullable,
+        )
+        .erased();
+        let storage =
+            PrimitiveArray::new(buffer![0i64, 1_000_000, -1_000_000], Validity::NonNullable)
+                .into_array();
+        let array = ExtensionArray::try_new(ext_dtype.clone(), storage)?.into_array();
+
+        let mut ctx = SESSION.create_execution_ctx();
+        let MinMaxResult { min, max } =
+            min_max(&array, &mut ctx, NumericalAggregateOpts::default())?
+                .vortex_expect("min/max over a non-empty, non-null array");
+
+        // The extrema keep the extension dtype, including the fixed-offset timezone.
+        let expected_dtype = DType::Extension(ext_dtype);
+        assert_eq!(min.dtype(), &expected_dtype);
+        assert_eq!(max.dtype(), &expected_dtype);
+
+        // Ordering is over the underlying epoch microseconds and so is timezone-independent.
+        assert_eq!(
+            min.as_extension()
+                .to_storage_scalar()
+                .as_primitive()
+                .typed_value::<i64>(),
+            Some(-1_000_000)
+        );
+        assert_eq!(
+            max.as_extension()
+                .to_storage_scalar()
+                .as_primitive()
+                .typed_value::<i64>(),
+            Some(1_000_000)
+        );
+
+        // Displaying the extrema resolves the timezone a second time, and offsets it correctly.
+        assert_eq!(format!("{}", min.as_extension()), expected_min);
+        assert_eq!(format!("{}", max.as_extension()), expected_max);
+
+        Ok(())
+    }
+
+    /// A timezone that resolves to nothing at all must fail the aggregation rather than abort the
+    /// process, since zone maps are built on the write path.
+    #[test]
+    fn test_extension_min_max_unresolvable_timezone_errors() -> VortexResult<()> {
+        let ext_dtype = Timestamp::new_with_tz(
+            TimeUnit::Microseconds,
+            Some(Arc::from("Not/A/Timezone")),
+            Nullability::NonNullable,
+        )
+        .erased();
+        let storage =
+            PrimitiveArray::new(buffer![0i64, 1_000_000], Validity::NonNullable).into_array();
+        let array = ExtensionArray::try_new(ext_dtype, storage)?.into_array();
+
+        let mut ctx = SESSION.create_execution_ctx();
+        assert!(min_max(&array, &mut ctx, NumericalAggregateOpts::default()).is_err());
+
         Ok(())
     }
 }

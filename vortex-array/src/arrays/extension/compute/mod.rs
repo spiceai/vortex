@@ -94,6 +94,8 @@ mod test {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use rstest::rstest;
     use vortex_buffer::buffer;
 
@@ -130,6 +132,35 @@ mod tests {
         test_array_consistency(
             &array.into_array(),
             &mut array_session().create_execution_ctx(),
+        );
+    }
+
+    /// Reading a value out of a timestamp column resolves its timezone. Arrow allows a fixed UTC
+    /// offset there, and a timezone that resolves to nothing must surface as an error rather than
+    /// abort the process.
+    #[rstest]
+    #[case("+00:00", true)]
+    #[case("-05:30", true)]
+    #[case("America/New_York", true)]
+    #[case("Not/A/Timezone", false)]
+    fn test_extension_scalar_at_resolves_timezone(
+        #[case] timezone: &str,
+        #[case] expected_ok: bool,
+    ) {
+        let ext_dtype = Timestamp::new_with_tz(
+            TimeUnit::Microseconds,
+            Some(Arc::from(timezone)),
+            Nullability::NonNullable,
+        )
+        .erased();
+        let array = ExtensionArray::new(ext_dtype, buffer![1_000_000i64, 2_000_000].into_array())
+            .into_array();
+
+        let mut ctx = array_session().create_execution_ctx();
+        assert_eq!(
+            array.execute_scalar(0, &mut ctx).is_ok(),
+            expected_ok,
+            "for {timezone}"
         );
     }
 }
