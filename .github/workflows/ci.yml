@@ -690,7 +690,7 @@ jobs:
       - name: "Checkout base flatbuffers"
         working-directory: vortex-flatbuffers/
         env:
-          BASE_REF: ${{ github.base_ref || github.ref_name }}
+          BASE_REF: ${{ github.base_ref || (github.event_name == 'push' && github.ref_name) || 'develop' }}
         run: |
           cp -R flatbuffers flatbuffers.HEAD
           git fetch origin "$BASE_REF" --depth 1
