@@ -38,8 +38,10 @@ systemctl disable apparmor ModemManager
 # mask prevents them from being started by other services
 systemctl mask ModemManager
 
-# For apparmor specifically, also teardown loaded profiles
-aa-teardown
+# For apparmor specifically, also teardown loaded profiles. Runners that do not
+# have apparmor fully available fail this, which is not a reason to abandon the
+# rest of the tuning.
+aa-teardown || true
 
 # Reduce background activity (Ubuntu-specific)
 for unit in \
@@ -52,9 +54,10 @@ for unit in \
   motd-news.timer \
   apport
 do
-  systemctl disable --now "$unit" 2>/dev/null
+  # Not every unit exists on every image; a missing one is not a failure.
+  systemctl disable --now "$unit" 2>/dev/null || true
 done
-systemctl mask irqbalance 2>/dev/null
+systemctl mask irqbalance 2>/dev/null || true
 
 CPU_COUNT="$(nproc)"
 HOUSEKEEPING_CPUS="0-1"

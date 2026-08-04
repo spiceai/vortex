@@ -91,6 +91,10 @@ jobs:
       - uses: ./.github/actions/setup-prebuild
         with:
           enable-sccache: ${{ github.repository == 'vortex-data/vortex' && 'true' || 'false' }}
+          # Upstream runs each entry on a runner of that architecture. The fork
+          # cross-compiles both from x64, so the standard library for the target
+          # has to be installed.
+          targets: ${{ matrix.target }}
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29  # v2.2.1
       - name: Install cargo-zigbuild
         uses: taiki-e/cache-cargo-install-action@66c9585ef5ca780ee69399975a5e911f47905995

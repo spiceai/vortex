@@ -67,6 +67,19 @@ jobs:
           sccache: s3
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7
       - uses: ./.github/actions/setup-prebuild
+      - name: Free disk space
+        if: github.repository != 'vortex-data/vortex'
+        shell: bash
+        # Upstream requests disk=large for this job. A GitHub-hosted runner has far
+        # less, and an instrumented build of the whole workspace fills it.
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/local/share/powershell \
+            /usr/local/lib/node_modules "${AGENT_TOOLSDIRECTORY:-}"
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
       - name: Ensure llvm-tools are installed
         run: |
           rustup component add llvm-tools || \
@@ -198,6 +211,39 @@ jobs:
         run: |
           rustup toolchain install $NIGHTLY_TOOLCHAIN
           rustup component add --toolchain $NIGHTLY_TOOLCHAIN rust-src rustfmt clippy llvm-tools-preview
+      - name: Provide llvm-symbolizer
+        if: github.repository != 'vortex-data/vortex'
+        shell: bash
+        # The sanitizer env pins /usr/bin/llvm-symbolizer, which the prebuild image
+        # supplies. Without it the sanitizers cannot resolve frames, and because
+        # every entry in tsan_suppressions.txt matches on a symbol name, none of the
+        # known-benign crossbeam and oneshot races get suppressed.
+        run: |
+          if [ ! -x /usr/bin/llvm-symbolizer ]; then
+            SYM="$(command -v llvm-symbolizer || true)"
+            if [ -z "$SYM" ]; then
+              SYSROOT="$(rustc +$NIGHTLY_TOOLCHAIN --print sysroot)"
+              SYM="$(find "$SYSROOT" -name llvm-symbolizer -type f 2>/dev/null | head -1)"
+            fi
+            if [ -z "$SYM" ]; then
+              SYM="$(ls -1 /usr/bin/llvm-symbolizer-* 2>/dev/null | sort -V | tail -1 || true)"
+            fi
+            if [ -z "$SYM" ]; then
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq llvm
+              SYM="$(command -v llvm-symbolizer || true)"
+              if [ -z "$SYM" ]; then
+                SYM="$(ls -1 /usr/bin/llvm-symbolizer-* 2>/dev/null | sort -V | tail -1 || true)"
+              fi
+            fi
+            if [ -z "$SYM" ]; then
+              echo "no llvm-symbolizer available; sanitizer suppressions match on symbol"
+              echo "names, so the run would report known-benign races as failures"
+              exit 1
+            fi
+            sudo ln -sf "$SYM" /usr/bin/llvm-symbolizer
+          fi
+          /usr/bin/llvm-symbolizer --version
       - name: Build tests with sanitizer
         run: |
           RUSTFLAGS="${RUSTFLAGS} ${{ matrix.sanitizer_flags }}" \
@@ -267,6 +313,39 @@ jobs:
         run: |
           rustup toolchain install $NIGHTLY_TOOLCHAIN
           rustup component add --toolchain $NIGHTLY_TOOLCHAIN rust-src rustfmt clippy llvm-tools-preview
+      - name: Provide llvm-symbolizer
+        if: github.repository != 'vortex-data/vortex'
+        shell: bash
+        # The sanitizer env pins /usr/bin/llvm-symbolizer, which the prebuild image
+        # supplies. Without it the sanitizers cannot resolve frames, and because
+        # every entry in tsan_suppressions.txt matches on a symbol name, none of the
+        # known-benign crossbeam and oneshot races get suppressed.
+        run: |
+          if [ ! -x /usr/bin/llvm-symbolizer ]; then
+            SYM="$(command -v llvm-symbolizer || true)"
+            if [ -z "$SYM" ]; then
+              SYSROOT="$(rustc +$NIGHTLY_TOOLCHAIN --print sysroot)"
+              SYM="$(find "$SYSROOT" -name llvm-symbolizer -type f 2>/dev/null | head -1)"
+            fi
+            if [ -z "$SYM" ]; then
+              SYM="$(ls -1 /usr/bin/llvm-symbolizer-* 2>/dev/null | sort -V | tail -1 || true)"
+            fi
+            if [ -z "$SYM" ]; then
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq llvm
+              SYM="$(command -v llvm-symbolizer || true)"
+              if [ -z "$SYM" ]; then
+                SYM="$(ls -1 /usr/bin/llvm-symbolizer-* 2>/dev/null | sort -V | tail -1 || true)"
+              fi
+            fi
+            if [ -z "$SYM" ]; then
+              echo "no llvm-symbolizer available; sanitizer suppressions match on symbol"
+              echo "names, so the run would report known-benign races as failures"
+              exit 1
+            fi
+            sudo ln -sf "$SYM" /usr/bin/llvm-symbolizer
+          fi
+          /usr/bin/llvm-symbolizer --version
       - name: Build FFI library
         run: |
           # TODO(myrrc): remove --no-default-features

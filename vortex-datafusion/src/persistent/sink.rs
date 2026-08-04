@@ -1402,16 +1402,21 @@ mod tests {
             file_metas.iter().map(|m| m.size).collect::<Vec<_>>()
         );
 
-        // Every file except the first should be reasonably sized. The first
-        // file may be smaller because the compression ratio is unknown until
-        // the first write completes.
-        for meta in file_metas.iter().skip(1) {
+        // Files in the middle should be reasonably sized. The first may be smaller
+        // because the compression ratio is unknown until the first write completes,
+        // and the last holds whatever remained when the input ended, so its size
+        // depends on how the input divides rather than on the target.
+        let mut sizes: Vec<(String, u64)> = file_metas
+            .iter()
+            .map(|m| (m.location.to_string(), m.size))
+            .collect();
+        sizes.sort();
+        let without_last = sizes.len().saturating_sub(1);
+        for (location, size) in sizes.iter().take(without_last).skip(1) {
             assert!(
-                meta.size > target_bytes / 4,
-                "File {} is {}B, far below target {}B — splitting on Arrow memory, not compressed size",
-                meta.location,
-                meta.size,
-                target_bytes
+                *size > target_bytes / 4,
+                "File {location} is {size}B, far below target {target_bytes}B — \
+                 splitting on Arrow memory, not compressed size. Sizes: {sizes:?}"
             );
         }
 
