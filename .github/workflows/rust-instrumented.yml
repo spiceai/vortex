@@ -44,7 +44,9 @@ jobs:
   rust-coverage:
     name: "Rust tests (coverage) (${{ matrix.suite }})"
     needs: duckdb-ready
-    timeout-minutes: 30
+    # An instrumented build and run of the whole workspace does not fit in thirty
+    # minutes without the prebuild image and its compile cache.
+    timeout-minutes: ${{ github.repository == 'vortex-data/vortex' && 30 || 75 }}
     permissions:
       id-token: write
     strategy:
