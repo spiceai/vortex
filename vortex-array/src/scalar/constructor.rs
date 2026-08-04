@@ -8,6 +8,7 @@ use std::sync::Arc;
 use vortex_buffer::BufferString;
 use vortex_buffer::ByteBuffer;
 use vortex_error::VortexExpect;
+use vortex_error::VortexResult;
 use vortex_error::vortex_panic;
 
 use crate::dtype::DType;
@@ -182,12 +183,24 @@ impl Scalar {
     ///
     /// # Panics
     ///
-    /// Panics if the storage dtype of `ext_dtype` does not match `value`'s dtype.
+    /// Panics if the storage dtype of `ext_dtype` does not match `storage_scalar`'s dtype, or if
+    /// `storage_scalar` is not a valid value for the extension type. Use
+    /// [`Scalar::try_extension_ref`] where an invalid storage value is recoverable.
     pub fn extension_ref(ext_dtype: ExtDTypeRef, storage_scalar: Scalar) -> Self {
+        Self::try_extension_ref(ext_dtype, storage_scalar)
+            .vortex_expect("unable to construct an extension `Scalar`")
+    }
+
+    /// Creates a new extension scalar wrapping the given storage value, returning an error if
+    /// `storage_scalar` is not a valid value for the extension type.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the storage dtype of `ext_dtype` does not match `storage_scalar`'s dtype.
+    pub fn try_extension_ref(ext_dtype: ExtDTypeRef, storage_scalar: Scalar) -> VortexResult<Self> {
         assert_eq!(ext_dtype.storage_dtype(), storage_scalar.dtype());
 
         Self::try_new(DType::Extension(ext_dtype), storage_scalar.into_value())
-            .vortex_expect("unable to construct an extension `Scalar`")
     }
 
     /// Creates a new variant scalar from a row-specific nested scalar.

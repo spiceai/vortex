@@ -57,6 +57,7 @@ use vortex::extension::datetime::TemporalMetadata;
 use vortex::extension::datetime::Time;
 use vortex::extension::datetime::TimeUnit;
 use vortex::extension::datetime::Timestamp;
+use vortex::extension::datetime::is_utc_timezone;
 use vortex_geo::extension::GeoMetadata;
 use vortex_geo::extension::LineString;
 use vortex_geo::extension::MultiLineString;
@@ -283,7 +284,7 @@ fn temporal_to_duckdb(temporal: TemporalMetadata) -> VortexResult<LogicalType> {
             _ => vortex_bail!("Invalid TimeUnit {} for timestamp", unit),
         },
         TemporalMetadata::Timestamp(unit, Some(tz)) => {
-            if tz.as_ref() != "UTC" {
+            if !is_utc_timezone(tz.as_ref()) {
                 vortex_bail!("Invalid timezone for timestamp_tz {tz}, must be UTC");
             }
             if unit != &TimeUnit::Microseconds {
@@ -574,19 +575,43 @@ mod tests {
     fn test_timestamp_with_timezone() {
         use vortex::extension::datetime::TimeUnit;
 
-        let dtype = DType::Extension(
-            Timestamp::new_with_tz(
-                TimeUnit::Microseconds,
-                Some("UTC".into()),
-                Nullability::NonNullable,
-            )
-            .erased(),
-        );
+        // Every spelling of a zero UTC offset maps to TIMESTAMP_TZ. Iceberg and `arrow-rs` emit
+        // the offset form rather than the IANA name.
+        for tz in ["UTC", "+00:00", "-00:00", "+0000", "-0000", "+00", "-00"] {
+            let dtype = DType::Extension(
+                Timestamp::new_with_tz(
+                    TimeUnit::Microseconds,
+                    Some(tz.into()),
+                    Nullability::NonNullable,
+                )
+                .erased(),
+            );
 
-        assert_eq!(
-            LogicalType::try_from(&dtype).unwrap().as_type_id(),
-            cpp::DUCKDB_TYPE::DUCKDB_TYPE_TIMESTAMP_TZ
-        );
+            assert_eq!(
+                LogicalType::try_from(&dtype).unwrap().as_type_id(),
+                cpp::DUCKDB_TYPE::DUCKDB_TYPE_TIMESTAMP_TZ,
+                "for {tz}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_timestamp_with_non_utc_timezone_is_rejected() {
+        use vortex::extension::datetime::TimeUnit;
+
+        // DuckDB's TIMESTAMP_TZ is UTC-based, so zones that are not UTC are still unsupported.
+        for tz in ["+09:00", "-05:30", "America/New_York", "Not/A/Timezone"] {
+            let dtype = DType::Extension(
+                Timestamp::new_with_tz(
+                    TimeUnit::Microseconds,
+                    Some(tz.into()),
+                    Nullability::NonNullable,
+                )
+                .erased(),
+            );
+
+            assert!(LogicalType::try_from(&dtype).is_err(), "for {tz}");
+        }
     }
 
     #[test]
