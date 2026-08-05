@@ -10162,7 +10162,6 @@ dependencies = [
  "kanal",
  "moka",
  "object_store",
- "oneshot",
  "parking_lot",
  "pin-project-lite",
  "rstest",
