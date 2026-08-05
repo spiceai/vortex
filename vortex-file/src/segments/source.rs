@@ -26,6 +26,12 @@ use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
 use vortex_io::VortexReadAt;
 use vortex_io::runtime::Handle;
+// The segment-read result channel is tokio's oneshot, re-exported by `vortex-io`, not the
+// `oneshot` crate: `ReadFuture` below is polled and then dropped on cancellation, and the
+// `oneshot` crate's receiver releases its stored waker from inside its own destructor, which
+// reenters executor task teardown and can free the waker under a concurrently waking sender.
+// See `vortex-io/src/runtime/handle.rs` for the full note.
+use vortex_io::runtime::oneshot;
 use vortex_io::runtime::JoinOutcome;
 use vortex_layout::segments::SegmentFuture;
 use vortex_layout::segments::SegmentId;
@@ -229,7 +235,8 @@ impl SegmentSource for FileSegmentSource {
 
         let fut = ReadFuture {
             id,
-            recv: recv.into_future(),
+            recv,
+            recv_closed: false,
             polled: false,
             finished: false,
             events: self.events.clone(),
@@ -248,7 +255,11 @@ impl SegmentSource for FileSegmentSource {
 /// If dropped, the read request will be canceled where possible.
 struct ReadFuture {
     id: usize,
-    recv: oneshot::AsyncReceiver<VortexResult<BufferHandle>>,
+    recv: oneshot::Receiver<VortexResult<BufferHandle>>,
+    /// Set once `recv` has produced a result. The closed-channel path below returns
+    /// `Pending` while it joins the driver, so this future is polled again afterwards, and
+    /// a one-shot receiver must not be polled once it has completed.
+    recv_closed: bool,
     polled: bool,
     finished: bool,
     events: mpsc::UnboundedSender<ReadEvent>,
@@ -256,10 +267,35 @@ struct ReadFuture {
     driver_panic: DriverPanic,
 }
 
+impl ReadFuture {
+    /// Join the driver after the request's sender has been dropped, so a panic raised while
+    /// driving reads is re-raised here rather than surfacing as a generic error.
+    fn poll_join_driver(&mut self, cx: &mut Context<'_>) -> Poll<VortexResult<BufferHandle>> {
+        match self.driver.poll_unpin(cx) {
+            Poll::Ready(()) => {
+                self.finished = true;
+                // Re-raise the driver panic on the first reader to observe it; later readers
+                // fall through to the graceful dropped error.
+                if let Some(panic) = self.driver_panic.lock().take() {
+                    std::panic::resume_unwind(panic);
+                }
+                Poll::Ready(Err(vortex_err!(
+                    "ReadRequest dropped by runtime: channel closed"
+                )))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 impl Future for ReadFuture {
     type Output = VortexResult<BufferHandle>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.recv_closed {
+            return self.poll_join_driver(cx);
+        }
+
         match self.recv.poll_unpin(cx) {
             // note: we are skipping polled and dropped events for this if the future is ready on
             //       the first poll, that means this request was completed before it was polled,
@@ -268,21 +304,12 @@ impl Future for ReadFuture {
                 self.finished = true;
                 Poll::Ready(result)
             }
-            // The request's sender was dropped, so the driver has finished. Join it so a panic
-            // raised while driving reads is re-raised here rather than surfacing as a generic
-            // error. Only report the dropped error once the driver has finished.
-            Poll::Ready(Err(e)) => match self.driver.poll_unpin(cx) {
-                Poll::Ready(()) => {
-                    self.finished = true;
-                    // Re-raise the driver panic on the first reader to observe it; later readers
-                    // fall through to the graceful dropped error.
-                    if let Some(panic) = self.driver_panic.lock().take() {
-                        std::panic::resume_unwind(panic);
-                    }
-                    Poll::Ready(Err(vortex_err!("ReadRequest dropped by runtime: {e}")))
-                }
-                Poll::Pending => Poll::Pending,
-            },
+            // The request's sender was dropped. Record that so later polls skip the completed
+            // receiver, then join the driver before reporting the error.
+            Poll::Ready(Err(_)) => {
+                self.recv_closed = true;
+                self.poll_join_driver(cx)
+            }
             Poll::Pending if !self.polled => {
                 self.polled = true;
                 // Notify the I/O stream that this request has been polled.
@@ -387,7 +414,58 @@ mod tests {
     use vortex_layout::segments::SegmentSource;
     use vortex_metrics::DefaultMetricsRegistry;
 
+    use std::sync::atomic::AtomicBool;
+
     use super::*;
+
+    /// A dropped request whose driver has not finished yet returns `Pending`, so this future
+    /// is polled again afterwards. The receiver has already produced its result by then and
+    /// must not be polled a second time.
+    #[test]
+    fn dropped_request_with_pending_driver_completes_without_repolling_receiver() {
+        let driver_ready = Arc::new(AtomicBool::new(false));
+        let driver: SharedDriver = {
+            let driver_ready = Arc::clone(&driver_ready);
+            future::poll_fn(move |_| {
+                if driver_ready.load(Ordering::SeqCst) {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .boxed()
+            .shared()
+        };
+
+        let (events, _events_rx) = mpsc::unbounded();
+        let (send, recv) = oneshot::channel::<VortexResult<BufferHandle>>();
+        // Dropping the sender is what makes the receiver complete with an error.
+        drop(send);
+
+        let mut fut = ReadFuture {
+            id: 0,
+            recv,
+            recv_closed: false,
+            polled: false,
+            finished: false,
+            events,
+            driver,
+            driver_panic: Arc::new(Mutex::new(None)),
+        };
+
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // The receiver completes here, but the driver has not finished.
+        assert!(Pin::new(&mut fut).poll(&mut cx).is_pending());
+
+        driver_ready.store(true, Ordering::SeqCst);
+        let result = Pin::new(&mut fut).poll(&mut cx);
+        assert!(
+            matches!(result, Poll::Ready(Err(_))),
+            "expected the dropped-request error once the driver finished"
+        );
+    }
 
     #[derive(Clone)]
     struct PanickingReadAt;
