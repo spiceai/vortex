@@ -4,3 +4,14 @@ slow-timeout = { period = "30s", terminate-after = 5 }
 [[profile.default.overrides]]
 filter = 'test(compress_large_int | fsst_compress_offsets_overflow_i32)'
 priority = 100
+
+# Used only by the coverage job. These two tests are already singled out above
+# for being slow; instrumented they run long enough to reach the default cap and
+# be terminated. Raising it here keeps the tighter cap, and so the hang signal it
+# provides, for every other run.
+[profile.coverage]
+
+[[profile.coverage.overrides]]
+filter = 'test(compress_large_int | fsst_compress_offsets_overflow_i32)'
+priority = 100
+slow-timeout = { period = "60s", terminate-after = 10 }

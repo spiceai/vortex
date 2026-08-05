@@ -12,5 +12,16 @@ runs:
       shell: bash
       run: |
         wget -O /tmp/flatc.zip "https://github.com/google/flatbuffers/releases/download/v${{ inputs.flatc_version }}/Linux.flatc.binary.clang++-18.zip"
-        unzip /tmp/flatc.zip flatc
-        mv flatc /usr/local/bin/
+        unzip -o /tmp/flatc.zip flatc -d /tmp
+
+        # This sometimes runs in a container where user is root and there's no sudo.
+        if command -v sudo &>/dev/null
+        then
+          CMD=sudo
+        else
+          CMD=
+        fi
+        $CMD mv /tmp/flatc /usr/local/bin/
+
+        rm -f /tmp/flatc.zip
+        flatc --version

@@ -557,13 +557,16 @@ TEST_CASE("Multithreaded scan", "[datasource]") {
                 vx_partition_free(partition);
             };
 
-            estimate = {};
-            vx_partition_row_count(partition, &estimate, &error_tl);
+            // Each thread needs its own out-param. Sharing the enclosing one
+            // means every thread writes the same struct, so a thread can assert
+            // against a row count another thread produced.
+            vx_estimate estimate_tl = {};
+            vx_partition_row_count(partition, &estimate_tl, &error_tl);
             require_no_error(error_tl, false);
-            if (estimate.type != VX_ESTIMATE_EXACT) {
+            if (estimate_tl.type != VX_ESTIMATE_EXACT) {
                 throw std::runtime_error("estimate type mismatch");
             }
-            if (estimate.estimate != SAMPLE_ROWS) {
+            if (estimate_tl.estimate != SAMPLE_ROWS) {
                 throw std::runtime_error("estimate mismatch");
             }
 

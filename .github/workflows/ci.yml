@@ -119,6 +119,13 @@ jobs:
         with:
           enable-sccache: "true"
 
+      - name: Install uv
+        if: github.repository != 'vortex-data/vortex'
+        uses: spiraldb/actions/.github/actions/setup-uv@a746510eafaa926484c354541cfc49b2ec06cc63  # 0.18.6
+        with:
+          sync: false
+          prune-cache: false
+
       - name: Pytest - Vortex
         run: |
           uv run --all-packages pytest --benchmark-disable -n auto test/
@@ -289,6 +296,11 @@ jobs:
       - uses: ./.github/actions/setup-prebuild
         with:
           enable-sccache: "true"
+      - name: Install cargo-minimal-versions
+        if: github.repository != 'vortex-data/vortex'
+        uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9  # v2
+        with:
+          tool: cargo-minimal-versions
       - run: cargo minimal-versions check --direct --workspace --ignore-private
 
   rust-lint:
@@ -388,10 +400,6 @@ jobs:
       - uses: ./.github/actions/setup-prebuild
         with:
           enable-sccache: "true"
-      - name: Install cargo-hack
-        if: github.repository != 'vortex-data/vortex'
-        shell: bash
-        run: command -v cargo-hack >/dev/null || cargo install --locked cargo-hack
       - name: Rust Lint - Clippy No Default Features
         shell: bash
         run: |
@@ -542,7 +550,9 @@ jobs:
 
   cxx-api:
     name: "C++ API"
-    timeout-minutes: 5
+    # Upstream builds this from a warm prebuild image; a fork compiles vortex-ffi
+    # and the C++ tests from scratch, which does not fit in five minutes.
+    timeout-minutes: ${{ github.repository == 'vortex-data/vortex' && 5 || 30 }}
     runs-on: >-
       ${{ github.repository == 'vortex-data/vortex'
           && format('runs-on={0}/runner=amd64-medium/image=ubuntu24-full-x64-pre-v2/extras=s3-cache/tag=cxx-build', github.run_id)
@@ -594,6 +604,12 @@ jobs:
       - uses: ./.github/actions/setup-prebuild
         with:
           enable-sccache: "true"
+      - name: Install uv
+        if: github.repository != 'vortex-data/vortex'
+        uses: spiraldb/actions/.github/actions/setup-uv@a746510eafaa926484c354541cfc49b2ec06cc63  # 0.18.6
+        with:
+          sync: false
+          prune-cache: false
       - name: Run sqllogictest tests
         run: |
           ./vortex-sqllogictest/slt/tpch/generate_data.sh
@@ -648,6 +664,9 @@ jobs:
       - uses: ./.github/actions/setup-prebuild
         with:
           enable-sccache: "true"
+      - name: Install flatc
+        if: github.repository != 'vortex-data/vortex'
+        uses: ./.github/actions/setup-flatc
       - name: Install nightly for cbindgen macro expansion
         run: rustup toolchain install $NIGHTLY_TOOLCHAIN
       - name: "regenerate all .fbs/.proto Rust code"
@@ -662,12 +681,20 @@ jobs:
           git status --porcelain
           test -z "$(git status --porcelain)"
 
-      - name: "Checkout develop flatbuffers"
+      # Compare against the branch being merged into, not always develop. A
+      # release branch is behind develop by construction, so conforming a release
+      # branch against develop reports every field develop has added since as a
+      # deleted field. Comparing against the base ref asks the question that
+      # matters for any branch: does this change stay compatible with what it is
+      # being merged into.
+      - name: "Checkout base flatbuffers"
         working-directory: vortex-flatbuffers/
+        env:
+          BASE_REF: ${{ github.base_ref || (github.event_name == 'push' && github.ref_name) || 'develop' }}
         run: |
           cp -R flatbuffers flatbuffers.HEAD
-          git fetch origin develop --depth 1
-          git checkout origin/develop -- flatbuffers
+          git fetch origin "$BASE_REF" --depth 1
+          git checkout "origin/$BASE_REF" -- flatbuffers
       - name: "Verify flatbuffer back-compat"
         working-directory: vortex-flatbuffers/
         run: |
