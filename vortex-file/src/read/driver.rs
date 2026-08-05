@@ -8,8 +8,6 @@ use std::task::Context;
 use std::task::Poll;
 
 use futures::Stream;
-#[cfg(all(test, not(feature = "tokio")))]
-use oneshot;
 use pin_project_lite::pin_project;
 use tracing::trace;
 use vortex_buffer::Alignment;
@@ -335,6 +333,7 @@ mod tests {
     use vortex_metrics::DefaultMetricsRegistry;
     use vortex_metrics::MetricValue;
     use vortex_metrics::MetricsRegistry;
+    use vortex_io::runtime::oneshot;
 
     use super::*;
     use crate::read::request::IoRequestInner;

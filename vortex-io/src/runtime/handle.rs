@@ -9,6 +9,21 @@ use std::task::Poll;
 use std::task::ready;
 
 use futures::FutureExt;
+/// The one-shot channel carrying a spawned [`Task`]'s result.
+///
+/// This is tokio's channel rather than the `oneshot` crate. The `oneshot` crate's receiver
+/// releases its stored waker from inside its own destructor; when that waker belongs to an
+/// executor's task handle, the drop reenters that executor's task teardown, which either
+/// trips its "future still here when dropping" assertion or frees the waker under a sender
+/// that is concurrently waking it -- a use-after-free faulting on the indirect call in
+/// `ReceiverWaker::unpark`. Dropping a [`Task`] that has already been polled is exactly that
+/// window, so ordinary cancellation can corrupt memory. Tokio's receiver drops no waker in
+/// its own destructor: it marks the channel closed, wakes the sender by reference, and defers
+/// waker cleanup until both ends are gone. `single.rs` avoids the hazard the same way.
+///
+/// Re-exported so crates building on this runtime use the same channel rather than each
+/// taking a direct tokio dependency.
+pub use tokio::sync::oneshot;
 use tracing::Instrument;
 use vortex_error::vortex_panic;
 
@@ -84,7 +99,7 @@ impl Handle {
             .boxed(),
         );
         Task {
-            recv: recv.into_future(),
+            recv,
             abort_handle: Some(abort_handle),
         }
     }
@@ -124,7 +139,7 @@ impl Handle {
             .boxed(),
         );
         Task {
-            recv: recv.into_future(),
+            recv,
             abort_handle: Some(abort_handle),
         }
     }
@@ -154,7 +169,7 @@ impl Handle {
             }
         }));
         Task {
-            recv: recv.into_future(),
+            recv,
             abort_handle: Some(abort_handle),
         }
     }
@@ -176,7 +191,7 @@ impl Handle {
             }
         }));
         Task {
-            recv: recv.into_future(),
+            recv,
             abort_handle: Some(abort_handle),
         }
     }
@@ -188,7 +203,7 @@ impl Handle {
 /// continue running in the background, call [`Task::detach`].
 #[must_use = "When a Task is dropped without being awaited, it is cancelled"]
 pub struct Task<T> {
-    recv: oneshot::AsyncReceiver<T>,
+    recv: oneshot::Receiver<T>,
     abort_handle: Option<AbortHandleRef>,
 }
 
