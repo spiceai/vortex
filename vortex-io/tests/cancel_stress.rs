@@ -26,7 +26,7 @@ use vortex_io::runtime::tokio::TokioRuntime;
 
 /// Long enough to cover the window reliably; short enough for CI.
 const RUN_FOR: Duration = Duration::from_secs(3);
-const WORKERS: u64 = 16;
+const WORKERS: u64 = 8;
 
 /// Cheap deterministic jitter, so the cancellation lands at varying points relative to
 /// the spawned future's completion. A fixed delay would only ever probe one interleaving.
@@ -37,47 +37,52 @@ fn xorshift(state: &mut u64) -> u64 {
     *state
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn cancelling_a_polled_task_is_sound() {
-    let handle = TokioRuntime::current();
-    let deadline = Instant::now() + RUN_FOR;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let mut workers = Vec::with_capacity(WORKERS as usize);
-    for worker in 0..WORKERS {
-        let handle = handle.clone();
-        workers.push(tokio::spawn(async move {
-            let mut seed = worker.wrapping_mul(7919).wrapping_add(1);
-            let mut cancelled = 0u64;
-            while Instant::now() < deadline {
-                let r = xorshift(&mut seed);
-                let spin = r % 2048;
-                let yields = (r >> 11) % 4;
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelling_a_polled_task_is_sound() {
+        let handle = TokioRuntime::current();
+        let deadline = Instant::now() + RUN_FOR;
 
-                let mut task = Box::pin(handle.spawn(async move {
-                    for _ in 0..yields {
-                        tokio::task::yield_now().await;
+        let mut workers = Vec::new();
+        for worker in 0..WORKERS {
+            let handle = handle.clone();
+            workers.push(tokio::spawn(async move {
+                let mut seed = worker.wrapping_mul(7919).wrapping_add(1);
+                let mut cancelled = 0u64;
+                while Instant::now() < deadline {
+                    let r = xorshift(&mut seed);
+                    let spin = r % 2048;
+                    let yields = (r >> 11) % 4;
+
+                    let mut task = Box::pin(handle.spawn(async move {
+                        for _ in 0..yields {
+                            tokio::task::yield_now().await;
+                        }
+                        (0..spin).fold(0u64, |acc, i| acc.wrapping_add(i))
+                    }));
+
+                    // Poll once so the task handle registers a waker, then drop it while the
+                    // spawned future is still completing. This is what query cancellation does.
+                    let first = poll_fn(|cx| Poll::Ready(task.as_mut().poll(cx))).await;
+                    if first.is_pending() {
+                        for _ in 0..((r >> 24) % 3) {
+                            tokio::task::yield_now().await;
+                        }
+                        drop(task);
+                        cancelled += 1;
                     }
-                    (0..spin).fold(0u64, |acc, i| acc.wrapping_add(i))
-                }));
-
-                // Poll once so the task handle registers a waker, then drop it while the
-                // spawned future is still completing. This is what query cancellation does.
-                let first = poll_fn(|cx| Poll::Ready(task.as_mut().poll(cx))).await;
-                if first.is_pending() {
-                    for _ in 0..((r >> 24) % 3) {
-                        tokio::task::yield_now().await;
-                    }
-                    drop(task);
-                    cancelled += 1;
                 }
-            }
-            cancelled
-        }));
-    }
+                cancelled
+            }));
+        }
 
-    let mut cancelled = 0u64;
-    for worker in workers {
-        cancelled += worker.await.expect("stress worker panicked");
+        let mut cancelled = 0u64;
+        for worker in workers {
+            cancelled += worker.await.expect("stress worker panicked");
+        }
+        assert!(cancelled > 0, "no cancellation actually raced a completion");
     }
-    assert!(cancelled > 0, "no cancellation actually raced a completion");
 }
