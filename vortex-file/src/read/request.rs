@@ -13,6 +13,7 @@ use vortex_buffer::Alignment;
 use vortex_error::VortexError;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
+use vortex_io::runtime::oneshot;
 use vortex_error::vortex_ensure;
 
 /// An I/O request, either a single read or a coalesced set of reads.
@@ -113,8 +114,8 @@ impl Debug for ReadRequest {
 
 impl ReadRequest {
     pub(crate) fn resolve(self, result: VortexResult<BufferHandle>) {
-        if let Err(e) = self.callback.send(result) {
-            trace!("ReadRequest {} dropped before resolving: {e}", self.id);
+        if self.callback.send(result).is_err() {
+            trace!("ReadRequest {} dropped before resolving", self.id);
         }
     }
 }

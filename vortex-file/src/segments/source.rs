@@ -21,6 +21,12 @@ use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
 use vortex_io::VortexReadAt;
 use vortex_io::runtime::Handle;
+// The segment-read result channel is tokio's oneshot, re-exported by `vortex-io`, not the
+// `oneshot` crate: `ReadFuture` below is polled and then dropped on cancellation, and the
+// `oneshot` crate's receiver releases its stored waker from inside its own destructor, which
+// reenters executor task teardown and can free the waker under a concurrently waking sender.
+// See `vortex-io/src/runtime/handle.rs` for the full note.
+use vortex_io::runtime::oneshot;
 use vortex_layout::segments::SegmentFuture;
 use vortex_layout::segments::SegmentId;
 use vortex_layout::segments::SegmentSource;
@@ -180,7 +186,7 @@ impl SegmentSource for FileSegmentSource {
 
         let fut = ReadFuture {
             id,
-            recv: recv.into_future(),
+            recv,
             polled: false,
             finished: false,
             events: self.events.clone(),
@@ -197,7 +203,7 @@ impl SegmentSource for FileSegmentSource {
 /// If dropped, the read request will be canceled where possible.
 struct ReadFuture {
     id: usize,
-    recv: oneshot::AsyncReceiver<VortexResult<BufferHandle>>,
+    recv: oneshot::Receiver<VortexResult<BufferHandle>>,
     polled: bool,
     finished: bool,
     events: mpsc::UnboundedSender<ReadEvent>,
