@@ -9773,7 +9773,6 @@ dependencies = [
  "kanal",
  "moka",
  "object_store 0.13.2",
- "oneshot",
  "parking_lot",
  "pin-project-lite",
  "rstest",
