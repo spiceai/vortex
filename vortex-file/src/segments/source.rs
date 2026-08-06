@@ -26,13 +26,13 @@ use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
 use vortex_io::VortexReadAt;
 use vortex_io::runtime::Handle;
+use vortex_io::runtime::JoinOutcome;
 // The segment-read result channel is tokio's oneshot, re-exported by `vortex-io`, not the
 // `oneshot` crate: `ReadFuture` below is polled and then dropped on cancellation, and the
 // `oneshot` crate's receiver releases its stored waker from inside its own destructor, which
 // reenters executor task teardown and can free the waker under a concurrently waking sender.
 // See `vortex-io/src/runtime/handle.rs` for the full note.
 use vortex_io::runtime::oneshot;
-use vortex_io::runtime::JoinOutcome;
 use vortex_layout::segments::SegmentFuture;
 use vortex_layout::segments::SegmentId;
 use vortex_layout::segments::SegmentSource;
@@ -408,13 +408,12 @@ impl SegmentSource for BufferSegmentSource {
 #[cfg(test)]
 mod tests {
     use std::panic::AssertUnwindSafe;
+    use std::sync::atomic::AtomicBool;
 
     use futures::future::BoxFuture;
     use vortex_io::runtime::tokio::TokioRuntime;
     use vortex_layout::segments::SegmentSource;
     use vortex_metrics::DefaultMetricsRegistry;
-
-    use std::sync::atomic::AtomicBool;
 
     use super::*;
 

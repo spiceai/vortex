@@ -330,10 +330,10 @@ mod tests {
     use vortex_array::buffer::BufferHandle;
     use vortex_buffer::Alignment;
     use vortex_error::VortexResult;
+    use vortex_io::runtime::oneshot;
     use vortex_metrics::DefaultMetricsRegistry;
     use vortex_metrics::MetricValue;
     use vortex_metrics::MetricsRegistry;
-    use vortex_io::runtime::oneshot;
 
     use super::*;
     use crate::read::request::IoRequestInner;
