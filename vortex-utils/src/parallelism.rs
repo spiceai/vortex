@@ -42,23 +42,27 @@ pub struct SetParallelismError {
 
 impl fmt::Display for SetParallelismError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let installed = match self.installed {
-            Some(installed) => installed.to_string(),
-            None => "unknown".to_string(),
-        };
-        if self.installed_was_declared {
-            write!(
+        let requested = self.requested;
+        // A failed detection is its own case rather than the word "unknown" substituted into
+        // one of the other two, which would read "resolved to the detected unknown".
+        // `installed` is only ever `None` on that path — declaring always stores a value — so
+        // the `None` arm does not need to distinguish declared from detected.
+        match (self.installed_was_declared, self.installed) {
+            (true, Some(installed)) => write!(
                 f,
-                "cannot set the available parallelism to {}: {installed} was already declared",
-                self.requested
-            )
-        } else {
-            write!(
+                "cannot set the available parallelism to {requested}: {installed} was already \
+                 declared"
+            ),
+            (false, Some(installed)) => write!(
                 f,
-                "cannot set the available parallelism to {}: it was already resolved to the \
-                 detected {installed}, so this call came after something read it",
-                self.requested
-            )
+                "cannot set the available parallelism to {requested}: it was already resolved to \
+                 the detected {installed}, so this call came after something read it"
+            ),
+            (_, None) => write!(
+                f,
+                "cannot set the available parallelism to {requested}: detection already ran and \
+                 failed, so this call came after something read it"
+            ),
         }
     }
 }
