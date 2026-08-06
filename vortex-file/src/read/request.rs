@@ -13,8 +13,8 @@ use vortex_buffer::Alignment;
 use vortex_error::VortexError;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
-use vortex_io::runtime::oneshot;
 use vortex_error::vortex_ensure;
+use vortex_io::runtime::oneshot;
 
 /// An I/O request, either a single read or a coalesced set of reads.
 #[derive(Debug)]
