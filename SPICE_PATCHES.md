@@ -50,8 +50,9 @@ exists: a grep proves presence, a test proves behaviour.
 | 10 | `UncompressedSizeInBytes` statistic handling | `6712e9ffa` (#3) | Incorrect statistic propagation | — (needs a check) | No |
 | 11 | Intra-file decode parallelism | `9d3aafb06`, `26b274c72` (#62) | Scan throughput on large chunk spans | — (needs a check) | Possibly upstream |
 | 12 | Restore lint checks on forks | `bb80c537b` | Fork CI not running lints | — (CI config) | No |
+| 13 | `set_available_parallelism` | this change | Scan and writer fan-out sized from the machine's core count rather than what the host process is entitled to (spiceai/spiceai#12328) | `cargo test -p vortex-utils --test parallelism_declared --test parallelism_declared_too_late` | Proposed — additive, detection unchanged |
 
-**Confidence:** rows 1–4 are verified against the branches. Rows 5–12 are seeded from an
+**Confidence:** rows 1–4 and 13 are verified against the branches. Rows 5–12 are seeded from an
 audit of non-merge commits on `spiceai-54` authored by Spice engineers; their descriptions
 come from commit subjects rather than from reading each diff, and some may be upstream
 cherry-picks rather than Spice patches. Anyone touching a row should confirm it and fill in
