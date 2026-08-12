@@ -29,7 +29,6 @@ use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_io::runtime::BlockingRuntime;
-use vortex_io::runtime::Handle;
 use vortex_io::runtime::Task;
 use vortex_io::session::RuntimeSessionExt;
 use vortex_metrics::MetricsRegistry;
@@ -44,6 +43,35 @@ use crate::scan::repeated_scan::RepeatedScan;
 use crate::scan::split_by::SplitBy;
 use crate::scan::splits::Splits;
 use crate::scan::splits::attempt_split_ranges;
+
+/// How a scan's configured split concurrency maps onto splits actually in flight.
+///
+/// The distinction is load-bearing for any caller that reasons about the number:
+/// the per-worker form is a lookahead multiplier, so the width it produces depends
+/// on the machine, while the absolute form is the width itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitConcurrency {
+    /// `n` splits per worker thread. The effective width is `n * available
+    /// parallelism`, which makes it a good default for throughput and a poor one
+    /// for a bound — see [`ScanBuilder::with_absolute_concurrency`].
+    PerWorker(usize),
+    /// Exactly `n` splits in flight, whatever parallelism the host reports.
+    Absolute(usize),
+}
+
+impl SplitConcurrency {
+    /// The number of splits to hold in flight.
+    ///
+    /// The single place either form becomes a width, so a caller that reads the
+    /// setting and the scan that honors it cannot disagree about what it meant.
+    pub fn effective(self) -> usize {
+        match self {
+            Self::PerWorker(n) => n.saturating_mul(get_available_parallelism().unwrap_or(1)),
+            Self::Absolute(n) => n,
+        }
+        .max(1)
+    }
+}
 
 /// Builder for scanning a [`LayoutReader`] into arrays, streams, iterators, or mapped outputs.
 ///
@@ -70,8 +98,8 @@ pub struct ScanBuilder<A> {
     selection: Selection,
     /// How to split the file for concurrent processing.
     split_by: SplitBy,
-    /// The number of splits to make progress on concurrently **per-thread**.
-    concurrency: usize,
+    /// How many splits to make progress on concurrently.
+    concurrency: SplitConcurrency,
     /// Function to apply to each [`ArrayRef`] within the spawned split tasks.
     map_fn: Arc<dyn Fn(ArrayRef) -> VortexResult<A> + Send + Sync>,
     metrics_registry: Option<Arc<dyn MetricsRegistry>>,
@@ -98,7 +126,7 @@ impl ScanBuilder<ArrayRef> {
             split_by: SplitBy::Layout,
             // We default to four tasks per worker thread, which allows for some I/O lookahead
             // without too much impact on work-stealing.
-            concurrency: 4,
+            concurrency: SplitConcurrency::PerWorker(4),
             map_fn: Arc::new(Ok),
             metrics_registry: None,
             file_stats: None,
@@ -190,16 +218,46 @@ impl<A: 'static + Send> ScanBuilder<A> {
         self
     }
 
-    /// Returns the per-worker row-split concurrency.
+    /// Returns the effective concurrency
     pub fn concurrency(&self) -> usize {
+        self.concurrency.effective()
+    }
+
+    /// Returns the configured row-split concurrency.
+    pub fn split_concurrency(&self) -> SplitConcurrency {
         self.concurrency
     }
 
     /// The number of row splits to make progress on concurrently per-thread, must
     /// be greater than 0.
+    ///
+    /// The effective width is this value times the available parallelism. Callers
+    /// that must bound the splits actually in flight — because they size a memory
+    /// budget against it, or run under a CPU entitlement narrower than the host —
+    /// want [`Self::with_absolute_concurrency`] instead.
     pub fn with_concurrency(mut self, concurrency: usize) -> Self {
         assert!(concurrency > 0);
-        self.concurrency = concurrency;
+        self.concurrency = SplitConcurrency::PerWorker(concurrency);
+        self
+    }
+
+    /// The exact number of row splits to hold in flight, independent of how many
+    /// worker threads the host offers. Must be greater than 0.
+    ///
+    /// `1` is genuinely serial. Use this when the number has to mean something to
+    /// the caller — a memory reservation sized per in-flight split, or a scan
+    /// confined to a CPU entitlement that [`get_available_parallelism`] cannot see
+    /// (it reports the machine's cores, so under a cgroup quota the per-worker form
+    /// multiplies by the node's core count rather than the share this process was
+    /// granted).
+    ///
+    /// The bound covers a split's reads, not just its execution: the streaming paths
+    /// ([`Self::into_stream`] and [`RepeatedScan::execute_stream`]) construct split tasks
+    /// lazily, so a split registers its reads only once admitted. [`Self::build`] returns
+    /// every task at once and so is not bounded by this setting.
+    pub fn with_absolute_concurrency(mut self, concurrency: usize) -> Self {
+        assert!(concurrency > 0);
+        self.concurrency = SplitConcurrency::Absolute(concurrency);
         self
     }
 
@@ -326,6 +384,9 @@ impl<A: 'static + Send> ScanBuilder<A> {
     }
 
     /// Constructs a task per row split of the scan, returned as a vector of futures.
+    ///
+    /// Every split registers its reads up-front, so the configured concurrency does not bound
+    /// this. Use [`Self::into_stream`] when the caller needs that bound.
     pub fn build(self) -> VortexResult<Vec<BoxFuture<'static, VortexResult<Option<A>>>>> {
         // The ultimate short circuit
         if self.limit.is_some_and(|l| l == 0) {
@@ -354,18 +415,9 @@ impl<A: 'static + Send> ScanBuilder<A> {
 
 enum LazyScanState<A: 'static + Send> {
     Builder(Option<Box<ScanBuilder<A>>>),
-    Preparing(PreparingScan<A>),
+    Preparing(Task<VortexResult<RepeatedScan<A>>>),
     Stream(BoxStream<'static, VortexResult<A>>),
     Error(Option<vortex_error::VortexError>),
-}
-
-type PreparedScanTasks<A> = Vec<BoxFuture<'static, VortexResult<Option<A>>>>;
-
-struct PreparingScan<A: 'static + Send> {
-    ordered: bool,
-    concurrency: usize,
-    handle: Handle,
-    task: Task<VortexResult<PreparedScanTasks<A>>>,
 }
 
 struct LazyScanStream<A: 'static + Send> {
@@ -390,41 +442,22 @@ impl<A: 'static + Send> Stream for LazyScanStream<A> {
             match &mut self.state {
                 LazyScanState::Builder(builder) => {
                     let builder = builder.take().vortex_expect("polled after completion");
-                    let ordered = builder.ordered;
-                    let num_workers = get_available_parallelism().unwrap_or(1);
-                    let concurrency = builder.concurrency * num_workers;
-                    let handle = builder.session.handle();
-                    let task = handle.spawn_blocking(move || {
-                        builder.prepare().and_then(|scan| scan.execute(None))
-                    });
-                    self.state = LazyScanState::Preparing(PreparingScan {
-                        ordered,
-                        concurrency,
-                        handle,
-                        task,
-                    });
+                    // Only `prepare` runs on the blocking pool. Split tasks are built lazily by
+                    // the stream below, so that the configured concurrency — not the split count
+                    // — bounds how many splits have registered reads.
+                    let task = builder
+                        .session
+                        .handle()
+                        .spawn_blocking(move || builder.prepare());
+                    self.state = LazyScanState::Preparing(task);
                 }
-                LazyScanState::Preparing(preparing) => {
-                    match ready!(Pin::new(&mut preparing.task).poll(cx)) {
-                        Ok(tasks) => {
-                            let ordered = preparing.ordered;
-                            let concurrency = preparing.concurrency;
-                            let handle = preparing.handle.clone();
-                            let stream =
-                                futures::stream::iter(tasks).map(move |task| handle.spawn(task));
-                            let stream = if ordered {
-                                stream.buffered(concurrency).boxed()
-                            } else {
-                                stream.buffer_unordered(concurrency).boxed()
-                            };
-                            let stream = stream
-                                .filter_map(|chunk| async move { chunk.transpose() })
-                                .boxed();
-                            self.state = LazyScanState::Stream(stream);
-                        }
+                LazyScanState::Preparing(task) => match ready!(Pin::new(task).poll(cx)) {
+                    Ok(scan) => match scan.execute_stream(None) {
+                        Ok(stream) => self.state = LazyScanState::Stream(stream.boxed()),
                         Err(err) => self.state = LazyScanState::Error(Some(err)),
-                    }
-                }
+                    },
+                    Err(err) => self.state = LazyScanState::Error(Some(err)),
+                },
                 LazyScanState::Stream(stream) => return stream.as_mut().poll_next(cx),
                 LazyScanState::Error(err) => return Poll::Ready(err.take().map(Err)),
             }
@@ -466,6 +499,7 @@ mod test {
     use futures::Stream;
     use futures::task::noop_waker_ref;
     use parking_lot::Mutex;
+    use rstest::rstest;
     use vortex_array::IntoArray;
     use vortex_array::MaskFuture;
     use vortex_array::VortexSessionExecute;
@@ -495,7 +529,10 @@ mod test {
     use crate::LayoutReader;
     use crate::RowSplits;
     use crate::SplitRange;
+    use crate::scan::test::ProbeLayoutReader;
     use crate::scan::test::SCAN_SESSION;
+    use crate::scan::test::SplitProbe;
+    use crate::scan::test::assert_bounded_scan;
     use crate::scan::test::session_with_handle;
 
     fn nested_dtype() -> DType {
@@ -870,6 +907,44 @@ mod test {
         assert_eq!(calls.load(Ordering::Relaxed), 0);
 
         drop(runtime);
+    }
+
+    /// [`ScanBuilder::into_stream`] must admit splits under the configured concurrency too: it
+    /// prepares the scan off-thread, then builds each split task lazily as the buffer admits it.
+    #[rstest]
+    #[case::serial(1)]
+    #[case::bounded(3)]
+    fn into_stream_bounds_registered_splits(#[case] concurrency: usize) -> VortexResult<()> {
+        const ROW_COUNT: usize = 8;
+
+        let mut ctx = array_session().create_execution_ctx();
+        let probe = Arc::new(SplitProbe::default());
+        let reader = Arc::new(ProbeLayoutReader::new(ROW_COUNT, Arc::clone(&probe)));
+
+        let runtime = SingleThreadRuntime::default();
+        let session = session_with_handle(runtime.handle());
+
+        let stream = ScanBuilder::new(session, reader)
+            .with_absolute_concurrency(concurrency)
+            .into_stream()?;
+
+        let mut values = Vec::new();
+        for (yielded, chunk) in runtime.block_on_stream(stream).enumerate() {
+            let prim = chunk?.execute::<PrimitiveArray>(&mut ctx)?;
+            values.extend(prim.into_buffer::<i32>().iter().copied());
+
+            let admitted = yielded + 1 + concurrency;
+            assert!(
+                probe.registered() <= admitted,
+                "{} splits registered after {} yielded, expected at most {admitted}",
+                probe.registered(),
+                yielded + 1,
+            );
+        }
+
+        assert_bounded_scan(&values, ROW_COUNT, &probe, concurrency);
+
+        Ok(())
     }
 
     #[test]

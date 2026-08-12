@@ -54,12 +54,18 @@ use vortex_scan::PartitionStream;
 use vortex_scan::ScanRequest;
 use vortex_scan::selection::Selection;
 use vortex_session::VortexSession;
-use vortex_utils::parallelism::get_available_parallelism;
 
 use crate::LayoutReaderRef;
 use crate::scan::scan_builder::ScanBuilder;
 
 /// Default concurrency for opening deferred readers.
+///
+/// A fixed width rather than the host's parallelism: a caller running under a CPU
+/// entitlement narrower than the machine (a cgroup quota) cannot see that count
+/// reflected in `available_parallelism`, so deriving the default from it opens
+/// files far wider than the share the process was granted. Callers that want the
+/// machine's parallelism can still ask for it through
+/// [`MultiLayoutDataSource::with_concurrency`].
 const DEFAULT_CONCURRENCY: usize = 8;
 
 /// An async factory that produces a [`LayoutReaderRef`].
@@ -124,7 +130,7 @@ impl MultiLayoutDataSource {
         session: &VortexSession,
     ) -> Self {
         let dtype = first.dtype().clone();
-        let concurrency = get_available_parallelism().unwrap_or(DEFAULT_CONCURRENCY);
+        let concurrency = DEFAULT_CONCURRENCY;
 
         let total = 1 + remaining.len();
         let mut sizes = byte_sizes;
@@ -172,7 +178,7 @@ impl MultiLayoutDataSource {
         byte_sizes: Vec<Option<u64>>,
         session: &VortexSession,
     ) -> Self {
-        let concurrency = get_available_parallelism().unwrap_or(DEFAULT_CONCURRENCY);
+        let concurrency = DEFAULT_CONCURRENCY;
 
         let mut sizes = byte_sizes;
         if sizes.is_empty() {
@@ -203,7 +209,8 @@ impl MultiLayoutDataSource {
     /// Sets the concurrency for opening deferred readers.
     ///
     /// Controls how many file opens run in parallel via `buffer_unordered`.
-    /// Defaults to the number of available CPU cores.
+    /// Defaults to 8 — a fixed width, not the host's parallelism, so a process
+    /// under a CPU quota does not open files against the whole machine's core count.
     pub fn with_concurrency(mut self, concurrency: usize) -> Self {
         self.concurrency = concurrency;
         self
