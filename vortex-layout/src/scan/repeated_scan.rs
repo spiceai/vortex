@@ -23,10 +23,10 @@ use vortex_io::runtime::BlockingRuntime;
 use vortex_io::session::RuntimeSessionExt;
 use vortex_scan::selection::Selection;
 use vortex_session::VortexSession;
-use vortex_utils::parallelism::get_available_parallelism;
 
 use crate::LayoutReaderRef;
 use crate::scan::filter::FilterExpr;
+use crate::scan::scan_builder::SplitConcurrency;
 use crate::scan::splits::Splits;
 use crate::scan::tasks::TaskContext;
 use crate::scan::tasks::split_exec;
@@ -47,8 +47,8 @@ pub struct RepeatedScan<A: 'static + Send> {
     selection: Selection,
     /// The natural splits of the file.
     splits: Splits,
-    /// The number of splits to make progress on concurrently **per-thread**.
-    concurrency: usize,
+    /// How many splits to make progress on concurrently.
+    concurrency: SplitConcurrency,
     /// Function to apply to each [`ArrayRef`] within the spawned split tasks.
     map_fn: Arc<dyn Fn(ArrayRef) -> VortexResult<A> + Send + Sync>,
     /// Maximal number of rows to read (after filtering)
@@ -98,7 +98,7 @@ impl<A: 'static + Send> RepeatedScan<A> {
         row_range: Option<Range<u64>>,
         selection: Selection,
         splits: Splits,
-        concurrency: usize,
+        concurrency: SplitConcurrency,
         map_fn: Arc<dyn Fn(ArrayRef) -> VortexResult<A> + Send + Sync>,
         limit: Option<u64>,
         dtype: DType,
@@ -200,8 +200,7 @@ impl<A: 'static + Send> RepeatedScan<A> {
         row_range: Option<Range<u64>>,
     ) -> VortexResult<impl Stream<Item = VortexResult<A>> + Send + 'static + use<A>> {
         use futures::StreamExt;
-        let num_workers = get_available_parallelism().unwrap_or(1);
-        let concurrency = self.concurrency * num_workers;
+        let concurrency = self.concurrency.effective();
         let handle = self.session.handle();
 
         let stream =

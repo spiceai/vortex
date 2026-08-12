@@ -45,6 +45,35 @@ use crate::scan::split_by::SplitBy;
 use crate::scan::splits::Splits;
 use crate::scan::splits::attempt_split_ranges;
 
+/// How a scan's configured split concurrency maps onto splits actually in flight.
+///
+/// The distinction is load-bearing for any caller that reasons about the number:
+/// the per-worker form is a lookahead multiplier, so the width it produces depends
+/// on the machine, while the absolute form is the width itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitConcurrency {
+    /// `n` splits per worker thread. The effective width is `n * available
+    /// parallelism`, which makes it a good default for throughput and a poor one
+    /// for a bound — see [`ScanBuilder::with_absolute_concurrency`].
+    PerWorker(usize),
+    /// Exactly `n` splits in flight, whatever parallelism the host reports.
+    Absolute(usize),
+}
+
+impl SplitConcurrency {
+    /// The number of splits to hold in flight.
+    ///
+    /// The single place either form becomes a width, so a caller that reads the
+    /// setting and the scan that honors it cannot disagree about what it meant.
+    pub fn effective(self) -> usize {
+        match self {
+            Self::PerWorker(n) => n.saturating_mul(get_available_parallelism().unwrap_or(1)),
+            Self::Absolute(n) => n,
+        }
+        .max(1)
+    }
+}
+
 /// Builder for scanning a [`LayoutReader`] into arrays, streams, iterators, or mapped outputs.
 ///
 /// A scan has three independent row restriction mechanisms:
@@ -70,8 +99,8 @@ pub struct ScanBuilder<A> {
     selection: Selection,
     /// How to split the file for concurrent processing.
     split_by: SplitBy,
-    /// The number of splits to make progress on concurrently **per-thread**.
-    concurrency: usize,
+    /// How many splits to make progress on concurrently.
+    concurrency: SplitConcurrency,
     /// Function to apply to each [`ArrayRef`] within the spawned split tasks.
     map_fn: Arc<dyn Fn(ArrayRef) -> VortexResult<A> + Send + Sync>,
     metrics_registry: Option<Arc<dyn MetricsRegistry>>,
@@ -98,7 +127,7 @@ impl ScanBuilder<ArrayRef> {
             split_by: SplitBy::Layout,
             // We default to four tasks per worker thread, which allows for some I/O lookahead
             // without too much impact on work-stealing.
-            concurrency: 4,
+            concurrency: SplitConcurrency::PerWorker(4),
             map_fn: Arc::new(Ok),
             metrics_registry: None,
             file_stats: None,
@@ -190,16 +219,36 @@ impl<A: 'static + Send> ScanBuilder<A> {
         self
     }
 
-    /// Returns the per-worker row-split concurrency.
-    pub fn concurrency(&self) -> usize {
+    /// Returns the configured row-split concurrency.
+    pub fn concurrency(&self) -> SplitConcurrency {
         self.concurrency
     }
 
     /// The number of row splits to make progress on concurrently per-thread, must
     /// be greater than 0.
+    ///
+    /// The effective width is this value times the available parallelism. Callers
+    /// that must bound the splits actually in flight — because they size a memory
+    /// budget against it, or run under a CPU entitlement narrower than the host —
+    /// want [`Self::with_absolute_concurrency`] instead.
     pub fn with_concurrency(mut self, concurrency: usize) -> Self {
         assert!(concurrency > 0);
-        self.concurrency = concurrency;
+        self.concurrency = SplitConcurrency::PerWorker(concurrency);
+        self
+    }
+
+    /// The exact number of row splits to hold in flight, independent of how many
+    /// worker threads the host offers. Must be greater than 0.
+    ///
+    /// `1` is genuinely serial. Use this when the number has to mean something to
+    /// the caller — a memory reservation sized per in-flight split, or a scan
+    /// confined to a CPU entitlement that [`get_available_parallelism`] cannot see
+    /// (it reports the machine's cores, so under a cgroup quota the per-worker form
+    /// multiplies by the node's core count rather than the share this process was
+    /// granted).
+    pub fn with_absolute_concurrency(mut self, concurrency: usize) -> Self {
+        assert!(concurrency > 0);
+        self.concurrency = SplitConcurrency::Absolute(concurrency);
         self
     }
 
@@ -391,8 +440,7 @@ impl<A: 'static + Send> Stream for LazyScanStream<A> {
                 LazyScanState::Builder(builder) => {
                     let builder = builder.take().vortex_expect("polled after completion");
                     let ordered = builder.ordered;
-                    let num_workers = get_available_parallelism().unwrap_or(1);
-                    let concurrency = builder.concurrency * num_workers;
+                    let concurrency = builder.concurrency.effective();
                     let handle = builder.session.handle();
                     let task = handle.spawn_blocking(move || {
                         builder.prepare().and_then(|scan| scan.execute(None))
