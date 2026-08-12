@@ -209,7 +209,8 @@ impl MultiLayoutDataSource {
     /// Sets the concurrency for opening deferred readers.
     ///
     /// Controls how many file opens run in parallel via `buffer_unordered`.
-    /// Defaults to [`DEFAULT_CONCURRENCY`].
+    /// Defaults to 8 — a fixed width, not the host's parallelism, so a process
+    /// under a CPU quota does not open files against the whole machine's core count.
     pub fn with_concurrency(mut self, concurrency: usize) -> Self {
         self.concurrency = concurrency;
         self
