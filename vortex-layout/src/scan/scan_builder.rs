@@ -219,8 +219,13 @@ impl<A: 'static + Send> ScanBuilder<A> {
         self
     }
 
+    /// Returns the effective concurrency
+    pub fn concurrency(&self) -> usize {
+        self.concurrency.effective()
+    }
+
     /// Returns the configured row-split concurrency.
-    pub fn concurrency(&self) -> SplitConcurrency {
+    pub fn split_concurrency(&self) -> SplitConcurrency {
         self.concurrency
     }
 
@@ -440,7 +445,7 @@ impl<A: 'static + Send> Stream for LazyScanStream<A> {
                 LazyScanState::Builder(builder) => {
                     let builder = builder.take().vortex_expect("polled after completion");
                     let ordered = builder.ordered;
-                    let concurrency = builder.concurrency.effective();
+                    let concurrency = builder.concurrency();
                     let handle = builder.session.handle();
                     let task = handle.spawn_blocking(move || {
                         builder.prepare().and_then(|scan| scan.execute(None))
