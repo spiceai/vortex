@@ -8,13 +8,9 @@ use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::OnceLock;
 
-/// The one answer this copy of the library will ever give.
-///
-/// Written exactly once, by whichever of [`set_available_parallelism`] and
-/// [`get_available_parallelism`] runs first. Keeping the declared value and the detected one
-/// in a single cell is what makes the answer stable: components read it when they are
-/// constructed and keep it, so a value that could still change would leave two components in
-/// the same process sized against different numbers.
+/// The resolved parallelism, written once by whichever of [`set_available_parallelism`] and
+/// [`get_available_parallelism`] runs first. A single cell keeps every reader and any later
+/// declaration in agreement.
 static PARALLELISM: OnceLock<Resolved> = OnceLock::new();
 
 struct Resolved {
@@ -24,29 +20,23 @@ struct Resolved {
     declared: bool,
 }
 
-/// Why [`set_available_parallelism`] could not install the requested value.
-///
-/// The parallelism was already resolved, and it cannot be revised: whatever read it has
-/// already sized itself.
+/// The parallelism was already resolved to a different value, so the requested one was not
+/// installed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SetParallelismError {
     /// The value that was requested, and is *not* in effect.
     pub requested: NonZeroUsize,
     /// The value that is in effect. `None` if detection failed.
     pub installed: Option<usize>,
-    /// Whether the installed value was declared by an earlier call — an embedder that
-    /// declares two different values — as opposed to detected, which means this call simply
-    /// came after something already read the parallelism.
+    /// Whether the installed value was declared by an earlier call, as opposed to detected.
     pub installed_was_declared: bool,
 }
 
 impl fmt::Display for SetParallelismError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let requested = self.requested;
-        // A failed detection is its own case rather than the word "unknown" substituted into
-        // one of the other two, which would read "resolved to the detected unknown".
-        // `installed` is only ever `None` on that path — declaring always stores a value — so
-        // the `None` arm does not need to distinguish declared from detected.
+        // `installed` is `None` only when detection ran and failed, so the `None` arm needs
+        // no declared/detected distinction.
         match (self.installed_was_declared, self.installed) {
             (true, Some(installed)) => write!(
                 f,
@@ -71,32 +61,19 @@ impl Error for SetParallelismError {}
 
 /// Declares the parallelism [`get_available_parallelism`] reports.
 ///
-/// [`get_available_parallelism`] otherwise asks the operating system, which answers for the
-/// *machine* rather than for this process. The two differ whenever the host is entitled to
-/// less than the machine: a container whose CPU allocation is expressed as a share rather
-/// than a quota, a scheduler allocation, or an explicit user setting. Every component that
-/// defaults its fan-out from that call then sizes for the whole machine at once. An embedder
-/// that has already resolved what it is entitled to declares it here so that they all agree
-/// with it.
+/// The operating system answers for the machine; an embedder running under a narrower CPU
+/// entitlement (a container share, a scheduler allocation) declares that entitlement here so
+/// every component sizes from it. It is a default fan-out, not an enforced ceiling: some
+/// components derive a larger number from it.
 ///
-/// This sets a *default fan-out*, not an enforced ceiling. Each component takes the value
-/// independently, and some derive a larger number from it — a scan runs several tasks per
-/// worker, for instance — so the total concurrency in flight is a multiple of it, not a
-/// budget capped by it.
-///
-/// Call this during start-up, before anything reads the parallelism. Whichever call comes
-/// first fixes the answer for good, so a declaration that arrives after any read fails rather
-/// than leaving components in one process sized against two different numbers. Declaring the
-/// value already in effect succeeds, so an embedder may call this from more than one entry
-/// point.
-///
-/// The value is scoped to this copy of `vortex-utils`. A `cdylib` — the Python, JNI and C
-/// bindings each build one — links its own, and must declare into it separately.
+/// Call during start-up, before anything reads the parallelism: whichever of the setter and
+/// getter runs first fixes the value for the process. Declaring the value already in effect
+/// succeeds. Each `cdylib` links its own copy of `vortex-utils` and must declare separately.
 ///
 /// # Errors
 ///
-/// [`SetParallelismError`] if a different value is already in effect, either because it was
-/// declared earlier or because it was already detected. The value in effect is unchanged.
+/// [`SetParallelismError`] if a different value is already in effect (declared or detected).
+/// The value in effect is unchanged.
 pub fn set_available_parallelism(parallelism: NonZeroUsize) -> Result<(), SetParallelismError> {
     let resolved = PARALLELISM.get_or_init(|| Resolved {
         value: Some(parallelism.get()),
@@ -136,9 +113,9 @@ pub fn get_available_parallelism() -> Option<usize> {
 mod tests {
     use super::get_available_parallelism;
 
-    /// The detection path, exercised in a binary where nothing declares a value. The tests
-    /// that *do* declare one each live in their own integration-test binary, because the
-    /// answer is resolved once per process and cannot be reset.
+    /// The detection path, in a binary where nothing declares a value. The declaration
+    /// orderings live in their own integration-test binaries: the value resolves once per
+    /// process.
     #[test]
     fn detects_parallelism_when_nothing_is_declared() {
         let detected = get_available_parallelism()
@@ -148,8 +125,7 @@ mod tests {
             "parallelism must be positive, got {detected}"
         );
 
-        // Repeated calls read the resolved value rather than re-probing, so they cannot
-        // disagree.
+        // Repeated calls read the resolved value.
         assert_eq!(get_available_parallelism(), Some(detected));
     }
 }

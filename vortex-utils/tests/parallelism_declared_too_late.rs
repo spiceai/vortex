@@ -1,16 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! A declaration that arrives after something has already read the parallelism is refused,
-//! and the value already in effect keeps being reported.
+//! Read-first ordering: a declaration arriving after the parallelism has been read is
+//! refused, and the detected value stays in effect.
 //!
-//! This is the ordering that actually bites an embedder, and the reason the declared value
-//! and the detected one share a single cell. Were they separate, a late declaration would
-//! change what the getter reports while every component built before it kept the machine's
-//! core count — one process sized against two different numbers, with nothing to show for it.
-//! Failing loudly instead gives the embedder something it can log.
-//!
-//! One test per binary, for the reason given in `parallelism_declared`.
+//! One test per binary — see `parallelism_declared`.
 
 use std::num::NonZeroUsize;
 
@@ -26,8 +20,7 @@ mod tests {
         let detected = get_available_parallelism()
             .expect("available_parallelism is expected to resolve on a test host");
 
-        // One more than whatever this host reports, so the assertions below distinguish the
-        // requested value from the resolved one on any machine.
+        // One more than the detected value, so requested and installed differ on any host.
         let requested = NonZeroUsize::new(detected + 1).expect("detected + 1 is not zero");
 
         let err = set_available_parallelism(requested)
@@ -39,7 +32,7 @@ mod tests {
             "the value in effect came from detection, not from an earlier declaration"
         );
 
-        // The refusal is not cosmetic: the detected value is still what everything reads.
+        // The detected value is still what readers see.
         assert_eq!(get_available_parallelism(), Some(detected));
     }
 }
