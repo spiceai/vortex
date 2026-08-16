@@ -20,6 +20,8 @@ use bindgen::callbacks::ParseCallbacks;
 // You can substitute this URL for https://github.com/duckdb/duckdb/releases/download
 // We use own infrastructure for testing pre-release builds
 const DUCKDB_RELEASES_URL: &str = "https://ci-builds.vortex.dev";
+// Fallback for tagged releases the mirror does not carry; archives use the same names.
+const DUCKDB_OFFICIAL_RELEASES_URL: &str = "https://github.com/duckdb/duckdb/releases/download";
 
 const DUCKDB_SOURCE_RELEASE_URL: &str = "https://github.com/duckdb/duckdb/archive/refs/tags";
 const DUCKDB_SOURCE_COMMIT_URL: &str = "https://github.com/duckdb/duckdb/archive";
@@ -325,7 +327,8 @@ fn extract(archive: &Path, dest: &Path) {
     zip::ZipArchive::new(file).unwrap().extract(dest).unwrap();
 }
 
-/// Download DuckDB library archive from R2 and extract it.
+/// Download DuckDB library archive from R2 and extract it. Tagged releases the
+/// mirror does not carry fall back to the official DuckDB release archive.
 /// Return false if archive is not available or download failed
 fn download(version: &DuckDBVersion, library_dir: &Path) -> bool {
     let target = env::var("TARGET").unwrap();
@@ -345,7 +348,13 @@ fn download(version: &DuckDBVersion, library_dir: &Path) -> bool {
 
     fs::create_dir_all(library_dir).unwrap();
     if !try_download_url(&url, &archive_path) {
-        return false;
+        if !matches!(version, DuckDBVersion::Release(_)) {
+            return false;
+        }
+        let fallback = format!("{DUCKDB_OFFICIAL_RELEASES_URL}/{version}/{archive_name}");
+        if !try_download_url(&fallback, &archive_path) {
+            return false;
+        }
     }
 
     let duckdb_lib_dir = archive_path.parent().unwrap().to_path_buf();
@@ -674,7 +683,10 @@ fn main() {
         match &version {
             DuckDBVersion::Release(_) => {
                 if !download(&version, &library_dir) {
-                    println!("cargo:error=DuckDB release {version} not available in R2");
+                    println!(
+                        "cargo:error=DuckDB release {version} not available in R2 or the \
+                         official DuckDB releases"
+                    );
                     exit(1);
                 }
             }
