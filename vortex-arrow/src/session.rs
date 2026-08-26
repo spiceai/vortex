@@ -339,6 +339,13 @@ impl ArrowSession {
                 *size as u32,
                 nullability,
             ),
+            // A Map is stored as its entries list, so it recurses like one: extension
+            // metadata on a key or value field must reach its importer exactly as it does
+            // for the `List<Struct<..>>` the map is aliased to.
+            DataType::Map(entries, _ordered) => DType::List(
+                Arc::new(self.from_arrow_field(entries.as_ref())?),
+                nullability,
+            ),
             DataType::Struct(fields) => {
                 let entries = fields
                     .iter()
@@ -577,6 +584,19 @@ impl ArrowSession {
                 let validity = nulls(list.nulls(), field.is_nullable())?;
                 Ok(ListViewArray::try_new(elements, offsets, sizes, validity)?.into_array())
             }
+            // Arrow requires a map's entries struct to be non-nullable, so only the map
+            // itself carries validity; the entries recurse so nested extension fields reach
+            // their importers.
+            DataType::Map(entries_field, _ordered) => {
+                let map = array.as_map();
+                let entries = self.from_arrow_array(
+                    Arc::new(map.entries().clone()) as ArrowArrayRef,
+                    entries_field.as_ref(),
+                )?;
+                let offsets = map.offsets().clone().into_array();
+                let validity = nulls(map.nulls(), field.is_nullable())?;
+                Ok(ListArray::try_new(entries, offsets, validity)?.into_array())
+            }
             _ => ArrayRef::from_arrow(array.as_ref(), field.is_nullable()),
         }
     }
@@ -782,6 +802,82 @@ mod tests {
         assert_eq!(fsb.len(), 2);
         assert_eq!(fsb.value(0), b"0123456789abcdef");
         assert_eq!(fsb.value(1), b"fedcba9876543210");
+        Ok(())
+    }
+
+    /// A map's key and value fields are ordinary fields and may carry extension metadata, so
+    /// importing a map through the session has to recurse into its entries exactly as the
+    /// `List<Struct<..>>` it is aliased to does. Without that recursion the whole map
+    /// delegates to the canonical conversion, which is plugin-blind: a `Map<Utf8, UUID>`
+    /// would be read as raw `FixedSizeBinary(16)` and fail to import at all.
+    #[test]
+    fn map_import_recurses_into_entries_so_nested_extensions_reach_their_importer()
+    -> VortexResult<()> {
+        use arrow_array::MapArray;
+        use arrow_array::StringArray;
+        use arrow_array::StructArray;
+        use arrow_buffer::OffsetBuffer;
+
+        let session = ArrowSession::default();
+
+        let mut value_field = Field::new("values", DataType::FixedSizeBinary(16), false);
+        value_field.try_with_extension_type(ArrowUuid)?;
+        let value_field = Arc::new(value_field);
+        let key_field = Arc::new(Field::new("keys", DataType::Utf8, false));
+        let entries_field = Arc::new(Field::new(
+            "entries",
+            DataType::Struct(vec![Arc::clone(&key_field), Arc::clone(&value_field)].into()),
+            false,
+        ));
+        let map_field = Field::new("m", DataType::Map(Arc::clone(&entries_field), false), true);
+
+        // The dtype has to see through the map to the UUID extension.
+        let dtype = session.from_arrow_field(&map_field)?;
+        let DType::List(entries_dtype, _) = &dtype else {
+            panic!("expected a List dtype for a map, got {dtype}");
+        };
+        let DType::Struct(entry_fields, _) = entries_dtype.as_ref() else {
+            panic!("expected Struct entries, got {entries_dtype}");
+        };
+        let values_dtype = entry_fields
+            .field("values")
+            .expect("entries should carry a `values` field");
+        assert!(
+            matches!(&values_dtype, DType::Extension(ext) if ext.id() == Uuid.id()),
+            "expected the map's values to import as the Uuid extension, got {values_dtype}",
+        );
+
+        // And so does the array import.
+        let entries = StructArray::try_new(
+            vec![Arc::clone(&key_field), Arc::clone(&value_field)].into(),
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b"])) as ArrowArrayRef,
+                Arc::new(FixedSizeBinaryArray::try_from_iter(
+                    [*b"0123456789abcdef", *b"fedcba9876543210"].into_iter(),
+                )?) as ArrowArrayRef,
+            ],
+            None,
+        )?;
+        let map: ArrowArrayRef = Arc::new(MapArray::try_new(
+            entries_field,
+            OffsetBuffer::new(vec![0, 1, 2].into()),
+            entries,
+            None,
+            false,
+        )?);
+
+        let imported = session.from_arrow_array(Arc::clone(&map), &map_field)?;
+        assert_eq!(imported.dtype(), &dtype);
+
+        // The export half already recurses - `to_arrow_map` hands the entries field to the
+        // list executor, which dispatches through the session - so the map round-trips whole.
+        let vortex_session = array_session();
+        let exported = vortex_session.arrow().execute_arrow(
+            imported,
+            Some(&map_field),
+            &mut vortex_session.create_execution_ctx(),
+        )?;
+        assert_eq!(exported.as_ref(), map.as_ref());
         Ok(())
     }
 }
