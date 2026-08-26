@@ -13,6 +13,7 @@ use arrow_array::GenericByteArray;
 use arrow_array::GenericByteViewArray;
 use arrow_array::GenericListArray;
 use arrow_array::GenericListViewArray;
+use arrow_array::MapArray as ArrowMapArray;
 use arrow_array::NullArray as ArrowNullArray;
 use arrow_array::OffsetSizeTrait;
 use arrow_array::PrimitiveArray as ArrowPrimitiveArray;
@@ -477,6 +478,20 @@ impl FromArrowArray<&ArrowFixedSizeListArray> for ArrayRef {
     }
 }
 
+impl FromArrowArray<&ArrowMapArray> for ArrayRef {
+    fn from_arrow(value: &ArrowMapArray, nullable: bool) -> VortexResult<Self> {
+        // Arrow's Map is logically List<Struct<key, value>> with i32 offsets, and Vortex
+        // aliases it to exactly that (see `DType::try_from_arrow`). Arrow requires both the
+        // entries struct and the keys within it to be non-nullable, so the entries convert
+        // as non-nullable and only the map itself carries validity.
+        let entries = Self::from_arrow(value.entries() as &dyn ArrowArray, false)?;
+        let offsets = value.offsets().clone().into_array();
+        let nulls = nulls(value.nulls(), nullable)?;
+
+        Ok(ListArray::try_new(entries, offsets, nulls)?.into_array())
+    }
+}
+
 impl FromArrowArray<&ArrowNullArray> for ArrayRef {
     fn from_arrow(value: &ArrowNullArray, nullable: bool) -> VortexResult<Self> {
         vortex_ensure!(
@@ -546,6 +561,7 @@ impl FromArrowArray<&dyn ArrowArray> for ArrayRef {
             DataType::ListView(_) => Self::from_arrow(array.as_list_view::<i32>(), nullable),
             DataType::LargeListView(_) => Self::from_arrow(array.as_list_view::<i64>(), nullable),
             DataType::FixedSizeList(..) => Self::from_arrow(array.as_fixed_size_list(), nullable),
+            DataType::Map(..) => Self::from_arrow(array.as_map(), nullable),
             DataType::Null => Self::from_arrow(as_null_array(array), nullable),
             DataType::Timestamp(u, _) => match u {
                 ArrowTimeUnit::Second => {
@@ -656,6 +672,7 @@ impl FromArrowArray<&RecordBatch> for ArrayRef {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::LazyLock;
 
     use arrow_array::Array as ArrowArray;
     use arrow_array::BinaryArray;
@@ -708,6 +725,7 @@ mod tests {
     use arrow_schema::Schema;
     use rstest::rstest;
     use vortex_array::ArrayRef;
+    use vortex_array::VortexSessionExecute as _;
     use vortex_array::arrays::Decimal;
     use vortex_array::arrays::FixedSizeList;
     use vortex_array::arrays::List;
@@ -725,6 +743,7 @@ mod tests {
     use vortex_array::extension::datetime::TimeUnit;
     use vortex_array::extension::datetime::Timestamp;
 
+    use crate::ArrowSessionExt as _;
     use crate::FromArrowArray as _;
     use crate::IntoVortexArray as _;
 
@@ -1568,5 +1587,54 @@ mod tests {
         assert!(
             ArrayRef::from_arrow(null_struct_array_with_non_nullable_field.as_ref(), true).is_err()
         );
+    }
+
+    /// Arrow `Map` has no Vortex `DType`; it is aliased to `List<Struct<key, value>>` on import
+    /// and rebuilt on export. Both halves have to be present for a `Map` column to survive a
+    /// Vortex file, so this asserts the full round trip rather than either direction alone.
+    #[test]
+    fn map_array_roundtrips_through_the_list_alias() {
+        use arrow_array::MapArray;
+        use arrow_array::builder::MapBuilder;
+        use arrow_array::builder::StringBuilder;
+        use vortex_session::VortexSession;
+
+        static SESSION: LazyLock<VortexSession> = LazyLock::new(vortex_array::array_session);
+
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
+        builder.keys().append_value("a");
+        builder.values().append_value(1);
+        builder.keys().append_value("b");
+        builder.values().append_value(2);
+        builder.append(true).expect("first map entry should append");
+        builder.append(false).expect("null map entry should append");
+        builder.keys().append_value("c");
+        builder.values().append_value(3);
+        builder.append(true).expect("third map entry should append");
+        let arrow_map = builder.finish();
+
+        // Import: the map becomes a Vortex list of key/value structs.
+        let vortex_array =
+            ArrayRef::from_arrow(&arrow_map, true).expect("map should convert to a vortex array");
+        assert_eq!(vortex_array.len(), 3);
+        let list = vortex_array.as_::<List>();
+        assert_eq!(list.elements().len(), 3);
+        assert_eq!(list.elements().as_::<Struct>().names().len(), 2);
+
+        // Export: asking for the original Arrow `Map` type rebuilds a `MapArray`, not a list.
+        let field = Field::new("m", arrow_map.data_type().clone(), true);
+        let back = SESSION
+            .arrow()
+            .execute_arrow(
+                vortex_array,
+                Some(&field),
+                &mut SESSION.create_execution_ctx(),
+            )
+            .expect("vortex list should convert back to an arrow map");
+        let back = back
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .expect("export should produce a MapArray");
+        assert_eq!(back, &arrow_map);
     }
 }
