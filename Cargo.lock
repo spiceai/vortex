@@ -10166,6 +10166,7 @@ dependencies = [
  "pin-project-lite",
  "rstest",
  "rstest_reuse",
+ "tempfile",
  "tokio",
  "tracing",
  "url",
