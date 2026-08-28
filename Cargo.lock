@@ -10156,6 +10156,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "codspeed-divan-compat",
  "flatbuffers",
  "futures",
  "itertools 0.14.0",

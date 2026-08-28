@@ -30,6 +30,10 @@
     clippy::tests_outside_test_module,
     reason = "an integration test binary is entirely test code"
 )]
+#![expect(
+    clippy::cast_possible_truncation,
+    reason = "measured byte counts are far inside every cast's range"
+)]
 
 use std::alloc::GlobalAlloc;
 use std::alloc::Layout as AllocLayout;
@@ -41,13 +45,11 @@ use std::sync::PoisonError;
 use std::sync::RwLock;
 use std::sync::RwLockWriteGuard;
 use std::sync::atomic::AtomicIsize;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
 use futures::future::BoxFuture;
-use moka::future::Cache;
-use moka::future::CacheBuilder;
-use moka::policy::EvictionPolicy;
 use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
 use vortex_array::arrays::PrimitiveArray;
@@ -62,7 +64,6 @@ use vortex_array::stream::ArrayStreamExt;
 use vortex_array::validity::Validity;
 use vortex_buffer::Alignment;
 use vortex_buffer::ByteBuffer;
-use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
 use vortex_file::OpenOptionsSessionExt;
@@ -71,6 +72,7 @@ use vortex_io::CoalesceConfig;
 use vortex_io::VortexReadAt;
 use vortex_io::session::RuntimeSession;
 use vortex_io::session::RuntimeSessionExt;
+use vortex_layout::segments::MokaSegmentCache;
 use vortex_layout::segments::SegmentCache;
 use vortex_layout::segments::SegmentId;
 use vortex_layout::session::LayoutSession;
@@ -127,21 +129,8 @@ static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     session
 });
 
-/// The cache under investigation, rebuilt here so that moka's own view of what it holds -
-/// `weighted_size` and `entry_count`, and `run_pending_tasks` to settle eviction - is observable.
-/// Weigher, capacity units and eviction policy are copied from `MokaSegmentCache::new`; only the
-/// hasher differs, which does not affect weighing or eviction.
-fn mirror_of_moka_segment_cache(max_capacity_bytes: u64) -> Cache<SegmentId, ByteBuffer> {
-    CacheBuilder::new(max_capacity_bytes)
-        .weigher(|_, buffer: &ByteBuffer| {
-            u32::try_from(buffer.len().min(u32::MAX as usize)).vortex_expect("must fit")
-        })
-        .eviction_policy(EvictionPolicy::tiny_lfu())
-        .build()
-}
-
 /// A [`SegmentCache`] that records the buffer handed to every `put` without storing anything, so
-/// the recorded slices can be replayed into a cache under controlled conditions.
+/// the recorded slices can be replayed into a real cache under controlled conditions.
 #[derive(Default)]
 struct Recording {
     puts: Mutex<Vec<(SegmentId, ByteBuffer)>>,
@@ -159,6 +148,32 @@ impl SegmentCache for Recording {
             .unwrap_or_else(PoisonError::into_inner)
             .push((id, buffer));
         Ok(())
+    }
+}
+
+/// The two admission strategies under comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    /// `MokaSegmentCache::new` - copy the segment into its own allocation.
+    Compacting,
+    /// `MokaSegmentCache::new_sharing_windows` - store the slice as handed over, retaining the
+    /// coalesced read window behind it. The pre-fix behaviour.
+    SharingWindows,
+}
+
+impl Admission {
+    fn cache(self, budget: u64) -> MokaSegmentCache {
+        match self {
+            Self::Compacting => MokaSegmentCache::new(budget),
+            Self::SharingWindows => MokaSegmentCache::new_sharing_windows(budget),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Compacting => "compacting    ",
+            Self::SharingWindows => "sharing-window",
+        }
     }
 }
 
@@ -196,6 +211,11 @@ impl<R: VortexReadAt> VortexReadAt for RecordingReadAt<R> {
     }
 }
 
+/// Heap moka retains for its own bookkeeping beyond the entries themselves, after a run of
+/// inserts. Grows with insert activity, not with the budget; measured at 45-50KB for the 40-insert
+/// runs below.
+const MOKA_ACTIVITY_SLACK: isize = 128 << 10;
+
 const COLUMNS: usize = 40;
 const CHUNKS: usize = 8;
 const ROWS: usize = 4096;
@@ -222,6 +242,30 @@ async fn write_file(path: &std::path::Path) -> VortexResult<()> {
     let mut bytes = Vec::new();
     SESSION.write_options().write(&mut bytes, stream).await?;
     std::fs::write(path, &bytes).map_err(|e| vortex_err!("failed to write file: {e}"))?;
+    Ok(())
+}
+
+/// Scan `columns` from the file at `path` through `cache`, dropping everything the scan produced.
+async fn scan_through_cache(
+    path: &std::path::Path,
+    cache: Arc<dyn SegmentCache>,
+    columns: &[&str],
+) -> VortexResult<()> {
+    let file = SESSION
+        .open_options()
+        .with_segment_cache(cache)
+        .open_path(path)
+        .await?;
+
+    let array = file
+        .scan()?
+        .with_projection(select(columns.to_vec(), root()))
+        .into_array_stream()?
+        .read_all()
+        .await?;
+
+    drop(array);
+    drop(file);
     Ok(())
 }
 
@@ -285,14 +329,14 @@ fn scan_and_record(path: &std::path::Path, columns: &[&str]) -> VortexResult<Off
 
 /// What the cache thinks it holds, and what it actually retains.
 struct Accounting {
-    /// `sum(buffer.len())` over every admitted segment: what the weigher charged.
-    charged: usize,
-    /// Moka's own weighted size after eviction has settled.
+    /// Moka's own weighted size after eviction has settled: what the cache believes it holds.
     weighted: u64,
     entries: u64,
-    /// Heap released when the cache is dropped, less moka's own structural overhead: the segment
-    /// bytes the cache was really retaining.
-    retained: isize,
+    /// Heap released when the cache is dropped: buffers, map entries and moka's own tables.
+    retained_total: isize,
+    /// The same, less the heap an empty cache of the same budget retains, so this is the entries
+    /// alone without moka's fixed structural cost.
+    retained_entries: isize,
 }
 
 /// Heap released by dropping a settled cache holding `puts`. Takes ownership so that the cache is
@@ -300,16 +344,36 @@ struct Accounting {
 fn retained_by_cache(
     puts: Vec<(SegmentId, ByteBuffer)>,
     budget: u64,
+    admission: Admission,
 ) -> VortexResult<(isize, u64, u64)> {
-    let cache = mirror_of_moka_segment_cache(budget);
+    let cache = admission.cache(budget);
 
     let rt = runtime()?;
     rt.block_on(async {
         for (id, buffer) in puts {
-            cache.insert(id, buffer).await;
+            cache.put(id, buffer).await?;
         }
-        cache.run_pending_tasks().await;
-    });
+        // Moka applies queued writes and evictions in bounded batches, so a single
+        // `run_pending_tasks` leaves evicted values still queued and alive - measured at 2.86MB
+        // still held after one call where six calls settled to 266KB. Drain until the heap stops
+        // falling, then confirm with a couple of no-change iterations.
+        let mut stable = 0;
+        let mut previous = live();
+        for _ in 0..64 {
+            cache.run_pending_tasks().await;
+            let current = live();
+            if current >= previous {
+                stable += 1;
+                if stable == 3 {
+                    break;
+                }
+            } else {
+                stable = 0;
+            }
+            previous = current;
+        }
+        VortexResult::Ok(())
+    })?;
 
     let weighted = cache.weighted_size();
     let entries = cache.entry_count();
@@ -320,19 +384,20 @@ fn retained_by_cache(
     Ok((before - live(), weighted, entries))
 }
 
-/// Replay `puts` into a cache with `budget`, settle eviction, then measure. Moka's structural
-/// overhead is measured against an empty cache of the same budget and subtracted, so `retained`
-/// is segment bytes only.
-fn account(puts: Vec<(SegmentId, ByteBuffer)>, budget: u64) -> VortexResult<Accounting> {
-    let charged: usize = puts.iter().map(|(_, buffer)| buffer.len()).sum();
-    let (overhead, ..) = retained_by_cache(Vec::new(), budget)?;
-    let (total, weighted, entries) = retained_by_cache(puts, budget)?;
+/// Replay `puts` into a cache with `budget` under `admission`, settle eviction, then measure.
+fn account(
+    puts: Vec<(SegmentId, ByteBuffer)>,
+    budget: u64,
+    admission: Admission,
+) -> VortexResult<Accounting> {
+    let (empty, ..) = retained_by_cache(Vec::new(), budget, admission)?;
+    let (retained_total, weighted, entries) = retained_by_cache(puts, budget, admission)?;
 
     Ok(Accounting {
-        charged,
         weighted,
         entries,
-        retained: total - overhead,
+        retained_total,
+        retained_entries: retained_total - empty,
     })
 }
 
@@ -340,22 +405,27 @@ fn column_names() -> Vec<String> {
     (0..COLUMNS).map(|c| format!("column_number_{c}")).collect()
 }
 
-fn report(label: &str, budget: u64, a: &Accounting) {
+fn report(admission: Admission, budget: u64, a: &Accounting) {
     println!(
-        "{label}: budget {budget} B | moka holds {} entries weighing {} B | really retains {} B \
-         ({:.1}x budget)",
+        "  {} budget {:>9} | holds {:>3} entries weighing {:>9} B | retains {:>9} B total, \
+         {:>9} B in entries | {:>6.2}x budget",
+        admission.label(),
+        budget,
         a.entries,
         a.weighted,
-        a.retained,
-        a.retained as f64 / budget as f64,
+        a.retained_total,
+        a.retained_entries,
+        a.retained_entries as f64 / budget as f64,
     );
 }
 
-/// A cache squeezed below the size of its coalesced read windows evicts down to its budget by its
-/// own accounting, yet keeps retaining the windows in full: any one surviving slice pins its whole
-/// window, so eviction cannot release the memory.
+/// The core property the copy restores: a byte budget bounds the memory the cache retains.
+///
+/// Sharing windows, a cached slice pins the whole coalesced read window it was cut from, so the
+/// retained heap is set by the read pattern rather than the budget and eviction cannot release it.
+/// Compacting, every entry owns its bytes, so retained heap tracks the budget.
 #[test]
-fn evicted_segment_cache_still_retains_whole_coalesced_windows() -> VortexResult<()> {
+fn compacting_admission_keeps_retained_heap_within_budget() -> VortexResult<()> {
     let _m = measuring();
 
     let dir = tempfile::tempdir().map_err(|e| vortex_err!("tempdir: {e}"))?;
@@ -371,33 +441,74 @@ fn evicted_segment_cache_still_retains_whole_coalesced_windows() -> VortexResult
     {
         // One scan purely to describe the physical reads the cached slices are cut from.
         let offered = scan_and_record(&path, &all)?;
-        let mut reads = offered.reads.clone();
-        reads.sort_unstable();
         println!(
-            "file {file_size} B, {} segments offered to the cache, {} physical reads \
-             (largest {} B, total {} B)",
+            "file {file_size} B, {} segments offered, {} physical reads (largest {} B, total {} B)",
             offered.puts.len(),
-            reads.len(),
-            reads.last().copied().unwrap_or(0),
-            reads.iter().sum::<usize>(),
+            offered.reads.len(),
+            offered.reads.iter().max().copied().unwrap_or(0),
+            offered.reads.iter().sum::<usize>(),
         );
     }
 
-    for budget in [256u64 << 10, 512 << 10, 1 << 20] {
-        // A fresh scan per budget: the recorded slices must not outlive their own measurement.
-        let offered = scan_and_record(&path, &all)?;
-        let a = account(offered.puts, budget)?;
-        report("all columns", budget, &a);
+    // The last budget exceeds the file, so nothing evicts and the ratio isolates the accounting
+    // from the eviction behaviour.
+    for budget in [256u64 << 10, 512 << 10, 1 << 20, 8 << 20] {
+        for admission in [Admission::SharingWindows, Admission::Compacting] {
+            // A fresh scan per measurement: recorded slices must not outlive their own measurement.
+            let offered = scan_and_record(&path, &all)?;
+            let offered_count = offered.puts.len() as u64;
+            let a = account(offered.puts, budget, admission)?;
+            report(admission, budget, &a);
+            let evicted = a.entries < offered_count;
+
+            match admission {
+                Admission::Compacting => {
+                    // The cache's self-report must be truthful: retained heap is its weighted
+                    // size plus moka's own bookkeeping, which grows with insert *activity* rather
+                    // than with the budget (measured at 45-50KB for these 40-insert runs).
+                    assert!(
+                        a.retained_entries <= a.weighted as isize + MOKA_ACTIVITY_SLACK,
+                        "charged {} B but retains {} B, beyond the {MOKA_ACTIVITY_SLACK} B slack",
+                        a.weighted,
+                        a.retained_entries,
+                    );
+                    // Moka keeps weighted size under the budget, so the above bounds real memory.
+                    assert!(a.weighted <= budget, "moka exceeded its own capacity");
+                    // And the charge must not be so pessimistic that the budget under-fills.
+                    assert!(
+                        a.retained_entries as f64 >= a.weighted as f64 * 0.8,
+                        "charged {} B but only retains {} B: the weight is too pessimistic",
+                        a.weighted,
+                        a.retained_entries,
+                    );
+                }
+                // The pre-fix behaviour, asserted so this test fails if the comparison arm ever
+                // stops demonstrating the bug. Only overshoots once something has been evicted:
+                // with every slice of a window cached, the window is fully charged and the
+                // accounting happens to be right - which is why a full scan into a generous cache
+                // never exposed this.
+                Admission::SharingWindows if evicted => {
+                    assert!(
+                        a.retained_entries > a.weighted as isize * 2,
+                        "sharing windows retained {} B against a charge of {} B: expected the \
+                         pinned read window to dominate",
+                        a.retained_entries,
+                        a.weighted,
+                    );
+                }
+                Admission::SharingWindows => {}
+            }
+        }
     }
 
     Ok(())
 }
 
 /// Gap accounting: a projection whose columns sit within the coalescing distance of each other,
-/// but not adjacent, triggers one physical read spanning the columns in between. The cache is
-/// charged for the segments it asked for and retains the gap bytes for free.
+/// but not adjacent, triggers one physical read spanning the columns in between. Sharing windows,
+/// the cache retains those gap bytes for free; compacting, it does not retain them at all.
 #[test]
-fn projected_scan_segment_cache_retains_unrequested_gap_bytes() -> VortexResult<()> {
+fn compacting_admission_does_not_retain_unrequested_gap_bytes() -> VortexResult<()> {
     let _m = measuring();
 
     let dir = tempfile::tempdir().map_err(|e| vortex_err!("tempdir: {e}"))?;
@@ -412,25 +523,43 @@ fn projected_scan_segment_cache_retains_unrequested_gap_bytes() -> VortexResult<
         vec!["column_number_7", "column_number_12", "column_number_17"],
         vec!["column_number_0", "column_number_20", "column_number_39"],
     ] {
-        let offered = scan_and_record(&path, &columns)?;
-        let read_total: usize = offered.reads.iter().sum();
-        let largest_read = offered.reads.iter().max().copied().unwrap_or(0);
-        let reads = offered.reads.len();
-        let segments = offered.puts.len();
+        let descriptor = {
+            let offered = scan_and_record(&path, &columns)?;
+            format!(
+                "{} column(s), {} segments totalling {} B, {} physical reads totalling {} B \
+                 (largest {} B)",
+                columns.len(),
+                offered.puts.len(),
+                offered.puts.iter().map(|(_, b)| b.len()).sum::<usize>(),
+                offered.reads.len(),
+                offered.reads.iter().sum::<usize>(),
+                offered.reads.iter().max().copied().unwrap_or(0),
+            )
+        };
+        println!("{descriptor}");
 
-        // A budget large enough that nothing is evicted: the overshoot here is gap bytes alone.
-        let a = account(offered.puts, 1 << 30)?;
-        println!(
-            "{} of {COLUMNS} columns: {segments} segments charged {} B | {reads} physical reads \
-             totalling {read_total} B (largest {largest_read} B) | really retains {} B \
-             ({:.2}x charged)",
-            columns.len(),
-            a.charged,
-            a.retained,
-            a.retained as f64 / a.charged as f64,
-        );
-        assert_eq!(a.weighted, a.charged as u64, "nothing should have evicted");
-        assert_eq!(a.entries, segments as u64);
+        // A budget large enough that nothing is evicted, so any overshoot is gap bytes alone.
+        for admission in [Admission::SharingWindows, Admission::Compacting] {
+            let offered = scan_and_record(&path, &columns)?;
+            let wanted: usize = offered.puts.iter().map(|(_, b)| b.len()).sum();
+            let a = account(offered.puts, 1 << 30, admission)?;
+            println!(
+                "  {} retains {:>9} B in entries for {:>9} B of wanted segment bytes ({:.2}x)",
+                admission.label(),
+                a.retained_entries,
+                wanted,
+                a.retained_entries as f64 / wanted as f64,
+            );
+
+            if admission == Admission::Compacting {
+                // Own allocation per entry: len + alignment, plus the entry's own bookkeeping.
+                assert!(
+                    a.retained_entries < (wanted as isize * 3) / 2,
+                    "compacting admission retained {} B for {wanted} B of wanted bytes",
+                    a.retained_entries,
+                );
+            }
+        }
     }
 
     Ok(())
@@ -487,6 +616,201 @@ fn multi_file_footer_cache_kb_weigher_truncation() -> VortexResult<()> {
             footer_size.map_or_else(|| "none".to_string(), |b| b.to_string())
         );
     }
+
+    Ok(())
+}
+
+/// Calibration for `MokaSegmentCache`'s per-entry overhead charge.
+///
+/// A compacted value costs its own allocation (`len + *alignment`) plus fixed per-entry heap: the
+/// `Bytes` control block, moka's entry record, and its policy bookkeeping. That fixed cost is
+/// invisible in `len()` but dominates once segments are small, so the weigher charges a constant
+/// for it. This measures what the constant should be, using independently allocated buffers so no
+/// window sharing is involved.
+#[test]
+fn per_entry_overhead_calibration() -> VortexResult<()> {
+    let _m = measuring();
+
+    for segment_len in [64usize, 256, 1024, 8192, 65536] {
+        let count = 256;
+        // Budget high enough that nothing evicts, so every entry is held.
+        let puts: Vec<(SegmentId, ByteBuffer)> = (0..count)
+            .map(|i| {
+                (
+                    SegmentId::from(i as u32),
+                    ByteBuffer::copy_from(vec![i as u8; segment_len]),
+                )
+            })
+            .collect();
+
+        let a = account(puts, 1 << 30, Admission::Compacting)?;
+        let per_entry = a.retained_entries as f64 / count as f64;
+        println!(
+            "{count} x {segment_len:>6} B segments: charged {:>9} B, retains {:>9} B in entries \
+             -> {per_entry:>8.1} B/entry, overhead {:>6.1} B/entry",
+            a.weighted,
+            a.retained_entries,
+            per_entry - segment_len as f64,
+        );
+    }
+
+    Ok(())
+}
+
+/// A [`SegmentCache`] that counts hits and misses on the way through to a real cache.
+struct HitCounting {
+    inner: MokaSegmentCache,
+    hits: AtomicUsize,
+    misses: AtomicUsize,
+}
+
+#[async_trait]
+impl SegmentCache for HitCounting {
+    async fn get(&self, id: SegmentId) -> VortexResult<Option<ByteBuffer>> {
+        let result = self.inner.get(id).await?;
+        if result.is_some() {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(result)
+    }
+
+    async fn put(&self, id: SegmentId, buffer: ByteBuffer) -> VortexResult<()> {
+        self.inner.put(id, buffer).await
+    }
+}
+
+/// Outcome of populating a cache with one scan and then re-scanning through it.
+struct Reuse {
+    entries: u64,
+    hits: usize,
+    misses: usize,
+    /// Heap the cache retains once eviction has settled, less an empty cache of the same budget.
+    retained: isize,
+}
+
+/// Populate a cache with one full scan, re-scan through it, then measure what it retains.
+fn scan_twice(path: &std::path::Path, budget: u64, admission: Admission) -> VortexResult<Reuse> {
+    let (empty, ..) = retained_by_cache(Vec::new(), budget, admission)?;
+
+    let cache = Arc::new(HitCounting {
+        inner: admission.cache(budget),
+        hits: AtomicUsize::new(0),
+        misses: AtomicUsize::new(0),
+    });
+
+    let names = column_names();
+    let all: Vec<&str> = names.iter().map(String::as_str).collect();
+    let rt = runtime()?;
+
+    // First scan populates; counters are reset so the second scan alone is measured.
+    rt.block_on(scan_through_cache(
+        path,
+        Arc::clone(&cache) as Arc<dyn SegmentCache>,
+        &all,
+    ))?;
+    cache.hits.store(0, Ordering::Relaxed);
+    cache.misses.store(0, Ordering::Relaxed);
+
+    rt.block_on(scan_through_cache(
+        path,
+        Arc::clone(&cache) as Arc<dyn SegmentCache>,
+        &all,
+    ))?;
+
+    let hits = cache.hits.load(Ordering::Relaxed);
+    let misses = cache.misses.load(Ordering::Relaxed);
+
+    rt.block_on(async {
+        let mut stable = 0;
+        let mut previous = live();
+        for _ in 0..64 {
+            cache.inner.run_pending_tasks().await;
+            let current = live();
+            if current >= previous {
+                stable += 1;
+                if stable == 3 {
+                    break;
+                }
+            } else {
+                stable = 0;
+            }
+            previous = current;
+        }
+    });
+
+    let entries = cache.inner.entry_count();
+    let before = live();
+    drop(cache);
+    drop(rt);
+    let retained = before - live() - empty;
+
+    Ok(Reuse {
+        entries,
+        hits,
+        misses,
+        retained,
+    })
+}
+
+/// The practical payoff, stated in the units an operator actually has: for a given amount of real
+/// memory, how much of the file does the cache serve on a re-scan?
+///
+/// Comparing at equal *budget* understates the difference, because both arms then hold the same
+/// number of entries - one of them just uses far more memory to do it. Comparing at equal *memory*
+/// is the honest question.
+#[test]
+fn hit_rate_at_equal_memory() -> VortexResult<()> {
+    let _m = measuring();
+
+    let dir = tempfile::tempdir().map_err(|e| vortex_err!("tempdir: {e}"))?;
+    let path = dir.path().join("reuse.vortex");
+    runtime()?.block_on(write_file(&path))?;
+
+    // Undersized budget: the regime where the two arms diverge.
+    const BUDGET: u64 = 256 << 10;
+    let sharing = scan_twice(&path, BUDGET, Admission::SharingWindows)?;
+
+    // Give the compacting cache the memory the sharing cache actually consumed.
+    let equal_memory = sharing.retained.max(1) as u64;
+    let compacting = scan_twice(&path, equal_memory, Admission::Compacting)?;
+
+    for (label, budget, r) in [
+        ("sharing-window", BUDGET, &sharing),
+        ("compacting    ", equal_memory, &compacting),
+    ] {
+        let total = r.hits + r.misses;
+        println!(
+            "  {label} budget {budget:>9} B -> retains {:>9} B | {:>3} entries | \
+             re-scan {:>3}/{:<3} segments served ({:>5.1}% hit rate)",
+            r.retained,
+            r.entries,
+            r.hits,
+            total,
+            100.0 * r.hits as f64 / total as f64,
+        );
+    }
+
+    // Same memory, strictly more of the file served. The budget handed to the compacting arm is
+    // the sharing arm's measured footprint, so it may exceed it by its own bookkeeping.
+    //
+    // Note the sharing arm's footprint is not reproducible run to run - it depends on which slices
+    // happen to survive eviction and therefore on how many distinct read windows stay pinned,
+    // which moka's lazy eviction makes timing-dependent. Measured between 2.3MB and 5.4MB for this
+    // file against the same 256KB budget. That nondeterminism is itself part of the problem.
+    assert!(
+        compacting.retained <= sharing.retained + MOKA_ACTIVITY_SLACK,
+        "compacting used {} B against the {} B the sharing arm was measured at",
+        compacting.retained,
+        sharing.retained,
+    );
+    assert!(
+        compacting.hits > sharing.hits,
+        "for the same memory, compacting served {} segments vs {}",
+        compacting.hits,
+        sharing.hits,
+    );
 
     Ok(())
 }

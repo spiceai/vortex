@@ -48,36 +48,125 @@ impl SegmentCache for NoOpSegmentCache {
     }
 }
 
+/// Bytes charged per entry on top of its buffer, covering the `Bytes` control block, the map
+/// entry, and moka's per-entry policy bookkeeping.
+///
+/// Without this a cache of small segments overshoots badly: the cost is fixed per entry, so it
+/// dominates once segments are a few hundred bytes. Measured at a flat 483 B/entry against real
+/// retained heap, independent of segment size, by `per_entry_overhead_calibration` in
+/// `vortex-file/tests/segment_cache_size_accounting.rs`; rounded up so the charge never
+/// under-reports.
+const ENTRY_OVERHEAD: usize = 512;
+
+/// Heap bytes an admitted segment costs the cache: its own allocation plus per-entry overhead.
+///
+/// [`compact`] gives every value an allocation of `len + *alignment` bytes (see
+/// [`vortex_buffer::BufferMut::with_capacity_preferred_aligned`]), so this is exact rather than an
+/// estimate - which is the whole point of copying on admission.
+fn charged_bytes(buffer: &ByteBuffer) -> usize {
+    buffer.len() + *buffer.alignment() + ENTRY_OVERHEAD
+}
+
+/// Copy `buffer` into an allocation it exclusively owns, preserving its reported alignment.
+///
+/// Segments arrive as zero-copy slices of a coalesced read window: `CoalescedRequest::resolve`
+/// cuts one physical read into a slice per segment, and `Buffer`'s backing `Bytes` keeps that
+/// whole window alive while any slice of it lives. A cache storing such a slice therefore retains
+/// the entire window - up to `CoalesceConfig::max_size`, 4MB for a local file and 16MB for object
+/// storage - while `len()` reports only the slice.
+///
+/// That gap cannot be closed by weighing more accurately. `Buffer` maintains
+/// `length * size_of::<T>() == bytes.len()`, and `Bytes` exposes no capacity, so the size of the
+/// allocation a slice pins is not observable from the slice. Copying is what makes the weight
+/// truthful: after this, the value owns its bytes and nothing else is retained on its behalf.
+///
+/// The copy is unconditional for the same reason - there is no way to ask whether a given buffer
+/// is already the sole occupant of its allocation.
+fn compact(buffer: &ByteBuffer) -> ByteBuffer {
+    // `preferred_alignment: None` keeps the allocation at `len + *alignment` instead of
+    // over-aligning to `Alignment::DEFAULT_ALIGNMENT` and charging 256 bytes of slack per entry.
+    ByteBuffer::copy_from_preferred_aligned(buffer, buffer.alignment(), None)
+}
+
 /// A [`SegmentCache`] based around an in-memory Moka cache.
-pub struct MokaSegmentCache(Cache<SegmentId, ByteBuffer, FxBuildHasher>);
+///
+/// Segments are copied into their own allocation on admission; see [`compact`] for why, and
+/// [`Self::new_sharing_windows`] for the variant that does not.
+pub struct MokaSegmentCache {
+    cache: Cache<SegmentId, ByteBuffer, FxBuildHasher>,
+    compact_on_put: bool,
+}
 
 impl MokaSegmentCache {
     /// Construct a Moka-backed cache capped by total buffer bytes.
+    ///
+    /// Admitted segments are copied into their own allocation so that the cache retains exactly
+    /// what it charges itself for. See [`compact`].
     pub fn new(max_capacity_bytes: u64) -> Self {
-        Self(
-            CacheBuilder::new(max_capacity_bytes)
-                .name("vortex-segment-cache")
-                // Weight each segment by the number of bytes in the buffer.
-                .weigher(|_, buffer: &ByteBuffer| {
-                    u32::try_from(buffer.len().min(u32::MAX as usize)).vortex_expect("must fit")
-                })
-                // We configure LFU (vs LRU) since the cache is mostly used when re-reading the
-                // same file - it is _not_ used when reading the same segments during a single
-                // scan.
-                .eviction_policy(EvictionPolicy::tiny_lfu())
-                .build_with_hasher(FxBuildHasher),
-        )
+        Self {
+            cache: Self::build(max_capacity_bytes),
+            compact_on_put: true,
+        }
+    }
+
+    /// Construct a Moka-backed cache that stores admitted segments as-is.
+    ///
+    /// Cheaper on admission - no copy - but a cached segment then retains the whole coalesced read
+    /// window it was sliced from, so the cache's byte capacity stops bounding its memory. Provided
+    /// for benchmarking the two admission strategies against each other; prefer [`Self::new`].
+    pub fn new_sharing_windows(max_capacity_bytes: u64) -> Self {
+        Self {
+            cache: Self::build(max_capacity_bytes),
+            compact_on_put: false,
+        }
+    }
+
+    fn build(max_capacity_bytes: u64) -> Cache<SegmentId, ByteBuffer, FxBuildHasher> {
+        CacheBuilder::new(max_capacity_bytes)
+            .name("vortex-segment-cache")
+            .weigher(|_, buffer: &ByteBuffer| {
+                u32::try_from(charged_bytes(buffer).min(u32::MAX as usize))
+                    .vortex_expect("must fit")
+            })
+            // We configure LFU (vs LRU) since the cache is mostly used when re-reading the
+            // same file - it is _not_ used when reading the same segments during a single
+            // scan.
+            .eviction_policy(EvictionPolicy::tiny_lfu())
+            .build_with_hasher(FxBuildHasher)
+    }
+
+    /// Total weight of the entries currently held, in bytes, once eviction has settled.
+    pub fn weighted_size(&self) -> u64 {
+        self.cache.weighted_size()
+    }
+
+    /// Number of entries currently held, once eviction has settled.
+    pub fn entry_count(&self) -> u64 {
+        self.cache.entry_count()
+    }
+
+    /// Apply any pending admission and eviction work.
+    ///
+    /// Moka performs that work in the background, so [`Self::weighted_size`] and
+    /// [`Self::entry_count`] only reflect a settled cache after this resolves.
+    pub async fn run_pending_tasks(&self) {
+        self.cache.run_pending_tasks().await;
     }
 }
 
 #[async_trait]
 impl SegmentCache for MokaSegmentCache {
     async fn get(&self, id: SegmentId) -> VortexResult<Option<ByteBuffer>> {
-        Ok(self.0.get(&id).await)
+        Ok(self.cache.get(&id).await)
     }
 
     async fn put(&self, id: SegmentId, buffer: ByteBuffer) -> VortexResult<()> {
-        self.0.insert(id, buffer).await;
+        let buffer = if self.compact_on_put {
+            compact(&buffer)
+        } else {
+            buffer
+        };
+        self.cache.insert(id, buffer).await;
         Ok(())
     }
 }
