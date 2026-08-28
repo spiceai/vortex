@@ -34,6 +34,9 @@ mod union;
 
 use std::sync::Arc;
 
+/// Bytes an `Arc`/`Arc<[T]>` allocation adds on top of its payload: two `usize` reference counts.
+pub(crate) const ARC_OVERHEAD: usize = 2 * size_of::<usize>();
+
 /// The logical types of elements in Vortex arrays.
 ///
 /// `DType` represents the different logical data types that can be represented in a Vortex array.

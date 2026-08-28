@@ -44,6 +44,46 @@ static LAYOUT_VERIFIER: LazyLock<VerifierOptions> = LazyLock::new(|| {
     }
 });
 
+/// Approximate heap bytes retained by one materialised layout tree node.
+///
+/// Materialising a node allocates an `Arc<dyn Layout>` for the node itself, an
+/// `Arc<dyn LayoutChildren>` view over its serialized children, the `OnceCell` array that
+/// memoises those children, a clone of the node's [`DType`] (a freshly parsed
+/// [`StructFields`](vortex_array::dtype::StructFields) for a struct node) and its segment id
+/// list. The exact total is encoding- and schema-dependent, so this is a single conservative
+/// constant, chosen above the largest per-node cost measured across flat, wide, chunked and
+/// nested schemas. `footer_size_accounting` in `vortex-file/tests` is the regression test that
+/// keeps it honest.
+pub const APPROX_LAYOUT_NODE_BYTES: usize = 480;
+
+/// Approximate heap bytes a fully materialised layout tree will retain.
+///
+/// Computed from the serialized layout alone: the tree is walked in its flatbuffer form, so
+/// nothing is materialised and no [`LayoutRef`] is allocated. Callers use this to budget for a
+/// [`LayoutRef`] whose children are built lazily, and whose retained size therefore grows after
+/// it has been handed to a cache.
+pub fn approx_layout_tree_size(flatbuffer: impl AsRef<[u8]>) -> VortexResult<usize> {
+    let fb_layout = root_with_opts::<layout::Layout>(&LAYOUT_VERIFIER, flatbuffer.as_ref())?;
+    Ok(approx_tree_size_of(fb_layout))
+}
+
+/// [`approx_layout_tree_size`] over an already validated flatbuffer root.
+///
+/// Validation dominates the cost of the walk, so callers that have already validated the buffer
+/// go through here rather than paying for it twice.
+fn approx_tree_size_of(fb_layout: layout::Layout<'_>) -> usize {
+    fn count(layout: layout::Layout<'_>) -> usize {
+        1 + layout
+            .children()
+            .unwrap_or_default()
+            .iter()
+            .map(count)
+            .sum::<usize>()
+    }
+
+    count(fb_layout) * APPROX_LAYOUT_NODE_BYTES
+}
+
 /// Parse a [`LayoutRef`] from a layout flatbuffer.
 pub fn layout_from_flatbuffer(
     flatbuffer: FlatBuffer,
@@ -52,10 +92,14 @@ pub fn layout_from_flatbuffer(
     ctx: &ReadContext,
     session: &VortexSession,
 ) -> VortexResult<LayoutRef> {
-    layout_from_flatbuffer_with_options(flatbuffer, dtype, layout_ctx, ctx, session, false)
+    Ok(layout_from_flatbuffer_with_options(flatbuffer, dtype, layout_ctx, ctx, session, false)?.0)
 }
 
 /// Parse a [`LayoutRef`] from a layout flatbuffer with unknown-encoding behavior control.
+///
+/// Also returns [`approx_layout_tree_size`] for the parsed layout. The two are computed together
+/// because both need a validated flatbuffer, and validating it twice costs more than the walk
+/// itself.
 pub fn layout_from_flatbuffer_with_options(
     flatbuffer: FlatBuffer,
     dtype: &DType,
@@ -63,17 +107,21 @@ pub fn layout_from_flatbuffer_with_options(
     ctx: &ReadContext,
     session: &VortexSession,
     allow_unknown: bool,
-) -> VortexResult<LayoutRef> {
+) -> VortexResult<(LayoutRef, usize)> {
     let layout_session = session.layouts();
     let layouts = layout_session.registry();
     let fb_layout = root_with_opts::<layout::Layout>(&LAYOUT_VERIFIER, &flatbuffer)?;
+    let approx_tree_size = approx_tree_size_of(fb_layout);
     let encoding_id = layout_ctx
         .resolve(fb_layout.encoding())
         .ok_or_else(|| vortex_err!("Invalid encoding ID: {}", fb_layout.encoding()))?;
     let encoding = layouts.find(&encoding_id);
 
     if encoding.is_none() && allow_unknown {
-        return foreign_layout_from_fb(fb_layout, dtype, layout_ctx);
+        return Ok((
+            foreign_layout_from_fb(fb_layout, dtype, layout_ctx)?,
+            approx_tree_size,
+        ));
     }
     let encoding =
         encoding.ok_or_else(|| vortex_err!("Invalid encoding ID: {}", fb_layout.encoding()))?;
@@ -112,7 +160,7 @@ pub fn layout_from_flatbuffer_with_options(
         &build_ctx,
     )?;
 
-    Ok(layout)
+    Ok((layout, approx_tree_size))
 }
 
 fn foreign_layout_from_fb(
@@ -229,6 +277,7 @@ mod tests {
     use vortex_flatbuffers::layout as fbl;
     use vortex_session::registry::ReadContext;
 
+    use super::APPROX_LAYOUT_NODE_BYTES;
     use super::layout_from_flatbuffer_with_options;
     use crate::LayoutEncodingId;
     use crate::session::LayoutSession;
@@ -276,7 +325,7 @@ mod tests {
         let array_ctx = ReadContext::new([]);
         let session = vortex_array::array_session().with::<LayoutSession>();
 
-        let layout = layout_from_flatbuffer_with_options(
+        let (layout, approx_tree_size) = layout_from_flatbuffer_with_options(
             layout_buffer,
             &DType::Variant(Nullability::Nullable),
             &layout_ctx,
@@ -286,6 +335,11 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(
+            approx_tree_size,
+            2 * APPROX_LAYOUT_NODE_BYTES,
+            "the foreign layout and its single child"
+        );
         assert_eq!(layout.encoding_id().as_ref(), "vortex.test.foreign_layout");
         assert_eq!(layout.row_count(), 10);
         assert_eq!(layout.metadata(), vec![1, 2, 3]);

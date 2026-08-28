@@ -7,6 +7,7 @@ use std::fmt::Display;
 use std::fmt::Formatter;
 
 use itertools::Itertools;
+use vortex_buffer::Alignment;
 use vortex_buffer::BufferString;
 use vortex_buffer::ByteBuffer;
 use vortex_error::vortex_panic;
@@ -41,6 +42,27 @@ pub enum ScalarValue {
 }
 
 impl ScalarValue {
+    /// Approximate heap bytes retained by this value, excluding the size of the value itself.
+    pub fn approx_heap_size(&self) -> usize {
+        match self {
+            Self::Bool(_) | Self::Primitive(_) | Self::Decimal(_) => 0,
+            Self::Utf8(s) => s.len() + *Alignment::DEFAULT_ALIGNMENT,
+            Self::Binary(b) => b.len() + *Alignment::DEFAULT_ALIGNMENT,
+            Self::Tuple(values) => {
+                values.capacity() * size_of::<Option<ScalarValue>>()
+                    + values
+                        .iter()
+                        .map(|v| v.as_ref().map_or(0, Self::approx_heap_size))
+                        .sum::<usize>()
+            }
+            Self::Variant(scalar) => {
+                size_of::<Scalar>()
+                    + scalar.dtype().approx_heap_size()
+                    + scalar.value().map_or(0, Self::approx_heap_size)
+            }
+        }
+    }
+
     /// Returns the zero / identity value for the given [`DType`].
     pub(super) fn zero_value(dtype: &DType) -> Self {
         match dtype {

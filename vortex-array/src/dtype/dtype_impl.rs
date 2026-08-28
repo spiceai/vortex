@@ -11,6 +11,7 @@ use vortex_error::VortexExpect;
 use vortex_error::vortex_panic;
 
 use super::DType;
+use crate::dtype::ARC_OVERHEAD;
 use crate::dtype::FieldDType;
 use crate::dtype::FieldName;
 use crate::dtype::PType;
@@ -44,6 +45,25 @@ const _: [(); size_of::<DType>()] = [(); 12];
 impl DType {
     /// The default `DType` for bytes.
     pub const BYTES: Self = Primitive(PType::U8, Nullability::NonNullable);
+
+    /// Approximate heap bytes retained by this `DType`, excluding the 24 bytes of the value
+    /// itself.
+    ///
+    /// `List` and `FixedSizeList` element types are eagerly materialised and so are walked.
+    /// Struct fields and union variants are **not**: when read from a file they are lazily-parsed
+    /// flatbuffer views, and walking them would materialise the allocations being accounted for.
+    /// The result is therefore a lower bound for a dtype that has not been fully traversed yet.
+    pub fn approx_heap_size(&self) -> usize {
+        match self {
+            Null | Bool(_) | Primitive(..) | Decimal(..) | Utf8(_) | Binary(_) | Variant(_) => 0,
+            List(element, _) | FixedSizeList(element, ..) => {
+                ARC_OVERHEAD + size_of::<DType>() + element.approx_heap_size()
+            }
+            Struct(fields, _) => fields.approx_heap_size(),
+            Union(variants, _) => variants.approx_heap_size(),
+            Extension(_) => size_of::<ExtDTypeRef>(),
+        }
+    }
 
     /// Get the nullability of the `DType`.
     #[inline]

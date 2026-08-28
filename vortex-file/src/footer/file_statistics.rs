@@ -128,6 +128,31 @@ impl FileStatistics {
         }
     }
 
+    /// Approximate heap bytes retained by these statistics.
+    ///
+    /// Walks the per-field stats sets and their scalar values, which are fully materialised at
+    /// parse time. Field dtypes are measured with
+    /// [`DType::approx_heap_size`](vortex_array::dtype::DType::approx_heap_size), which does not
+    /// walk lazily-parsed struct fields.
+    pub fn approx_heap_size(&self) -> usize {
+        const ARC_OVERHEAD: usize = 2 * size_of::<usize>();
+
+        ARC_OVERHEAD
+            + self.stats.len() * size_of::<StatsSet>()
+            + ARC_OVERHEAD
+            + self.dtypes.len() * size_of::<DType>()
+            + self
+                .stats
+                .iter()
+                .map(StatsSet::approx_heap_size)
+                .sum::<usize>()
+            + self
+                .dtypes
+                .iter()
+                .map(DType::approx_heap_size)
+                .sum::<usize>()
+    }
+
     /// Returns a reference to the statistics sets.
     pub fn stats_sets(&self) -> &Arc<[StatsSet]> {
         &self.stats

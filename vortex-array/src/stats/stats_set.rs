@@ -42,6 +42,27 @@ pub struct StatsSet {
 }
 
 impl StatsSet {
+    /// Approximate heap bytes retained by this stats set, excluding the size of the set itself.
+    ///
+    /// A [`StatsSet`] keeps its first few entries inline, so a small set retains nothing on the
+    /// heap beyond whatever its scalar values point at.
+    pub fn approx_heap_size(&self) -> usize {
+        let spilled = if self.values.spilled() {
+            self.values.capacity() * size_of::<(Stat, Precision<ScalarValue>)>()
+        } else {
+            0
+        };
+        spilled
+            + self
+                .values
+                .iter()
+                .map(|(_, v)| match v {
+                    Precision::Exact(sv) | Precision::Inexact(sv) => sv.approx_heap_size(),
+                    Precision::Absent => 0,
+                })
+                .sum::<usize>()
+    }
+
     /// Create new StatSet without validating uniqueness of all the entries
     ///
     /// # Safety

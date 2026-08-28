@@ -11,6 +11,7 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_ensure_eq;
 
+use crate::dtype::ARC_OVERHEAD;
 use crate::dtype::DType;
 use crate::dtype::FieldDType;
 use crate::dtype::FieldNames;
@@ -258,6 +259,21 @@ impl UnionVariants {
     }
 
     /// Get the names of the variants in the union.
+    /// Approximate heap bytes retained by this `UnionVariants`.
+    ///
+    /// Like [`StructFields::approx_heap_size`](crate::dtype::StructFields::approx_heap_size),
+    /// nested variant dtypes are not walked.
+    pub fn approx_heap_size(&self) -> usize {
+        let nvariants = self.0.dtypes.len();
+        ARC_OVERHEAD
+            + size_of::<UnionVariantsInner>()
+            + ARC_OVERHEAD
+            + nvariants * size_of::<FieldDType>()
+            + ARC_OVERHEAD
+            + self.0.type_ids.len()
+            + self.0.names.approx_heap_size()
+    }
+
     pub fn names(&self) -> &FieldNames {
         &self.0.names
     }

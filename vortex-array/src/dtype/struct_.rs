@@ -15,6 +15,7 @@ use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
 use vortex_utils::aliases::hash_map::HashMap;
 
+use crate::dtype::ARC_OVERHEAD;
 use crate::dtype::DType;
 use crate::dtype::FieldName;
 use crate::dtype::FieldNames;
@@ -310,6 +311,28 @@ impl StructFields {
             names,
             dtypes.into(),
         )))
+    }
+
+    /// Approximate heap bytes retained by this `StructFields`.
+    ///
+    /// Counts the allocations this value owns directly: the shared inner state, the field dtype
+    /// array, the field name array and the field name strings.
+    ///
+    /// Nested field dtypes are deliberately **not** walked. For a `StructFields` read from a file
+    /// they are lazily-parsed flatbuffer views, and walking them would materialise exactly the
+    /// allocations the caller is trying to account for.
+    pub fn approx_heap_size(&self) -> usize {
+        let nfields = self.0.dtypes.len();
+        ARC_OVERHEAD
+            + size_of::<StructFieldsInner>()
+            + ARC_OVERHEAD
+            + nfields * size_of::<FieldDType>()
+            + self.0.names.approx_heap_size()
+            + self
+                .0
+                .indices
+                .get()
+                .map_or(0, |m| m.capacity() * size_of::<(FieldName, usize)>())
     }
 
     /// Get the names of the fields in the struct
