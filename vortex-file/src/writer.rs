@@ -41,7 +41,7 @@ use vortex_io::kanal_ext::KanalExt;
 use vortex_io::runtime::BlockingRuntime;
 use vortex_io::session::RuntimeSessionExt;
 use vortex_layout::LayoutStrategy;
-use vortex_layout::approx_layout_tree_size;
+use vortex_layout::approx_materialised_tree_size;
 use vortex_layout::layouts::file_stats::accumulate_stats;
 use vortex_layout::sequence::SequenceId;
 use vortex_layout::sequence::SequentialStreamAdapter;
@@ -252,12 +252,12 @@ impl VortexWriteOptions {
         );
 
         // Emit the footer buffers and EOF.
-        let (footer_buffers, layout_index) = footer
+        let footer_buffers = footer
             .clone()
             .into_serializer()
             .with_offset(position)
             .with_exclude_dtype(self.exclude_dtype)
-            .serialize_with_layout_index()?;
+            .serialize()?;
 
         // Record the size this footer would retain if it were read back and fully scanned, so a
         // footer taken straight from a write reports the same thing a parsed one does. See
@@ -265,8 +265,8 @@ impl VortexWriteOptions {
         // reader keeps the dtype, layout and footer segments but not the statistics segment,
         // postscript or EOF marker.
         let serialized_bytes = footer_buffers.iter().map(|b| b.len()).sum::<usize>();
-        let layout_tree_bytes = approx_layout_tree_size(&footer_buffers[layout_index])?;
-        footer = footer.with_approx_retained_size(serialized_bytes, layout_tree_bytes);
+        let layout_tree_bytes = approx_materialised_tree_size(footer.layout());
+        footer.set_approx_retained_size(serialized_bytes, layout_tree_bytes);
 
         for buffer in footer_buffers {
             position += buffer.len() as u64;

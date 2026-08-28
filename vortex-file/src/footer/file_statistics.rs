@@ -8,6 +8,9 @@
 //! and data exploration.
 use std::sync::Arc;
 
+/// Bytes an `Arc<[T]>` allocation adds on top of its payload: two `usize` reference counts.
+const ARC_OVERHEAD: usize = 2 * size_of::<usize>();
+
 use flatbuffers::FlatBufferBuilder;
 use flatbuffers::WIPOffset;
 use itertools::Itertools;
@@ -135,12 +138,10 @@ impl FileStatistics {
     /// [`DType::approx_heap_size`](vortex_array::dtype::DType::approx_heap_size), which does not
     /// walk lazily-parsed struct fields.
     pub fn approx_heap_size(&self) -> usize {
-        const ARC_OVERHEAD: usize = 2 * size_of::<usize>();
-
         ARC_OVERHEAD
-            + self.stats.len() * size_of::<StatsSet>()
+            + size_of_val(&*self.stats)
             + ARC_OVERHEAD
-            + self.dtypes.len() * size_of::<DType>()
+            + size_of_val(&*self.dtypes)
             + self
                 .stats
                 .iter()

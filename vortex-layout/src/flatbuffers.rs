@@ -44,44 +44,57 @@ static LAYOUT_VERIFIER: LazyLock<VerifierOptions> = LazyLock::new(|| {
     }
 });
 
-/// Approximate heap bytes retained by one materialised layout tree node.
+/// Approximate heap bytes retained by one materialised layout tree node, excluding the
+/// variable-size parts that [`approx_serialized_tree_size`] adds per node.
 ///
 /// Materialising a node allocates an `Arc<dyn Layout>` for the node itself, an
 /// `Arc<dyn LayoutChildren>` view over its serialized children, the `OnceCell` array that
-/// memoises those children, a clone of the node's [`DType`] (a freshly parsed
-/// [`StructFields`](vortex_array::dtype::StructFields) for a struct node) and its segment id
-/// list. The exact total is encoding- and schema-dependent, so this is a single conservative
-/// constant, chosen above the largest per-node cost measured across flat, wide, chunked and
-/// nested schemas. `footer_size_accounting` in `vortex-file/tests` is the regression test that
-/// keeps it honest.
-pub const APPROX_LAYOUT_NODE_BYTES: usize = 480;
+/// memoises those children and a clone of the node's [`DType`]. The exact total is encoding- and
+/// schema-dependent, so this is a single conservative constant, chosen above the largest
+/// per-node cost measured across flat, wide, chunked and nested schemas.
+/// `footer_size_accounting` in `vortex-file/tests` is the regression test that keeps it honest.
+const APPROX_LAYOUT_NODE_BYTES: usize = 480;
 
-/// Approximate heap bytes a fully materialised layout tree will retain.
+/// Approximate heap bytes a fully materialised layout tree will retain, walked over an already
+/// validated flatbuffer root.
 ///
-/// Computed from the serialized layout alone: the tree is walked in its flatbuffer form, so
-/// nothing is materialised and no [`LayoutRef`] is allocated. Callers use this to budget for a
+/// Nothing is materialised and no [`LayoutRef`] is allocated. Callers use this to budget for a
 /// [`LayoutRef`] whose children are built lazily, and whose retained size therefore grows after
 /// it has been handed to a cache.
-pub fn approx_layout_tree_size(flatbuffer: impl AsRef<[u8]>) -> VortexResult<usize> {
-    let fb_layout = root_with_opts::<layout::Layout>(&LAYOUT_VERIFIER, flatbuffer.as_ref())?;
-    Ok(approx_tree_size_of(fb_layout))
-}
-
-/// [`approx_layout_tree_size`] over an already validated flatbuffer root.
 ///
-/// Validation dominates the cost of the walk, so callers that have already validated the buffer
-/// go through here rather than paying for it twice.
-fn approx_tree_size_of(fb_layout: layout::Layout<'_>) -> usize {
-    fn count(layout: layout::Layout<'_>) -> usize {
-        1 + layout
-            .children()
-            .unwrap_or_default()
-            .iter()
-            .map(count)
-            .sum::<usize>()
+/// Beyond the flat per-node cost, each node is charged for the two parts a layout retains whose
+/// size is unbounded but readable straight from the flatbuffer: its metadata (which encodings
+/// such as flat and foreign layouts copy onto the heap per node) and its segment id list.
+fn approx_serialized_tree_size(fb_layout: layout::Layout<'_>) -> usize {
+    fn node_size(layout: layout::Layout<'_>) -> usize {
+        APPROX_LAYOUT_NODE_BYTES
+            + layout.metadata().map_or(0, |m| m.len())
+            + layout
+                .segments()
+                .map_or(0, |s| s.len() * size_of::<SegmentId>())
+            + layout
+                .children()
+                .unwrap_or_default()
+                .iter()
+                .map(node_size)
+                .sum::<usize>()
     }
 
-    count(fb_layout) * APPROX_LAYOUT_NODE_BYTES
+    node_size(fb_layout)
+}
+
+/// Approximate heap bytes an already materialised layout tree retains.
+///
+/// The in-memory counterpart of the estimate [`layout_from_flatbuffer_with_options`] returns.
+/// Use this when the tree is already in hand - a writer sizing the footer it just built - so that
+/// its serialized form does not have to be re-validated just to be counted.
+///
+/// This charges the flat per-node cost only. Unlike the flatbuffer walk it does not add each
+/// node's metadata and segment ids, because reading those from a materialised layout allocates,
+/// and it would do so once per node purely to measure. It therefore reads a few percent lower
+/// than the same tree measured through [`layout_from_flatbuffer_with_options`].
+pub fn approx_materialised_tree_size(layout: &LayoutRef) -> usize {
+    layout.depth_first_traversal().count() * APPROX_LAYOUT_NODE_BYTES
 }
 
 /// Parse a [`LayoutRef`] from a layout flatbuffer.
@@ -97,9 +110,9 @@ pub fn layout_from_flatbuffer(
 
 /// Parse a [`LayoutRef`] from a layout flatbuffer with unknown-encoding behavior control.
 ///
-/// Also returns [`approx_layout_tree_size`] for the parsed layout. The two are computed together
-/// because both need a validated flatbuffer, and validating it twice costs more than the walk
-/// itself.
+/// Also returns the approximate heap the fully materialised tree will retain. The two are
+/// computed together because both need a validated flatbuffer, and validating it twice costs
+/// more than the walk itself.
 pub fn layout_from_flatbuffer_with_options(
     flatbuffer: FlatBuffer,
     dtype: &DType,
@@ -111,7 +124,7 @@ pub fn layout_from_flatbuffer_with_options(
     let layout_session = session.layouts();
     let layouts = layout_session.registry();
     let fb_layout = root_with_opts::<layout::Layout>(&LAYOUT_VERIFIER, &flatbuffer)?;
-    let approx_tree_size = approx_tree_size_of(fb_layout);
+    let approx_tree_size = approx_serialized_tree_size(fb_layout);
     let encoding_id = layout_ctx
         .resolve(fb_layout.encoding())
         .ok_or_else(|| vortex_err!("Invalid encoding ID: {}", fb_layout.encoding()))?;
@@ -278,6 +291,7 @@ mod tests {
     use vortex_session::registry::ReadContext;
 
     use super::APPROX_LAYOUT_NODE_BYTES;
+    use super::SegmentId;
     use super::layout_from_flatbuffer_with_options;
     use crate::LayoutEncodingId;
     use crate::session::LayoutSession;
@@ -335,10 +349,11 @@ mod tests {
         )
         .unwrap();
 
+        // Two nodes at the flat per-node cost, plus each node's metadata (3 bytes at the root,
+        // 1 at the child) and the root's single segment id.
         assert_eq!(
             approx_tree_size,
-            2 * APPROX_LAYOUT_NODE_BYTES,
-            "the foreign layout and its single child"
+            2 * APPROX_LAYOUT_NODE_BYTES + 3 + 1 + size_of::<SegmentId>(),
         );
         assert_eq!(layout.encoding_id().as_ref(), "vortex.test.foreign_layout");
         assert_eq!(layout.row_count(), 10);

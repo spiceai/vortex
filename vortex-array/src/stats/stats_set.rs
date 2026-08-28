@@ -47,6 +47,7 @@ impl StatsSet {
     /// A [`StatsSet`] keeps its first few entries inline, so a small set retains nothing on the
     /// heap beyond whatever its scalar values point at.
     pub fn approx_heap_size(&self) -> usize {
+        // Note `StatsArray` is the smallvec's inline *backing array*, so size one element.
         let spilled = if self.values.spilled() {
             self.values.capacity() * size_of::<(Stat, Precision<ScalarValue>)>()
         } else {
@@ -56,9 +57,10 @@ impl StatsSet {
             + self
                 .values
                 .iter()
-                .map(|(_, v)| match v {
-                    Precision::Exact(sv) | Precision::Inexact(sv) => sv.approx_heap_size(),
-                    Precision::Absent => 0,
+                .map(|(_, v)| {
+                    v.as_ref()
+                        .into_inner()
+                        .map_or(0, ScalarValue::approx_heap_size)
                 })
                 .sum::<usize>()
     }

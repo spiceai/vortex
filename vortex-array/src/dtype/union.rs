@@ -15,6 +15,7 @@ use crate::dtype::ARC_OVERHEAD;
 use crate::dtype::DType;
 use crate::dtype::FieldDType;
 use crate::dtype::FieldNames;
+use crate::dtype::arc_slice_heap_size;
 
 /// Type information for a union array.
 ///
@@ -258,22 +259,25 @@ impl UnionVariants {
         ))))
     }
 
-    /// Get the names of the variants in the union.
     /// Approximate heap bytes retained by this `UnionVariants`.
     ///
     /// Like [`StructFields::approx_heap_size`](crate::dtype::StructFields::approx_heap_size),
-    /// nested variant dtypes are not walked.
+    /// variant dtypes still held as flatbuffer views are not walked.
     pub fn approx_heap_size(&self) -> usize {
-        let nvariants = self.0.dtypes.len();
         ARC_OVERHEAD
             + size_of::<UnionVariantsInner>()
-            + ARC_OVERHEAD
-            + nvariants * size_of::<FieldDType>()
-            + ARC_OVERHEAD
-            + self.0.type_ids.len()
+            + arc_slice_heap_size::<FieldDType>(self.0.dtypes.len())
+            + arc_slice_heap_size::<u8>(self.0.type_ids.len())
             + self.0.names.approx_heap_size()
+            + self
+                .0
+                .dtypes
+                .iter()
+                .map(FieldDType::approx_heap_size)
+                .sum::<usize>()
     }
 
+    /// Get the names of the variants in the union.
     pub fn names(&self) -> &FieldNames {
         &self.0.names
     }

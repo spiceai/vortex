@@ -64,15 +64,7 @@ impl FooterSerializer {
 
     /// Serialize the footer into a byte buffer that can later be deserialized as a [`Footer`].
     /// This can be helpful for storing some footer data out-of-band to accelerate opening a file.
-    pub fn serialize(self) -> VortexResult<Vec<ByteBuffer>> {
-        Ok(self.serialize_with_layout_index()?.0)
-    }
-
-    /// Serialize the footer, also returning the index of the layout buffer within the result.
-    ///
-    /// The writer needs the serialized layout to size the layout tree the footer will retain -
-    /// see [`Footer::approx_byte_size`](crate::Footer::approx_byte_size).
-    pub(crate) fn serialize_with_layout_index(mut self) -> VortexResult<(Vec<ByteBuffer>, usize)> {
+    pub fn serialize(mut self) -> VortexResult<Vec<ByteBuffer>> {
         let mut buffers = vec![];
 
         let dtype_segment = if self.exclude_dtype {
@@ -87,7 +79,6 @@ impl FooterSerializer {
         //  doesn't need to look anything up in the registry.
         let layout_ctx = LayoutContext::default();
 
-        let layout_index = buffers.len();
         let (buffer, layout_segment) = write_flatbuffer(
             &mut self.offset,
             &self.footer.layout().flatbuffer_writer(&layout_ctx),
@@ -141,7 +132,7 @@ impl FooterSerializer {
         eof[4..8].copy_from_slice(&MAGIC_BYTES);
         buffers.push(ByteBuffer::copy_from(eof));
 
-        Ok((buffers, layout_index))
+        Ok(buffers)
     }
 }
 

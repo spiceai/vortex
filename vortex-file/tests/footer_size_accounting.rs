@@ -19,21 +19,26 @@
 //! current-thread runtime rather than yielding to a shared one.
 
 // `parking_lot`'s fallback path allocates when a lock is contended, which would land inside
-// whichever measurement is in flight. The std mutex parks on a futex without allocating.
+// whichever measurement is in flight. The std locks park on a futex without allocating.
 #![expect(
     clippy::disallowed_types,
-    reason = "std Mutex parks without allocating; parking_lot would perturb the counting allocator"
+    reason = "std locks park without allocating; parking_lot would perturb the counting allocator"
 )]
 
 use std::alloc::GlobalAlloc;
 use std::alloc::Layout as AllocLayout;
 use std::alloc::System;
 use std::sync::LazyLock;
-use std::sync::Mutex;
+use std::sync::PoisonError;
+use std::sync::RwLock;
+use std::sync::RwLockReadGuard;
+use std::sync::RwLockWriteGuard;
 use std::sync::atomic::AtomicIsize;
 use std::sync::atomic::Ordering;
 
 use rstest::rstest;
+use rstest_reuse::apply;
+use rstest_reuse::template;
 use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
 use vortex_array::arrays::PrimitiveArray;
@@ -60,14 +65,19 @@ struct Counting;
 
 static LIVE: AtomicIsize = AtomicIsize::new(0);
 
-/// Serialises this binary's tests. [`LIVE`] is process-wide, so no test here may allocate while
-/// another is measuring.
-static MEASURE: Mutex<()> = Mutex::new(());
+/// [`LIVE`] is process-wide, so no test in this binary may allocate while another is measuring.
+/// Measuring tests take the write lock; tests that only need to not disturb one take the read
+/// lock and still run concurrently with each other.
+static MEASURE: RwLock<()> = RwLock::new(());
 
-/// Run `f` with no other test in this binary allocating concurrently.
-fn measured<T>(f: impl FnOnce() -> T) -> T {
-    let _guard = MEASURE.lock().unwrap_or_else(|e| e.into_inner());
-    f()
+/// Hold for the body of a test that reads [`LIVE`]. Nothing else in this binary runs meanwhile.
+fn measuring() -> RwLockWriteGuard<'static, ()> {
+    MEASURE.write().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Hold for the body of a test that allocates but does not measure.
+fn not_measuring() -> RwLockReadGuard<'static, ()> {
+    MEASURE.read().unwrap_or_else(PoisonError::into_inner)
 }
 
 unsafe impl GlobalAlloc for Counting {
@@ -134,29 +144,23 @@ fn chunk(shape: Shape, seed: u64) -> ArrayRef {
         }
     };
 
-    let mut names = Vec::with_capacity(shape.columns);
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(shape.columns);
-    for c in 0..shape.columns {
-        names.push(format!("column_number_{c}"));
+    let column = |c: usize| -> ArrayRef {
         if shape.nested == 0 {
-            columns.push(leaf(c));
+            leaf(c)
         } else {
-            let inner: Vec<String> = (0..shape.nested).map(|f| format!("field_{f}")).collect();
-            columns.push(
-                StructArray::new(
-                    FieldNames::from_iter(inner.iter().map(String::as_str)),
-                    (0..shape.nested).map(leaf).collect::<Vec<_>>(),
-                    shape.rows,
-                    Validity::NonNullable,
-                )
-                .into_array(),
-            );
+            StructArray::new(
+                FieldNames::from_iter((0..shape.nested).map(|f| format!("field_{f}"))),
+                (0..shape.nested).map(leaf).collect::<Vec<_>>(),
+                shape.rows,
+                Validity::NonNullable,
+            )
+            .into_array()
         }
-    }
+    };
 
     StructArray::new(
-        FieldNames::from_iter(names.iter().map(String::as_str)),
-        columns,
+        FieldNames::from_iter((0..shape.columns).map(|c| format!("column_number_{c}"))),
+        (0..shape.columns).map(column).collect::<Vec<_>>(),
         shape.rows,
         Validity::NonNullable,
     )
@@ -191,10 +195,7 @@ async fn write_file_async(shape: Shape) -> VortexResult<ByteBuffer> {
 
 /// Materialise every child layout, as scanning the whole file does.
 fn materialise(layout: &LayoutRef) -> VortexResult<()> {
-    for i in 0..layout.nchildren() {
-        materialise(&layout.child(i)?)?;
-    }
-    Ok(())
+    layout.children()?.iter().try_for_each(materialise)
 }
 
 fn open_footer(file: &ByteBuffer) -> VortexResult<Footer> {
@@ -241,94 +242,92 @@ const TINY: Shape = Shape {
     statistics: true,
 };
 
+/// The shapes both tests run over.
+#[template]
+#[rstest]
+#[case::flat(FLAT)]
+#[case::wide(WIDE)]
+#[case::nested(NESTED)]
+#[case::no_stats(NO_STATS)]
+#[case::tiny(TINY)]
+fn shapes(#[case] shape: Shape) {}
+
 /// A cached footer's reported size must not change when a scan materialises its layout tree.
 ///
 /// DataFusion's `DefaultFilesMetadataCache` subtracts `memory_size()` at eviction, having added it
 /// at admission; if the value grew in between, its `memory_used` underflows.
-#[rstest]
-#[case::flat(FLAT)]
-#[case::wide(WIDE)]
-#[case::nested(NESTED)]
-#[case::no_stats(NO_STATS)]
-#[case::tiny(TINY)]
+#[apply(shapes)]
 fn approx_byte_size_is_stable_across_scans(#[case] shape: Shape) -> VortexResult<()> {
-    measured(|| {
-        let file = write_file(shape)?;
-        let footer = open_footer(&file)?;
+    let _guard = not_measuring();
+    let file = write_file(shape)?;
+    let footer = open_footer(&file)?;
 
-        let on_admission = footer.approx_byte_size();
-        assert!(on_admission.is_some(), "a parsed footer must report a size");
+    let on_admission = footer.approx_byte_size();
+    assert!(on_admission.is_some(), "a parsed footer must report a size");
 
-        // A cache hands the same footer back to every scan, so the tree is built into this object.
-        for _ in 0..3 {
-            materialise(footer.layout())?;
-            assert_eq!(
-                footer.approx_byte_size(),
-                on_admission,
-                "approx_byte_size changed after a scan; caches that record it at admission and \
+    // A cache hands the same footer back to every scan, so the tree is built into this object.
+    for _ in 0..3 {
+        materialise(footer.layout())?;
+        assert_eq!(
+            footer.approx_byte_size(),
+            on_admission,
+            "approx_byte_size changed after a scan; caches that record it at admission and \
              subtract it at eviction will underflow",
-            );
-        }
+        );
+    }
 
-        Ok(())
-    })
+    Ok(())
 }
 
 /// The reported size must be close to the heap the footer really retains, and must not
 /// under-report: a cache bounded by an under-reported size holds a multiple of its budget.
-#[rstest]
-#[case::flat(FLAT)]
-#[case::wide(WIDE)]
-#[case::nested(NESTED)]
-#[case::no_stats(NO_STATS)]
-#[case::tiny(TINY)]
+#[apply(shapes)]
 fn approx_byte_size_tracks_retained_heap(#[case] shape: Shape) -> VortexResult<()> {
-    measured(|| {
-        let file = write_file(shape)?;
+    let _guard = measuring();
+    let file = write_file(shape)?;
 
-        // Warm every lazily-initialised registry so it is not charged to the measurement.
-        materialise(open_footer(&file)?.layout())?;
+    // Warm every lazily-initialised registry so it is not charged to the measurement.
+    materialise(open_footer(&file)?.layout())?;
 
-        let before = live();
-        let footer = open_footer(&file)?;
-        materialise(footer.layout())?;
-        let retained = live() - before;
-        let reported = footer
-            .approx_byte_size()
-            .expect("a parsed footer must report a size") as isize;
-        drop(footer);
-        let after_drop = live() - before;
+    let before = live();
+    let footer = open_footer(&file)?;
+    materialise(footer.layout())?;
+    let retained = live() - before;
+    let reported = footer
+        .approx_byte_size()
+        .expect("a parsed footer must report a size") as isize;
+    drop(footer);
+    let after_drop = live() - before;
 
-        assert!(
-            retained > 0,
-            "expected the footer to retain something, measured {retained} bytes",
-        );
+    assert!(
+        retained > 0,
+        "expected the footer to retain something, measured {retained} bytes",
+    );
 
-        // Under-reporting is the failure that matters: it is what let a 50MB cache budget hold an
-        // order of magnitude more. Allow a little slack for allocator differences across platforms.
-        assert!(
-            reported * 5 >= retained * 4,
-            "approx_byte_size under-reports: reported {reported} B for {retained} B of retained heap \
+    // Under-reporting is the failure that matters: it is what let a 50MB cache budget hold an
+    // order of magnitude more. Allow a little slack for allocator differences across platforms.
+    assert!(
+        reported * 5 >= retained * 4,
+        "approx_byte_size under-reports: reported {reported} B for {retained} B of retained heap \
          ({:.1}x). {shape:?}",
-            retained as f64 / reported as f64,
-        );
+        retained as f64 / reported as f64,
+    );
 
-        // Over-reporting is safe but wasteful, and a large drift means the estimate has stopped
-        // tracking what a footer actually holds.
-        assert!(
-            reported <= retained * 2,
-            "approx_byte_size over-reports: reported {reported} B for {retained} B of retained heap \
+    // Over-reporting is safe but wasteful, and a large drift means the estimate has stopped
+    // tracking what a footer actually holds.
+    assert!(
+        reported <= retained * 2,
+        "approx_byte_size over-reports: reported {reported} B for {retained} B of retained heap \
          ({:.1}x). {shape:?}",
-            reported as f64 / retained as f64,
-        );
+        reported as f64 / retained as f64,
+    );
 
-        // Nothing measured above may outlive the footer.
-        assert!(
-            after_drop < retained / 4,
-            "dropping the footer left {after_drop} of {retained} bytes live; the footer graph is \
+    // Nothing measured above may outlive the footer.
+    assert!(
+        after_drop < retained / 4,
+        "dropping the footer left {after_drop} of {retained} bytes live; the footer graph is \
          holding on to something",
-        );
+    );
 
-        Ok(())
-    })
+    Ok(())
 }

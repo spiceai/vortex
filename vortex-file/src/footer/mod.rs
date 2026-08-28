@@ -40,13 +40,6 @@ use vortex_layout::layout_from_flatbuffer_with_options;
 use vortex_session::VortexSession;
 use vortex_session::registry::ReadContext;
 
-/// Bytes of slack a [`ByteBuffer`] allocation carries beyond its payload, from the default
-/// over-alignment applied by
-/// [`BufferMut::with_capacity_preferred_aligned`](vortex_buffer::BufferMut::with_capacity_preferred_aligned).
-fn buffer_alloc_slack() -> usize {
-    *Alignment::DEFAULT_ALIGNMENT
-}
-
 /// Captures the layout information of a Vortex file.
 #[derive(Debug, Clone)]
 pub struct Footer {
@@ -75,20 +68,28 @@ impl Footer {
         }
     }
 
-    pub(crate) fn with_approx_byte_size(mut self, approx_byte_size: usize) -> Self {
-        self.approx_byte_size = Some(approx_byte_size);
-        self
-    }
-
     /// Record [`Self::approx_byte_size`] from the sizes only the caller knows: the serialized
-    /// footer segments it wrote, and the layout tree those segments describe.
-    pub(crate) fn with_approx_retained_size(
-        self,
+    /// footer segments, and the layout tree those segments describe.
+    ///
+    /// The layout tree is charged up front even though it is built lazily. A [`Footer`] is handed
+    /// to caches that record its size once, at admission, and subtract that same accessor's value
+    /// at eviction; a size that grew in between would drive their accounting negative.
+    pub(crate) fn set_approx_retained_size(
+        &mut self,
         serialized_bytes: usize,
         layout_tree_bytes: usize,
-    ) -> Self {
-        let size = self.approx_retained_size(serialized_bytes, layout_tree_bytes);
-        self.with_approx_byte_size(size)
+    ) {
+        self.approx_byte_size = Some(
+            serialized_bytes
+                + layout_tree_bytes
+                + self.dtype().approx_heap_size()
+                + self
+                    .statistics
+                    .as_ref()
+                    .map_or(0, FileStatistics::approx_heap_size)
+                + size_of_val(&*self.segments)
+                + size_of_val(self.array_read_ctx.ids()),
+        );
     }
 
     /// Read the [`Footer`] from a flatbuffer.
@@ -100,14 +101,15 @@ impl Footer {
         statistics: Option<FileStatistics>,
         session: &VortexSession,
     ) -> VortexResult<Self> {
-        // The footer keeps a private copy of each flatbuffer segment it parsed, and every copy
-        // carries the over-alignment slack `BufferMut` adds. A file written with
-        // `exclude_dtype` has no dtype segment.
-        let dtype_buffers = usize::from(dtype_bytes_len > 0);
+        // The footer keeps a private copy of each flatbuffer segment it parsed - the footer and
+        // layout segments, plus the dtype segment unless the file was written with
+        // `exclude_dtype` - and `BufferMut` over-aligns every one of them to
+        // `Alignment::DEFAULT_ALIGNMENT`, so each carries up to that much slack.
+        let retained_segments = 2 + usize::from(dtype_bytes_len > 0);
         let serialized_bytes = footer_bytes.len()
             + layout_bytes.len()
             + dtype_bytes_len
-            + (2 + dtype_buffers) * buffer_alloc_slack();
+            + retained_segments * *Alignment::DEFAULT_ALIGNMENT;
         let fb_footer = root::<fb::Footer>(&footer_bytes)?;
 
         // Create a LayoutContext from the registry.
@@ -153,37 +155,9 @@ impl Footer {
             vortex_bail!("Segment offsets are not ordered");
         }
 
-        let footer = Self {
-            root_layout,
-            segments,
-            statistics,
-            array_read_ctx,
-            approx_byte_size: None,
-        };
-        let approx_byte_size = footer.approx_retained_size(serialized_bytes, layout_tree_bytes);
-        Ok(footer.with_approx_byte_size(approx_byte_size))
-    }
-
-    /// Approximate heap bytes this footer retains once its layout tree is fully materialised.
-    ///
-    /// `serialized_bytes` is the size of the flatbuffer copies the footer holds on to, and
-    /// `layout_tree_bytes` the estimated cost of the materialised layout tree - see
-    /// [`approx_layout_tree_size`].
-    ///
-    /// The layout tree is deliberately charged up front. A [`Footer`] is handed to caches that
-    /// record its size once, at admission, and subtract that same accessor's value at eviction; a
-    /// size that grew in between would drive their accounting negative. See
-    /// [`Self::approx_byte_size`].
-    fn approx_retained_size(&self, serialized_bytes: usize, layout_tree_bytes: usize) -> usize {
-        serialized_bytes
-            + layout_tree_bytes
-            + self.dtype().approx_heap_size()
-            + self
-                .statistics
-                .as_ref()
-                .map_or(0, FileStatistics::approx_heap_size)
-            + self.segments.len() * size_of::<SegmentSpec>()
-            + size_of_val(self.array_read_ctx.ids())
+        let mut footer = Self::new(root_layout, segments, statistics, array_read_ctx);
+        footer.set_approx_retained_size(serialized_bytes, layout_tree_bytes);
+        Ok(footer)
     }
 
     /// Returns the root [`LayoutRef`] of the file.

@@ -10,6 +10,7 @@ use itertools::Itertools;
 use vortex_utils::aliases::StringEscape;
 
 use crate::dtype::ARC_OVERHEAD;
+use crate::dtype::arc_slice_heap_size;
 
 /// A name for a field in a struct.
 #[derive(Clone, Debug, Eq, PartialOrd, Ord, Hash)]
@@ -157,8 +158,7 @@ impl FieldNames {
     /// Approximate heap bytes retained by this `FieldNames`: the shared array plus each name's
     /// string allocation.
     pub fn approx_heap_size(&self) -> usize {
-        ARC_OVERHEAD
-            + self.0.len() * size_of::<FieldName>()
+        arc_slice_heap_size::<FieldName>(self.0.len())
             + self
                 .0
                 .iter()

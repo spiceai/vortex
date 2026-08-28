@@ -10165,6 +10165,7 @@ dependencies = [
  "parking_lot",
  "pin-project-lite",
  "rstest",
+ "rstest_reuse",
  "tokio",
  "tracing",
  "url",
