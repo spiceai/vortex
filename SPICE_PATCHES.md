@@ -50,7 +50,8 @@ exists: a grep proves presence, a test proves behaviour.
 | 4 | Fixed-offset timezone resolution | `6cdea73d6` (#75), `5b4bee108` (#78) | Panic `failed to find time zone '+00:00'` for a `timestamptz` column | `test -f vortex-array/src/extension/datetime/timezone.rs` | No |
 | 5 | Balance `list_contains` OR tree | `d694abda6` (#37) | Plan blowup on large `IN`-list filters | — (needs a check) | No |
 | 6 | Avoid session lock re-entry in writer init | `c536c9aed` (#29) | Deadlock in `vortex-file` writer initialisation | — (needs a check) | No |
-| 7 | `vortex.date` → `vortex.timestamp` extension casts | `7e5b08151` (#28) | Missing cast between extension types | — (needs a check) | No |
+| 7 | `vortex.date` → `vortex.timestamp` extension casts | `7e5b08151` (#28) | Missing cast between extension types | `cargo test -p vortex-array --lib arrays::extension::compute::cast` | No |
+| 15 | `vortex.date` → `vortex.timestamp` **scalar** cast | this change | Row 7 covers arrays only. A scan casts a file's `min`/`max` statistic — a scalar — through the same expression, and `Scalar::cast` routed an extension source through the *target's* storage type: `date[days]` failed the scan outright, and `date[ms]` shares `i64` with `timestamp[ns]`, so it silently returned an instant 10^6 too small and pruned files that held matching rows (spiceai/spiceai#13624) | `cargo test -p vortex-array --lib scalar::typed_view::extension::tests::test_ext_scalar_cast` | No |
 | 8 | N-ary `CASE WHEN` expression | `4bfa4331b` (#12), `df23c3797` | Expression support required by pushdown | — (needs a check) | Possibly upstream |
 | 9 | Unsupported pushdown node bubbles `TRUE` | `8044a8470` (#8) | Pushdown erroring instead of degrading to "keep row"; empty `IN` list | — (needs a check) | No |
 | 10 | `UncompressedSizeInBytes` statistic handling | `6712e9ffa` (#3) | Incorrect statistic propagation | — (needs a check) | No |

@@ -3,7 +3,6 @@
 
 use vortex_buffer::BufferMut;
 use vortex_error::VortexResult;
-use vortex_error::vortex_bail;
 
 use crate::ArrayRef;
 use crate::ExecutionCtx;
@@ -19,6 +18,8 @@ use crate::dtype::PType;
 use crate::extension::datetime::AnyTemporal;
 use crate::extension::datetime::TemporalMetadata;
 use crate::extension::datetime::TimeUnit;
+use crate::extension::datetime::convert_temporal_value;
+use crate::extension::datetime::date_to_timestamp_scale;
 use crate::scalar_fn::fns::cast::CastKernel;
 use crate::scalar_fn::fns::cast::CastReduce;
 use crate::validity::Validity;
@@ -159,59 +160,6 @@ fn cast_date_values_to_timestamp(
     }
 
     Ok(PrimitiveArray::new(output.freeze(), validity))
-}
-
-fn date_to_timestamp_scale(
-    source_unit: TimeUnit,
-    target_unit: TimeUnit,
-) -> VortexResult<(i64, i64)> {
-    let source_ns = to_nanoseconds(source_unit)?;
-    let target_ns = to_nanoseconds(target_unit)?;
-
-    if source_ns >= target_ns {
-        let multiply = source_ns / target_ns;
-        return Ok((multiply, 1));
-    }
-
-    let divide = target_ns / source_ns;
-    Ok((1, divide))
-}
-
-fn to_nanoseconds(unit: TimeUnit) -> VortexResult<i64> {
-    match unit {
-        TimeUnit::Nanoseconds => Ok(1),
-        TimeUnit::Microseconds => Ok(1_000),
-        TimeUnit::Milliseconds => Ok(1_000_000),
-        TimeUnit::Seconds => Ok(1_000_000_000),
-        TimeUnit::Days => Ok(86_400_000_000_000),
-    }
-}
-
-fn convert_temporal_value(value: i64, multiply: i64, divide: i64) -> VortexResult<i64> {
-    let mut scaled = i128::from(value)
-        .checked_mul(i128::from(multiply))
-        .ok_or_else(|| {
-            vortex_error::vortex_err!(
-                Compute: "Date value {value} overflows while scaling to timestamp"
-            )
-        })?;
-
-    if divide != 1 {
-        let divisor = i128::from(divide);
-        if scaled % divisor != 0 {
-            vortex_bail!(
-                Compute: "Date value {value} cannot be represented exactly in target timestamp unit"
-            );
-        }
-        scaled /= divisor;
-    }
-
-    if scaled < i128::from(i64::MIN) || scaled > i128::from(i64::MAX) {
-        vortex_bail!(Compute: "Date value {value} overflows target timestamp range");
-    }
-
-    i64::try_from(scaled)
-        .map_err(|_| vortex_error::vortex_err!(Compute: "Date value {value} overflows target timestamp range"))
 }
 
 #[cfg(test)]

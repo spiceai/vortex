@@ -320,3 +320,154 @@ fn test_ext_scalar_with_metadata() {
     let ext = scalar.as_extension();
     assert_eq!(ext.ext_dtype().metadata::<TestExtMetadata>(), &1234);
 }
+
+/// A `vortex.date` scalar has to convert into a `vortex.timestamp` one, not be re-labelled.
+///
+/// A scan falsifies `cast(col as timestamp) > lit` into `cast(max(col) as timestamp) <= lit`
+/// and binds `max(col)` to a literal, so this cast decides whether a file is read at all.
+/// Casting through the target's storage type instead — which is what happens when an
+/// extension source is not given the chance to convert itself — hands back the date's own
+/// number under the timestamp's meaning, and the two share `i64` storage for `Date64`, so it
+/// does not even fail: the file is pruned and its matching rows never load.
+#[test]
+fn test_ext_scalar_cast_date_to_timestamp() {
+    use crate::extension::datetime::Date;
+    use crate::extension::datetime::TimeUnit;
+    use crate::extension::datetime::Timestamp;
+
+    // 2024-03-01, as days and as milliseconds since the epoch.
+    const DAYS: i32 = 19_783;
+    const MILLIS: i64 = 1_709_251_200_000;
+    const NANOS: i64 = 1_709_251_200_000_000_000;
+
+    let nanos_dtype =
+        DType::Extension(Timestamp::new(TimeUnit::Nanoseconds, Nullability::NonNullable).erased());
+
+    let from_days = Scalar::try_new(
+        DType::Extension(Date::new(TimeUnit::Days, Nullability::NonNullable).erased()),
+        Some(DAYS.into()),
+    )
+    .unwrap();
+    let casted = from_days.cast(&nanos_dtype).unwrap();
+    assert_eq!(casted.dtype(), &nanos_dtype);
+    assert_eq!(
+        casted.as_extension().to_storage_scalar(),
+        Scalar::primitive(NANOS, Nullability::NonNullable),
+        "a date in days has to scale into the target's unit"
+    );
+
+    let from_millis = Scalar::try_new(
+        DType::Extension(Date::new(TimeUnit::Milliseconds, Nullability::NonNullable).erased()),
+        Some(MILLIS.into()),
+    )
+    .unwrap();
+    let casted = from_millis.cast(&nanos_dtype).unwrap();
+    assert_eq!(casted.dtype(), &nanos_dtype);
+    assert_eq!(
+        casted.as_extension().to_storage_scalar(),
+        Scalar::primitive(NANOS, Nullability::NonNullable),
+        "sharing i64 storage with the target is not a reason to skip the conversion"
+    );
+}
+
+/// The scalar cast has to land on the same instant as the array kernel.
+///
+/// One of the two is applied to a file's statistics and the other to its rows, so a
+/// disagreement between them is not a type error — it is a file pruned by a comparison the
+/// row filter would never have made.
+#[test]
+fn test_ext_scalar_cast_date_to_timestamp_matches_the_array_kernel() {
+    use crate::IntoArray;
+    use crate::arrays::ExtensionArray;
+    use crate::arrays::PrimitiveArray;
+    use crate::builtins::ArrayBuiltins;
+    use crate::executor::VortexSessionExecute;
+    use crate::extension::datetime::Date;
+    use crate::extension::datetime::TimeUnit;
+    use crate::extension::datetime::Timestamp;
+
+    let session = crate::array_session();
+    let mut ctx = session.create_execution_ctx();
+
+    for (source_unit, values) in [
+        (TimeUnit::Days, vec![0i64, 19_783, -1]),
+        (
+            TimeUnit::Milliseconds,
+            vec![0i64, 1_709_251_200_000, -86_400_000],
+        ),
+    ] {
+        for target_unit in [
+            TimeUnit::Seconds,
+            TimeUnit::Milliseconds,
+            TimeUnit::Microseconds,
+            TimeUnit::Nanoseconds,
+        ] {
+            let source_dtype = Date::new(source_unit, Nullability::NonNullable).erased();
+            let target_dtype =
+                DType::Extension(Timestamp::new(target_unit, Nullability::NonNullable).erased());
+
+            let storage = if source_unit == TimeUnit::Days {
+                PrimitiveArray::from_iter(values.iter().map(|v| i32::try_from(*v).unwrap()))
+                    .into_array()
+            } else {
+                PrimitiveArray::from_iter(values.iter().copied()).into_array()
+            };
+            let array = ExtensionArray::new(source_dtype.clone(), storage).into_array();
+            let casted = array
+                .cast(target_dtype.clone())
+                .and_then(|a| a.execute::<ExtensionArray>(&mut ctx));
+
+            for (idx, value) in values.iter().enumerate() {
+                let scalar_value = if source_unit == TimeUnit::Days {
+                    i32::try_from(*value).unwrap().into()
+                } else {
+                    (*value).into()
+                };
+                let scalar =
+                    Scalar::try_new(DType::Extension(source_dtype.clone()), Some(scalar_value))
+                        .unwrap();
+                let scalar_cast = scalar.cast(&target_dtype);
+
+                match &casted {
+                    Ok(array) => {
+                        let expected = array
+                            .clone()
+                            .into_array()
+                            .execute_scalar(idx, &mut ctx)
+                            .unwrap();
+                        assert_eq!(
+                            scalar_cast.unwrap(),
+                            expected,
+                            "{source_unit} -> {target_unit} disagrees at index {idx}"
+                        );
+                    }
+                    Err(_) => assert!(
+                        scalar_cast.is_err(),
+                        "{source_unit} -> {target_unit} converts a scalar the array kernel refuses"
+                    ),
+                }
+            }
+        }
+    }
+}
+
+/// A pair of extension types with no defined conversion has to be refused, not re-labelled.
+///
+/// `vortex.timestamp[ms]` and `vortex.timestamp[ns]` both store `i64`, so re-labelling one as
+/// the other returns an instant a million times too small without any error. The array kernel
+/// refuses this pair, and so must the scalar cast.
+#[test]
+fn test_ext_scalar_cast_between_timestamp_units_is_refused() {
+    use crate::extension::datetime::TimeUnit;
+    use crate::extension::datetime::Timestamp;
+
+    let millis = Scalar::try_new(
+        DType::Extension(Timestamp::new(TimeUnit::Milliseconds, Nullability::NonNullable).erased()),
+        Some(1_709_251_200_000i64.into()),
+    )
+    .unwrap();
+
+    let nanos =
+        DType::Extension(Timestamp::new(TimeUnit::Nanoseconds, Nullability::NonNullable).erased());
+    assert!(millis.cast(&nanos).is_err());
+}
