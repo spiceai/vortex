@@ -538,9 +538,11 @@ mod tests {
     ///
     /// `i64::MIN` nanoseconds is 1677-09-21T00:12:43.145224192Z and `i64::MAX` is
     /// 2262-04-11T23:47:16.854775807Z, both far inside Jiff's range. A Jiff `Span` stops one
-    /// short of `i64::MIN`, so validating through one refuses a value that a
-    /// `vortex.timestamp[ns]` array holds and that `DateToTimestamp` converts into — the
-    /// scalar and the array disagreeing at exactly the boundary this module exists to align.
+    /// short of `i64::MIN`, so validating through one refuses a value a `vortex.timestamp[ns]`
+    /// array carries — the scalar and the array disagreeing about the same storage value,
+    /// which is the shape of defect this module exists to rule out. No `vortex.date` reaches
+    /// this value (neither of its units divides it), so the range is what has to be right
+    /// here, not the conversion.
     #[rstest::rstest]
     #[case(i64::MIN)]
     #[case(i64::MIN + 1)]
