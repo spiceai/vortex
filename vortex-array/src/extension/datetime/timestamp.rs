@@ -56,6 +56,38 @@ impl Timestamp {
         ExtDType::try_new(options, DType::Primitive(PType::I64, nullability))
             .vortex_expect("failed to create timestamp dtype")
     }
+
+    /// The inclusive range of storage values a `vortex.timestamp` in `unit` can hold.
+    ///
+    /// Taken from Jiff's own limits, and the one definition of them: `unpack_native` refuses a
+    /// scalar outside this range and `DateToTimestamp` refuses to convert a date into one, so
+    /// a converted date can always be carried by a scalar. A scan prunes a file on the scalar
+    /// conversion and filters the rows it kept on the array one, so the two ranges parting
+    /// company is a file dropped by a comparison the row filter would never have made.
+    ///
+    /// Nanoseconds are the whole of `i64`: its floor is 1677-09-21 and its ceiling 2262-04-11,
+    /// both far inside Jiff's range, so the conversion below clamps rather than narrowing.
+    pub(crate) fn storage_range(unit: TimeUnit) -> VortexResult<(i64, i64)> {
+        Ok(match unit {
+            TimeUnit::Nanoseconds => (
+                i64::try_from(jiff::Timestamp::MIN.as_nanosecond()).unwrap_or(i64::MIN),
+                i64::try_from(jiff::Timestamp::MAX.as_nanosecond()).unwrap_or(i64::MAX),
+            ),
+            TimeUnit::Microseconds => (
+                jiff::Timestamp::MIN.as_microsecond(),
+                jiff::Timestamp::MAX.as_microsecond(),
+            ),
+            TimeUnit::Milliseconds => (
+                jiff::Timestamp::MIN.as_millisecond(),
+                jiff::Timestamp::MAX.as_millisecond(),
+            ),
+            TimeUnit::Seconds => (
+                jiff::Timestamp::MIN.as_second(),
+                jiff::Timestamp::MAX.as_second(),
+            ),
+            TimeUnit::Days => vortex_bail!("Timestamp does not support Days time unit"),
+        })
+    }
 }
 
 /// Options for the Timestamp DType.
@@ -237,17 +269,18 @@ impl ExtVTable for Timestamp {
             TimeUnit::Days => vortex_bail!("Timestamp does not support Days time unit"),
         };
 
-        // Validate the storage value is within the valid range for Timestamp. Build the span
-        // through the checked constructor: `Span::new().seconds(v)` panics for a `v` outside
-        // Jiff's span range, which is wider than a timestamp's, so a storage value between the
-        // two limits would abort here instead of reaching the `checked_add` below.
-        let span = metadata
-            .unit
-            .to_jiff_span(ts_value)
-            .map_err(|e| vortex_err!("Invalid timestamp scalar: {}", e))?;
-        jiff::Timestamp::UNIX_EPOCH
-            .checked_add(span)
-            .map_err(|e| vortex_err!("Invalid timestamp scalar: {}", e))?;
+        // Compare against the timestamp's own range rather than routing the value through a
+        // Jiff `Span`. A span's limits are not a timestamp's at either end: they stop one
+        // short of `i64::MIN` nanoseconds, which is a valid 1677 instant, and they run past
+        // the last instant everywhere else, where the unchecked constructors abort rather
+        // than report. This range is also what `DateToTimestamp` converts into, so a scalar
+        // accepts exactly the values the array kernel produces.
+        let (min, max) = Self::storage_range(metadata.unit)?;
+        vortex_ensure!(
+            (min..=max).contains(&ts_value),
+            "Invalid timestamp scalar: {ts_value} {} is outside the instants a timestamp can represent ({min}..={max})",
+            metadata.unit
+        );
 
         // Validate the timezone resolves, accepting both IANA names and fixed UTC offsets.
         if let Some(tz) = tz {
@@ -431,22 +464,23 @@ mod tests {
         assert_eq!(TimestampValue::Seconds(1, Some(&bad)).to_string(), unzoned);
     }
 
-    /// A storage value too large for a timestamp has to be reported, not panicked on.
+    /// A storage value outside the timestamp range has to be reported, not panicked on.
     ///
-    /// Validation builds a Jiff span from the storage value and adds it to the epoch. Jiff's
-    /// span range is wider than its timestamp range, and the unchecked span constructors
-    /// panic outside it, so a value between the two limits aborted the process here instead
-    /// of reaching the range check it was about to fail. Every one of these is a value a
-    /// `vortex.timestamp` array can hold, so any read of one reaches this path.
+    /// The hazard is Jiff's `Span`, whose limits are wider than a timestamp's and whose
+    /// unchecked constructors abort outside them: validating a storage value by building a
+    /// span from it takes the process down on the integer extrema below. `storage_range` is
+    /// total over `i64`, so every value here is reported. Each is one a `vortex.timestamp`
+    /// array can hold, so any read of one reaches this path.
     ///
-    /// Nanoseconds are absent because `i64::MAX` of them is only the year 2262 — the whole
-    /// `i64` range is inside what a timestamp can hold, so that unit has no such value.
+    /// Nanoseconds are absent because every `i64` is a valid nanosecond timestamp — see
+    /// `every_i64_is_a_valid_nanosecond_timestamp`.
     #[rstest::rstest]
     #[case(TimeUnit::Seconds, i64::MAX)]
     #[case(TimeUnit::Seconds, i64::MIN)]
     #[case(TimeUnit::Milliseconds, i64::MAX)]
     #[case(TimeUnit::Microseconds, i64::MAX)]
-    // Just past the last instant, and well short of the span limit that used to panic.
+    // Just past the last instant, and well short of the span limit — the half of the range
+    // that a span reports on, pinned alongside the half it aborts on.
     #[case(TimeUnit::Seconds, 253_402_300_800)]
     fn an_out_of_range_storage_value_is_an_error_not_a_panic(
         #[case] unit: TimeUnit,
@@ -459,5 +493,72 @@ mod tests {
             err.to_string().contains("Invalid timestamp scalar"),
             "the error has to name the problem, got: {err}"
         );
+    }
+
+    /// Every `i64` is a valid nanosecond timestamp, its floor included.
+    ///
+    /// `i64::MIN` nanoseconds is 1677-09-21T00:12:43.145224192Z and `i64::MAX` is
+    /// 2262-04-11T23:47:16.854775807Z, both far inside Jiff's range. A Jiff `Span` stops one
+    /// short of `i64::MIN`, so validating through one refuses a value that a
+    /// `vortex.timestamp[ns]` array holds and that `DateToTimestamp` converts into — the
+    /// scalar and the array disagreeing at exactly the boundary this module exists to align.
+    #[rstest::rstest]
+    #[case(i64::MIN)]
+    #[case(i64::MIN + 1)]
+    #[case(0)]
+    #[case(i64::MAX)]
+    fn every_i64_is_a_valid_nanosecond_timestamp(#[case] storage_value: i64) {
+        let dtype = DType::Extension(Timestamp::new(TimeUnit::Nanoseconds, Nullable).erased());
+        Scalar::try_new(dtype, Some(storage_value.into()))
+            .expect("every i64 nanosecond count is an instant a timestamp can represent");
+    }
+
+    /// The range a date converts into is exactly the range a scalar accepts.
+    ///
+    /// `DateToTimestamp` refuses to produce a value outside `Timestamp::storage_range` so that
+    /// a converted date can always be carried by a scalar. That only holds while this is the
+    /// same range the scalar itself enforces, so pin the two together at both ends — a scan
+    /// prunes a file on the scalar conversion and filters the rows it kept on the array one.
+    #[rstest::rstest]
+    #[case(TimeUnit::Seconds)]
+    #[case(TimeUnit::Milliseconds)]
+    #[case(TimeUnit::Microseconds)]
+    #[case(TimeUnit::Nanoseconds)]
+    fn the_storage_range_is_exactly_what_a_scalar_accepts(#[case] unit: TimeUnit) {
+        let (min, max) = Timestamp::storage_range(unit).expect("a range for every stored unit");
+        let scalar = |v: i64| {
+            Scalar::try_new(
+                DType::Extension(Timestamp::new(unit, Nullable).erased()),
+                Some(v.into()),
+            )
+        };
+
+        assert!(
+            scalar(min).is_ok(),
+            "{unit}: the floor of the range is an instant"
+        );
+        assert!(
+            scalar(max).is_ok(),
+            "{unit}: the ceiling of the range is an instant"
+        );
+        // Guarded, because the nanosecond range is the whole of `i64` and has no outside.
+        if min > i64::MIN {
+            assert!(
+                scalar(min - 1).is_err(),
+                "{unit}: one below the floor is not"
+            );
+        }
+        if max < i64::MAX {
+            assert!(
+                scalar(max + 1).is_err(),
+                "{unit}: one above the ceiling is not"
+            );
+        }
+    }
+
+    /// A timestamp is never stored in days, so it has no range of storage values.
+    #[test]
+    fn a_timestamp_in_days_has_no_storage_range() {
+        assert!(Timestamp::storage_range(TimeUnit::Days).is_err());
     }
 }

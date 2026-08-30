@@ -5,12 +5,20 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 
 use crate::EmptyMetadata;
+use crate::IntoArray;
+use crate::arrays::ExtensionArray;
+use crate::arrays::PrimitiveArray;
+use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
 use crate::dtype::Nullability;
 use crate::dtype::PType;
 use crate::dtype::extension::ExtDType;
 use crate::dtype::extension::ExtId;
 use crate::dtype::extension::ExtVTable;
+use crate::executor::VortexSessionExecute;
+use crate::extension::datetime::Date;
+use crate::extension::datetime::TimeUnit;
+use crate::extension::datetime::Timestamp;
 use crate::scalar::Scalar;
 use crate::scalar::ScalarValue;
 
@@ -331,10 +339,6 @@ fn test_ext_scalar_with_metadata() {
 /// does not even fail: the file is pruned and its matching rows never load.
 #[test]
 fn test_ext_scalar_cast_date_to_timestamp() {
-    use crate::extension::datetime::Date;
-    use crate::extension::datetime::TimeUnit;
-    use crate::extension::datetime::Timestamp;
-
     // 2024-03-01, as days and as milliseconds since the epoch.
     const DAYS: i32 = 19_783;
     const MILLIS: i64 = 1_709_251_200_000;
@@ -381,15 +385,6 @@ fn test_ext_scalar_cast_date_to_timestamp() {
 /// batch containing one unconvertible value would say nothing about the ones beside it.
 #[test]
 fn test_ext_scalar_cast_date_to_timestamp_matches_the_array_kernel() {
-    use crate::IntoArray;
-    use crate::arrays::ExtensionArray;
-    use crate::arrays::PrimitiveArray;
-    use crate::builtins::ArrayBuiltins;
-    use crate::executor::VortexSessionExecute;
-    use crate::extension::datetime::Date;
-    use crate::extension::datetime::TimeUnit;
-    use crate::extension::datetime::Timestamp;
-
     let session = crate::array_session();
     let mut ctx = session.create_execution_ctx();
 
@@ -473,9 +468,6 @@ fn test_ext_scalar_cast_date_to_timestamp_matches_the_array_kernel() {
 /// refuses this pair, and so must the scalar cast.
 #[test]
 fn test_ext_scalar_cast_between_timestamp_units_is_refused() {
-    use crate::extension::datetime::TimeUnit;
-    use crate::extension::datetime::Timestamp;
-
     let millis = Scalar::try_new(
         DType::Extension(Timestamp::new(TimeUnit::Milliseconds, Nullability::NonNullable).erased()),
         Some(1_709_251_200_000i64.into()),

@@ -18,6 +18,7 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 
 use crate::extension::datetime::TimeUnit;
+use crate::extension::datetime::Timestamp;
 
 /// Converts `vortex.date` values into `vortex.timestamp` values of another unit.
 ///
@@ -44,7 +45,7 @@ impl DateToTimestamp {
             (1, target_ns / source_ns)
         };
 
-        let (min, max) = representable_range(target_unit)?;
+        let (min, max) = Timestamp::storage_range(target_unit)?;
         Ok(Self {
             multiply,
             divide,
@@ -85,7 +86,8 @@ impl DateToTimestamp {
         // The `i64` range is wider than the instants a timestamp scalar accepts, and this is
         // where the array and the scalar would otherwise part company: an array can hold the
         // value, and a scalar built from it is rejected by `Timestamp`'s validation, so a
-        // file's statistics fail to cast while the rows they gate convert happily.
+        // file's statistics fail to cast while the rows they gate convert happily. The bounds
+        // are `Timestamp`'s own, so there is one range rather than two that must agree.
         if scaled < self.min || scaled > self.max {
             vortex_bail!(
                 Compute: "Date value {value} is outside the range a timestamp can represent"
@@ -105,35 +107,6 @@ fn to_nanoseconds(unit: TimeUnit) -> VortexResult<i64> {
         TimeUnit::Seconds => Ok(1_000_000_000),
         TimeUnit::Days => Ok(86_400_000_000_000),
     }
-}
-
-/// The inclusive range of storage values a `vortex.timestamp` in `unit` can hold.
-///
-/// Taken from Jiff's own limits, because `Timestamp`'s scalar validation is what enforces
-/// them: it builds a Jiff span from the storage value and adds it to the epoch, so a value
-/// beyond these bounds is one no timestamp scalar can be built from.
-fn representable_range(unit: TimeUnit) -> VortexResult<(i64, i64)> {
-    let (min, max) = match unit {
-        TimeUnit::Nanoseconds => (
-            i64::try_from(jiff::Timestamp::MIN.as_nanosecond()).unwrap_or(i64::MIN),
-            i64::try_from(jiff::Timestamp::MAX.as_nanosecond()).unwrap_or(i64::MAX),
-        ),
-        TimeUnit::Microseconds => (
-            jiff::Timestamp::MIN.as_microsecond(),
-            jiff::Timestamp::MAX.as_microsecond(),
-        ),
-        TimeUnit::Milliseconds => (
-            jiff::Timestamp::MIN.as_millisecond(),
-            jiff::Timestamp::MAX.as_millisecond(),
-        ),
-        TimeUnit::Seconds => (
-            jiff::Timestamp::MIN.as_second(),
-            jiff::Timestamp::MAX.as_second(),
-        ),
-        // `Timestamp::unpack_native` rejects this unit outright, so there is no range.
-        TimeUnit::Days => vortex_bail!("Timestamp does not support Days time unit"),
-    };
-    Ok((min, max))
 }
 
 #[cfg(test)]
