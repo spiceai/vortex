@@ -6,7 +6,6 @@
 use std::fmt;
 use std::sync::Arc;
 
-use jiff::Span;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
@@ -122,20 +121,60 @@ pub enum TimestampValue<'a> {
     Nanoseconds(i64, Option<&'a Arc<str>>),
 }
 
+impl TimestampValue<'_> {
+    /// The storage value and the unit it counts in.
+    fn storage(&self) -> (i64, TimeUnit) {
+        match self {
+            TimestampValue::Seconds(v, _) => (*v, TimeUnit::Seconds),
+            TimestampValue::Milliseconds(v, _) => (*v, TimeUnit::Milliseconds),
+            TimestampValue::Microseconds(v, _) => (*v, TimeUnit::Microseconds),
+            TimestampValue::Nanoseconds(v, _) => (*v, TimeUnit::Nanoseconds),
+        }
+    }
+
+    /// The timezone the value renders in, if it carries one.
+    fn timezone(&self) -> Option<&Arc<str>> {
+        match self {
+            TimestampValue::Seconds(_, tz)
+            | TimestampValue::Milliseconds(_, tz)
+            | TimestampValue::Microseconds(_, tz)
+            | TimestampValue::Nanoseconds(_, tz) => *tz,
+        }
+    }
+
+    /// The instant this value denotes, or `None` for a count no timestamp can hold.
+    ///
+    /// Every step reports rather than aborts. The unchecked `Span` constructors panic outside
+    /// the span range and `Timestamp + Span` panics outside the timestamp range, so a
+    /// `Display` impl — which has no way to report a failure — cannot be built on them.
+    fn to_jiff(&self) -> Option<jiff::Timestamp> {
+        // Every `i64` is a nanosecond instant and this constructor takes all of them, whereas
+        // a span's nanosecond floor is one above `i64::MIN`. `unpack_native` admits that whole
+        // range, so rendering has to as well.
+        if let TimestampValue::Nanoseconds(v, _) = self {
+            return jiff::Timestamp::from_nanosecond(i128::from(*v)).ok();
+        }
+
+        let (value, unit) = self.storage();
+        let span = unit.to_jiff_span(value).ok()?;
+        jiff::Timestamp::UNIX_EPOCH.checked_add(span).ok()
+    }
+}
+
 impl fmt::Display for TimestampValue<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (span, tz) = match self {
-            TimestampValue::Seconds(v, tz) => (Span::new().seconds(*v), *tz),
-            TimestampValue::Milliseconds(v, tz) => (Span::new().milliseconds(*v), *tz),
-            TimestampValue::Microseconds(v, tz) => (Span::new().microseconds(*v), *tz),
-            TimestampValue::Nanoseconds(v, tz) => (Span::new().nanoseconds(*v), *tz),
+        // A count that denotes no instant must not abort a `Display` impl, which has no way to
+        // report the failure. `unpack_native` refuses to build a scalar from one, but the
+        // variant is public and constructible on its own, so render the raw count and its unit.
+        let Some(ts) = self.to_jiff() else {
+            let (value, unit) = self.storage();
+            return write!(f, "{value}{unit}");
         };
-        let ts = jiff::Timestamp::UNIX_EPOCH + span;
 
-        match tz {
+        match self.timezone() {
             None => write!(f, "{ts}"),
-            // A timezone that does not resolve must not abort a `Display` impl, which has no way to
-            // report the failure. Render the underlying UTC timestamp instead.
+            // A timezone that does not resolve must not abort it either. Render the underlying
+            // UTC timestamp instead.
             Some(tz) => match resolve_timezone(tz.as_ref()) {
                 Ok(zone) => write!(f, "{}", ts.to_zoned(zone)),
                 Err(_) => write!(f, "{ts}"),
@@ -560,5 +599,44 @@ mod tests {
     #[test]
     fn a_timestamp_in_days_has_no_storage_range() {
         assert!(Timestamp::storage_range(TimeUnit::Days).is_err());
+    }
+
+    /// Rendering has to reach every instant a scalar can carry, the nanosecond floor included.
+    ///
+    /// A `Display` impl has no way to report a failure, so building one on `Span`'s unchecked
+    /// constructors turns an unrenderable value into an abort. `i64::MIN` nanoseconds is the
+    /// case that matters: `unpack_native` admits it, so it reaches this path as a scalar.
+    #[rstest::rstest]
+    #[case(
+        TimestampValue::Nanoseconds(i64::MIN, None),
+        "1677-09-21T00:12:43.145224192Z"
+    )]
+    #[case(
+        TimestampValue::Nanoseconds(i64::MAX, None),
+        "2262-04-11T23:47:16.854775807Z"
+    )]
+    #[case(TimestampValue::Nanoseconds(0, None), "1970-01-01T00:00:00Z")]
+    #[case(TimestampValue::Seconds(1_709_251_200, None), "2024-03-01T00:00:00Z")]
+    fn display_renders_every_instant_a_scalar_carries(
+        #[case] value: TimestampValue<'_>,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(value.to_string(), expected);
+    }
+
+    /// A count that denotes no instant renders as itself rather than aborting.
+    ///
+    /// `unpack_native` refuses to build a scalar from one, but `TimestampValue` is public and
+    /// constructible on its own, so `Display` still has to survive it.
+    #[rstest::rstest]
+    #[case(TimestampValue::Seconds(i64::MAX, None), "9223372036854775807s")]
+    #[case(TimestampValue::Seconds(i64::MIN, None), "-9223372036854775808s")]
+    #[case(TimestampValue::Milliseconds(i64::MAX, None), "9223372036854775807ms")]
+    #[case(TimestampValue::Seconds(253_402_300_800, None), "253402300800s")]
+    fn display_falls_back_on_a_count_that_is_not_an_instant(
+        #[case] value: TimestampValue<'_>,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(value.to_string(), expected);
     }
 }
