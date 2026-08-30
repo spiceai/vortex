@@ -16,10 +16,9 @@ use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
 use crate::dtype::PType;
 use crate::extension::datetime::AnyTemporal;
+use crate::extension::datetime::DateToTimestamp;
 use crate::extension::datetime::TemporalMetadata;
 use crate::extension::datetime::TimeUnit;
-use crate::extension::datetime::convert_temporal_value;
-use crate::extension::datetime::date_to_timestamp_scale;
 use crate::scalar_fn::fns::cast::CastKernel;
 use crate::scalar_fn::fns::cast::CastReduce;
 use crate::validity::Validity;
@@ -123,7 +122,7 @@ fn cast_date_values_to_timestamp(
     target_unit: TimeUnit,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<PrimitiveArray> {
-    let (multiply, divide) = date_to_timestamp_scale(source_unit, target_unit)?;
+    let conversion = DateToTimestamp::new(source_unit, target_unit)?;
 
     let input = values.as_slice::<i64>();
     let validity = values.validity()?;
@@ -133,7 +132,7 @@ fn cast_date_values_to_timestamp(
         Validity::NonNullable | Validity::AllValid => {
             for &value in input {
                 // SAFETY: output has sufficient capacity for all pushed values.
-                unsafe { output.push_unchecked(convert_temporal_value(value, multiply, divide)?) };
+                unsafe { output.push_unchecked(conversion.convert(value)?) };
             }
         }
         Validity::AllInvalid => {
@@ -145,11 +144,11 @@ fn cast_date_values_to_timestamp(
         Validity::Array(_) => {
             // Resolve validity to a boolean mask once. Null slots keep a placeholder 0 so a garbage
             // source value in a null slot cannot trip the overflow check in
-            // `convert_temporal_value`; the output re-uses `validity`, so those slots stay null.
+            // `DateToTimestamp::convert`; the output re-uses `validity`, so those slots stay null.
             let mask = validity.execute_mask(input.len(), ctx)?;
             for (i, &value) in input.iter().enumerate() {
                 let converted = if mask.value(i) {
-                    convert_temporal_value(value, multiply, divide)?
+                    conversion.convert(value)?
                 } else {
                     0i64
                 };

@@ -229,27 +229,22 @@ impl ExtVTable for Timestamp {
         let ts_value = storage_value.as_primitive().cast::<i64>()?;
         let tz = metadata.tz.as_ref();
 
-        let (span, value) = match metadata.unit {
-            TimeUnit::Nanoseconds => (
-                Span::new().nanoseconds(ts_value),
-                TimestampValue::Nanoseconds(ts_value, tz),
-            ),
-            TimeUnit::Microseconds => (
-                Span::new().microseconds(ts_value),
-                TimestampValue::Microseconds(ts_value, tz),
-            ),
-            TimeUnit::Milliseconds => (
-                Span::new().milliseconds(ts_value),
-                TimestampValue::Milliseconds(ts_value, tz),
-            ),
-            TimeUnit::Seconds => (
-                Span::new().seconds(ts_value),
-                TimestampValue::Seconds(ts_value, tz),
-            ),
+        let value = match metadata.unit {
+            TimeUnit::Nanoseconds => TimestampValue::Nanoseconds(ts_value, tz),
+            TimeUnit::Microseconds => TimestampValue::Microseconds(ts_value, tz),
+            TimeUnit::Milliseconds => TimestampValue::Milliseconds(ts_value, tz),
+            TimeUnit::Seconds => TimestampValue::Seconds(ts_value, tz),
             TimeUnit::Days => vortex_bail!("Timestamp does not support Days time unit"),
         };
 
-        // Validate the storage value is within the valid range for Timestamp.
+        // Validate the storage value is within the valid range for Timestamp. Build the span
+        // through the checked constructor: `Span::new().seconds(v)` panics for a `v` outside
+        // Jiff's span range, which is wider than a timestamp's, so a storage value between the
+        // two limits would abort here instead of reaching the `checked_add` below.
+        let span = metadata
+            .unit
+            .to_jiff_span(ts_value)
+            .map_err(|e| vortex_err!("Invalid timestamp scalar: {}", e))?;
         jiff::Timestamp::UNIX_EPOCH
             .checked_add(span)
             .map_err(|e| vortex_err!("Invalid timestamp scalar: {}", e))?;
@@ -434,5 +429,35 @@ mod tests {
         let bad = Arc::from("Not/A/Timezone");
         let unzoned = TimestampValue::Seconds(1, None).to_string();
         assert_eq!(TimestampValue::Seconds(1, Some(&bad)).to_string(), unzoned);
+    }
+
+    /// A storage value too large for a timestamp has to be reported, not panicked on.
+    ///
+    /// Validation builds a Jiff span from the storage value and adds it to the epoch. Jiff's
+    /// span range is wider than its timestamp range, and the unchecked span constructors
+    /// panic outside it, so a value between the two limits aborted the process here instead
+    /// of reaching the range check it was about to fail. Every one of these is a value a
+    /// `vortex.timestamp` array can hold, so any read of one reaches this path.
+    ///
+    /// Nanoseconds are absent because `i64::MAX` of them is only the year 2262 — the whole
+    /// `i64` range is inside what a timestamp can hold, so that unit has no such value.
+    #[rstest::rstest]
+    #[case(TimeUnit::Seconds, i64::MAX)]
+    #[case(TimeUnit::Seconds, i64::MIN)]
+    #[case(TimeUnit::Milliseconds, i64::MAX)]
+    #[case(TimeUnit::Microseconds, i64::MAX)]
+    // Just past the last instant, and well short of the span limit that used to panic.
+    #[case(TimeUnit::Seconds, 253_402_300_800)]
+    fn an_out_of_range_storage_value_is_an_error_not_a_panic(
+        #[case] unit: TimeUnit,
+        #[case] storage_value: i64,
+    ) {
+        let dtype = DType::Extension(Timestamp::new(unit, Nullable).erased());
+        let err = Scalar::try_new(dtype, Some(storage_value.into()))
+            .expect_err("a value past the last instant is not a timestamp");
+        assert!(
+            err.to_string().contains("Invalid timestamp scalar"),
+            "the error has to name the problem, got: {err}"
+        );
     }
 }

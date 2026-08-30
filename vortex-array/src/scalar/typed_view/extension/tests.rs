@@ -374,7 +374,11 @@ fn test_ext_scalar_cast_date_to_timestamp() {
 ///
 /// One of the two is applied to a file's statistics and the other to its rows, so a
 /// disagreement between them is not a type error — it is a file pruned by a comparison the
-/// row filter would never have made.
+/// row filter would never have made, or a scan that fails on a statistic whose rows convert
+/// fine.
+///
+/// Each value is cast on its own rather than as a batch: an array cast fails as a whole, so a
+/// batch containing one unconvertible value would say nothing about the ones beside it.
 #[test]
 fn test_ext_scalar_cast_date_to_timestamp_matches_the_array_kernel() {
     use crate::IntoArray;
@@ -389,11 +393,25 @@ fn test_ext_scalar_cast_date_to_timestamp_matches_the_array_kernel() {
     let session = crate::array_session();
     let mut ctx = session.create_execution_ctx();
 
+    // Ordinary dates, then the boundaries: the largest `Date32` value, the first day no
+    // timestamp can represent (10000-01-01) and the last one that can. The boundaries are
+    // where a range check applied to one path and not the other shows up — the array holds
+    // the converted value and the scalar's validation rejects it.
     for (source_unit, values) in [
-        (TimeUnit::Days, vec![0i64, 19_783, -1]),
+        (
+            TimeUnit::Days,
+            vec![0i64, 19_783, -1, i64::from(i32::MAX), 2_932_896, 2_932_895],
+        ),
         (
             TimeUnit::Milliseconds,
-            vec![0i64, 1_709_251_200_000, -86_400_000],
+            vec![
+                0i64,
+                1_709_251_200_000,
+                -86_400_000,
+                i64::from(i32::MAX) * 86_400_000,
+                253_402_300_800_000,
+                253_402_300_799_000,
+            ],
         ),
     ] {
         for target_unit in [
@@ -406,44 +424,41 @@ fn test_ext_scalar_cast_date_to_timestamp_matches_the_array_kernel() {
             let target_dtype =
                 DType::Extension(Timestamp::new(target_unit, Nullability::NonNullable).erased());
 
-            let storage = if source_unit == TimeUnit::Days {
-                PrimitiveArray::from_iter(values.iter().map(|v| i32::try_from(*v).unwrap()))
-                    .into_array()
-            } else {
-                PrimitiveArray::from_iter(values.iter().copied()).into_array()
-            };
-            let array = ExtensionArray::new(source_dtype.clone(), storage).into_array();
-            let casted = array
-                .cast(target_dtype.clone())
-                .and_then(|a| a.execute::<ExtensionArray>(&mut ctx));
-
-            for (idx, value) in values.iter().enumerate() {
-                let scalar_value = if source_unit == TimeUnit::Days {
-                    i32::try_from(*value).unwrap().into()
+            for value in &values {
+                let (storage, scalar_value) = if source_unit == TimeUnit::Days {
+                    let Ok(days) = i32::try_from(*value) else {
+                        continue;
+                    };
+                    (PrimitiveArray::from_iter([days]).into_array(), days.into())
                 } else {
-                    (*value).into()
+                    (
+                        PrimitiveArray::from_iter([*value]).into_array(),
+                        (*value).into(),
+                    )
                 };
+
+                let array_cast = ExtensionArray::new(source_dtype.clone(), storage)
+                    .into_array()
+                    .cast(target_dtype.clone())
+                    .and_then(|a| a.execute::<ExtensionArray>(&mut ctx));
+
                 let scalar =
                     Scalar::try_new(DType::Extension(source_dtype.clone()), Some(scalar_value))
                         .unwrap();
                 let scalar_cast = scalar.cast(&target_dtype);
 
-                match &casted {
+                match array_cast {
                     Ok(array) => {
-                        let expected = array
-                            .clone()
-                            .into_array()
-                            .execute_scalar(idx, &mut ctx)
-                            .unwrap();
+                        let expected = array.into_array().execute_scalar(0, &mut ctx).unwrap();
                         assert_eq!(
                             scalar_cast.unwrap(),
                             expected,
-                            "{source_unit} -> {target_unit} disagrees at index {idx}"
+                            "{source_unit} -> {target_unit} disagrees on {value}"
                         );
                     }
                     Err(_) => assert!(
                         scalar_cast.is_err(),
-                        "{source_unit} -> {target_unit} converts a scalar the array kernel refuses"
+                        "{source_unit} -> {target_unit} converts {value}, which the array kernel refuses"
                     ),
                 }
             }

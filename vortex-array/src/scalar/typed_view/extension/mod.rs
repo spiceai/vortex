@@ -14,9 +14,8 @@ use vortex_error::vortex_panic;
 use crate::dtype::DType;
 use crate::dtype::extension::ExtDTypeRef;
 use crate::extension::datetime::AnyTemporal;
+use crate::extension::datetime::DateToTimestamp;
 use crate::extension::datetime::TemporalMetadata;
-use crate::extension::datetime::convert_temporal_value;
-use crate::extension::datetime::date_to_timestamp_scale;
 use crate::scalar::Scalar;
 use crate::scalar::ScalarValue;
 
@@ -156,8 +155,7 @@ impl<'a> ExtScalar<'a> {
             return Ok(Some(Scalar::try_new(target_dtype.clone(), None)?));
         };
 
-        let (multiply, divide) = date_to_timestamp_scale(*source_unit, *target_unit)?;
-        let converted = convert_temporal_value(value, multiply, divide)?;
+        let converted = DateToTimestamp::new(*source_unit, *target_unit)?.convert(value)?;
 
         let storage_value = Scalar::primitive(converted, target_dtype.nullability())
             .cast(target_ext_dtype.storage_dtype())?
