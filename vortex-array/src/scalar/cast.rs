@@ -42,9 +42,15 @@ impl Scalar {
             return Scalar::try_new(target_dtype.clone(), self.value().cloned());
         }
 
-        // TODO(connor): This isn't really correct for extension types.
-        // If the target is an extension type, then we want to cast to its storage type.
-        if let Some(ext_dtype) = target_dtype.as_extension_opt() {
+        // If the target is an extension type, cast to its storage type and re-label. This is
+        // only sound when the source carries no interpretation of its own: an extension source
+        // knows what its values mean and converts itself in the match below. Re-labelling one
+        // would hand back the source's number under the target's meaning — a `vortex.date[ms]`
+        // and a `vortex.timestamp[ns]` share `i64` storage, so the date would come back as an
+        // instant a million times too small.
+        if !matches!(self.dtype(), DType::Extension(..))
+            && let Some(ext_dtype) = target_dtype.as_extension_opt()
+        {
             let cast_storage_scalar_value = self.cast(ext_dtype.storage_dtype())?.into_value();
             return Scalar::try_new(target_dtype.clone(), cast_storage_scalar_value);
         }
