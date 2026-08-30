@@ -13,6 +13,9 @@ use vortex_error::vortex_panic;
 
 use crate::dtype::DType;
 use crate::dtype::extension::ExtDTypeRef;
+use crate::extension::datetime::AnyTemporal;
+use crate::extension::datetime::DateToTimestamp;
+use crate::extension::datetime::TemporalMetadata;
 use crate::scalar::Scalar;
 use crate::scalar::ScalarValue;
 
@@ -99,11 +102,17 @@ impl<'a> ExtScalar<'a> {
             return Scalar::try_new(target_dtype.clone(), self.value.cloned());
         }
 
-        // We only allow casting to the same extension dtype for now.
-        if let DType::Extension(ext_dtype) = target_dtype
-            && self.ext_dtype.eq_ignore_nullability(ext_dtype)
-        {
-            return Scalar::try_new(target_dtype.clone(), self.value.cloned());
+        if let DType::Extension(ext_dtype) = target_dtype {
+            // The same extension dtype: the value already means what the target says it does.
+            if self.ext_dtype.eq_ignore_nullability(ext_dtype) {
+                return Scalar::try_new(target_dtype.clone(), self.value.cloned());
+            }
+
+            // A different one needs the value converted, which is defined only for the pairs
+            // `Extension`'s `CastKernel` converts at the array level.
+            if let Some(scalar) = self.cast_date_to_timestamp(ext_dtype, target_dtype)? {
+                return Ok(scalar);
+            }
         }
 
         vortex_bail!(
@@ -112,6 +121,46 @@ impl<'a> ExtScalar<'a> {
             self.ext_dtype.storage_dtype(),
             target_dtype
         );
+    }
+
+    /// Convert a `vortex.date` scalar to a `vortex.timestamp` one, rescaling the value.
+    ///
+    /// Returns `Ok(None)` for any other pair of extension types, leaving the caller to refuse
+    /// the cast. The conversion mirrors `Extension`'s `CastKernel`, which is what a scan
+    /// applies to the rows of a file whose statistics were compared through here.
+    fn cast_date_to_timestamp(
+        &self,
+        target_ext_dtype: &ExtDTypeRef,
+        target_dtype: &DType,
+    ) -> VortexResult<Option<Scalar>> {
+        let (Some(source_temporal), Some(target_temporal)) = (
+            self.ext_dtype.metadata_opt::<AnyTemporal>(),
+            target_ext_dtype.metadata_opt::<AnyTemporal>(),
+        ) else {
+            return Ok(None);
+        };
+
+        let (TemporalMetadata::Date(source_unit), TemporalMetadata::Timestamp(target_unit, _)) =
+            (source_temporal, target_temporal)
+        else {
+            return Ok(None);
+        };
+
+        // Null is handled by `Scalar::cast` before it reaches an extension scalar, and by the
+        // nullability check above; a null that gets this far still converts to a null.
+        let Some(value) = self.to_storage_scalar().as_primitive().as_opt::<i64>() else {
+            return Ok(None);
+        };
+        let Some(value) = value else {
+            return Ok(Some(Scalar::try_new(target_dtype.clone(), None)?));
+        };
+
+        let converted = DateToTimestamp::new(*source_unit, *target_unit)?.convert(value)?;
+
+        let storage_value = Scalar::primitive(converted, target_dtype.nullability())
+            .cast(target_ext_dtype.storage_dtype())?
+            .into_value();
+        Ok(Some(Scalar::try_new(target_dtype.clone(), storage_value)?))
     }
 }
 
