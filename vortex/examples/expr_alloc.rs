@@ -178,6 +178,22 @@ fn and_chain(n: usize) -> Expression {
     and_collect((0..n).map(|i| gt(get_item("l_orderkey", root()), lit(i as i64)))).unwrap()
 }
 
+/// A right-leaning `AND` chain of `n` predicates, as a planner emits before any normalization:
+/// `and(p0, and(p1, and(p2, ...)))`. Used to check what happens to spine depth, since
+/// `and_collect` rebalances and exists to keep later recursive passes off a long chain.
+fn deep_and_chain(n: usize) -> Expression {
+    (0..n)
+        .rev()
+        .map(|i| gt(get_item("l_orderkey", root()), lit(i as i64)))
+        .reduce(|acc, p| and(p, acc))
+        .unwrap()
+}
+
+/// Longest root-to-leaf path through the expression, counting nodes.
+fn depth(expr: &Expression) -> usize {
+    1 + expr.children().iter().map(depth).max().unwrap_or(0)
+}
+
 fn projection_expr() -> Expression {
     select(["l_orderkey", "l_extendedprice", "l_discount"], root())
 }
@@ -307,6 +323,20 @@ fn main() -> VortexResult<()> {
             let scope = scope();
             let expr = and_chain(n);
             timed(&format!("and_chain n={n}"), iters, || {
+                Ok(expr.optimize_recursive(&scope)?.children().len())
+            })?;
+        }
+        "deep_and" => {
+            let n: usize = args.next().map(|s| s.parse().unwrap()).unwrap_or(512);
+            let scope = scope();
+            let expr = deep_and_chain(n);
+            let optimized = expr.optimize_recursive(&scope)?;
+            println!(
+                "deep_and: n={n}, input depth {}, optimized depth {}",
+                depth(&expr),
+                depth(&optimized)
+            );
+            timed(&format!("deep_and n={n}"), iters, || {
                 Ok(expr.optimize_recursive(&scope)?.children().len())
             })?;
         }
