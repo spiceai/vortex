@@ -10,6 +10,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use itertools::Itertools;
+use smallvec::SmallVec;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 use vortex_session::VortexSession;
@@ -97,7 +98,7 @@ impl Expression {
             return Ok(scope.clone());
         }
 
-        let dtypes: Vec<_> = self
+        let dtypes: SmallVec<[DType; 3]> = self
             .children
             .iter()
             .map(|c| c.return_dtype(scope))

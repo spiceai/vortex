@@ -7,6 +7,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use itertools::Itertools;
+use smallvec::SmallVec;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_utils::aliases::hash_map::HashMap;
@@ -144,19 +145,25 @@ impl Expression {
             any_optimizations = true;
         }
 
-        // Then recursively optimize children
-        let mut new_children = Vec::with_capacity(current.children().len());
-        let mut any_child_optimized = false;
-        for child in current.children().iter() {
+        // Then recursively optimize children. The child vector is only allocated once a child
+        // actually changes, since the overwhelming majority of nodes are already optimal.
+        let mut new_children: Option<Vec<Expression>> = None;
+        for (idx, child) in current.children().iter().enumerate() {
             if let Some(optimized) = child.try_optimize_recursive_inner(scope, cache)? {
-                new_children.push(optimized);
-                any_child_optimized = true;
-            } else {
+                new_children
+                    .get_or_insert_with(|| {
+                        let children = current.children();
+                        let mut new_children = Vec::with_capacity(children.len());
+                        new_children.extend_from_slice(&children[..idx]);
+                        new_children
+                    })
+                    .push(optimized);
+            } else if let Some(new_children) = new_children.as_mut() {
                 new_children.push(child.clone());
             }
         }
 
-        if any_child_optimized {
+        if let Some(new_children) = new_children {
             current = current.with_children(new_children)?;
             any_optimizations = true;
 
@@ -238,7 +245,7 @@ impl SimplifyCtx for SimplifyCache<'_> {
         }
 
         // Otherwise, compute dtype from children
-        let input_dtypes: Vec<_> = expr
+        let input_dtypes: SmallVec<[DType; 3]> = expr
             .children()
             .iter()
             .map(|c| self.return_dtype(c))
