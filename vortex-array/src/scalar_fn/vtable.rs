@@ -262,7 +262,29 @@ pub trait ReduceNode {
     fn scalar_fn(&self) -> Option<&ScalarFnRef>;
 
     /// Descend to the child of this handle.
+    ///
+    /// This materializes a node, which for most implementations means an allocation. A rule that
+    /// only needs to know what a child *is* before deciding whether it can fire should probe with
+    /// [`ReduceNode::child_scalar_fn`] or [`ReduceNode::child_dtype`] first.
     fn child(&self, idx: usize) -> ReduceNodeRef;
+
+    /// The scalar function of the child at `idx`, if it is one.
+    ///
+    /// Lets a rule test a child without materializing a node for it. The default implementation
+    /// descends through [`ReduceNode::child`]; implementations that can answer without one should
+    /// override it.
+    fn child_scalar_fn(&self, idx: usize) -> Option<ScalarFnRef> {
+        self.child(idx).scalar_fn().cloned()
+    }
+
+    /// The data type of the child at `idx`.
+    ///
+    /// Lets a rule test a child's type without materializing a node for it. The default
+    /// implementation descends through [`ReduceNode::child`]; implementations that can answer
+    /// without one should override it.
+    fn child_dtype(&self, idx: usize) -> VortexResult<DType> {
+        self.child(idx).node_dtype()
+    }
 
     /// Returns the number of children of this node.
     fn child_count(&self) -> usize;

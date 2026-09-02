@@ -284,6 +284,14 @@ impl ReduceNode for ExpressionReduceNode {
         })
     }
 
+    fn child_scalar_fn(&self, idx: usize) -> Option<ScalarFnRef> {
+        Some(self.expression.child(idx).scalar_fn().clone())
+    }
+
+    fn child_dtype(&self, idx: usize) -> VortexResult<DType> {
+        self.expression.child(idx).return_dtype(&self.scope)
+    }
+
     fn child_count(&self) -> usize {
         self.expression.children().len()
     }

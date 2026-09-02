@@ -127,6 +127,21 @@ impl ReduceNode for ArrayRef {
         Arc::new(self.nth_child(idx).vortex_expect("child idx out of bounds"))
     }
 
+    fn child_scalar_fn(&self, idx: usize) -> Option<ScalarFnRef> {
+        self.nth_child(idx)
+            .vortex_expect("child idx out of bounds")
+            .as_opt::<ScalarFn>()
+            .map(|a| a.data().scalar_fn().clone())
+    }
+
+    fn child_dtype(&self, idx: usize) -> VortexResult<DType> {
+        Ok(self
+            .nth_child(idx)
+            .vortex_expect("child idx out of bounds")
+            .dtype()
+            .clone())
+    }
+
     fn child_count(&self) -> usize {
         self.nchildren()
     }

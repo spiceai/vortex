@@ -141,12 +141,13 @@ impl ScalarFnVTable for Cast {
         node: &dyn ReduceNode,
         _ctx: &dyn ReduceCtx,
     ) -> VortexResult<Option<ReduceNodeRef>> {
-        // Collapse node if child is already the target type
-        let child = node.child(0);
-        if &child.node_dtype()? == target_dtype {
-            return Ok(Some(child));
+        // Collapse node if child is already the target type. Reading the child's dtype through
+        // the probe avoids materializing a node for it when the cast is doing real work, which is
+        // the common case.
+        if &node.child_dtype(0)? != target_dtype {
+            return Ok(None);
         }
-        Ok(None)
+        Ok(Some(node.child(0)))
     }
 
     fn validity(&self, dtype: &DType, expression: &Expression) -> VortexResult<Option<Expression>> {

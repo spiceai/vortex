@@ -126,25 +126,29 @@ impl ScalarFnVTable for GetItem {
         node: &dyn ReduceNode,
         ctx: &dyn ReduceCtx,
     ) -> VortexResult<Option<ReduceNodeRef>> {
-        let child = node.child(0);
-        if let Some(child_fn) = child.scalar_fn()
-            && let Some(pack) = child_fn.as_opt::<Pack>()
-            && let Some(idx) = pack.names.find(field_name)
-        {
-            let mut field = child.child(idx);
+        // Probe what the child is before descending into it: `ReduceNode::child` materializes a
+        // node, and the child is a `Pack` only rarely.
+        let Some(child_fn) = node.child_scalar_fn(0) else {
+            return Ok(None);
+        };
+        let Some(pack) = child_fn.as_opt::<Pack>() else {
+            return Ok(None);
+        };
+        let Some(idx) = pack.names.find(field_name) else {
+            return Ok(None);
+        };
 
-            // Possibly mask the field if the pack is nullable
-            if pack.nullability.is_nullable() {
-                field = ctx.new_node(
-                    Mask.bind(EmptyOptions),
-                    &[field, ctx.new_node(Literal.bind(true.into()), &[])?],
-                )?;
-            }
+        let mut field = node.child(0).child(idx);
 
-            return Ok(Some(field));
+        // Possibly mask the field if the pack is nullable
+        if pack.nullability.is_nullable() {
+            field = ctx.new_node(
+                Mask.bind(EmptyOptions),
+                &[field, ctx.new_node(Literal.bind(true.into()), &[])?],
+            )?;
         }
 
-        Ok(None)
+        Ok(Some(field))
     }
 
     fn simplify_untyped(
