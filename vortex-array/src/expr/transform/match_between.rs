@@ -3,7 +3,8 @@
 
 use crate::expr::Expression;
 use crate::expr::and_collect;
-use crate::expr::forms::conjuncts;
+use crate::expr::forms::balanced_spine_depth;
+use crate::expr::forms::conjuncts_with_spine_depth;
 use crate::expr::lit;
 use crate::scalar_fn::ScalarFnVTableExt;
 use crate::scalar_fn::fns::between::Between;
@@ -19,8 +20,10 @@ use crate::scalar_fn::fns::operators::Operator;
 pub fn find_between(expr: Expression) -> Expression {
     // We search all pairs of cnfs to find any pair of expressions can be converted into a between
     // expression.
-    let mut conjuncts = conjuncts(&expr);
-    let mut rest = vec![];
+    let (mut conjuncts, spine_depth) = conjuncts_with_spine_depth(&expr);
+    let conjunct_count = conjuncts.len();
+    let mut rest = Vec::with_capacity(conjunct_count);
+    let mut any_matched = false;
 
     for idx in 0..conjuncts.len() {
         let Some(c) = conjuncts.get(idx).cloned() else {
@@ -37,12 +40,21 @@ pub fn find_between(expr: Expression) -> Expression {
                 rest.push(expr);
                 conjuncts.remove(idx2);
                 matched = true;
+                any_matched = true;
                 break;
             }
         }
         if !matched {
             rest.push(c.clone())
         }
+    }
+
+    // With no conjunct rewritten, `and_collect` would rebuild the spine node for node - two
+    // allocations each - to hand back an equivalent expression. The one thing that rebuild still
+    // buys is the balancing, which exists to keep later recursive passes off a long chain, so it
+    // is only worth paying for when the spine is deeper than the balanced form would be.
+    if !any_matched && spine_depth <= balanced_spine_depth(conjunct_count) {
+        return expr;
     }
 
     and_collect(rest).unwrap_or_else(|| lit(true))
