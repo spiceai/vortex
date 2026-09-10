@@ -22,8 +22,10 @@ pub mod build_views;
 
 mod view;
 pub use view::BinaryView;
+mod views_side;
 pub use view::Inlined;
 pub use view::Ref;
+pub(crate) use views_side::ViewsSide;
 
 #[cfg(test)]
 mod tests;

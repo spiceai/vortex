@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::cmp::Ordering;
 use std::sync::Arc;
 
+use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 
 use crate::aggregate_fn::AggregateFnRef;
@@ -25,6 +27,7 @@ use crate::expr::lt_eq;
 use crate::expr::or;
 use crate::expr::or_collect;
 use crate::expr::stats::Stat;
+use crate::scalar::Scalar;
 use crate::scalar::StringLike;
 use crate::scalar_fn::EmptyOptions;
 use crate::scalar_fn::ScalarFnId;
@@ -401,6 +404,30 @@ impl StatsRewriteRule for ListContainsAllNonNanStatsRewrite {
     }
 }
 
+/// Ceiling on how many interior-gap terms the `list_contains` falsifier emits
+/// alongside the outer range test.
+///
+/// A gap per adjacent pair proves exactly what a term per element would, so a
+/// list shorter than this takes them all. A longer list takes only the boundaries
+/// that divide it evenly, because each additional term is evaluated against
+/// every zone and buys progressively less — the gaps of a wide scattered list
+/// are all too narrow for a zone to fit inside however many are emitted.
+///
+/// Unlike the per-element form this stays a single top-level `OR`, so it never
+/// hands the optimizer the wide `AND` whose pairwise `between` search made
+/// deriving the predicate quadratic in the list length.
+///
+/// Boundaries are taken by position in the sorted list rather than by width:
+/// comparing widths needs arithmetic the element type may not have (strings,
+/// decimals across scales), while a position needs only the ordering every
+/// element type already provides.
+///
+/// Odd on purpose: the boundaries divide the sorted list evenly, so an odd
+/// count puts one of them at the median — which is where the single wide gap
+/// of a list split into a low group and a high group falls. An even count
+/// straddles it and prunes measurably less on exactly that shape.
+const FALSIFY_MAX_GAP_TERMS: usize = 31;
+
 fn list_contains_falsify<P: NonNanProof>(
     expr: &Expression,
     ctx: &StatsRewriteCtx<'_>,
@@ -408,12 +435,12 @@ fn list_contains_falsify<P: NonNanProof>(
     let list = expr.child(0);
     let needle = expr.child(1);
 
-    let Some(list_scalar) = literal_stat(list, Stat::Min) else {
-        return Ok(None);
-    };
-    let elements = list_scalar
+    // Read the literal directly rather than through `literal_stat`, whose
+    // `Stat::Min` arm would clone the whole list into a fresh `Literal` only for
+    // it to be unwrapped again here.
+    let elements = list
         .as_opt::<Literal>()
-        .and_then(|literal| literal.as_list_opt())
+        .and_then(|scalar| scalar.as_list_opt())
         .and_then(|list| list.elements());
     let Some(elements) = elements else {
         return Ok(None);
@@ -422,6 +449,13 @@ fn list_contains_falsify<P: NonNanProof>(
         return Ok(P::EMIT_UNGUARDED_REWRITES.then(|| lit(true)));
     }
 
+    // Before any work on the list: describing it as intervals means sorting it,
+    // and a rule that cannot guard this needle would sort it only to throw the
+    // result away.
+    let Some(guard) = non_nan_guard::<P>(ctx, [needle])? else {
+        return Ok(None);
+    };
+
     let Some(value_max) = max(needle, ctx) else {
         return Ok(None);
     };
@@ -429,16 +463,64 @@ fn list_contains_falsify<P: NonNanProof>(
         return Ok(None);
     };
 
-    let value_predicate = and_collect(elements.iter().map(|value| {
-        or(
-            lt(value_max.clone(), lit(value.clone())),
-            gt(value_min.clone(), lit(value.clone())),
-        )
-    }));
-    value_predicate
-        .map(|value_predicate| with_non_nan_guards::<P>(ctx, [needle], value_predicate))
-        .transpose()
-        .map(Option::flatten)
+    // A null element cannot make `list_contains` true — the equality form maps
+    // it to `false` through its own null fill — so it is not a value a zone has
+    // to be checked against. Dropping nulls rather than abandoning the whole
+    // list is what lets `x IN (1, 2, NULL, 3)` prune at all.
+    let mut sorted: Vec<&Scalar> = elements.iter().filter(|e| !e.is_null()).collect();
+
+    // Sorting is what lets the whole list be described by a handful of
+    // intervals instead of one term per element, and the intervals are only
+    // sound if that order is the one the statistics comparison uses. Whether
+    // values order at all is a property of their dtype, which every element of
+    // a list shares, so one incomparable pair means none of them order and the
+    // list proves nothing. Floats do order here: they compare totally, so `NaN`
+    // and the two signed zeros have positions rather than being incomparable.
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    if sorted
+        .windows(2)
+        .any(|pair| pair[0].partial_cmp(pair[1]).is_none())
+    {
+        return Ok(None);
+    }
+
+    // Equal values have nothing between them, so they cannot bound a gap.
+    // Collapsing them before the boundaries are chosen is what stops a list of
+    // mostly duplicates from spending every boundary inside one repeated value:
+    // `[0; 32] + [1000]` has exactly one gap, and sampling the sorted list
+    // directly would place all 31 boundaries inside the run of zeroes and miss
+    // it.
+    sorted.dedup_by(|a, b| (**a).partial_cmp(&**b) == Some(Ordering::Equal));
+
+    // Every element was null, so nothing orders and nothing is provable.
+    let (Some(lowest), Some(highest)) = (sorted.first(), sorted.last()) else {
+        return Ok(None);
+    };
+
+    // A scope is proven free of the list when it lies wholly outside the list's
+    // range, or wholly inside one of the gaps between two adjacent list values —
+    // nothing orders between an adjacent pair, so a row strictly between them
+    // cannot be in the list. The gaps are what make a clustered list prunable:
+    // a list split into a low group and a high group leaves most of the column
+    // *inside* its range, where the outer bound alone proves nothing.
+    let mut terms = Vec::with_capacity((sorted.len() + 1).min(FALSIFY_MAX_GAP_TERMS + 2));
+    terms.push(lt(value_max.clone(), lit((*lowest).clone())));
+    terms.push(gt(value_min.clone(), lit((*highest).clone())));
+
+    let gaps = (sorted.len() - 1).min(FALSIFY_MAX_GAP_TERMS);
+    for gap in 1..=gaps {
+        let idx = gap * sorted.len() / (gaps + 1);
+        let (below, above) = (sorted[idx - 1], sorted[idx]);
+        terms.push(and(
+            gt(value_min.clone(), lit(below.clone())),
+            lt(value_max.clone(), lit(above.clone())),
+        ));
+    }
+
+    // The two outer-range terms are pushed unconditionally, so there is always
+    // something to reduce.
+    let value_predicate = or_collect(terms).vortex_expect("terms is never empty");
+    Ok(Some(guard.apply(value_predicate)))
 }
 
 #[derive(Debug)]
@@ -627,11 +709,36 @@ fn stat_expr(expr: &Expression, stat: Stat, ctx: &StatsRewriteCtx<'_>) -> Option
         .then(|| stat_fn(expr.clone(), aggregate_fn))
 }
 
-fn with_non_nan_guards<'a, P: NonNanProof>(
+/// The NaN guard a rewrite carries, resolved independently of the value
+/// predicate it will guard.
+enum NanGuard {
+    /// The value predicate has to be conjoined with this check.
+    Check(Expression),
+    /// No possible NaN-bearing expression remains, so the value predicate is
+    /// already guarded and stands alone.
+    Unguarded,
+}
+
+impl NanGuard {
+    fn apply(self, value_predicate: Expression) -> Expression {
+        match self {
+            Self::Check(check) => and(check, value_predicate),
+            Self::Unguarded => value_predicate,
+        }
+    }
+}
+
+/// Resolves the guard for `exprs`, or `None` when this proof cannot guard them
+/// and the rule must therefore emit nothing.
+///
+/// Worth resolving before the value predicate is built rather than after: two
+/// rules are registered per function and differ only in this proof, so for any
+/// given needle one of them commonly emits nothing. Asking first is what stops
+/// it from building a predicate it will discard.
+fn non_nan_guard<'a, P: NonNanProof>(
     ctx: &StatsRewriteCtx<'_>,
     exprs: impl IntoIterator<Item = &'a Expression>,
-    value_predicate: Expression,
-) -> VortexResult<Option<Expression>> {
+) -> VortexResult<Option<NanGuard>> {
     let mut nan_checks = Vec::new();
     for expr in exprs {
         match P::check(ctx, expr)? {
@@ -640,16 +747,22 @@ fn with_non_nan_guards<'a, P: NonNanProof>(
             NanCheck::Unavailable => return Ok(None),
         }
     }
-    let nan_predicate = and_collect(nan_checks);
 
-    Ok(match nan_predicate {
-        Some(nan_check) => Some(and(nan_check, value_predicate)),
-        // No possible NaN-bearing expression remains, so the value predicate is
-        // already guarded. Only one registered rule emits this unguarded
-        // rewrite so non-float comparisons are not duplicated.
-        None if P::EMIT_UNGUARDED_REWRITES => Some(value_predicate),
+    Ok(match and_collect(nan_checks) {
+        Some(check) => Some(NanGuard::Check(check)),
+        // Only one registered rule emits an unguarded rewrite, so a non-float
+        // comparison is not rewritten twice.
+        None if P::EMIT_UNGUARDED_REWRITES => Some(NanGuard::Unguarded),
         None => None,
     })
+}
+
+fn with_non_nan_guards<'a, P: NonNanProof>(
+    ctx: &StatsRewriteCtx<'_>,
+    exprs: impl IntoIterator<Item = &'a Expression>,
+    value_predicate: Expression,
+) -> VortexResult<Option<Expression>> {
+    Ok(non_nan_guard::<P>(ctx, exprs)?.map(|guard| guard.apply(value_predicate)))
 }
 
 fn literal_stat(expr: &Expression, stat: Stat) -> Option<Expression> {
@@ -909,22 +1022,26 @@ mod tests {
         );
         let expr = list_contains(lit(list), col("a"));
 
+        // The falsifier describes the list as intervals: the scope lies wholly
+        // outside the list's range, or wholly inside a gap between two adjacent
+        // list values. For a list this dense the gaps cover every element, so
+        // it proves exactly what a term per element would.
         assert_eq!(
             falsify(&expr)?,
-            Some(and(
-                and(
-                    or(
-                        lt(stat(col("a"), Stat::Max), lit(1i32)),
-                        gt(stat(col("a"), Stat::Min), lit(1i32)),
-                    ),
-                    or(
-                        lt(stat(col("a"), Stat::Max), lit(2i32)),
-                        gt(stat(col("a"), Stat::Min), lit(2i32)),
-                    ),
+            Some(or(
+                or(
+                    lt(stat(col("a"), Stat::Max), lit(1i32)),
+                    gt(stat(col("a"), Stat::Min), lit(3i32)),
                 ),
                 or(
-                    lt(stat(col("a"), Stat::Max), lit(3i32)),
-                    gt(stat(col("a"), Stat::Min), lit(3i32)),
+                    and(
+                        gt(stat(col("a"), Stat::Min), lit(1i32)),
+                        lt(stat(col("a"), Stat::Max), lit(2i32)),
+                    ),
+                    and(
+                        gt(stat(col("a"), Stat::Min), lit(2i32)),
+                        lt(stat(col("a"), Stat::Max), lit(3i32)),
+                    ),
                 ),
             ))
         );

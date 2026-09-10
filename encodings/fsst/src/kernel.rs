@@ -16,6 +16,8 @@ use vortex_array::scalar_fn::fns::cast::Cast;
 use vortex_array::scalar_fn::fns::cast::CastExecuteAdaptor;
 use vortex_array::scalar_fn::fns::like::Like;
 use vortex_array::scalar_fn::fns::like::LikeExecuteAdaptor;
+use vortex_array::scalar_fn::fns::list_contains::ListContains;
+use vortex_array::scalar_fn::fns::list_contains::ListContainsElementExecuteAdaptor;
 use vortex_session::VortexSession;
 
 use crate::FSST;
@@ -24,6 +26,11 @@ pub(super) fn initialize(session: &VortexSession) {
     let kernels = session.kernels();
     kernels.register_execute_parent_kernel(Cast.id(), FSST, CastExecuteAdaptor(FSST));
     kernels.register_execute_parent_kernel(Binary.id(), FSST, CompareExecuteAdaptor(FSST));
+    kernels.register_execute_parent_kernel(
+        ListContains.id(),
+        FSST,
+        ListContainsElementExecuteAdaptor(FSST),
+    );
     kernels.register_execute_parent_kernel(Filter.id(), FSST, FilterExecuteAdaptor(FSST));
     kernels.register_execute_parent_kernel(Dict.id(), FSST, TakeExecuteAdaptor(FSST));
     kernels.register_execute_parent_kernel(Like.id(), FSST, LikeExecuteAdaptor(FSST));

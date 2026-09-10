@@ -160,6 +160,17 @@ impl<'a> ListScalar<'a> {
         })
     }
 
+    /// Returns the element values, borrowed from the scalar itself.
+    ///
+    /// Returns None if the list is null. Unlike [`Self::elements`] this clones
+    /// nothing, so it is the form to reach for when a caller only reads the
+    /// values; the cost of materializing a `Vec<Scalar>` is proportional to the
+    /// length of the list and is paid again on drop.
+    #[inline]
+    pub fn element_values(&self) -> Option<&'a [Option<ScalarValue>]> {
+        self.elements
+    }
+
     /// Returns all elements in the list as a vector of scalars.
     ///
     /// Returns None if the list is null.
