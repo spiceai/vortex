@@ -3,18 +3,23 @@
 
 mod kernel;
 
+use std::hash::Hash;
 use std::ops::BitOr;
 
 use arrow_buffer::bit_iterator::BitIndexIterator;
 pub use kernel::*;
+use num_traits::AsPrimitive;
 use num_traits::Zero;
 use vortex_buffer::BitBuffer;
+use vortex_buffer::BitBufferMut;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
+use vortex_mask::Mask;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
+use vortex_utils::aliases::hash_set::HashSet;
 use vortex_utils::iter::ReduceBalancedIterExt;
 
 use crate::ArrayRef;
@@ -23,20 +28,30 @@ use crate::IntoArray;
 use crate::arrays::BoolArray;
 use crate::arrays::Constant;
 use crate::arrays::ConstantArray;
+use crate::arrays::ExtensionArray;
 use crate::arrays::ListViewArray;
 use crate::arrays::PrimitiveArray;
+use crate::arrays::VarBin;
+use crate::arrays::VarBinViewArray;
 use crate::arrays::bool::BoolArrayExt;
+use crate::arrays::extension::ExtensionArrayExt;
 use crate::arrays::listview::ListViewArrayExt;
+use crate::arrays::primitive::NativeValue;
 use crate::arrays::primitive::PrimitiveArrayExt;
 use crate::arrays::scalar_fn::ScalarFnFactoryExt;
+use crate::arrays::varbin::VarBinArrayExt;
+use crate::arrays::varbinview::ViewsSide;
 use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
 use crate::dtype::IntegerPType;
+use crate::dtype::NativePType;
 use crate::dtype::Nullability;
 use crate::match_each_integer_ptype;
+use crate::match_each_native_ptype;
 use crate::match_each_unsigned_integer_ptype;
 use crate::scalar::ListScalar;
 use crate::scalar::Scalar;
+use crate::scalar::ScalarValue;
 use crate::scalar_fn::Arity;
 use crate::scalar_fn::ChildName;
 use crate::scalar_fn::EmptyOptions;
@@ -111,10 +126,13 @@ impl ScalarFnVTable for ListContains {
         let list_array = args.get(0)?;
         let value_array = args.get(1)?;
 
-        if let Some(list_scalar) = list_array.as_constant()
-            && let Some(value_scalar) = value_array.as_constant()
+        // The needle is tested first: for an `IN` list it is an array, so this
+        // fails on a downcast, whereas `list_array.as_constant()` deep-clones
+        // every element of the list before the chain can reject it.
+        if let Some(value_scalar) = value_array.as_constant()
+            && let Some(list_constant) = list_array.as_opt::<Constant>()
         {
-            let result = compute_contains_scalar(&list_scalar, &value_scalar)?;
+            let result = compute_contains_scalar(list_constant.scalar(), &value_scalar)?;
             return Ok(ConstantArray::new(result, args.row_count()).into_array());
         }
 
@@ -176,21 +194,62 @@ fn compute_list_contains(
 
     if let Some(value_scalar) = value.as_constant() {
         list_contains_scalar(array, &value_scalar, nullability, ctx)
-    } else if let Some(list_scalar) = array.as_constant() {
-        constant_list_scalar_contains(&list_scalar.as_list(), value, nullability)
+    } else if let Some(list_constant) = array.as_opt::<Constant>() {
+        constant_list_scalar_contains(&list_constant.scalar().as_list(), value, nullability, ctx)
     } else {
         todo!("unsupported list contains with list and element as arrays")
     }
 }
 
+/// List length past which membership is answered by probing a set instead of by
+/// OR-ing one equality per element.
+///
+/// The equality form costs one full-length comparison per element, so it grows
+/// with the list, while the probe is built once per batch and then answers each
+/// row in constant time. Where they cross depends on how expensive one
+/// comparison is, which is a property of the column rather than of its type.
+/// Measured on an 8192-row batch: `i64` needles run the equality form at 3.46,
+/// 7.29 and 11.42us for one, two and three elements against a probe at 17.25us
+/// for four, crossing just above four; `Utf8` needles run it at 10.92, 26.04 and
+/// 38.96us against a probe at 37.08us, crossing just below three. Four sits
+/// between them, within about 13% of the equality form at its worst point and
+/// ahead of it everywhere after.
+const HASH_PROBE_MIN_ELEMENTS: usize = 4;
+
+/// Slots per element to size the probe set with.
+///
+/// Sizing it at exactly the element count leaves the table at its maximum load
+/// factor, where the resulting probe chains cost 16-57% more than this across
+/// four to eight thousand elements. Four slots an element buys a further 7-9%
+/// over two for the mid-range sizes, for at most a few tens of kilobytes.
+const PROBE_SET_HEADROOM: usize = 4;
+
 /// There is a constant list scalar (haystack) being compared to an array of needles.
 fn constant_list_scalar_contains(
-    list_scalar: &ListScalar,
+    list_scalar: &ListScalar<'_>,
     values: &ArrayRef,
     nullability: Nullability,
+    ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
-    let elements = list_scalar.elements().vortex_expect("non null");
+    // Borrowed rather than materialized as `Vec<Scalar>`: this runs once per
+    // batch, and cloning every element of the list back out of the scalar costs
+    // more than the set built from them.
+    let element_values = list_scalar.element_values().vortex_expect("non null");
 
+    // A null element is not a key on any probe path, so the whole list goes back
+    // to the equality form. Establishing that here rather than inside the probe
+    // is what stops a nullable list from canonicalizing the needles, and keying
+    // as much of the list as precedes the null, only to discard both and run the
+    // equality form anyway — which would make such a list dearer than it was
+    // before the probe existed.
+    if element_values.len() >= HASH_PROBE_MIN_ELEMENTS
+        && element_values.iter().all(Option::is_some)
+        && let Some(probed) = hash_probe_contains(element_values, values, nullability, ctx)?
+    {
+        return Ok(probed);
+    }
+
+    let elements = list_scalar.elements().vortex_expect("non null");
     let len = values.len();
     let false_scalar = Scalar::bool(false, nullability);
 
@@ -213,6 +272,171 @@ fn constant_list_scalar_contains(
         .try_reduce_balanced(|acc, res| acc.binary(res, Operator::Or))?;
 
     Ok(result.unwrap_or_else(|| ConstantArray::new(false_scalar, len).into_array()))
+}
+
+/// Answers membership by building a set from the list once and probing it in a
+/// single pass over the needles.
+///
+/// Covers primitive, `Utf8` and `Binary` needles. Returns `None` for anything
+/// else, and for a list holding a null element, leaving the caller on the
+/// OR-of-equalities form, which is the definition of the operation.
+///
+/// Validity follows the equality form exactly: it fills a null comparison with
+/// `false`, so a null needle is `false` rather than null, and the result carries
+/// no invalid slots.
+fn hash_probe_contains(
+    elements: &[Option<ScalarValue>],
+    values: &ArrayRef,
+    nullability: Nullability,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<Option<ArrayRef>> {
+    let len = values.len();
+    let ptype = match values.dtype() {
+        DType::Primitive(ptype, _) => *ptype,
+        // Strings and byte strings key on their bytes; see `bytes_probe_contains`.
+        DType::Utf8(_) | DType::Binary(_) => {
+            return bytes_probe_contains(elements, values, nullability, ctx);
+        }
+        // An extension value *is* its storage value — `ScalarValue` has no
+        // extension variant — and `Operator::Eq` compares extensions through
+        // their storage, so the list's values key a storage probe unchanged.
+        // Both sides were checked against each other before dispatch, so they
+        // unwrap to the same storage type; one whose storage this path does not
+        // cover declines below and takes the equality form, as it would have.
+        DType::Extension(_) => {
+            let storage = values.clone().execute::<ExtensionArray>(ctx)?;
+            return hash_probe_contains(elements, storage.storage_array(), nullability, ctx);
+        }
+        _ => return Ok(None),
+    };
+
+    let needles = values.clone().execute::<PrimitiveArray>(ctx)?;
+    let validity = needles.validity()?.execute_mask(len, ctx)?;
+
+    let bits = match_each_native_ptype!(ptype, |T| {
+        let Some(set) = primitive_key_set::<T>(elements) else {
+            return Ok(None);
+        };
+        let slice = needles.as_slice::<T>();
+        probe_rows(len, &validity, |idx| set.contains(&NativeValue(slice[idx])))
+    });
+
+    Ok(Some(BoolArray::new(bits, nullability.into()).into_array()))
+}
+
+/// Keys the list on its primitive values, or `None` if any element is not a
+/// non-null primitive of `T`.
+///
+/// [`NativeValue`] is the key rather than the bare value because its equality is
+/// the one the kernel answers with: `NativePType::is_eq` compares floats by
+/// their bits, so `NaN` matches itself and `-0.0` does not match `0.0`, and a
+/// set keyed on the value would disagree with `Operator::Eq` on both.
+///
+/// A null element is not a key, and the equality form maps it to `false`
+/// through its own null fill, so such a list goes back to that form rather than
+/// being answered with a key missing.
+fn primitive_key_set<T: NativePType>(
+    elements: &[Option<ScalarValue>],
+) -> Option<HashSet<NativeValue<T>>>
+where
+    NativeValue<T>: Hash + Eq,
+{
+    let mut set = HashSet::with_capacity(elements.len() * PROBE_SET_HEADROOM);
+    for element in elements {
+        let ScalarValue::Primitive(pvalue) = element.as_ref()? else {
+            return None;
+        };
+        // The list's element dtype was checked against the needle dtype before
+        // dispatch, so this holds; `cast` would otherwise convert a value of
+        // some other width and key it under a number it never equals.
+        if !pvalue.is_instance_of(&T::PTYPE) {
+            return None;
+        }
+        set.insert(NativeValue(pvalue.cast::<T>().ok()?));
+    }
+    Some(set)
+}
+
+/// Membership for `Utf8`/`Binary` needles, keyed on the element bytes.
+///
+/// The keys borrow from `elements`, which outlives the set, so building it
+/// copies no string data.
+fn bytes_probe_contains(
+    elements: &[Option<ScalarValue>],
+    values: &ArrayRef,
+    nullability: Nullability,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<Option<ArrayRef>> {
+    let mut set: HashSet<&[u8]> = HashSet::with_capacity(elements.len() * PROBE_SET_HEADROOM);
+    for element in elements {
+        // A null element is not a key; the whole list goes back to the
+        // equality form rather than being answered with a key missing.
+        let bytes = match element {
+            Some(ScalarValue::Utf8(value)) => value.as_bytes(),
+            Some(ScalarValue::Binary(value)) => value.as_slice(),
+            _ => return Ok(None),
+        };
+        set.insert(bytes);
+    }
+
+    let len = values.len();
+
+    // `VarBin` already holds what the probe needs — a byte buffer and a run of
+    // offsets — but it is not canonical, so executing it would first build a
+    // `VarBinView`: sixteen bytes of view per row, to reach bytes that are
+    // already contiguous. For short values that view costs more to construct
+    // than the whole comparison it serves, and FSST's codes arrive in exactly
+    // this shape.
+    let bits = if let Some(varbin) = values.as_opt::<VarBin>() {
+        let validity = varbin.varbin_validity().execute_mask(len, ctx)?;
+        let bytes = varbin.bytes().as_slice();
+        let offsets = varbin.offsets().clone().execute::<PrimitiveArray>(ctx)?;
+        match_each_integer_ptype!(offsets.ptype(), |O| {
+            // One offset per row plus a final end, so adjacent pairs are the
+            // rows in order.
+            let offsets = offsets.as_slice::<O>();
+            probe_rows(len, &validity, |idx| {
+                let (start, end): (usize, usize) = (offsets[idx].as_(), offsets[idx + 1].as_());
+                set.contains(&bytes[start..end])
+            })
+        })
+    } else {
+        let needles = values.clone().execute::<VarBinViewArray>(ctx)?;
+        let validity = needles.validity()?.execute_mask(len, ctx)?;
+        // Resolved once: reaching a row's bytes through the array re-derives the
+        // views slice and re-checks the buffer index on every row.
+        let side = ViewsSide::new(&needles);
+        let views = side.views();
+        probe_rows(len, &validity, |idx| {
+            set.contains(side.view_bytes(&views[idx]))
+        })
+    };
+
+    Ok(Some(BoolArray::new(bits, nullability.into()).into_array()))
+}
+
+/// One pass over the needles, setting the bit for each one the set holds.
+///
+/// An invalid needle is `false`, which is what the OR-of-equalities form's null
+/// fill produces, so the result carries no invalid slots. `hit` is asked about a
+/// row only when that row is valid.
+fn probe_rows(len: usize, validity: &Mask, hit: impl Fn(usize) -> bool) -> BitBuffer {
+    match validity {
+        Mask::AllTrue(_) => (0..len).map(hit).collect(),
+        Mask::AllFalse(_) => BitBuffer::new_unset(len),
+        Mask::Values(valid) => {
+            // Walking the valid rows a word at a time skips runs of nulls
+            // wholesale, where testing validity per row pays a branch for every
+            // one of them.
+            let mut bits = BitBufferMut::new_unset(len);
+            valid.bit_buffer().for_each_set_index(|idx| {
+                if hit(idx) {
+                    bits.set(idx);
+                }
+            });
+            bits.freeze()
+        }
+    }
 }
 
 /// Returns a [`BoolArray`] where each bit represents if a list contains the scalar.
@@ -400,16 +624,20 @@ mod tests {
     use rstest::rstest;
     use vortex_buffer::BitBuffer;
     use vortex_buffer::Buffer;
+    use vortex_buffer::buffer;
     use vortex_error::VortexExpect;
     use vortex_error::VortexResult;
     use vortex_session::VortexSession;
 
+    use super::ListContains;
     use crate::ArrayRef;
     use crate::IntoArray;
     use crate::VortexSessionExecute;
     use crate::array_session;
+    use crate::arrays::ExtensionArray;
     use crate::arrays::ListArray;
     use crate::arrays::VarBinArray;
+    use crate::arrays::scalar_fn::ScalarFnFactoryExt;
     use crate::assert_arrays_eq;
     use crate::dtype::DType;
     use crate::dtype::Nullability;
@@ -426,7 +654,10 @@ mod tests {
     use crate::expr::or;
     use crate::expr::root;
     use crate::expr::stats::Stat;
+    use crate::extension::datetime::TimeUnit;
+    use crate::extension::datetime::Timestamp;
     use crate::scalar::Scalar;
+    use crate::scalar_fn::EmptyOptions;
     use crate::scalar_fn::fns::list_contains::BoolArray;
     use crate::scalar_fn::fns::list_contains::ConstantArray;
     use crate::scalar_fn::fns::list_contains::ListViewArray;
@@ -599,23 +830,27 @@ mod tests {
             Nullability::NonNullable,
         );
 
+        // The falsifier describes the list as intervals: the scope lies wholly
+        // outside the list's range, or wholly inside a gap between two adjacent
+        // list values. For a list this dense the gaps cover every element, so
+        // it proves exactly what a term per element would.
         assert_eq!(
             expr.falsify(&scope, &STATS_SESSION)?,
-            Some(and(
-                and(
-                    or(
-                        lt(stat(col("a"), Stat::Max), lit(1i32)),
-                        gt(stat(col("a"), Stat::Min), lit(1i32)),
-                    ),
-                    or(
-                        lt(stat(col("a"), Stat::Max), lit(2i32)),
-                        gt(stat(col("a"), Stat::Min), lit(2i32)),
-                    )
+            Some(or(
+                or(
+                    lt(stat(col("a"), Stat::Max), lit(1i32)),
+                    gt(stat(col("a"), Stat::Min), lit(3i32)),
                 ),
                 or(
-                    lt(stat(col("a"), Stat::Max), lit(3i32)),
-                    gt(stat(col("a"), Stat::Min), lit(3i32)),
-                )
+                    and(
+                        gt(stat(col("a"), Stat::Min), lit(1i32)),
+                        lt(stat(col("a"), Stat::Max), lit(2i32)),
+                    ),
+                    and(
+                        gt(stat(col("a"), Stat::Min), lit(2i32)),
+                        lt(stat(col("a"), Stat::Max), lit(3i32)),
+                    ),
+                ),
             ))
         );
         Ok(())
@@ -931,5 +1166,137 @@ mod tests {
 
         let expected_zero = BoolArray::from_iter([true, false, false, false]);
         assert_arrays_eq!(result_zero, expected_zero, &mut ctx);
+    }
+
+    // Extension needles are answered through their storage; these came with
+    // that support and belong beside the path that now provides it.
+    /// Membership over a timestamp column, whose storage is the `i64` beneath it.
+    fn timestamps_in(list_values: &[i64], unit: TimeUnit) -> Vec<bool> {
+        let mut ctx = array_session().create_execution_ctx();
+        let ext_dtype = Timestamp::new(unit, Nullability::NonNullable).erased();
+        let needles = ExtensionArray::new(
+            ext_dtype.clone(),
+            buffer![10i64, 20, 30, 40, 50].into_array(),
+        )
+        .into_array();
+
+        let element_dtype = DType::Extension(ext_dtype);
+        let list = Scalar::list(
+            Arc::new(element_dtype.clone()),
+            list_values
+                .iter()
+                .map(|v| {
+                    Scalar::primitive(*v, Nullability::NonNullable)
+                        .cast(&element_dtype)
+                        .expect("i64 into the timestamp it stores")
+                })
+                .collect(),
+            Nullability::NonNullable,
+        );
+
+        let len = needles.len();
+        let result = ListContains
+            .try_new_array(
+                len,
+                EmptyOptions,
+                [ConstantArray::new(list, len).into_array(), needles],
+            )
+            .expect("build")
+            .execute::<BoolArray>(&mut ctx)
+            .expect("execute");
+        result.bool_vec(&mut ctx)
+    }
+
+    #[test]
+    fn a_timestamp_list_is_answered_through_its_storage() {
+        // Long enough to take the set probe rather than OR-of-equalities.
+        assert_eq!(
+            timestamps_in(&[10, 30, 50, 70], TimeUnit::Milliseconds),
+            vec![true, false, true, false, true]
+        );
+        // Below the probe threshold, so the equality form answers it; both must
+        // agree.
+        assert_eq!(
+            timestamps_in(&[20, 40], TimeUnit::Milliseconds),
+            vec![false, true, false, true, false]
+        );
+    }
+
+    #[test]
+    fn a_nullable_list_holding_a_null_falls_back_instead_of_panicking() {
+        // The dtype check ignores nullability, so a nullable extension list can
+        // reach this kernel against a non-nullable column. A null element then
+        // has no storage value to unwrap.
+        let mut ctx = array_session().create_execution_ctx();
+        let nullable = DType::Extension(
+            Timestamp::new(TimeUnit::Milliseconds, Nullability::Nullable).erased(),
+        );
+        let needles = ExtensionArray::new(
+            Timestamp::new(TimeUnit::Milliseconds, Nullability::NonNullable).erased(),
+            buffer![10i64, 20, 30, 40, 50].into_array(),
+        )
+        .into_array();
+
+        let mut elements: Vec<Scalar> = [10i64, 30, 50, 70]
+            .iter()
+            .map(|v| {
+                Scalar::primitive(*v, Nullability::NonNullable)
+                    .cast(&nullable)
+                    .expect("i64 into the timestamp it stores")
+            })
+            .collect();
+        elements.push(Scalar::null(nullable.clone()));
+        let list = Scalar::list(Arc::new(nullable), elements, Nullability::Nullable);
+
+        let len = needles.len();
+        let result = ListContains
+            .try_new_array(
+                len,
+                EmptyOptions,
+                [ConstantArray::new(list, len).into_array(), needles],
+            )
+            .expect("build")
+            .execute::<BoolArray>(&mut ctx)
+            .expect("execute");
+        assert_eq!(
+            result.bool_vec(&mut ctx),
+            vec![true, false, true, false, true]
+        );
+    }
+
+    #[test]
+    fn a_different_time_unit_is_not_matched_against_raw_storage() {
+        // The list is in seconds and the column in milliseconds. Their storage
+        // integers would compare equal, but the values do not.
+        let mut ctx = array_session().create_execution_ctx();
+        let needles = ExtensionArray::new(
+            Timestamp::new(TimeUnit::Milliseconds, Nullability::NonNullable).erased(),
+            buffer![10i64, 20, 30].into_array(),
+        )
+        .into_array();
+        let seconds =
+            DType::Extension(Timestamp::new(TimeUnit::Seconds, Nullability::NonNullable).erased());
+        let list = Scalar::list(
+            Arc::new(seconds.clone()),
+            vec![
+                Scalar::primitive(10i64, Nullability::NonNullable)
+                    .cast(&seconds)
+                    .expect("i64 into the timestamp it stores"),
+            ],
+            Nullability::NonNullable,
+        );
+        let len = needles.len();
+        let result = ListContains
+            .try_new_array(
+                len,
+                EmptyOptions,
+                [ConstantArray::new(list, len).into_array(), needles],
+            )
+            .expect("build")
+            .execute::<BoolArray>(&mut ctx);
+        assert!(
+            result.is_err(),
+            "a seconds list must not match a milliseconds column"
+        );
     }
 }
