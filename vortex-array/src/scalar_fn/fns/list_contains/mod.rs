@@ -236,7 +236,14 @@ fn constant_list_scalar_contains(
     // more than the set built from them.
     let element_values = list_scalar.element_values().vortex_expect("non null");
 
+    // A null element is not a key on any probe path, so the whole list goes back
+    // to the equality form. Establishing that here rather than inside the probe
+    // is what stops a nullable list from canonicalizing the needles, and keying
+    // as much of the list as precedes the null, only to discard both and run the
+    // equality form anyway — which would make such a list dearer than it was
+    // before the probe existed.
     if element_values.len() >= HASH_PROBE_MIN_ELEMENTS
+        && element_values.iter().all(Option::is_some)
         && let Some(probed) = hash_probe_contains(element_values, values, nullability, ctx)?
     {
         return Ok(probed);

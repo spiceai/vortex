@@ -74,6 +74,12 @@ impl ListContainsElementKernel for FSST {
             return Ok(None);
         }
 
+        // A null element has no compressed form and sends the whole list back to
+        // the generic path, so find that out before compressing any of it.
+        if elements.iter().any(Option::is_none) {
+            return Ok(None);
+        }
+
         let compressor = element.compressor();
         let code_dtype = DType::Binary(Nullability::NonNullable);
         let mut codes = Vec::with_capacity(elements.len());
