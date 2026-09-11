@@ -13,8 +13,6 @@ use crate::scalar_fn::fns::binary::Binary;
 use crate::scalar_fn::fns::binary::CompareExecuteAdaptor;
 use crate::scalar_fn::fns::cast::Cast;
 use crate::scalar_fn::fns::cast::CastExecuteAdaptor;
-use crate::scalar_fn::fns::list_contains::ListContains;
-use crate::scalar_fn::fns::list_contains::ListContainsElementExecuteAdaptor;
 
 pub(crate) fn initialize(session: &VortexSession) {
     let kernels = session.kernels();
@@ -24,10 +22,5 @@ pub(crate) fn initialize(session: &VortexSession) {
         CompareExecuteAdaptor(Extension),
     );
     kernels.register_execute_parent_kernel(Cast.id(), Extension, CastExecuteAdaptor(Extension));
-    kernels.register_execute_parent_kernel(
-        ListContains.id(),
-        Extension,
-        ListContainsElementExecuteAdaptor(Extension),
-    );
     kernels.register_execute_parent_kernel(Dict.id(), Extension, TakeExecuteAdaptor(Extension));
 }
