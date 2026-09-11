@@ -130,6 +130,7 @@ mod tests {
     use vortex_error::VortexResult;
     use vortex_session::VortexSession;
 
+    use super::MIN_ROWS_PER_LIST_ELEMENT;
     use crate::fsst_compress;
     use crate::fsst_train_compressor;
 
@@ -168,12 +169,40 @@ mod tests {
         None,
     ];
 
+    /// Rows in the test column.
+    ///
+    /// The kernel declines below [`MIN_ROWS_PER_LIST_ELEMENT`] rows per list
+    /// element, so the longest list the tests use needs a column this size
+    /// before the kernel will engage at all. `VALUES` is cycled to fill it, so
+    /// the answers repeat with the same period.
+    const ROWS: usize = 8 * 32 * 2;
+
     fn answers(
         list: Vec<&str>,
         needle_nullability: Nullability,
     ) -> VortexResult<Vec<Option<bool>>> {
+        answers_over(&VALUES, list, needle_nullability)
+    }
+
+    /// Answers over `column` cycled to [`ROWS`] rows, asserting that the
+    /// compressed and uncompressed paths agree.
+    fn answers_over(
+        column: &[Option<&str>],
+        list: Vec<&str>,
+        needle_nullability: Nullability,
+    ) -> VortexResult<Vec<Option<bool>>> {
+        assert!(
+            list.len() * MIN_ROWS_PER_LIST_ELEMENT <= ROWS,
+            "a {}-element list needs {} rows for the kernel to engage, column has {ROWS}",
+            list.len(),
+            list.len() * MIN_ROWS_PER_LIST_ELEMENT,
+        );
         let mut ctx = SESSION.create_execution_ctx();
-        let plain = VarBinArray::from_iter(VALUES, DType::Utf8(needle_nullability)).into_array();
+        let plain = VarBinArray::from_iter(
+            (0..ROWS).map(|i| column[i % column.len()]),
+            DType::Utf8(needle_nullability),
+        )
+        .into_array();
         let compressor = fsst_train_compressor(&plain, &mut ctx)?;
         let compressed = fsst_compress(&plain, &compressor, &mut ctx)?.into_array();
 
@@ -201,7 +230,19 @@ mod tests {
         // The compressed answer must equal the uncompressed one; the tests then
         // only have to assert the latter.
         assert_eq!(results[0], results[1], "FSST answer diverged from VarBin");
-        Ok(results.remove(1))
+
+        // The column is `VALUES` cycled, so the answers are too. Checking that
+        // and returning one period keeps the expectations readable while the
+        // column stays long enough to reach the kernel.
+        let answers = results.remove(1);
+        let period = &answers[..column.len()];
+        for (chunk, at) in answers
+            .chunks(column.len())
+            .zip((0..).step_by(column.len()))
+        {
+            assert_eq!(chunk, period, "answers stopped repeating at row {at}");
+        }
+        Ok(period.to_vec())
     }
 
     #[test]
@@ -308,33 +349,12 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn non_nullable_needles() -> VortexResult<()> {
-        let mut ctx = SESSION.create_execution_ctx();
-        let plain = VarBinArray::from_iter(
-            ["a", "b", "c", "d"].map(Some),
-            DType::Utf8(Nullability::NonNullable),
-        )
-        .into_array();
-        let compressor = fsst_train_compressor(&plain, &mut ctx)?;
-        let compressed = fsst_compress(&plain, &compressor, &mut ctx)?.into_array();
-
-        let list = Scalar::list(
-            Arc::new(DType::Utf8(Nullability::NonNullable)),
-            ["a", "c", "e", "f"]
-                .map(|v| Scalar::utf8(v, Nullability::NonNullable))
-                .to_vec(),
-            Nullability::NonNullable,
-        );
-        let len = compressed.len();
-        let result = ListContains
-            .try_new_array(
-                len,
-                EmptyOptions,
-                [ConstantArray::new(list, len).into_array(), compressed],
-            )?
-            .execute::<BoolArray>(&mut ctx)?;
-
         assert_eq!(
-            bool_answers(&result, &mut ctx),
+            answers_over(
+                &["a", "b", "c", "d"].map(Some),
+                vec!["a", "c", "e", "f"],
+                Nullability::NonNullable
+            )?,
             vec![Some(true), Some(false), Some(true), Some(false)]
         );
         Ok(())

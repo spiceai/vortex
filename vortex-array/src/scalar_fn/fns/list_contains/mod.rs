@@ -11,6 +11,7 @@ pub use kernel::*;
 use num_traits::AsPrimitive;
 use num_traits::Zero;
 use vortex_buffer::BitBuffer;
+use vortex_buffer::BitBufferMut;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
@@ -297,9 +298,8 @@ fn hash_probe_contains(
         let Some(set) = primitive_key_set::<T>(elements) else {
             return Ok(None);
         };
-        probe_rows(needles.as_slice::<T>().iter(), &validity, |needle| {
-            set.contains(&NativeValue(*needle))
-        })
+        let slice = needles.as_slice::<T>();
+        probe_rows(len, &validity, |idx| set.contains(&NativeValue(slice[idx])))
     });
 
     Ok(Some(BoolArray::new(bits, nullability.into()).into_array()))
@@ -375,8 +375,9 @@ fn bytes_probe_contains(
         match_each_integer_ptype!(offsets.ptype(), |O| {
             // One offset per row plus a final end, so adjacent pairs are the
             // rows in order.
-            probe_rows(offsets.as_slice::<O>().windows(2), &validity, |pair| {
-                let (start, end): (usize, usize) = (pair[0].as_(), pair[1].as_());
+            let offsets = offsets.as_slice::<O>();
+            probe_rows(len, &validity, |idx| {
+                let (start, end): (usize, usize) = (offsets[idx].as_(), offsets[idx + 1].as_());
                 set.contains(&bytes[start..end])
             })
         })
@@ -386,8 +387,9 @@ fn bytes_probe_contains(
         // Resolved once: reaching a row's bytes through the array re-derives the
         // views slice and re-checks the buffer index on every row.
         let side = ViewsSide::new(&needles);
-        probe_rows(side.views().iter(), &validity, |view| {
-            set.contains(side.view_bytes(view))
+        let views = side.views();
+        probe_rows(len, &validity, |idx| {
+            set.contains(side.view_bytes(&views[idx]))
         })
     };
 
@@ -397,19 +399,24 @@ fn bytes_probe_contains(
 /// One pass over the needles, setting the bit for each one the set holds.
 ///
 /// An invalid needle is `false`, which is what the OR-of-equalities form's null
-/// fill produces, so the result carries no invalid slots.
-fn probe_rows<N>(
-    needles: impl ExactSizeIterator<Item = N>,
-    validity: &Mask,
-    hit: impl Fn(N) -> bool,
-) -> BitBuffer {
+/// fill produces, so the result carries no invalid slots. `hit` is asked about a
+/// row only when that row is valid.
+fn probe_rows(len: usize, validity: &Mask, hit: impl Fn(usize) -> bool) -> BitBuffer {
     match validity {
-        Mask::AllTrue(_) => needles.map(hit).collect(),
-        Mask::AllFalse(len) => BitBuffer::new_unset(*len),
-        Mask::Values(valid) => needles
-            .enumerate()
-            .map(|(idx, needle)| valid.value(idx) && hit(needle))
-            .collect(),
+        Mask::AllTrue(_) => (0..len).map(hit).collect(),
+        Mask::AllFalse(_) => BitBuffer::new_unset(len),
+        Mask::Values(valid) => {
+            // Walking the valid rows a word at a time skips runs of nulls
+            // wholesale, where testing validity per row pays a branch for every
+            // one of them.
+            let mut bits = BitBufferMut::new_unset(len);
+            valid.bit_buffer().for_each_set_index(|idx| {
+                if hit(idx) {
+                    bits.set(idx);
+                }
+            });
+            bits.freeze()
+        }
     }
 }
 

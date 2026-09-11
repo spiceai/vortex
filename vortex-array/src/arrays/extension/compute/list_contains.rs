@@ -52,16 +52,25 @@ impl ListContainsElementKernel for Extension {
 
         let storage = element.storage_array().clone();
         let storage_dtype = storage.dtype().clone();
+        let mut storage_elements = Vec::with_capacity(elements.len());
+        for value in elements {
+            // A null element has no storage value to carry, and the dtype check
+            // above ignores nullability, so a nullable list can arrive against a
+            // non-nullable column. The generic path answers such a list, so hand
+            // the whole thing back to it rather than building a scalar the
+            // storage dtype cannot hold.
+            let Some(value) = value else {
+                return Ok(None);
+            };
+            // SAFETY: these are the values of a validated extension list scalar,
+            // so each is a valid non-null value of the storage dtype.
+            storage_elements
+                .push(unsafe { Scalar::new_unchecked(storage_dtype.clone(), Some(value.clone())) });
+        }
+
         let storage_list = Scalar::list(
             storage_dtype,
-            elements
-                .iter()
-                .map(|value| {
-                    // SAFETY: these are the values of a validated extension list
-                    // scalar, so each is a valid value of the storage dtype.
-                    unsafe { Scalar::new_unchecked(storage.dtype().clone(), value.clone()) }
-                })
-                .collect(),
+            storage_elements,
             list_constant.scalar().dtype().nullability(),
         );
         let len = storage.len();
@@ -149,6 +158,49 @@ mod tests {
         assert_eq!(
             timestamps_in(&[20, 40], TimeUnit::Milliseconds),
             vec![false, true, false, true, false]
+        );
+    }
+
+    #[test]
+    fn a_nullable_list_holding_a_null_falls_back_instead_of_panicking() {
+        // The dtype check ignores nullability, so a nullable extension list can
+        // reach this kernel against a non-nullable column. A null element then
+        // has no storage value to unwrap.
+        let mut ctx = array_session().create_execution_ctx();
+        let nullable = DType::Extension(
+            Timestamp::new(TimeUnit::Milliseconds, Nullability::Nullable).erased(),
+        );
+        let needles = ExtensionArray::new(
+            Timestamp::new(TimeUnit::Milliseconds, Nullability::NonNullable).erased(),
+            buffer![10i64, 20, 30, 40, 50].into_array(),
+        )
+        .into_array();
+
+        let mut elements: Vec<Scalar> = [10i64, 30, 50, 70]
+            .iter()
+            .map(|v| {
+                Scalar::primitive(*v, Nullability::NonNullable)
+                    .cast(&nullable)
+                    .expect("i64 into the timestamp it stores")
+            })
+            .collect();
+        elements.push(Scalar::null(nullable.clone()));
+        let list = Scalar::list(Arc::new(nullable), elements, Nullability::Nullable);
+
+        let len = needles.len();
+        let result = ListContains
+            .try_new_array(
+                len,
+                EmptyOptions,
+                [ConstantArray::new(list, len).into_array(), needles],
+            )
+            .expect("build")
+            .execute::<BoolArray>(&mut ctx)
+            .expect("execute");
+        let bits = result.bit_buffer_view();
+        assert_eq!(
+            (0..bits.len()).map(|i| bits.value(i)).collect::<Vec<_>>(),
+            vec![true, false, true, false, true]
         );
     }
 
