@@ -11,9 +11,11 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_ensure_eq;
 
+use crate::dtype::ARC_OVERHEAD;
 use crate::dtype::DType;
 use crate::dtype::FieldDType;
 use crate::dtype::FieldNames;
+use crate::dtype::arc_slice_heap_size;
 
 /// Type information for a union array.
 ///
@@ -255,6 +257,24 @@ impl UnionVariants {
             dtypes.into(),
             Arc::from(type_ids),
         ))))
+    }
+
+    /// Approximate heap bytes retained by this `UnionVariants`.
+    ///
+    /// Like [`StructFields::approx_heap_size`](crate::dtype::StructFields::approx_heap_size),
+    /// variant dtypes still held as flatbuffer views are not walked.
+    pub fn approx_heap_size(&self) -> usize {
+        ARC_OVERHEAD
+            + size_of::<UnionVariantsInner>()
+            + arc_slice_heap_size::<FieldDType>(self.0.dtypes.len())
+            + arc_slice_heap_size::<u8>(self.0.type_ids.len())
+            + self.0.names.approx_heap_size()
+            + self
+                .0
+                .dtypes
+                .iter()
+                .map(FieldDType::approx_heap_size)
+                .sum::<usize>()
     }
 
     /// Get the names of the variants in the union.

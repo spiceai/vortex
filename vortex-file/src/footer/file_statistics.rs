@@ -8,6 +8,9 @@
 //! and data exploration.
 use std::sync::Arc;
 
+/// Bytes an `Arc<[T]>` allocation adds on top of its payload: two `usize` reference counts.
+const ARC_OVERHEAD: usize = 2 * size_of::<usize>();
+
 use flatbuffers::FlatBufferBuilder;
 use flatbuffers::WIPOffset;
 use itertools::Itertools;
@@ -126,6 +129,29 @@ impl FileStatistics {
                 dtypes: Arc::new([file_dtype.clone()]),
             })
         }
+    }
+
+    /// Approximate heap bytes retained by these statistics.
+    ///
+    /// Walks the per-field stats sets and their scalar values, which are fully materialised at
+    /// parse time. Field dtypes are measured with
+    /// [`DType::approx_heap_size`](vortex_array::dtype::DType::approx_heap_size), which does not
+    /// walk lazily-parsed struct fields.
+    pub fn approx_heap_size(&self) -> usize {
+        ARC_OVERHEAD
+            + size_of_val(&*self.stats)
+            + ARC_OVERHEAD
+            + size_of_val(&*self.dtypes)
+            + self
+                .stats
+                .iter()
+                .map(StatsSet::approx_heap_size)
+                .sum::<usize>()
+            + self
+                .dtypes
+                .iter()
+                .map(DType::approx_heap_size)
+                .sum::<usize>()
     }
 
     /// Returns a reference to the statistics sets.

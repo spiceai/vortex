@@ -11,6 +11,7 @@ use vortex_error::VortexExpect;
 use vortex_error::vortex_panic;
 
 use super::DType;
+use crate::dtype::ARC_OVERHEAD;
 use crate::dtype::FieldDType;
 use crate::dtype::FieldName;
 use crate::dtype::PType;
@@ -44,6 +45,29 @@ const _: [(); size_of::<DType>()] = [(); 12];
 impl DType {
     /// The default `DType` for bytes.
     pub const BYTES: Self = Primitive(PType::U8, Nullability::NonNullable);
+
+    /// Approximate heap bytes retained by this `DType`, excluding the size of the value itself.
+    ///
+    /// Struct fields and union variants that are still flatbuffer views contribute nothing: they
+    /// own no heap of their own, and parsing one to measure it would allocate a subtree that is
+    /// not retained - see [`FieldDType::approx_heap_size`]. Everything already materialised is
+    /// walked.
+    ///
+    /// Not to be confused with [`Scalar::approx_nbytes`](crate::scalar::Scalar::approx_nbytes),
+    /// which measures a value's uncompressed logical size rather than retained heap.
+    pub fn approx_heap_size(&self) -> usize {
+        match self {
+            Null | Bool(_) | Primitive(..) | Decimal(..) | Utf8(_) | Binary(_) | Variant(_) => 0,
+            List(element, _) | FixedSizeList(element, ..) => {
+                ARC_OVERHEAD + size_of::<DType>() + element.approx_heap_size()
+            }
+            Struct(fields, _) => fields.approx_heap_size(),
+            Union(variants, _) => variants.approx_heap_size(),
+            // The concrete extension payload behind the `Arc` is opaque here, so only the
+            // allocation holding it is charged. A lower bound.
+            Extension(_) => ARC_OVERHEAD,
+        }
+    }
 
     /// Get the nullability of the `DType`.
     #[inline]

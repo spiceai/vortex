@@ -15,10 +15,12 @@ use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
 use vortex_utils::aliases::hash_map::HashMap;
 
+use crate::dtype::ARC_OVERHEAD;
 use crate::dtype::DType;
 use crate::dtype::FieldName;
 use crate::dtype::FieldNames;
 use crate::dtype::PType;
+use crate::dtype::arc_slice_heap_size;
 use crate::dtype::serde::flatbuffers::ViewedDType;
 
 /// DType of a struct's field, either owned or a pointer to an underlying flatbuffer.
@@ -102,6 +104,20 @@ impl FieldDType {
     #[inline]
     pub fn value(&self) -> VortexResult<DType> {
         self.inner.value()
+    }
+
+    /// Approximate heap bytes retained by this field's dtype.
+    ///
+    /// An owned dtype is walked, since its whole subtree is materialised and retained. A view is
+    /// charged nothing: it is a shared handle onto the dtype flatbuffer plus a session handle,
+    /// both of which the owner of the buffer accounts for. Notably, a view is *not* parsed here -
+    /// [`value`](Self::value) memoises nothing, so parsing to measure would allocate a subtree
+    /// that this `FieldDType` does not retain.
+    pub fn approx_heap_size(&self) -> usize {
+        match &self.inner {
+            FieldDTypeInner::Owned(dtype) => dtype.approx_heap_size(),
+            FieldDTypeInner::View(_) => 0,
+        }
     }
 }
 
@@ -310,6 +326,29 @@ impl StructFields {
             names,
             dtypes.into(),
         )))
+    }
+
+    /// Approximate heap bytes retained by this `StructFields`.
+    ///
+    /// Counts the shared inner state, the field dtype array, the field names, the lazily-built
+    /// name lookup if it has been populated, and any field dtypes that are owned rather than
+    /// flatbuffer views - see [`FieldDType::approx_heap_size`].
+    pub fn approx_heap_size(&self) -> usize {
+        ARC_OVERHEAD
+            + size_of::<StructFieldsInner>()
+            + arc_slice_heap_size::<FieldDType>(self.0.dtypes.len())
+            + self.0.names.approx_heap_size()
+            + self
+                .0
+                .indices
+                .get()
+                .map_or(0, |m| m.capacity() * size_of::<(FieldName, usize)>())
+            + self
+                .0
+                .dtypes
+                .iter()
+                .map(FieldDType::approx_heap_size)
+                .sum::<usize>()
     }
 
     /// Get the names of the fields in the struct

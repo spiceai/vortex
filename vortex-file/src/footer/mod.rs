@@ -27,6 +27,7 @@ use itertools::Itertools;
 pub use segment::*;
 use vortex_array::ArrayId;
 use vortex_array::dtype::DType;
+use vortex_buffer::Alignment;
 use vortex_buffer::ByteBuffer;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
@@ -67,20 +68,48 @@ impl Footer {
         }
     }
 
-    pub(crate) fn with_approx_byte_size(mut self, approx_byte_size: usize) -> Self {
-        self.approx_byte_size = Some(approx_byte_size);
-        self
+    /// Record [`Self::approx_byte_size`] from the sizes only the caller knows: the serialized
+    /// footer segments, and the layout tree those segments describe.
+    ///
+    /// The layout tree is charged up front even though it is built lazily. A [`Footer`] is handed
+    /// to caches that record its size once, at admission, and subtract that same accessor's value
+    /// at eviction; a size that grew in between would drive their accounting negative.
+    pub(crate) fn set_approx_retained_size(
+        &mut self,
+        serialized_bytes: usize,
+        layout_tree_bytes: usize,
+    ) {
+        self.approx_byte_size = Some(
+            serialized_bytes
+                + layout_tree_bytes
+                + self.dtype().approx_heap_size()
+                + self
+                    .statistics
+                    .as_ref()
+                    .map_or(0, FileStatistics::approx_heap_size)
+                + size_of_val(&*self.segments)
+                + size_of_val(self.array_read_ctx.ids()),
+        );
     }
 
     /// Read the [`Footer`] from a flatbuffer.
     pub(crate) fn from_flatbuffer(
         footer_bytes: FlatBuffer,
         layout_bytes: FlatBuffer,
+        dtype_bytes_len: usize,
         dtype: DType,
         statistics: Option<FileStatistics>,
         session: &VortexSession,
     ) -> VortexResult<Self> {
-        let approx_byte_size = footer_bytes.len() + layout_bytes.len();
+        // The footer keeps a private copy of each flatbuffer segment it parsed - the footer and
+        // layout segments, plus the dtype segment unless the file was written with
+        // `exclude_dtype` - and `BufferMut` over-aligns every one of them to
+        // `Alignment::DEFAULT_ALIGNMENT`, so each carries up to that much slack.
+        let retained_segments = 2 + usize::from(dtype_bytes_len > 0);
+        let serialized_bytes = footer_bytes.len()
+            + layout_bytes.len()
+            + dtype_bytes_len
+            + retained_segments * *Alignment::DEFAULT_ALIGNMENT;
         let fb_footer = root::<fb::Footer>(&footer_bytes)?;
 
         // Create a LayoutContext from the registry.
@@ -103,7 +132,9 @@ impl Footer {
             .collect();
         let array_read_ctx = ReadContext::new(array_ids);
 
-        let root_layout = layout_from_flatbuffer_with_options(
+        // `layout_tree_bytes` budgets for the layout tree, which is built lazily but must be
+        // charged up front - see `Self::approx_byte_size`.
+        let (root_layout, layout_tree_bytes) = layout_from_flatbuffer_with_options(
             layout_bytes,
             &dtype,
             &layout_read_ctx,
@@ -124,13 +155,9 @@ impl Footer {
             vortex_bail!("Segment offsets are not ordered");
         }
 
-        Ok(Self {
-            root_layout,
-            segments,
-            statistics,
-            array_read_ctx,
-            approx_byte_size: Some(approx_byte_size),
-        })
+        let mut footer = Self::new(root_layout, segments, statistics, array_read_ctx);
+        footer.set_approx_retained_size(serialized_bytes, layout_tree_bytes);
+        Ok(footer)
     }
 
     /// Returns the root [`LayoutRef`] of the file.
@@ -162,7 +189,16 @@ impl Footer {
         self.root_layout.dtype()
     }
 
-    /// Returns the approximate size of the footer in bytes, used for caching and memory management.
+    /// Approximate heap bytes this footer retains, for cache admission and memory accounting.
+    ///
+    /// This covers everything the footer keeps alive: the flatbuffer copies, the parsed dtype,
+    /// the file statistics, the segment map, the encoding read contexts, and the layout tree.
+    ///
+    /// The layout tree is built lazily, as scans walk it, *into the footer a cache is already
+    /// holding*. The value reported here therefore budgets for the fully materialised tree from
+    /// the start, and is stable for the lifetime of the footer. Caches rely on that: they record
+    /// an entry's size at admission and subtract this accessor's value again at eviction, so a
+    /// size that grew in between would drive their accounting negative.
     pub fn approx_byte_size(&self) -> Option<usize> {
         self.approx_byte_size
     }

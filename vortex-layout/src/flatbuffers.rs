@@ -44,6 +44,59 @@ static LAYOUT_VERIFIER: LazyLock<VerifierOptions> = LazyLock::new(|| {
     }
 });
 
+/// Approximate heap bytes retained by one materialised layout tree node, excluding the
+/// variable-size parts that [`approx_serialized_tree_size`] adds per node.
+///
+/// Materialising a node allocates an `Arc<dyn Layout>` for the node itself, an
+/// `Arc<dyn LayoutChildren>` view over its serialized children, the `OnceCell` array that
+/// memoises those children and a clone of the node's [`DType`]. The exact total is encoding- and
+/// schema-dependent, so this is a single conservative constant, chosen above the largest
+/// per-node cost measured across flat, wide, chunked and nested schemas.
+/// `footer_size_accounting` in `vortex-file/tests` is the regression test that keeps it honest.
+const APPROX_LAYOUT_NODE_BYTES: usize = 480;
+
+/// Approximate heap bytes a fully materialised layout tree will retain, walked over an already
+/// validated flatbuffer root.
+///
+/// Nothing is materialised and no [`LayoutRef`] is allocated. Callers use this to budget for a
+/// [`LayoutRef`] whose children are built lazily, and whose retained size therefore grows after
+/// it has been handed to a cache.
+///
+/// Beyond the flat per-node cost, each node is charged for the two parts a layout retains whose
+/// size is unbounded but readable straight from the flatbuffer: its metadata (which encodings
+/// such as flat and foreign layouts copy onto the heap per node) and its segment id list.
+fn approx_serialized_tree_size(fb_layout: layout::Layout<'_>) -> usize {
+    fn node_size(layout: layout::Layout<'_>) -> usize {
+        APPROX_LAYOUT_NODE_BYTES
+            + layout.metadata().map_or(0, |m| m.len())
+            + layout
+                .segments()
+                .map_or(0, |s| s.len() * size_of::<SegmentId>())
+            + layout
+                .children()
+                .unwrap_or_default()
+                .iter()
+                .map(node_size)
+                .sum::<usize>()
+    }
+
+    node_size(fb_layout)
+}
+
+/// Approximate heap bytes an already materialised layout tree retains.
+///
+/// The in-memory counterpart of the estimate [`layout_from_flatbuffer_with_options`] returns.
+/// Use this when the tree is already in hand - a writer sizing the footer it just built - so that
+/// its serialized form does not have to be re-validated just to be counted.
+///
+/// This charges the flat per-node cost only. Unlike the flatbuffer walk it does not add each
+/// node's metadata and segment ids, because reading those from a materialised layout allocates,
+/// and it would do so once per node purely to measure. It therefore reads a few percent lower
+/// than the same tree measured through [`layout_from_flatbuffer_with_options`].
+pub fn approx_materialised_tree_size(layout: &LayoutRef) -> usize {
+    layout.depth_first_traversal().count() * APPROX_LAYOUT_NODE_BYTES
+}
+
 /// Parse a [`LayoutRef`] from a layout flatbuffer.
 pub fn layout_from_flatbuffer(
     flatbuffer: FlatBuffer,
@@ -52,10 +105,14 @@ pub fn layout_from_flatbuffer(
     ctx: &ReadContext,
     session: &VortexSession,
 ) -> VortexResult<LayoutRef> {
-    layout_from_flatbuffer_with_options(flatbuffer, dtype, layout_ctx, ctx, session, false)
+    Ok(layout_from_flatbuffer_with_options(flatbuffer, dtype, layout_ctx, ctx, session, false)?.0)
 }
 
 /// Parse a [`LayoutRef`] from a layout flatbuffer with unknown-encoding behavior control.
+///
+/// Also returns the approximate heap the fully materialised tree will retain. The two are
+/// computed together because both need a validated flatbuffer, and validating it twice costs
+/// more than the walk itself.
 pub fn layout_from_flatbuffer_with_options(
     flatbuffer: FlatBuffer,
     dtype: &DType,
@@ -63,17 +120,21 @@ pub fn layout_from_flatbuffer_with_options(
     ctx: &ReadContext,
     session: &VortexSession,
     allow_unknown: bool,
-) -> VortexResult<LayoutRef> {
+) -> VortexResult<(LayoutRef, usize)> {
     let layout_session = session.layouts();
     let layouts = layout_session.registry();
     let fb_layout = root_with_opts::<layout::Layout>(&LAYOUT_VERIFIER, &flatbuffer)?;
+    let approx_tree_size = approx_serialized_tree_size(fb_layout);
     let encoding_id = layout_ctx
         .resolve(fb_layout.encoding())
         .ok_or_else(|| vortex_err!("Invalid encoding ID: {}", fb_layout.encoding()))?;
     let encoding = layouts.find(&encoding_id);
 
     if encoding.is_none() && allow_unknown {
-        return foreign_layout_from_fb(fb_layout, dtype, layout_ctx);
+        return Ok((
+            foreign_layout_from_fb(fb_layout, dtype, layout_ctx)?,
+            approx_tree_size,
+        ));
     }
     let encoding =
         encoding.ok_or_else(|| vortex_err!("Invalid encoding ID: {}", fb_layout.encoding()))?;
@@ -112,7 +173,7 @@ pub fn layout_from_flatbuffer_with_options(
         &build_ctx,
     )?;
 
-    Ok(layout)
+    Ok((layout, approx_tree_size))
 }
 
 fn foreign_layout_from_fb(
@@ -229,6 +290,8 @@ mod tests {
     use vortex_flatbuffers::layout as fbl;
     use vortex_session::registry::ReadContext;
 
+    use super::APPROX_LAYOUT_NODE_BYTES;
+    use super::SegmentId;
     use super::layout_from_flatbuffer_with_options;
     use crate::LayoutEncodingId;
     use crate::session::LayoutSession;
@@ -276,7 +339,7 @@ mod tests {
         let array_ctx = ReadContext::new([]);
         let session = vortex_array::array_session().with::<LayoutSession>();
 
-        let layout = layout_from_flatbuffer_with_options(
+        let (layout, approx_tree_size) = layout_from_flatbuffer_with_options(
             layout_buffer,
             &DType::Variant(Nullability::Nullable),
             &layout_ctx,
@@ -286,6 +349,12 @@ mod tests {
         )
         .unwrap();
 
+        // Two nodes at the flat per-node cost, plus each node's metadata (3 bytes at the root,
+        // 1 at the child) and the root's single segment id.
+        assert_eq!(
+            approx_tree_size,
+            2 * APPROX_LAYOUT_NODE_BYTES + 3 + 1 + size_of::<SegmentId>(),
+        );
         assert_eq!(layout.encoding_id().as_ref(), "vortex.test.foreign_layout");
         assert_eq!(layout.row_count(), 10);
         assert_eq!(layout.metadata(), vec![1, 2, 3]);

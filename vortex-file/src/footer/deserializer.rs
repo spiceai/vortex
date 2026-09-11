@@ -166,11 +166,14 @@ impl FooterDeserializer {
             })
             .transpose()?;
 
+        let dtype_bytes_len = dtype_segment.map_or(0, |segment| segment.length as usize);
+
         Ok(DeserializeStep::Done(self.parse_footer(
             initial_offset,
             &self.buffer,
             &postscript.footer,
             &postscript.layout,
+            dtype_bytes_len,
             dtype,
             file_stats,
         )?))
@@ -253,12 +256,14 @@ impl FooterDeserializer {
     }
 
     /// Parse the rest of the footer from the initial read.
+    #[expect(clippy::too_many_arguments, reason = "internal parse step")]
     fn parse_footer(
         &self,
         initial_offset: u64,
         initial_read: &[u8],
         footer_segment: &PostscriptSegment,
         layout_segment: &PostscriptSegment,
+        dtype_bytes_len: usize,
         dtype: DType,
         file_stats: Option<FileStatistics>,
     ) -> VortexResult<Footer> {
@@ -272,7 +277,14 @@ impl FooterDeserializer {
             &initial_read[layout_offset..layout_offset + (layout_segment.length as usize)],
         );
 
-        Footer::from_flatbuffer(footer_bytes, layout_bytes, dtype, file_stats, &self.session)
+        Footer::from_flatbuffer(
+            footer_bytes,
+            layout_bytes,
+            dtype_bytes_len,
+            dtype,
+            file_stats,
+            &self.session,
+        )
     }
 }
 

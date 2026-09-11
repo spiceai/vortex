@@ -9,6 +9,9 @@ use std::sync::Arc;
 use itertools::Itertools;
 use vortex_utils::aliases::StringEscape;
 
+use crate::dtype::ARC_OVERHEAD;
+use crate::dtype::arc_slice_heap_size;
+
 /// A name for a field in a struct.
 #[derive(Clone, Debug, Eq, PartialOrd, Ord, Hash)]
 #[allow(clippy::derived_hash_with_manual_eq)] // manual PartialEq adds Arc::ptr_eq fast path only
@@ -150,6 +153,19 @@ impl From<FieldName> for Arc<str> {
 #[allow(clippy::derived_hash_with_manual_eq)] // manual PartialEq adds Arc::ptr_eq fast path only
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct FieldNames(Arc<[FieldName]>);
+
+impl FieldNames {
+    /// Approximate heap bytes retained by this `FieldNames`: the shared array plus each name's
+    /// string allocation.
+    pub fn approx_heap_size(&self) -> usize {
+        arc_slice_heap_size::<FieldName>(self.0.len())
+            + self
+                .0
+                .iter()
+                .map(|n| ARC_OVERHEAD + n.as_ref().len())
+                .sum::<usize>()
+    }
+}
 
 impl PartialEq for FieldNames {
     fn eq(&self, other: &Self) -> bool {

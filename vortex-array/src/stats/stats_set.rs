@@ -42,6 +42,29 @@ pub struct StatsSet {
 }
 
 impl StatsSet {
+    /// Approximate heap bytes retained by this stats set, excluding the size of the set itself.
+    ///
+    /// A [`StatsSet`] keeps its first few entries inline, so a small set retains nothing on the
+    /// heap beyond whatever its scalar values point at.
+    pub fn approx_heap_size(&self) -> usize {
+        // Note `StatsArray` is the smallvec's inline *backing array*, so size one element.
+        let spilled = if self.values.spilled() {
+            self.values.capacity() * size_of::<(Stat, Precision<ScalarValue>)>()
+        } else {
+            0
+        };
+        spilled
+            + self
+                .values
+                .iter()
+                .map(|(_, v)| {
+                    v.as_ref()
+                        .into_inner()
+                        .map_or(0, ScalarValue::approx_heap_size)
+                })
+                .sum::<usize>()
+    }
+
     /// Create new StatSet without validating uniqueness of all the entries
     ///
     /// # Safety
