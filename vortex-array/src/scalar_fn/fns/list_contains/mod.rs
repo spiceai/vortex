@@ -611,31 +611,26 @@ fn list_is_not_empty(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-
-    use vortex_buffer::buffer;
-
-    use super::ListContains;
-    use crate::arrays::ExtensionArray;
-    use crate::arrays::scalar_fn::ScalarFnFactoryExt;
-    use crate::extension::datetime::TimeUnit;
-    use crate::extension::datetime::Timestamp;
-    use crate::scalar_fn::EmptyOptions;
     use std::sync::LazyLock;
 
     use itertools::Itertools;
     use rstest::rstest;
     use vortex_buffer::BitBuffer;
     use vortex_buffer::Buffer;
+    use vortex_buffer::buffer;
     use vortex_error::VortexExpect;
     use vortex_error::VortexResult;
     use vortex_session::VortexSession;
 
+    use super::ListContains;
     use crate::ArrayRef;
     use crate::IntoArray;
     use crate::VortexSessionExecute;
     use crate::array_session;
+    use crate::arrays::ExtensionArray;
     use crate::arrays::ListArray;
     use crate::arrays::VarBinArray;
+    use crate::arrays::scalar_fn::ScalarFnFactoryExt;
     use crate::assert_arrays_eq;
     use crate::dtype::DType;
     use crate::dtype::Nullability;
@@ -652,7 +647,10 @@ mod tests {
     use crate::expr::or;
     use crate::expr::root;
     use crate::expr::stats::Stat;
+    use crate::extension::datetime::TimeUnit;
+    use crate::extension::datetime::Timestamp;
     use crate::scalar::Scalar;
+    use crate::scalar_fn::EmptyOptions;
     use crate::scalar_fn::fns::list_contains::BoolArray;
     use crate::scalar_fn::fns::list_contains::ConstantArray;
     use crate::scalar_fn::fns::list_contains::ListViewArray;
