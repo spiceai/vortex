@@ -34,6 +34,7 @@ use vortex_io::session::RuntimeSessionExt;
 use vortex_metrics::MetricsRegistry;
 use vortex_scan::selection::Selection;
 use vortex_session::VortexSession;
+use vortex_utils::aliases::dash_map::DashMap;
 use vortex_utils::parallelism::get_available_parallelism;
 
 use crate::LayoutReader;
@@ -84,6 +85,64 @@ impl SplitConcurrency {
 /// Projection and filter expressions are optimized against the reader dtype during
 /// [`prepare`](Self::prepare). Work is divided by the configured [`SplitBy`] strategy or by
 /// explicit selection ranges.
+/// Memoizes the expression optimization [`ScanBuilder::build`] performs.
+///
+/// A file is read through one [`ScanBuilder`] per scan split, and every split
+/// of a file optimizes the same projection and the same filter against the same
+/// reader dtype. Optimization walks the expression tree and rebuilds it, so
+/// repeating it per split is work whose result cannot differ: the optimized
+/// form is a pure function of the expression and the scope it is optimized
+/// against, which are exactly the key here.
+///
+/// The cache is owned by the caller rather than held in the session on purpose.
+/// Entries are keyed by the whole expression, so a workload whose filters carry
+/// a different literal per query would never reuse one across queries while
+/// growing the map without bound. Scoping it to a scan bounds it by that scan's
+/// expressions and lets it drop when the scan does.
+#[derive(Clone, Default, Debug)]
+pub struct ExpressionCache(Arc<DashMap<(Expression, DType), Expression>>);
+
+impl ExpressionCache {
+    /// An empty cache, to be shared by every split of one scan.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The number of optimized expressions currently held.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether the cache holds nothing yet.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Optimizes `expr` against `scope`, reusing the result of an earlier call
+    /// with the same pair.
+    fn optimize(&self, expr: &Expression, scope: &DType) -> VortexResult<Expression> {
+        if let Some(hit) = self.0.get(&(expr.clone(), scope.clone())) {
+            return Ok(hit.clone());
+        }
+        let optimized = expr.optimize_recursive(scope)?;
+        self.0
+            .insert((expr.clone(), scope.clone()), optimized.clone());
+        Ok(optimized)
+    }
+}
+
+/// Optimizes `expr` against `scope`, through `cache` when one was supplied.
+fn optimize_expression(
+    cache: Option<&ExpressionCache>,
+    expr: &Expression,
+    scope: &DType,
+) -> VortexResult<Expression> {
+    match cache {
+        Some(cache) => cache.optimize(expr, scope),
+        None => expr.optimize_recursive(scope),
+    }
+}
+
 pub struct ScanBuilder<A> {
     session: VortexSession,
     layout_reader: LayoutReaderRef,
@@ -110,6 +169,9 @@ pub struct ScanBuilder<A> {
     /// The row-offset assigned to the first row of the file. Used by the `row_idx` expression,
     /// but not by the scan [`Selection`] which remains relative.
     row_offset: u64,
+    /// Shared across the splits of one scan, so the projection and filter are
+    /// optimized once per (expression, dtype) rather than once per split.
+    expression_cache: Option<ExpressionCache>,
 }
 
 impl ScanBuilder<ArrayRef> {
@@ -132,6 +194,7 @@ impl ScanBuilder<ArrayRef> {
             file_stats: None,
             limit: None,
             row_offset: 0,
+            expression_cache: None,
         }
     }
 
@@ -285,6 +348,20 @@ impl<A: 'static + Send> ScanBuilder<A> {
         self
     }
 
+    /// Share an [`ExpressionCache`] with the other splits of this scan, so the
+    /// projection and filter are optimized once per (expression, dtype) instead
+    /// of once per split.
+    pub fn with_expression_cache(mut self, cache: ExpressionCache) -> Self {
+        self.expression_cache = Some(cache);
+        self
+    }
+
+    /// Share an [`ExpressionCache`], when one was supplied.
+    pub fn with_some_expression_cache(mut self, cache: Option<ExpressionCache>) -> Self {
+        self.expression_cache = cache;
+        self
+    }
+
     /// The [`DType`] returned by the scan, after applying the projection.
     pub fn dtype(&self) -> VortexResult<DType> {
         self.projection.return_dtype(self.layout_reader.dtype())
@@ -315,6 +392,7 @@ impl<A: 'static + Send> ScanBuilder<A> {
             file_stats: self.file_stats,
             limit: self.limit,
             row_offset: self.row_offset,
+            expression_cache: self.expression_cache,
             map_fn: Arc::new(move |a| old_map_fn(a).and_then(&map_fn)),
         }
     }
@@ -341,11 +419,14 @@ impl<A: 'static + Send> ScanBuilder<A> {
         ));
 
         // Normalize and simplify the expressions.
-        let projection = self.projection.optimize_recursive(layout_reader.dtype())?;
+        let expression_cache = self.expression_cache.as_ref();
+        let projection =
+            optimize_expression(expression_cache, &self.projection, layout_reader.dtype())?;
 
         let filter = self
             .filter
-            .map(|f| f.optimize_recursive(layout_reader.dtype()))
+            .as_ref()
+            .map(|f| optimize_expression(expression_cache, f, layout_reader.dtype()))
             .transpose()?;
 
         // Construct field masks and compute the row splits of the scan.
@@ -971,5 +1052,70 @@ mod test {
         assert_eq!(values.as_ref(), [1, 2]);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod expression_cache_tests {
+    use vortex_array::dtype::DType;
+    use vortex_array::dtype::Nullability;
+    use vortex_array::dtype::PType;
+    use vortex_array::expr::eq;
+    use vortex_array::expr::lit;
+    use vortex_array::expr::root;
+
+    use super::ExpressionCache;
+
+    fn scope() -> DType {
+        DType::Primitive(PType::I32, Nullability::NonNullable)
+    }
+
+    /// A hit must return exactly what optimizing again would have produced.
+    ///
+    /// The cache exists to skip repeated work, so the only thing that can make
+    /// it wrong is returning something the uncached path would not have.
+    #[test]
+    fn a_hit_equals_optimizing_again() {
+        let expr = eq(root(), lit(7i32));
+        let scope = scope();
+        let uncached = expr
+            .optimize_recursive(&scope)
+            .expect("optimizing the expression should succeed");
+
+        let cache = ExpressionCache::new();
+        let miss = cache
+            .optimize(&expr, &scope)
+            .expect("first optimize should succeed");
+        let hit = cache
+            .optimize(&expr, &scope)
+            .expect("second optimize should be served from the cache");
+
+        assert_eq!(miss, uncached);
+        assert_eq!(hit, uncached);
+        assert_eq!(cache.len(), 1, "the same pair must occupy one entry");
+    }
+
+    /// The scope is part of the key: the same expression optimized against a
+    /// different dtype is a different question and must not reuse the answer.
+    #[test]
+    fn a_different_scope_is_a_different_entry() {
+        let expr = eq(root(), lit(7i32));
+        let cache = ExpressionCache::new();
+        cache
+            .optimize(&expr, &scope())
+            .expect("i32 scope should optimize");
+        cache
+            .optimize(
+                &expr,
+                &DType::Primitive(PType::I64, Nullability::NonNullable),
+            )
+            .expect("i64 scope should optimize");
+
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn a_fresh_cache_is_empty() {
+        assert!(ExpressionCache::new().is_empty());
     }
 }
