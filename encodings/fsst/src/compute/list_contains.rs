@@ -162,8 +162,8 @@ mod tests {
         None,
         Some("world"),
         Some(""),
-        Some("this is a very long string"),
-        Some("this is a very long strinX"),
+        Some("a value long enough to need a buffer 1"),
+        Some("a value long enough to need a buffer 2"),
         Some("hello"),
         None,
     ];
@@ -253,7 +253,13 @@ mod tests {
         // comparison that stopped at a prefix would answer both alike.
         assert_eq!(
             answers(
-                vec!["this is a very long string", "q", "qq", "qqq", "qqqq"],
+                vec![
+                    "a value long enough to need a buffer 1",
+                    "q",
+                    "qq",
+                    "qqq",
+                    "qqqq"
+                ],
                 Nullability::Nullable
             )?,
             vec![
