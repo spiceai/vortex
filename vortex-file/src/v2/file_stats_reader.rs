@@ -24,6 +24,7 @@ use vortex_layout::SplitRange;
 use vortex_mask::Mask;
 use vortex_session::VortexSession;
 use vortex_utils::aliases::dash_map::DashMap;
+use vortex_utils::aliases::dash_map::Entry;
 
 use crate::FileStatistics;
 use crate::pruning::can_prune_file_stats;
@@ -116,17 +117,19 @@ impl LayoutReader for FileStatsLayoutReader {
         expr: &Expression,
         mask: Mask,
     ) -> VortexResult<MaskFuture> {
-        // Check cache first with read-only lock.
-        if let Some(pruned) = self.prune_cache.get(expr) {
-            if *pruned {
-                return Ok(MaskFuture::ready(Mask::new_false(mask.len())));
+        // Decided under the entry, not around it: a file is read through one scan split
+        // per byte range and every split asks this same question concurrently, so a
+        // check-then-insert lets each of them run the evaluation the cache exists to
+        // perform once. The evaluation is pure and synchronous, so the shard lock the
+        // vacant entry holds is released before any I/O.
+        let pruned = match self.prune_cache.entry(expr.clone()) {
+            Entry::Occupied(entry) => *entry.get(),
+            Entry::Vacant(entry) => {
+                let pruned = self.evaluate_file_stats(expr)?;
+                entry.insert(pruned);
+                pruned
             }
-            return self.child.pruning_evaluation(row_range, expr, mask);
-        }
-
-        // Evaluate and cache.
-        let pruned = self.evaluate_file_stats(expr)?;
-        self.prune_cache.insert(expr.clone(), pruned);
+        };
 
         if pruned {
             Ok(MaskFuture::ready(Mask::new_false(mask.len())))
