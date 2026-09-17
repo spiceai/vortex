@@ -148,14 +148,14 @@ impl SegmentCacheSourceAdapter {
 impl SegmentSource for SegmentCacheSourceAdapter {
     fn request(&self, id: SegmentId) -> SegmentFuture {
         let cache = Arc::clone(&self.cache);
-        let delegate = self.source.request(id);
+        let source = Arc::clone(&self.source);
 
         async move {
             if let Ok(Some(segment)) = cache.get(id).await {
                 tracing::debug!("Resolved segment {} from cache", id);
                 return Ok(BufferHandle::new_host(segment));
             }
-            let result = delegate.await?;
+            let result = source.request(id).await?;
             // Cache only CPU buffers; device buffers are not cached.
             if let Some(buffer) = result.as_host_opt()
                 && let Err(e) = cache.put(id, buffer.clone()).await
@@ -165,5 +165,100 @@ impl SegmentSource for SegmentCacheSourceAdapter {
             Ok(result)
         }
         .boxed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    use vortex_error::vortex_err;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct CountingSource {
+        requests: AtomicUsize,
+    }
+
+    impl SegmentSource for CountingSource {
+        fn request(&self, _id: SegmentId) -> SegmentFuture {
+            self.requests.fetch_add(1, Ordering::SeqCst);
+            futures::future::ready(Ok(BufferHandle::new_host(ByteBuffer::from(vec![
+                1u8, 2, 3,
+            ]))))
+            .boxed()
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_hit_does_not_request_the_source() -> VortexResult<()> {
+        let cache: Arc<dyn SegmentCache> = Arc::new(MokaSegmentCache::new(1024));
+        let id = SegmentId::from(0);
+        cache.put(id, ByteBuffer::from(vec![9u8, 8, 7])).await?;
+        let source = Arc::new(CountingSource::default());
+        let adapter = SegmentCacheSourceAdapter::new(cache, Arc::<CountingSource>::clone(&source));
+
+        let request = adapter.request(id);
+        assert_eq!(source.requests.load(Ordering::SeqCst), 0);
+        let result = request.await?.to_host().await;
+        assert_eq!(result.as_slice(), &[9, 8, 7]);
+        assert_eq!(source.requests.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn miss_reads_and_populates_the_cache() -> VortexResult<()> {
+        let cache: Arc<dyn SegmentCache> = Arc::new(MokaSegmentCache::new(1024));
+        let source = Arc::new(CountingSource::default());
+        let adapter = SegmentCacheSourceAdapter::new(cache, Arc::<CountingSource>::clone(&source));
+        let id = SegmentId::from(0);
+
+        for _ in 0..2 {
+            assert_eq!(
+                adapter.request(id).await?.to_host().await.as_slice(),
+                &[1, 2, 3]
+            );
+        }
+        assert_eq!(source.requests.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn dropping_an_unpolled_request_does_not_request_the_source() {
+        let source = Arc::new(CountingSource::default());
+        let adapter = SegmentCacheSourceAdapter::new(
+            Arc::new(NoOpSegmentCache),
+            Arc::<CountingSource>::clone(&source),
+        );
+        drop(adapter.request(SegmentId::from(0)));
+        assert_eq!(source.requests.load(Ordering::SeqCst), 0);
+    }
+
+    struct UnavailableCache;
+
+    #[async_trait]
+    impl SegmentCache for UnavailableCache {
+        async fn get(&self, _id: SegmentId) -> VortexResult<Option<ByteBuffer>> {
+            Err(vortex_err!("cache unavailable"))
+        }
+
+        async fn put(&self, _id: SegmentId, _buffer: ByteBuffer) -> VortexResult<()> {
+            Err(vortex_err!("cache unavailable"))
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_cache_preserves_source_results() -> VortexResult<()> {
+        let source = Arc::new(CountingSource::default());
+        let adapter = SegmentCacheSourceAdapter::new(
+            Arc::new(UnavailableCache),
+            Arc::<CountingSource>::clone(&source),
+        );
+        let result = adapter.request(SegmentId::from(0)).await?.to_host().await;
+        assert_eq!(result.as_slice(), &[1, 2, 3]);
+        assert_eq!(source.requests.load(Ordering::SeqCst), 1);
+        Ok(())
     }
 }
