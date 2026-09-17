@@ -442,13 +442,12 @@ impl<A: 'static + Send> Stream for LazyScanStream<A> {
             match &mut self.state {
                 LazyScanState::Builder(builder) => {
                     let builder = builder.take().vortex_expect("polled after completion");
-                    // Only `prepare` runs on the blocking pool. Split tasks are built lazily by
-                    // the stream below, so that the configured concurrency — not the split count
-                    // — bounds how many splits have registered reads.
+                    // Preparation is CPU work. Split tasks are built lazily by the stream
+                    // below, so configured concurrency bounds registered split reads.
                     let task = builder
                         .session
                         .handle()
-                        .spawn_blocking(move || builder.prepare());
+                        .spawn_cpu(move || builder.prepare());
                     self.state = LazyScanState::Preparing(task);
                 }
                 LazyScanState::Preparing(task) => match ready!(Pin::new(task).poll(cx)) {
@@ -497,6 +496,7 @@ mod test {
     use std::time::Duration;
 
     use futures::Stream;
+    use futures::future::BoxFuture;
     use futures::task::noop_waker_ref;
     use parking_lot::Mutex;
     use rstest::rstest;
@@ -519,7 +519,10 @@ mod test {
     use vortex_array::expr::root;
     use vortex_error::VortexResult;
     use vortex_error::vortex_err;
+    use vortex_io::runtime::AbortHandleRef;
     use vortex_io::runtime::BlockingRuntime;
+    use vortex_io::runtime::Executor;
+    use vortex_io::runtime::Handle;
     use vortex_io::runtime::single::SingleThreadRuntime;
     use vortex_mask::Mask;
 
@@ -676,6 +679,56 @@ mod test {
         let _stream = ScanBuilder::new(session, reader).into_stream().unwrap();
 
         assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+
+    struct CountingExecutor {
+        runtime: tokio::runtime::Handle,
+        cpu: AtomicUsize,
+        blocking: AtomicUsize,
+    }
+
+    impl Executor for CountingExecutor {
+        fn spawn(&self, fut: BoxFuture<'static, ()>) -> AbortHandleRef {
+            Executor::spawn(&self.runtime, fut)
+        }
+
+        fn spawn_io(&self, fut: BoxFuture<'static, ()>) -> AbortHandleRef {
+            Executor::spawn_io(&self.runtime, fut)
+        }
+
+        fn spawn_cpu(&self, task: Box<dyn FnOnce() + Send + 'static>) -> AbortHandleRef {
+            self.cpu.fetch_add(1, Ordering::Relaxed);
+            Executor::spawn_cpu(&self.runtime, task)
+        }
+
+        fn spawn_blocking_io(&self, task: Box<dyn FnOnce() + Send + 'static>) -> AbortHandleRef {
+            self.blocking.fetch_add(1, Ordering::Relaxed);
+            Executor::spawn_blocking_io(&self.runtime, task)
+        }
+    }
+
+    #[tokio::test]
+    async fn into_stream_schedules_prepare_on_cpu_executor() -> VortexResult<()> {
+        let executor = Arc::new(CountingExecutor {
+            runtime: tokio::runtime::Handle::current(),
+            cpu: AtomicUsize::new(0),
+            blocking: AtomicUsize::new(0),
+        });
+        let runtime: Arc<dyn Executor> = Arc::<CountingExecutor>::clone(&executor);
+        let session = session_with_handle(Handle::new(Arc::downgrade(&runtime)));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let reader = Arc::new(CountingLayoutReader::new(Arc::clone(&calls)));
+        let mut stream = ScanBuilder::new(session, reader).into_stream()?;
+
+        assert_eq!(executor.cpu.load(Ordering::Relaxed), 0);
+        assert_eq!(executor.blocking.load(Ordering::Relaxed), 0);
+        let mut cx = Context::from_waker(noop_waker_ref());
+        assert!(Pin::new(&mut stream).poll_next(&mut cx).is_pending());
+        assert_eq!(executor.cpu.load(Ordering::Relaxed), 1);
+        assert_eq!(executor.blocking.load(Ordering::Relaxed), 0);
+        // The current-thread runtime has not polled the scheduled CPU task yet.
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        Ok(())
     }
 
     #[derive(Debug)]
