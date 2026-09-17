@@ -410,6 +410,7 @@ mod tests {
     use vortex_array::dtype::StructFields;
     use vortex_array::expr::Expression;
     use vortex_array::expr::col;
+    use vortex_array::expr::dynamic;
     use vortex_array::expr::eq;
     use vortex_array::expr::get_item;
     use vortex_array::expr::gt;
@@ -419,12 +420,16 @@ mod tests {
     use vortex_array::expr::root;
     use vortex_array::expr::select;
     use vortex_array::scalar::Scalar;
+    use vortex_array::scalar_fn::fns::operators::CompareOperator;
     use vortex_array::validity::Validity;
     use vortex_buffer::buffer;
+    use vortex_error::VortexResult;
+    use vortex_error::vortex_err;
     use vortex_io::runtime::single::block_on;
     use vortex_io::session::RuntimeSessionExt;
     use vortex_mask::Mask;
 
+    use super::StructReader;
     use crate::LayoutRef;
     use crate::LayoutStrategy;
     use crate::layouts::flat::writer::FlatLayoutStrategy;
@@ -434,6 +439,46 @@ mod tests {
     use crate::sequence::SequenceId;
     use crate::sequence::SequentialArrayStreamExt;
     use crate::test::SESSION;
+
+    #[rstest]
+    fn repeated_literal_partitions_are_bounded(
+        #[from(struct_layout)] (segments, layout): (Arc<dyn SegmentSource>, LayoutRef),
+    ) -> VortexResult<()> {
+        let reader = layout.new_reader("".into(), segments, &SESSION, &Default::default())?;
+        let reader = reader
+            .as_any()
+            .downcast_ref::<StructReader>()
+            .ok_or_else(|| vortex_err!("expected struct reader"))?;
+        for value in 0..1_000i32 {
+            reader.partition_expr(eq(col("a"), lit(value)))?;
+        }
+        assert!(reader.partitioned_expr_cache.len() <= 32);
+        Ok(())
+    }
+
+    #[rstest]
+    fn dynamic_partitions_do_not_retain_query_state(
+        #[from(struct_layout)] (segments, layout): (Arc<dyn SegmentSource>, LayoutRef),
+    ) -> VortexResult<()> {
+        let reader = layout.new_reader("".into(), segments, &SESSION, &Default::default())?;
+        let reader = reader
+            .as_any()
+            .downcast_ref::<StructReader>()
+            .ok_or_else(|| vortex_err!("expected struct reader"))?;
+        let state = Arc::new(3i32);
+        let value = Arc::clone(&state);
+        let expr = dynamic(
+            CompareOperator::Gt,
+            move || Some((*value).into()),
+            DType::Primitive(PType::I32, Nullability::NonNullable),
+            true,
+            col("a"),
+        );
+        drop(reader.partition_expr(expr)?);
+        assert_eq!(Arc::strong_count(&state), 1);
+        assert_eq!(reader.partitioned_expr_cache.len(), 0);
+        Ok(())
+    }
 
     #[fixture]
     fn empty_struct() -> (Arc<dyn SegmentSource>, LayoutRef) {
