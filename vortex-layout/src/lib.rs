@@ -29,6 +29,7 @@ pub mod aliases;
 mod children;
 pub mod display;
 mod encoding;
+pub mod expr_cache;
 mod flatbuffers;
 mod layout;
 mod reader;

@@ -3,7 +3,6 @@
 
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::OnceLock;
 
 use futures::try_join;
 use itertools::Itertools;
@@ -19,7 +18,6 @@ use vortex_array::dtype::FieldMask;
 use vortex_array::dtype::FieldName;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::StructFields;
-use vortex_array::expr::ExactExpr;
 use vortex_array::expr::Expression;
 use vortex_array::expr::col;
 use vortex_array::expr::make_free_field_annotator;
@@ -35,7 +33,6 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_err;
 use vortex_mask::Mask;
 use vortex_session::VortexSession;
-use vortex_utils::aliases::dash_map::DashMap;
 use vortex_utils::aliases::hash_map::HashMap;
 
 use crate::ArrayFuture;
@@ -44,6 +41,7 @@ use crate::LayoutReaderRef;
 use crate::LazyReaderChildren;
 use crate::RowSplits;
 use crate::SplitRange;
+use crate::expr_cache::ExpressionCache;
 use crate::layouts::partitioned::PartitionedExprEval;
 use crate::layouts::struct_::StructLayout;
 use crate::segments::SegmentSource;
@@ -59,7 +57,7 @@ pub struct StructReader {
     expanded_root_expr: Expression,
 
     field_lookup: Option<HashMap<FieldName, usize>>,
-    partitioned_expr_cache: DashMap<ExactExpr, Arc<OnceLock<Partitioned>>>,
+    partitioned_expr_cache: ExpressionCache<Partitioned>,
 }
 
 impl StructReader {
@@ -156,18 +154,8 @@ impl StructReader {
 
     /// Utility for partitioning an expression over the fields of a struct.
     fn partition_expr(&self, expr: Expression) -> VortexResult<Partitioned> {
-        let key = ExactExpr(expr.clone());
-        let binding = self
-            .partitioned_expr_cache
-            .entry(key)
-            .or_insert_with(|| Arc::new(OnceLock::new()));
-        let entry = binding.value();
-        if let Some(value) = entry.get() {
-            return Ok(value.clone());
-        }
-        let result = self.compute_partitioned_expr(expr)?;
-        let result = entry.get_or_init(|| result);
-        Ok(result.clone())
+        self.partitioned_expr_cache
+            .get_or_try_insert_with(&expr, || self.compute_partitioned_expr(expr.clone()))
     }
 
     fn compute_partitioned_expr(&self, expr: Expression) -> VortexResult<Partitioned> {

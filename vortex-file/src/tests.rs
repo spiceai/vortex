@@ -5,6 +5,8 @@
 use std::iter;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::atomic::AtomicI32;
+use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use futures::StreamExt;
@@ -38,6 +40,7 @@ use vortex_array::dtype::StructFields;
 use vortex_array::expr::and;
 use vortex_array::expr::cast;
 use vortex_array::expr::col;
+use vortex_array::expr::dynamic;
 use vortex_array::expr::eq;
 use vortex_array::expr::get_item;
 use vortex_array::expr::gt;
@@ -53,6 +56,7 @@ use vortex_array::extension::datetime::Timestamp;
 use vortex_array::extension::datetime::TimestampOptions;
 use vortex_array::scalar::Scalar;
 use vortex_array::scalar_fn::ScalarFnVTableExt;
+use vortex_array::scalar_fn::fns::operators::CompareOperator;
 use vortex_array::scalar_fn::fns::pack::Pack;
 use vortex_array::scalar_fn::fns::pack::PackOptions;
 use vortex_array::stats::PRUNING_STATS;
@@ -91,6 +95,115 @@ static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
 
     session
 });
+
+#[cfg(not(target_arch = "wasm32"))]
+#[tokio::test]
+async fn cached_file_reader_preserves_literal_and_dynamic_queries() -> VortexResult<()> {
+    let session = array_session()
+        .with::<LayoutSession>()
+        .with::<RuntimeSession>();
+    crate::register_default_encodings(&session);
+    let mut ctx = session.create_execution_ctx();
+    let array = StructArray::from_fields(&[
+        (
+            "id",
+            Buffer::from((0..256i32).collect::<Vec<_>>()).into_array(),
+        ),
+        (
+            "text",
+            VarBinArray::from_iter_nonnull(
+                (0..256).map(|i| if i % 2 == 0 { "even" } else { "odd" }),
+                DType::Utf8(Nullability::NonNullable),
+            )
+            .into_array(),
+        ),
+        (
+            "nullable",
+            PrimitiveArray::from_option_iter((0..256i32).map(|i| (i % 7 != 0).then_some(i)))
+                .into_array(),
+        ),
+    ])?
+    .into_array();
+    let mut bytes = ByteBufferMut::empty();
+    session
+        .write_options()
+        .write(&mut bytes, array.clone().to_array_stream())
+        .await?;
+    let path = std::env::temp_dir().join(format!("vortex-reader-cache-{}.vx", std::process::id()));
+    tokio::fs::write(&path, bytes.as_slice()).await?;
+    let file = session
+        .open_options()
+        .with_layout_reader_cache()
+        .open_path(&path)
+        .await?;
+    let result = async {
+        let reader = file.layout_reader()?;
+        assert!(Arc::ptr_eq(&reader, &file.layout_reader()?));
+        for value in 0..1_024i32 {
+            let actual = file
+                .scan()?
+                .with_filter(eq(col("id"), lit(value)))
+                .into_array_stream()?
+                .read_all()
+                .await?;
+            let start = usize::try_from(value).unwrap().min(256);
+            let expected = array.slice(start..(start + 1).min(256))?;
+            assert_arrays_eq!(actual, expected, &mut ctx);
+        }
+
+        let low = Arc::new(AtomicI32::new(255));
+        let high = Arc::new(AtomicI32::new(0));
+        let low_value = Arc::clone(&low);
+        let high_value = Arc::clone(&high);
+        let dtype = DType::Primitive(I32, Nullability::NonNullable);
+        let low_expr = dynamic(
+            CompareOperator::Gt,
+            move || Some(low_value.load(Ordering::Relaxed).into()),
+            dtype.clone(),
+            true,
+            col("id"),
+        );
+        let high_expr = dynamic(
+            CompareOperator::Gt,
+            move || Some(high_value.load(Ordering::Relaxed).into()),
+            dtype,
+            true,
+            col("id"),
+        );
+        for (a, b) in [(255, 0), (0, 255), (127, 63), (63, 127)] {
+            low.store(a, Ordering::Relaxed);
+            high.store(b, Ordering::Relaxed);
+            let scan_a = file
+                .scan()?
+                .with_filter(low_expr.clone())
+                .into_array_stream()?;
+            let scan_b = file
+                .scan()?
+                .with_filter(high_expr.clone())
+                .into_array_stream()?;
+            let (actual_a, actual_b) = futures::try_join!(scan_a.read_all(), scan_b.read_all())?;
+            assert_arrays_eq!(
+                actual_a,
+                array.slice(usize::try_from(a + 1).unwrap()..256)?,
+                &mut ctx
+            );
+            assert_arrays_eq!(
+                actual_b,
+                array.slice(usize::try_from(b + 1).unwrap()..256)?,
+                &mut ctx
+            );
+        }
+        drop(low_expr);
+        drop(high_expr);
+        assert_eq!(Arc::strong_count(&low), 1);
+        assert_eq!(Arc::strong_count(&high), 1);
+        Ok::<_, vortex_error::VortexError>(())
+    }
+    .await;
+    drop(file);
+    tokio::fs::remove_file(&path).await?;
+    result
+}
 
 #[tokio::test]
 async fn test_eof_values() {

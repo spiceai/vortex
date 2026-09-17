@@ -8,7 +8,6 @@ use std::fmt::Formatter;
 use std::ops::BitAnd;
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::OnceLock;
 
 use Nullability::NonNullable;
 pub use expr::*;
@@ -24,7 +23,6 @@ use vortex_array::dtype::FieldMask;
 use vortex_array::dtype::FieldName;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
-use vortex_array::expr::ExactExpr;
 use vortex_array::expr::Expression;
 use vortex_array::expr::is_root;
 use vortex_array::expr::root;
@@ -38,19 +36,19 @@ use vortex_mask::Mask;
 use vortex_sequence::Sequence;
 use vortex_sequence::SequenceArray;
 use vortex_session::VortexSession;
-use vortex_utils::aliases::dash_map::DashMap;
 
 use crate::ArrayFuture;
 use crate::LayoutReader;
 use crate::RowSplits;
 use crate::SplitRange;
+use crate::expr_cache::ExpressionCache;
 use crate::layouts::partitioned::PartitionedExprEval;
 
 pub struct RowIdxLayoutReader {
     name: Arc<str>,
     row_offset: u64,
     child: Arc<dyn LayoutReader>,
-    partition_cache: DashMap<ExactExpr, Arc<OnceLock<Partitioning>>>,
+    partition_cache: ExpressionCache<Partitioning>,
     session: VortexSession,
 }
 
@@ -60,29 +58,14 @@ impl RowIdxLayoutReader {
             name: Arc::clone(child.name()),
             row_offset,
             child,
-            partition_cache: DashMap::with_hasher(Default::default()),
+            partition_cache: Default::default(),
             session,
         }
     }
 
     fn partition_expr(&self, expr: &Expression) -> VortexResult<Partitioning> {
-        let key = ExactExpr(expr.clone());
-
-        // Check cache first with read-only lock.
-        if let Some(entry) = self.partition_cache.get(&key)
-            && let Some(partitioning) = entry.value().get()
-        {
-            return Ok(partitioning.clone());
-        }
-
-        let result = self.compute_partitioning(expr)?;
-
         self.partition_cache
-            .entry(key)
-            .or_insert_with(|| Arc::new(OnceLock::new()))
-            .get_or_init(|| result.clone());
-
-        Ok(result)
+            .get_or_try_insert_with(expr, || self.compute_partitioning(expr))
     }
 
     fn compute_partitioning(&self, expr: &Expression) -> VortexResult<Partitioning> {

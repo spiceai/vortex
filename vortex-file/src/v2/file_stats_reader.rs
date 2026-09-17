@@ -21,9 +21,9 @@ use vortex_layout::LayoutReader;
 use vortex_layout::LayoutReaderRef;
 use vortex_layout::RowSplits;
 use vortex_layout::SplitRange;
+use vortex_layout::expr_cache::ExpressionCache;
 use vortex_mask::Mask;
 use vortex_session::VortexSession;
-use vortex_utils::aliases::dash_map::DashMap;
 
 use crate::FileStatistics;
 use crate::pruning::can_prune_file_stats;
@@ -41,7 +41,7 @@ pub struct FileStatsLayoutReader {
     file_stats: FileStatistics,
     struct_fields: StructFields,
     session: VortexSession,
-    prune_cache: DashMap<Expression, bool>,
+    prune_cache: ExpressionCache<bool>,
 }
 
 impl FileStatsLayoutReader {
@@ -116,17 +116,9 @@ impl LayoutReader for FileStatsLayoutReader {
         expr: &Expression,
         mask: Mask,
     ) -> VortexResult<MaskFuture> {
-        // Check cache first with read-only lock.
-        if let Some(pruned) = self.prune_cache.get(expr) {
-            if *pruned {
-                return Ok(MaskFuture::ready(Mask::new_false(mask.len())));
-            }
-            return self.child.pruning_evaluation(row_range, expr, mask);
-        }
-
-        // Evaluate and cache.
-        let pruned = self.evaluate_file_stats(expr)?;
-        self.prune_cache.insert(expr.clone(), pruned);
+        let pruned = self
+            .prune_cache
+            .get_or_try_insert_with(expr, || self.evaluate_file_stats(expr))?;
 
         if pruned {
             Ok(MaskFuture::ready(Mask::new_false(mask.len())))

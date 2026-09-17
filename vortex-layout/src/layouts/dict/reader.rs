@@ -33,13 +33,13 @@ use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_mask::Mask;
 use vortex_session::VortexSession;
-use vortex_utils::aliases::dash_map::DashMap;
 
 use super::DictLayout;
 use crate::LayoutReader;
 use crate::LayoutReaderRef;
 use crate::RowSplits;
 use crate::SplitRange;
+use crate::expr_cache::ExpressionCache;
 use crate::layouts::SharedArrayFuture;
 use crate::segments::SegmentSource;
 
@@ -53,7 +53,7 @@ pub struct DictReader {
     /// Cached dict values array
     values_array: OnceLock<SharedArrayFuture>,
     /// Cache of expression evaluation results on the values array by expression
-    values_evals: DashMap<Expression, SharedArrayFuture>,
+    values_evals: ExpressionCache<SharedArrayFuture>,
 
     values: LayoutReaderRef,
     codes: LayoutReaderRef,
@@ -139,23 +139,16 @@ impl DictReader {
         // shouldn't.
         // TODO(joe): fixme
 
-        // Check cache first with read-only lock
-        if let Some(fut) = self.values_evals.get(&expr) {
-            return fut.clone();
-        }
-
-        self.values_evals
-            .entry(expr.clone())
-            .or_insert_with(|| {
-                self.values_array_uncanonical()
-                    .map(move |array| {
-                        let array = array?.apply(&expr)?;
-                        Ok(SharedArray::new(array).into_array())
-                    })
-                    .boxed()
-                    .shared()
-            })
-            .clone()
+        self.values_evals.get_or_insert_with(&expr, || {
+            let expr = expr.clone();
+            self.values_array_uncanonical()
+                .map(move |array| {
+                    let array = array?.apply(&expr)?;
+                    Ok(SharedArray::new(array).into_array())
+                })
+                .boxed()
+                .shared()
+        })
     }
 }
 

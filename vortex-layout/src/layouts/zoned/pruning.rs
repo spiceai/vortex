@@ -26,16 +26,15 @@ use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_mask::Mask;
 use vortex_session::VortexSession;
-use vortex_utils::aliases::dash_map::DashMap;
 
 use crate::LazyReaderChildren;
+use crate::expr_cache::ExpressionCache;
 use crate::layouts::zoned::ZonedLayout;
 use crate::layouts::zoned::zone_map::ZoneMap;
 
 type SharedZoneMap = Shared<BoxFuture<'static, SharedVortexResult<ZoneMap>>>;
 pub(super) type SharedPruningResult =
     Shared<BoxFuture<'static, SharedVortexResult<Arc<PruningResult>>>>;
-type PredicateCache = Arc<OnceLock<Option<Expression>>>;
 
 pub(super) struct PruningState {
     zone_count: usize,
@@ -46,9 +45,9 @@ pub(super) struct PruningState {
     lazy_children: Arc<LazyReaderChildren>,
     session: VortexSession,
 
-    pruning_result: LazyLock<DashMap<Expression, Option<SharedPruningResult>>>,
+    pruning_result: LazyLock<ExpressionCache<Option<SharedPruningResult>>>,
     zone_map: OnceLock<SharedZoneMap>,
-    pruning_predicates: LazyLock<Arc<DashMap<Expression, PredicateCache>>>,
+    pruning_predicates: LazyLock<ExpressionCache<Option<Expression>>>,
 }
 
 impl PruningState {
@@ -73,13 +72,8 @@ impl PruningState {
     }
 
     pub(super) fn pruning_mask_future(&self, expr: Expression) -> Option<SharedPruningResult> {
-        if let Some(result) = self.pruning_result.get(&expr) {
-            return result.value().clone();
-        }
-
-        self.pruning_result
-            .entry(expr.clone())
-            .or_insert_with(|| match self.pruning_predicate(expr.clone()) {
+        self.pruning_result.get_or_insert_with(&expr, || {
+            match self.pruning_predicate(expr.clone()) {
                 None => {
                     trace!(%expr, "no pruning predicate");
                     None
@@ -89,6 +83,7 @@ impl PruningState {
                     let zone_map = self.zone_map();
                     let dynamic_updates = DynamicExprUpdates::new(&expr);
                     let session = self.session.clone();
+                    let expr = expr.clone();
 
                     Some(
                         async move {
@@ -112,22 +107,20 @@ impl PruningState {
                         .shared(),
                     )
                 }
-            })
-            .clone()
+            }
+        })
     }
 
     fn pruning_predicate(&self, expr: Expression) -> Option<Expression> {
-        self.pruning_predicates
-            .entry(expr.clone())
-            .or_default()
-            .get_or_init(move || match expr.falsify(&self.dtype, &self.session) {
+        self.pruning_predicates.get_or_insert_with(&expr, || {
+            match expr.falsify(&self.dtype, &self.session) {
                 Ok(predicate) => predicate,
                 Err(error) => {
                     trace!(%expr, %error, "failed to construct stats rewrite predicate");
                     None
                 }
-            })
-            .clone()
+            }
+        })
     }
 
     fn zone_map(&self) -> SharedZoneMap {
