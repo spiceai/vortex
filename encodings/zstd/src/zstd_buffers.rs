@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use prost::Message as _;
 use vortex_array::Array;
+use vortex_array::ArrayDeserialization;
 use vortex_array::ArrayEq;
 use vortex_array::ArrayHash;
 use vortex_array::ArrayId;
@@ -39,6 +40,7 @@ use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
 use crate::ZstdBuffersMetadata;
+use crate::validate_frame_content_size;
 
 /// A [`ZstdBuffers`]-encoded Vortex array.
 pub type ZstdBuffersArray = Array<ZstdBuffers>;
@@ -59,42 +61,38 @@ impl ZstdBuffers {
 
     /// Compress every top-level buffer of `array` independently with zstd.
     ///
-    /// Children are preserved as slots and the wrapped array's serialized metadata is stored so the
-    /// original array can be rebuilt after decompression.
+    /// The wrapped array's serialized representation is captured so it can be rebuilt after
+    /// decompression, including any buffers or children selected by its serializer.
     pub fn compress(
         array: &ArrayRef,
         level: i32,
         session: &VortexSession,
     ) -> VortexResult<ZstdBuffersArray> {
-        let encoding_id = array.encoding_id();
-        let metadata = session
+        let serialization = session
             .array_serialize(array)?
             .ok_or_else(|| vortex_err!("[ZstdBuffers]: Array does not support serialization"))?;
-        let buffer_handles = array.buffer_handles();
-        let children = array.children();
 
-        let mut compressed_buffers = Vec::with_capacity(buffer_handles.len());
-        let mut uncompressed_sizes = Vec::with_capacity(buffer_handles.len());
-        let mut buffer_alignments = Vec::with_capacity(buffer_handles.len());
+        let mut compressed_buffers = Vec::with_capacity(serialization.buffers.len());
+        let mut uncompressed_sizes = Vec::with_capacity(serialization.buffers.len());
+        let mut buffer_alignments = Vec::with_capacity(serialization.buffers.len());
 
         let mut compressor = zstd::bulk::Compressor::new(level)?;
-        // Compression is currently CPU-only, so we gather all buffers on the host.
-        for handle in &buffer_handles {
-            buffer_alignments.push(u32::from(handle.alignment()));
-            let host_buf = handle.clone().try_to_host_sync()?;
-            uncompressed_sizes.push(host_buf.len() as u64);
-            let compressed = compressor.compress(&host_buf)?;
+        for buffer in &serialization.buffers {
+            buffer_alignments.push(u32::from(buffer.alignment()));
+            uncompressed_sizes.push(buffer.len() as u64);
+            let mut compressed = compressor.compress(buffer)?;
+            compressed.shrink_to_fit();
             compressed_buffers.push(BufferHandle::new_host(ByteBuffer::from(compressed)));
         }
 
         let data = ZstdBuffersData {
-            inner_encoding_id: encoding_id,
-            inner_metadata: metadata,
+            inner_encoding_id: serialization.serialized_id,
+            inner_metadata: serialization.metadata,
             compressed_buffers,
             uncompressed_sizes,
             buffer_alignments,
         };
-        let slots: ArraySlots = children.into_iter().map(Some).collect();
+        let slots: ArraySlots = serialization.children.into_iter().map(Some).collect();
         let compressed = Array::try_from_parts(
             ArrayParts::new(ZstdBuffers, array.dtype().clone(), array.len(), data)
                 .with_slots(slots),
@@ -109,20 +107,24 @@ impl ZstdBuffers {
         buffer_handles: &[BufferHandle],
         session: &VortexSession,
     ) -> VortexResult<ArrayRef> {
-        let registry = session.arrays().registry().clone();
-        let inner_vtable = registry
-            .find(&array.data().inner_encoding_id)
+        let inner_vtable = session
+            .arrays()
+            .registry()
+            .get(&array.data().inner_encoding_id)
             .ok_or_else(|| {
                 vortex_err!("Unknown inner encoding: {}", array.data().inner_encoding_id)
             })?;
 
         let children: Vec<ArrayRef> = array.slots().iter().flatten().cloned().collect();
         inner_vtable.deserialize(
-            array.dtype(),
-            array.len(),
-            &array.data().inner_metadata,
-            buffer_handles,
-            &children.as_slice(),
+            ArrayDeserialization::new(
+                array.data().inner_encoding_id,
+                array.dtype(),
+                array.len(),
+                &array.data().inner_metadata,
+                buffer_handles,
+                &children.as_slice(),
+            ),
             session,
         )
     }
@@ -257,6 +259,8 @@ impl ZstdBuffersData {
             let alignment = self.buffer_alignments.get(i).copied().unwrap_or(1);
 
             let aligned = Alignment::try_from(alignment)?;
+            let compressed = buf.clone().try_to_host_sync()?;
+            validate_frame_content_size(compressed.as_slice(), uncompressed_size, i)?;
             let mut output = ByteBufferMut::with_capacity_aligned(size, aligned);
             let spare = output.spare_capacity_mut();
 
@@ -273,7 +277,6 @@ impl ZstdBuffersData {
             // `set_len(size)` after zstd reports how many bytes were written.
             let dst =
                 unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr().cast::<u8>(), size) };
-            let compressed = buf.clone().try_to_host_sync()?;
             let written = decompressor.decompress_to_buffer(compressed.as_slice(), dst)?;
             if written != size {
                 return Err(vortex_err!(
@@ -294,6 +297,18 @@ impl ZstdBuffersData {
         // If invariants are somehow broken, device decompression could have UB, so ensure
         // they still hold.
         self.validate()?;
+        // Only host-resident frames are checked: reading a device frame's header would cost a D2H
+        // copy per frame, and the device output allocation is fallible so it cannot abort.
+        for (index, (buffer, &metadata_size)) in self
+            .compressed_buffers
+            .iter()
+            .zip(&self.uncompressed_sizes)
+            .enumerate()
+        {
+            if let Some(frame) = buffer.as_host_opt() {
+                validate_frame_content_size(frame.as_slice(), metadata_size, index)?;
+            }
+        }
 
         let output_sizes = self
             .uncompressed_sizes
@@ -341,7 +356,7 @@ fn compute_output_layout(
     let mut total_size = 0usize;
 
     for (&size, &alignment) in output_sizes.iter().zip(output_alignments.iter()) {
-        total_size = total_size.next_multiple_of(*alignment);
+        total_size = total_size.next_multiple_of(alignment.as_usize());
         offsets.push(total_size);
         total_size += size;
     }
@@ -649,6 +664,24 @@ mod tests {
         let compressed = ZstdBuffers::compress(&input, 3, &array_session())?;
 
         assert!(!compressed.statistics().get(Stat::Min).is_absent());
+        Ok(())
+    }
+
+    #[test]
+    fn test_rejects_mismatched_frame_content_size_before_output_allocation() -> VortexResult<()> {
+        let compressed = ZstdBuffers::compress(&make_primitive_array(), 3, &array_session())?;
+        let mut data = compressed.data().clone();
+        data.uncompressed_sizes[0] = 16 * 1024 * 1024 * 1024;
+
+        for error in [
+            data.decompress_buffers().unwrap_err(),
+            data.decode_plan().unwrap_err(),
+        ] {
+            assert!(
+                error.to_string().contains("metadata declares"),
+                "unexpected error: {error}"
+            );
+        }
         Ok(())
     }
 

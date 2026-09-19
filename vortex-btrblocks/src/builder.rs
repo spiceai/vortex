@@ -3,6 +3,7 @@
 
 //! Builder for configuring `BtrBlocksCompressor` instances.
 
+use vortex_array::ArrayId;
 use vortex_utils::aliases::hash_set::HashSet;
 
 use crate::BtrBlocksCompressor;
@@ -36,7 +37,6 @@ pub const ALL_SCHEMES: &[&dyn Scheme] = &[
     &integer::SequenceScheme,
     &integer::IntRLEScheme,
     // Prefer all other schemes above delta, for now (since its slower to decompress).
-    #[cfg(feature = "unstable_encodings")]
     &integer::DeltaScheme::new(1.25),
     ////////////////////////////////////////////////////////////////////////////////////////////////
     // Float schemes.
@@ -53,13 +53,13 @@ pub const ALL_SCHEMES: &[&dyn Scheme] = &[
     // Both string-fragmentation schemes are registered; the sample-based
     // selector keeps whichever is smaller per column.
     &string::FSSTScheme,
-    #[cfg(feature = "unstable_encodings")]
     &string::OnPairScheme,
     &string::NullDominatedSparseScheme,
     ////////////////////////////////////////////////////////////////////////////////////////////////
     // Binary schemes.
     ////////////////////////////////////////////////////////////////////////////////////////////////
     &binary::BinaryDictScheme,
+    &binary::VarBinScheme,
     // Decimal schemes.
     &decimal::DecimalScheme,
     // Temporal schemes.
@@ -152,51 +152,43 @@ impl BtrBlocksCompressorBuilder {
         builder
     }
 
-    /// Excludes schemes without CUDA kernel support and adds Zstd for string and binary compression.
+    /// Excludes schemes without CUDA kernel support, keeps FSST for string compression,
+    /// and adds Zstd for binary compression.
     ///
-    /// With the `unstable_encodings` feature, buffer-level Zstd compression is used which
-    /// preserves the array buffer layout for zero-conversion GPU decompression. Without it,
-    /// interleaved Zstd compression is used.
+    /// Both the array-level and the buffer-level Zstd schemes are added. Buffer-level
+    /// compression preserves binary arrays' buffer layout for zero-conversion GPU decompression,
+    /// but belongs to the opt-in `zstd` edition, so callers filter the two through
+    /// [`retain_allowed_encodings`](Self::retain_allowed_encodings).
     ///
     /// This preset is intended for files that will be decoded by CUDA kernels. It may choose a
     /// larger encoded representation than the default compressor.
     pub fn only_cuda_compatible(self) -> Self {
-        // String fragmentation schemes (OnPair, FSST) require host-side
-        // dictionary expansion at decode time, which is incompatible with
-        // pure-GPU decompression paths. Strip whichever string-fragment
-        // scheme is enabled by feature.
-        #[cfg_attr(
-            not(any(feature = "pco", feature = "unstable_encodings")),
-            allow(unused_mut)
-        )]
+        // Keep FSST, which has a CUDA decoder and direct Arrow offset-based export. Other
+        // string fragmentation and dictionary schemes still require unsupported decode paths.
+        #[cfg_attr(not(any(feature = "pco", feature = "zstd")), allow(unused_mut))]
         let mut excluded: Vec<SchemeId> = vec![
             integer::SparseScheme.id(),
             integer::IntRLEScheme.id(),
             float::ALPRDScheme.id(),
             float::FloatRLEScheme.id(),
             float::NullDominatedSparseScheme.id(),
+            string::NullDominatedSparseScheme.id(),
             string::StringDictScheme.id(),
-            string::FSSTScheme.id(),
             binary::BinaryDictScheme.id(),
         ];
-        #[cfg(feature = "unstable_encodings")]
-        excluded.push(string::OnPairScheme.id());
-        // Delta has no GPU decode kernel and its prefix-sum decode is inherently sequential, so it
-        // is incompatible with pure-GPU decompression paths.
-        #[cfg(feature = "unstable_encodings")]
+        // Delta now has a CUDA decode kernel, so arrays that reach the GPU already encoded with
+        // it — the Delta children OnPair emits, for instance — decode there. It stays excluded
+        // from this preset until GPU delta decode is benchmarked against the schemes it would
+        // displace, since the preset picks encodings rather than merely decoding them.
         excluded.push(integer::DeltaScheme::default().id());
         #[cfg(feature = "pco")]
         excluded.extend([integer::PcoScheme.id(), float::PcoScheme.id()]);
         let builder = self.exclude_schemes(excluded);
 
-        #[cfg(all(feature = "zstd", feature = "unstable_encodings"))]
+        #[cfg(feature = "zstd")]
         let builder = builder
-            .with_new_scheme(&string::ZstdBuffersScheme)
+            .with_new_scheme(&binary::ZstdScheme)
             .with_new_scheme(&binary::ZstdBuffersScheme);
-        #[cfg(all(feature = "zstd", not(feature = "unstable_encodings")))]
-        let builder = builder
-            .with_new_scheme(&string::ZstdScheme)
-            .with_new_scheme(&binary::ZstdScheme);
 
         builder
     }
@@ -208,6 +200,16 @@ impl BtrBlocksCompressorBuilder {
         self
     }
 
+    /// Retains only schemes whose produced encodings all belong to `allowed`.
+    ///
+    /// The file writer uses this to restrict compression to the encodings of its configured
+    /// editions.
+    pub fn retain_allowed_encodings(mut self, allowed: &HashSet<ArrayId>) -> Self {
+        self.schemes
+            .retain(|s| s.produced_encodings().iter().all(|id| allowed.contains(id)));
+        self
+    }
+
     /// Builds the configured [`BtrBlocksCompressor`].
     pub fn build(self) -> BtrBlocksCompressor {
         BtrBlocksCompressor(CascadingCompressor::new(self.schemes))
@@ -216,6 +218,9 @@ impl BtrBlocksCompressorBuilder {
 
 #[cfg(test)]
 mod tests {
+    use vortex_array::VTable;
+    use vortex_fastlanes::FoR;
+
     use super::*;
 
     #[test]
@@ -231,6 +236,27 @@ mod tests {
     }
 
     #[test]
+    fn retain_allowed_encodings_filters_schemes() {
+        let allowed: HashSet<ArrayId> = [FoR.id()].into_iter().collect();
+        let builder = BtrBlocksCompressorBuilder::default().retain_allowed_encodings(&allowed);
+        assert_eq!(builder.schemes.len(), 1);
+        assert_eq!(builder.schemes[0].id(), integer::FoRScheme.id());
+
+        let none = BtrBlocksCompressorBuilder::default().retain_allowed_encodings(&HashSet::new());
+        assert!(none.schemes.is_empty());
+    }
+
+    #[test]
+    fn retaining_all_declared_outputs_keeps_every_scheme() {
+        let allowed: HashSet<ArrayId> = ALL_SCHEMES
+            .iter()
+            .flat_map(|scheme| scheme.produced_encodings())
+            .collect();
+        let builder = BtrBlocksCompressorBuilder::default().retain_allowed_encodings(&allowed);
+        assert_eq!(builder.schemes.len(), ALL_SCHEMES.len());
+    }
+
+    #[test]
     fn cuda_compatible_excludes_alprd() {
         let builder = BtrBlocksCompressorBuilder::default().only_cuda_compatible();
         assert!(
@@ -238,6 +264,40 @@ mod tests {
                 .schemes
                 .iter()
                 .any(|s| s.id() == float::ALPRDScheme.id())
+        );
+    }
+
+    /// `vortex.sparse` has no CUDA decode kernel, so no sparse scheme may survive this preset.
+    #[test]
+    fn cuda_compatible_excludes_every_sparse_scheme() {
+        let builder = BtrBlocksCompressorBuilder::default().only_cuda_compatible();
+        for excluded in [
+            integer::SparseScheme.id(),
+            float::NullDominatedSparseScheme.id(),
+            string::NullDominatedSparseScheme.id(),
+        ] {
+            assert!(
+                !builder.schemes.iter().any(|s| s.id() == excluded),
+                "{excluded} should be excluded"
+            );
+        }
+    }
+
+    #[test]
+    fn cuda_compatible_uses_fsst_for_strings() {
+        let builder = BtrBlocksCompressorBuilder::default().only_cuda_compatible();
+        assert!(
+            builder
+                .schemes
+                .iter()
+                .any(|scheme| scheme.id() == string::FSSTScheme.id())
+        );
+        #[cfg(feature = "zstd")]
+        assert!(
+            !builder
+                .schemes
+                .iter()
+                .any(|scheme| scheme.id() == string::ZstdScheme.id())
         );
     }
 

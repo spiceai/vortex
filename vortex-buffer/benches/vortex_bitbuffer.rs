@@ -114,7 +114,11 @@ fn append_buffer_vortex_buffer(bencher: Bencher, length: usize) {
         });
 }
 
-#[divan::bench(args = INPUT_SIZE)]
+/// Arrow has no bulk append from a `BooleanBuffer`, so this appends bit-by-bit and runs an
+/// order of magnitude slower than the vortex bulk path; cap the top size accordingly.
+const APPEND_BUFFER_ARROW_INPUT_SIZE: &[usize] = &[128, 1024, 2048, 16_384, 32_768];
+
+#[divan::bench(args = APPEND_BUFFER_ARROW_INPUT_SIZE)]
 fn append_buffer_arrow_buffer(bencher: Bencher, length: usize) {
     bencher
         .with_inputs(|| {
@@ -153,30 +157,45 @@ fn value_arrow_buffer(bencher: Bencher, length: usize) {
     });
 }
 
-#[divan::bench(args = INPUT_SIZE)]
-fn slice_vortex_buffer(bencher: Bencher, length: usize) {
-    let buffer = BitBuffer::from_iter((0..length).map(|i| i % 2 == 0));
-    bencher
-        .with_inputs(|| (&buffer, length / 2))
-        .bench_refs(|(buffer, mid)| {
-            let mid = *mid;
-            buffer.slice(mid / 2..mid + mid / 2)
-        });
+/// Slicing only adjusts an offset, a length and a refcount, so its cost is independent of buffer
+/// length. Measure one length, with enough slices per iteration to stay above harness overhead.
+const SLICE_ITERS: usize = 64;
+const SLICE_INPUT_SIZE: usize = 65_536;
+
+#[divan::bench]
+fn slice_vortex_buffer(bencher: Bencher) {
+    let buffer = BitBuffer::from_iter((0..SLICE_INPUT_SIZE).map(|i| i % 2 == 0));
+    let mid = SLICE_INPUT_SIZE / 2;
+    bencher.with_inputs(|| &buffer).bench_refs(|buffer| {
+        let mut total = 0;
+        for offset in 0..SLICE_ITERS {
+            total += buffer.slice(mid / 2 + offset..mid + mid / 2).len();
+        }
+        total
+    });
 }
 
 #[cfg(not(codspeed))]
-#[divan::bench(args = INPUT_SIZE)]
-fn slice_arrow_buffer(bencher: Bencher, length: usize) {
-    let buffer = Arrow(BooleanBuffer::from_iter((0..length).map(|i| i % 2 == 0)));
-    bencher
-        .with_inputs(|| (&buffer, length / 2))
-        .bench_refs(|(buffer, mid)| {
-            let mid = *mid;
-            buffer.0.slice(mid / 2, mid / 2)
-        });
+#[divan::bench]
+fn slice_arrow_buffer(bencher: Bencher) {
+    let buffer = Arrow(BooleanBuffer::from_iter(
+        (0..SLICE_INPUT_SIZE).map(|i| i % 2 == 0),
+    ));
+    let mid = SLICE_INPUT_SIZE / 2;
+    bencher.with_inputs(|| &buffer).bench_refs(|buffer| {
+        let mut total = 0;
+        for offset in 0..SLICE_ITERS {
+            total += buffer.0.slice(mid / 2 + offset, mid / 2).len();
+        }
+        total
+    });
 }
 
-#[divan::bench(args = INPUT_SIZE)]
+/// Below a few thousand bits the measurement is mostly divan's fixed per-iteration overhead
+/// rather than the popcount, so it moves when the count itself has not changed.
+const TRUE_COUNT_INPUT_SIZE: &[usize] = &[16_384, 65_536];
+
+#[divan::bench(args = TRUE_COUNT_INPUT_SIZE)]
 fn true_count_vortex_buffer(bencher: Bencher, length: usize) {
     let buffer = BitBuffer::from_iter((0..length).map(true_count_pattern));
 
@@ -185,7 +204,7 @@ fn true_count_vortex_buffer(bencher: Bencher, length: usize) {
         .bench_refs(|buffer| buffer.true_count())
 }
 
-#[divan::bench(args = INPUT_SIZE)]
+#[divan::bench(args = TRUE_COUNT_INPUT_SIZE)]
 fn true_count_arrow_buffer(bencher: Bencher, length: usize) {
     let buffer = Arrow(BooleanBuffer::from_iter(
         (0..length).map(true_count_pattern),

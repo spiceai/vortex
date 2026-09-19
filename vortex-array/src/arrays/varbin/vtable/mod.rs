@@ -20,18 +20,22 @@ use crate::array::Array;
 use crate::array::ArrayId;
 use crate::array::ArrayView;
 use crate::array::VTable;
+use crate::arrays::PrimitiveArray;
 use crate::arrays::varbin::VarBinArrayExt;
+use crate::arrays::varbin::VarBinArraySlotsExt;
 use crate::arrays::varbin::VarBinData;
-use crate::arrays::varbin::array::NUM_SLOTS;
-use crate::arrays::varbin::array::OFFSETS_SLOT;
-use crate::arrays::varbin::array::SLOT_NAMES;
+use crate::arrays::varbin::VarBinSlots;
 use crate::buffer::BufferHandle;
+use crate::builders::ArrayBuilder;
+use crate::builders::VarBinViewBuilder;
 use crate::dtype::DType;
 use crate::dtype::Nullability;
 use crate::dtype::PType;
+use crate::match_each_integer_ptype;
+use crate::match_each_varbin_builder;
 use crate::serde::ArrayChildren;
 use crate::validity::Validity;
-mod canonical;
+pub(crate) mod canonical;
 mod kernel;
 mod operations;
 mod validity;
@@ -91,11 +95,12 @@ impl VTable for VarBin {
         slots: &[Option<ArrayRef>],
     ) -> VortexResult<()> {
         vortex_ensure!(
-            slots.len() == NUM_SLOTS,
-            "VarBinArray expected {NUM_SLOTS} slots, found {}",
+            slots.len() == VarBinSlots::COUNT,
+            "VarBinArray expected {} slots, found {}",
+            VarBinSlots::COUNT,
             slots.len()
         );
-        let offsets = slots[OFFSETS_SLOT]
+        let offsets = slots[VarBinSlots::OFFSETS]
             .as_ref()
             .vortex_expect("VarBinArray offsets slot");
         vortex_ensure!(
@@ -192,7 +197,7 @@ impl VTable for VarBin {
     }
 
     fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {
-        SLOT_NAMES[idx].to_string()
+        VarBinSlots::NAMES[idx].to_string()
     }
 
     fn reduce_parent(
@@ -203,11 +208,58 @@ impl VTable for VarBin {
         PARENT_RULES.evaluate(array, parent, child_idx)
     }
 
+    fn append_to_builder(
+        array: ArrayView<'_, Self>,
+        builder: &mut dyn ArrayBuilder,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<()> {
+        if let Some(result) =
+            match_each_varbin_builder!(builder, |builder| builder.append_varbin(array, ctx))
+        {
+            return result;
+        }
+
+        // The two arms here are every builder a `Utf8`/`Binary` dtype has: all four
+        // `VarBinBuilder` widths above, and `VarBinViewBuilder` below.
+        let Some(builder) = builder.as_any_mut().downcast_mut::<VarBinViewBuilder>() else {
+            vortex_bail!("append_to_builder for VarBin requires a variable-binary builder")
+        };
+        append_to_varbinview(array, builder, ctx)
+    }
+
     fn execute(array: Array<Self>, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
         Ok(ExecutionResult::done(
             varbin_to_canonical(array.as_view(), ctx)?.into_array(),
         ))
     }
+}
+
+/// Hands the value bytes to `builder` as a data buffer with views built over them.
+///
+/// Canonicalizing first would build the same views, then pay for them twice more: once to wrap
+/// them in a `VarBinViewArray` the builder immediately unwraps, and once for
+/// `append_varbinview_array` to rewrite every view so its buffer index is rebased onto the
+/// builder's. Handing the heap and offsets to the builder instead makes the whole append one view
+/// per row with no byte copy — the builder adopts the referenced range of the heap as it is. That
+/// range is fully covered by the new views, so this stays valid for a compacting builder too.
+fn append_to_varbinview(
+    array: ArrayView<'_, VarBin>,
+    builder: &mut VarBinViewBuilder,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<()> {
+    let len = array.as_ref().len();
+    let validity = array.varbin_validity().execute_mask(len, ctx)?;
+
+    let parts = array.into_owned().into_data_parts();
+    let offsets = parts.offsets.execute::<PrimitiveArray>(ctx)?;
+    match_each_integer_ptype!(offsets.ptype(), |P| {
+        builder.append_buffer_with_offsets(
+            parts.bytes.unwrap_host(),
+            offsets.as_slice::<P>(),
+            &validity,
+        )
+    });
+    Ok(())
 }
 
 #[derive(Clone, Debug)]

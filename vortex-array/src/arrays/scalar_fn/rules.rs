@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::any::Any;
-use std::sync::Arc;
-
 use itertools::Itertools;
-use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 
 use crate::ArrayRef;
@@ -18,16 +14,13 @@ use crate::arrays::ScalarFn;
 use crate::arrays::ScalarFnArray;
 use crate::arrays::Slice;
 use crate::arrays::StructArray;
+use crate::arrays::filter::prepare_mask_for_reuse;
 use crate::arrays::scalar_fn::ScalarFnArrayExt;
-use crate::dtype::DType;
 use crate::optimizer::rules::ArrayParentReduceRule;
 use crate::optimizer::rules::ArrayReduceRule;
 use crate::optimizer::rules::ParentRuleSet;
 use crate::optimizer::rules::ReduceRuleSet;
-use crate::scalar_fn::ReduceCtx;
-use crate::scalar_fn::ReduceNode;
-use crate::scalar_fn::ReduceNodeRef;
-use crate::scalar_fn::ScalarFnRef;
+use crate::scalar_fn::ArrayReduceNode;
 use crate::scalar_fn::fns::pack::Pack;
 use crate::validity::Validity;
 
@@ -35,7 +28,7 @@ pub(super) const RULES: ReduceRuleSet<ScalarFn> =
     ReduceRuleSet::new(&[&ScalarFnPackToStructRule, &ScalarFnAbstractReduceRule]);
 
 pub(super) const PARENT_RULES: ParentRuleSet<ScalarFn> = ParentRuleSet::new(&[
-    ParentRuleSet::lift(&ScalarFnUnaryFilterPushDownRule),
+    ParentRuleSet::lift(&ScalarFilterPushdownRule),
     ParentRuleSet::lift(&ScalarFnSliceReduceRule),
 ]);
 
@@ -94,77 +87,18 @@ impl ArrayParentReduceRule<ScalarFn> for ScalarFnSliceReduceRule {
 struct ScalarFnAbstractReduceRule;
 impl ArrayReduceRule<ScalarFn> for ScalarFnAbstractReduceRule {
     fn reduce(&self, array: ArrayView<'_, ScalarFn>) -> VortexResult<Option<ArrayRef>> {
-        if let Some(reduced) = array
-            .scalar_fn()
-            .reduce(array.as_ref(), &ArrayReduceCtx { len: array.len() })?
-        {
-            return Ok(Some(
-                reduced
-                    .as_any()
-                    .downcast_ref::<ArrayRef>()
-                    .vortex_expect("ReduceNode is not an ArrayRef")
-                    .clone(),
-            ));
+        let node = ArrayReduceNode::new(array.as_ref());
+        if let Some(reduced) = array.scalar_fn().reduce_array(&node)? {
+            return Ok(Some(reduced.into_array()));
         }
         Ok(None)
     }
 }
 
-impl ReduceNode for ArrayRef {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn node_dtype(&self) -> VortexResult<DType> {
-        Ok(self.dtype().clone())
-    }
-
-    fn scalar_fn(&self) -> Option<&ScalarFnRef> {
-        self.as_opt::<ScalarFn>().map(|a| a.data().scalar_fn())
-    }
-
-    fn child(&self, idx: usize) -> ReduceNodeRef {
-        Arc::new(self.nth_child(idx).vortex_expect("child idx out of bounds"))
-    }
-
-    fn child_count(&self) -> usize {
-        self.nchildren()
-    }
-}
-
-struct ArrayReduceCtx {
-    // The length of the array being reduced
-    len: usize,
-}
-impl ReduceCtx for ArrayReduceCtx {
-    fn new_node(
-        &self,
-        scalar_fn: ScalarFnRef,
-        children: &[ReduceNodeRef],
-    ) -> VortexResult<ReduceNodeRef> {
-        Ok(Arc::new(
-            ScalarFnArray::try_new_with_len(
-                scalar_fn,
-                children
-                    .iter()
-                    .map(|c| {
-                        c.as_any()
-                            .downcast_ref::<ArrayRef>()
-                            .vortex_expect("ReduceNode is not an ArrayRef")
-                            .clone()
-                    })
-                    .collect(),
-                self.len,
-            )?
-            .into_array(),
-        ))
-    }
-}
-
 #[derive(Debug)]
-struct ScalarFnUnaryFilterPushDownRule;
+struct ScalarFilterPushdownRule;
 
-impl ArrayParentReduceRule<ScalarFn> for ScalarFnUnaryFilterPushDownRule {
+impl ArrayParentReduceRule<ScalarFn> for ScalarFilterPushdownRule {
     type Parent = Filter;
 
     fn reduce_parent(
@@ -173,48 +107,145 @@ impl ArrayParentReduceRule<ScalarFn> for ScalarFnUnaryFilterPushDownRule {
         parent: ArrayView<'_, Filter>,
         _child_idx: usize,
     ) -> VortexResult<Option<ArrayRef>> {
-        // If we only have one non-constant child, then it is _always_ cheaper to push down the
-        // filter over the children of the scalar function array.
-        if child
+        let nchildren = child
             .iter_children()
             .filter(|c| !c.is::<Constant>())
-            .count()
-            == 1
+            .count();
+        if nchildren > 1
+            && let Some(values) = parent.filter_mask().values()
         {
-            let new_children: Vec<_> = child
-                .iter_children()
-                .map(|c| match c.as_opt::<Constant>() {
-                    Some(array) => {
-                        Ok(ConstantArray::new(array.scalar().clone(), parent.len()).into_array())
-                    }
-                    None => c.filter(parent.filter_mask().clone()),
-                })
-                .try_collect()?;
-
-            let new_array =
-                ScalarFnArray::try_new(child.scalar_fn().clone(), new_children)?.into_array();
-
-            return Ok(Some(new_array));
+            prepare_mask_for_reuse(values, nchildren);
         }
 
-        Ok(None)
+        let new_children: Vec<_> = child
+            .iter_children()
+            .map(|c| match c.as_opt::<Constant>() {
+                Some(array) => {
+                    Ok(ConstantArray::new(array.scalar().clone(), parent.len()).into_array())
+                }
+                None => c.filter(parent.filter_mask().clone()),
+            })
+            .try_collect()?;
+
+        Ok(Some(
+            ScalarFnArray::try_new_with_len(child.scalar_fn().clone(), new_children, parent.len())?
+                .into_array(),
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
     use vortex_error::VortexExpect;
+    use vortex_error::VortexResult;
+    use vortex_error::vortex_err;
+    use vortex_mask::Mask;
 
+    use super::ScalarFilterPushdownRule;
+    use crate::VortexSessionExecute;
     use crate::array::IntoArray;
+    use crate::array_session;
     use crate::arrays::ChunkedArray;
+    use crate::arrays::Constant;
+    use crate::arrays::Filter;
+    use crate::arrays::FilterArray;
     use crate::arrays::PrimitiveArray;
+    use crate::arrays::ScalarFn;
+    use crate::arrays::ScalarFnArray;
+    use crate::arrays::scalar_fn::ScalarFnArrayExt;
     use crate::arrays::scalar_fn::rules::ConstantArray;
+    use crate::assert_arrays_eq;
     use crate::dtype::DType;
     use crate::dtype::Nullability;
     use crate::dtype::PType;
     use crate::expr::cast;
     use crate::expr::is_null;
     use crate::expr::root;
+    use crate::optimizer::rules::ArrayParentReduceRule;
+    use crate::scalar::Scalar;
+    use crate::scalar_fn::TypedScalarFnInstance;
+    use crate::scalar_fn::fns::binary::Binary;
+    use crate::scalar_fn::fns::literal::Literal;
+    use crate::scalar_fn::fns::operators::Operator;
+
+    #[rstest]
+    #[case(0, [14, 14, 14, 14, 14])]
+    #[case(1, [7, 27, 47, 67, 87])]
+    #[case(2, [0, 40, 80, 120, 160])]
+    fn test_filter_pushdown(
+        #[case] nchildren: usize,
+        #[case] expected: [i32; 5],
+    ) -> VortexResult<()> {
+        let children = (0..2)
+            .map(|index| {
+                if index < nchildren {
+                    PrimitiveArray::from_iter(0i32..100).into_array()
+                } else {
+                    ConstantArray::new(7i32, 100).into_array()
+                }
+            })
+            .collect();
+        let array = ScalarFnArray::try_new(
+            TypedScalarFnInstance::new(Binary, Operator::Add).erased(),
+            children,
+        )?;
+        let mask = Mask::from_iter((0..100).map(|index| index % 20 == 0));
+        let values = mask
+            .values()
+            .ok_or_else(|| vortex_err!("expected mask values"))?;
+        assert!(values.cached_indices().is_none());
+        let parent = FilterArray::try_new(array.clone().into_array(), mask.clone())?;
+
+        let result = ScalarFilterPushdownRule
+            .reduce_parent(array.as_view(), parent.as_view(), 0)?
+            .ok_or_else(|| vortex_err!("expected filter pushdown"))?;
+
+        assert_eq!(values.cached_indices().is_some(), nchildren > 1);
+        let scalar_fn = result.as_::<ScalarFn>();
+        assert_eq!(scalar_fn.len(), 5);
+        for (index, child) in scalar_fn.iter_children().enumerate() {
+            assert_eq!(child.len(), 5);
+            if index < nchildren {
+                assert!(child.is::<Filter>());
+            } else {
+                assert!(child.is::<Constant>());
+            }
+        }
+        let expected = PrimitiveArray::from_iter(expected);
+        assert_arrays_eq!(
+            result,
+            expected,
+            &mut array_session().create_execution_ctx()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_filter_pushdown_without_children() -> VortexResult<()> {
+        let array = ScalarFnArray::try_new_with_len(
+            TypedScalarFnInstance::new(Literal, Scalar::from(7i32)).erased(),
+            vec![],
+            3,
+        )?;
+        let parent = FilterArray::try_new(
+            array.clone().into_array(),
+            Mask::from_iter([true, false, true]),
+        )?;
+
+        let result = ScalarFilterPushdownRule
+            .reduce_parent(array.as_view(), parent.as_view(), 0)?
+            .ok_or_else(|| vortex_err!("expected filter pushdown"))?;
+
+        assert_eq!(result.as_::<ScalarFn>().nchildren(), 0);
+        assert_eq!(result.len(), 2);
+        assert_arrays_eq!(
+            result,
+            ConstantArray::new(7i32, 2),
+            &mut array_session().create_execution_ctx()
+        );
+        Ok(())
+    }
 
     #[test]
     fn test_empty_constants() {

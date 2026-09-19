@@ -61,7 +61,8 @@ pub fn write_file_to_bytes(chunk: ArrayRef) -> VortexResult<ByteBuffer> {
     write_compressed_to_bytes(chunk, Arc::new(FlatLayoutStrategy::default()))
 }
 
-/// Write a `.vortex` file using a caller-provided layout strategy (compressor pipeline).
+/// Write a `.vortex` file using a caller-provided layout strategy (compressor pipeline), allowing
+/// the strategy to emit uneditioned encodings.
 pub fn write_compressed(
     path: &Path,
     chunk: ArrayRef,
@@ -76,6 +77,7 @@ pub fn write_compressed(
             .map_err(|e| vortex_err!("failed to create {}: {e}", path.display()))?;
         let _summary = session
             .write_options()
+            .disable_editions()
             .with_strategy(strategy)
             .write(&mut file, stream)
             .await?;
@@ -88,13 +90,25 @@ pub fn write_compressed_to_bytes(
     chunk: ArrayRef,
     strategy: Arc<dyn LayoutStrategy>,
 ) -> VortexResult<ByteBuffer> {
-    let stream = ArrayStreamAdapter::new(chunk.dtype().clone(), stream::iter([Ok(chunk)]));
+    write_compressed_to_bytes_with_session(&VortexSession::default(), chunk, strategy)
+}
 
-    runtime()?.block_on(async {
-        let session = VortexSession::default().with_tokio();
+/// Write a `.vortex` file into memory using a caller-provided session and layout strategy,
+/// allowing the strategy to emit uneditioned encodings.
+pub fn write_compressed_to_bytes_with_session(
+    session: &VortexSession,
+    chunk: ArrayRef,
+    strategy: Arc<dyn LayoutStrategy>,
+) -> VortexResult<ByteBuffer> {
+    let stream = ArrayStreamAdapter::new(chunk.dtype().clone(), stream::iter([Ok(chunk)]));
+    let session = session.clone();
+
+    runtime()?.block_on(async move {
+        let session = session.with_tokio();
         let mut bytes = Vec::new();
         let _summary = session
             .write_options()
+            .disable_editions()
             .with_strategy(strategy)
             .write(&mut bytes, stream)
             .await?;
@@ -142,8 +156,9 @@ pub fn read_layout_tree(bytes: ByteBuffer) -> VortexResult<()> {
             )?;
             let len =
                 usize::try_from(row_count).map_err(|e| vortex_err!("row count overflow: {e}"))?;
+            let expr = root().bind(reader.dtype())?;
             reader
-                .projection_evaluation(&(0..row_count), &root(), MaskFuture::new_true(len))?
+                .projection_evaluation(&(0..row_count), &expr, MaskFuture::new_true(len))?
                 .await?;
         }
 

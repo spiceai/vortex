@@ -6,8 +6,10 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use itertools::Itertools;
+use num_traits::AsPrimitive;
 use vortex_buffer::Alignment;
 use vortex_buffer::Buffer;
+use vortex_buffer::BufferAllocatorRef;
 use vortex_buffer::BufferMut;
 use vortex_buffer::ByteBuffer;
 use vortex_buffer::ByteBufferMut;
@@ -15,6 +17,7 @@ use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
+use vortex_mask::AllOr;
 use vortex_mask::Mask;
 use vortex_utils::aliases::hash_map::Entry;
 use vortex_utils::aliases::hash_map::HashMap;
@@ -25,11 +28,14 @@ use crate::IntoArray;
 use crate::arrays::VarBinViewArray;
 use crate::arrays::varbinview::VarBinViewArrayExt;
 use crate::arrays::varbinview::build_views::BinaryView;
+use crate::arrays::varbinview::build_views::MAX_BUFFER_LEN;
+use crate::arrays::varbinview::build_views::extend_views;
 use crate::arrays::varbinview::compact::BufferUtilization;
 use crate::builders::ArrayBuilder;
 use crate::builders::LazyBitBufferBuilder;
 use crate::canonical::Canonical;
 use crate::dtype::DType;
+use crate::dtype::NativePType;
 use crate::scalar::Scalar;
 
 /// The builder for building a [`VarBinViewArray`].
@@ -41,33 +47,84 @@ pub struct VarBinViewBuilder {
     in_progress: Option<ByteBufferMut>,
     growth_strategy: BufferGrowthStrategy,
     compaction_threshold: f64,
+    allocator: BufferAllocatorRef,
 }
 
 impl VarBinViewBuilder {
+    /// Creates a builder with room for `capacity` values.
+    #[deprecated(note = "use `with_capacity_in` with an explicit allocator")]
     pub fn with_capacity(dtype: DType, capacity: usize) -> Self {
-        Self::new(dtype, capacity, Default::default(), Default::default(), 0.0)
+        Self::with_capacity_in(dtype, capacity, BufferAllocatorRef::statically_allocated())
     }
 
+    /// Creates a builder with room for `capacity` values using `allocator`.
+    pub fn with_capacity_in(dtype: DType, capacity: usize, allocator: BufferAllocatorRef) -> Self {
+        Self::new_in(
+            dtype,
+            capacity,
+            Default::default(),
+            Default::default(),
+            0.0,
+            allocator,
+        )
+    }
+
+    /// Creates a builder that deduplicates completed buffers.
+    #[deprecated(note = "use `with_buffer_deduplication_in` with an explicit allocator")]
     pub fn with_buffer_deduplication(dtype: DType, capacity: usize) -> Self {
-        Self::new(
+        Self::with_buffer_deduplication_in(
+            dtype,
+            capacity,
+            BufferAllocatorRef::statically_allocated(),
+        )
+    }
+
+    /// Creates a builder that deduplicates completed buffers using `allocator`.
+    pub fn with_buffer_deduplication_in(
+        dtype: DType,
+        capacity: usize,
+        allocator: BufferAllocatorRef,
+    ) -> Self {
+        Self::new_in(
             dtype,
             capacity,
             CompletedBuffers::Deduplicated(Default::default()),
             Default::default(),
             0.0,
+            allocator,
         )
     }
 
+    /// Creates a builder that compacts buffers below `compaction_threshold` utilization.
+    #[deprecated(note = "use `with_compaction_in` with an explicit allocator")]
     pub fn with_compaction(dtype: DType, capacity: usize, compaction_threshold: f64) -> Self {
-        Self::new(
+        Self::with_compaction_in(
+            dtype,
+            capacity,
+            compaction_threshold,
+            BufferAllocatorRef::statically_allocated(),
+        )
+    }
+
+    /// Creates a compacting builder using `allocator`.
+    pub fn with_compaction_in(
+        dtype: DType,
+        capacity: usize,
+        compaction_threshold: f64,
+        allocator: BufferAllocatorRef,
+    ) -> Self {
+        Self::new_in(
             dtype,
             capacity,
             Default::default(),
             Default::default(),
             compaction_threshold,
+            allocator,
         )
     }
 
+    /// Creates a builder with explicit buffer policies.
+    #[deprecated(note = "use `new_in` with an explicit allocator")]
     pub fn new(
         dtype: DType,
         capacity: usize,
@@ -75,22 +132,43 @@ impl VarBinViewBuilder {
         growth_strategy: BufferGrowthStrategy,
         compaction_threshold: f64,
     ) -> Self {
+        Self::new_in(
+            dtype,
+            capacity,
+            completed,
+            growth_strategy,
+            compaction_threshold,
+            BufferAllocatorRef::statically_allocated(),
+        )
+    }
+
+    /// Creates a builder with explicit buffer policies and `allocator`.
+    pub fn new_in(
+        dtype: DType,
+        capacity: usize,
+        completed: CompletedBuffers,
+        growth_strategy: BufferGrowthStrategy,
+        compaction_threshold: f64,
+        allocator: BufferAllocatorRef,
+    ) -> Self {
         assert!(
             matches!(dtype, DType::Utf8(_) | DType::Binary(_)),
             "VarBinViewBuilder DType must be Utf8 or Binary."
         );
         Self {
-            views_builder: BufferMut::with_capacity_preferred_aligned(
+            views_builder: BufferMut::with_capacity_preferred_aligned_in(
                 capacity,
                 Alignment::of::<BinaryView>(),
                 None,
+                allocator.clone(),
             ),
-            nulls: LazyBitBufferBuilder::new(capacity),
+            nulls: LazyBitBufferBuilder::new(capacity, allocator.clone()),
             completed,
             in_progress: None,
             dtype,
             growth_strategy,
             compaction_threshold,
+            allocator,
         }
     }
 
@@ -148,10 +226,11 @@ impl VarBinViewBuilder {
     fn init_in_progress(&mut self, min_len: usize) {
         let next_buffer_size = self.growth_strategy.next_size() as usize;
         let to_reserve = next_buffer_size.max(min_len);
-        self.in_progress = Some(ByteBufferMut::with_capacity_preferred_aligned(
+        self.in_progress = Some(ByteBufferMut::with_capacity_preferred_aligned_in(
             to_reserve,
             Alignment::of::<u8>(),
             None,
+            self.allocator.clone(),
         ));
     }
 
@@ -188,47 +267,465 @@ impl VarBinViewBuilder {
         self.completed.len()
     }
 
-    /// Returns true if a non-empty in-progress buffer is staged (and would
-    /// become a completed buffer on the next flush), false otherwise.
-    pub fn in_progress(&self) -> bool {
-        self.in_progress.is_some()
+    /// Whether this builder compacts the data buffers it is handed. The lengths-driven and
+    /// gather appends use this to gate their utilization measurement; the buffer-adopting escape
+    /// hatches ([`append_views_built_at`](Self::append_views_built_at) and
+    /// [`push_buffers`](Self::push_buffers)) always bypass it.
+    fn compacts_buffers(&self) -> bool {
+        self.compaction_threshold > 0.0
     }
 
-    /// Pushes buffers and pre-adjusted views into the builder.
+    /// Adopts the buffers and views that `build` produces against the index its first buffer
+    /// will land at.
     ///
-    /// The provided `buffers` contain sections of data from a `VarBinViewArray`, and the
-    /// `views` are `BinaryView`s that have already been adjusted to reference the correct buffer
-    /// indices and offsets for this builder. All views must point to valid sections within the
-    /// provided buffers, and the validity length must match the view length.
+    /// The builder flushes its staged bytes, then hands `build` the index the next data buffer
+    /// will occupy; `build` returns data buffers — which land contiguously from that index — and
+    /// one view per entry of `validity`, already referencing them. This is the escape hatch for
+    /// an encoding that only discovers its views while walking its own byte format (e.g.
+    /// length-prefixed frames), where the lengths-driven appends cannot apply; keeping the
+    /// numbering inside this call is what makes the views come out right without a rebase pass.
     ///
     /// # Warning
     ///
-    /// This method does not check utilization of the given buffers. Callers must provide
-    /// buffers that are fully utilized by the given adjusted views.
+    /// This method does not check utilization of the returned buffers. `build` must return
+    /// buffers that are fully utilized by its views.
     ///
     /// # Panics
     ///
-    /// Panics if this builder deduplicates buffers and any of the given buffers already
-    /// exist in this builder.
-    pub fn push_buffer_and_adjusted_views(
+    /// Panics if `build` returns a different view count than `validity.len()`, or if this
+    /// builder deduplicates buffers and already holds one of the returned buffers.
+    pub fn append_views_built_at(
         &mut self,
-        buffers: &[ByteBuffer],
-        views: &Buffer<BinaryView>,
-        validity_mask: Mask,
-    ) {
+        validity: &Mask,
+        build: impl FnOnce(u32) -> VortexResult<(Vec<ByteBuffer>, Buffer<BinaryView>)>,
+    ) -> VortexResult<()> {
         self.flush_in_progress();
 
-        let expected_completed_len = self.completed.len() as usize + buffers.len();
-        self.completed.extend_from_slice_unchecked(buffers);
+        let start_index = self.completed.len();
+        let (buffers, views) = build(start_index)?;
+        assert_eq!(
+            views.len(),
+            validity.len(),
+            "Must build one view per validity entry"
+        );
+
+        let expected_completed_len = start_index as usize + buffers.len();
+        self.completed.extend_from_slice_unchecked(&buffers);
         assert_eq!(
             self.completed.len() as usize,
             expected_completed_len,
             "Some buffers already exist",
         );
         self.views_builder.extend_trusted(views.iter().copied());
-        self.push_only_validity_mask(&validity_mask);
+        self.nulls.append_validity_mask(validity);
 
-        debug_assert_eq!(self.nulls.len(), self.views_builder.len())
+        debug_assert_eq!(self.nulls.len(), self.views_builder.len());
+        Ok(())
+    }
+
+    /// Adopts `buffers` as completed data buffers, returning the index each landed at.
+    ///
+    /// Views appended afterwards (e.g. via [`append_views_gathered`](Self::append_views_gathered)
+    /// or [`append_views_scattered`](Self::append_views_scattered)) reference values through the
+    /// returned indices. A deduplicating builder returns the existing index for a buffer it
+    /// already holds, so repeated appends over shared storage — chunks gathered through one
+    /// dictionary, slices of one array — adopt it once.
+    ///
+    /// # Warning
+    ///
+    /// Buffers are taken as they are, without utilization measurement; like
+    /// [`append_views_built_at`](Self::append_views_built_at), this bypasses any compaction the
+    /// builder was configured for. Scattered appends deliberately have these semantics;
+    /// compacting paths that measure utilization use
+    /// [`push_buffers_compacted`](Self::push_buffers_compacted) instead.
+    fn push_buffers(&mut self, buffers: impl IntoIterator<Item = ByteBuffer>) -> Vec<u32> {
+        self.flush_in_progress();
+        buffers
+            .into_iter()
+            .map(|buffer| self.completed.push(buffer))
+            .collect()
+    }
+
+    /// The compacting counterpart of [`push_buffers`](Self::push_buffers): adopts each buffer
+    /// according to the [`CompactionStrategy`] its measured utilization earns — whole, sliced to
+    /// its referenced range, or not at all. Views into the buffers must then be rebased through
+    /// [`remap_view_compacted`](Self::remap_view_compacted), which routes views into unadopted
+    /// buffers through the builder's own storage.
+    fn push_buffers_compacted(
+        &mut self,
+        buffers: Vec<ByteBuffer>,
+        utilizations: &[BufferUtilization],
+    ) -> Vec<CompactedSlot> {
+        self.flush_in_progress();
+        buffers
+            .into_iter()
+            .zip(utilizations)
+            .map(|(buffer, utilization)| {
+                match compaction_strategy(utilization, self.compaction_threshold) {
+                    CompactionStrategy::KeepFull => CompactedSlot::Kept {
+                        index: self.completed.push(buffer),
+                    },
+                    CompactionStrategy::Slice { start, end } => CompactedSlot::Sliced {
+                        index: self
+                            .completed
+                            .push(buffer.slice(start as usize..end as usize)),
+                        shift: start,
+                    },
+                    CompactionStrategy::Rewrite => CompactedSlot::Rewrite { source: buffer },
+                }
+            })
+            .collect()
+    }
+
+    /// [`remap_view`] against [`CompactedSlot`]s: views into kept or sliced buffers are rebased
+    /// onto the index those landed at, and a view into a rewritten buffer has its bytes copied
+    /// into the builder's own storage. Inlined views pass through unchanged.
+    fn remap_view_compacted(&mut self, view: BinaryView, slots: &[CompactedSlot]) -> BinaryView {
+        if view.is_inlined() {
+            return view;
+        }
+        let view_ref = view.as_view();
+        match &slots[view_ref.buffer_index as usize] {
+            CompactedSlot::Kept { index } => view_ref
+                .with_buffer_and_offset(*index, view_ref.offset)
+                .into(),
+            CompactedSlot::Sliced { index, shift } => view_ref
+                .with_buffer_and_offset(*index, view_ref.offset - shift)
+                .into(),
+            CompactedSlot::Rewrite { source } => {
+                let bytes = &source.as_slice()[view_ref.as_range()];
+                let (buffer_idx, offset) = self.append_value_to_buffer(bytes);
+                BinaryView::make_view(bytes, buffer_idx, offset)
+            }
+        }
+    }
+
+    /// Appends `validity.len()` values, gathering each valid row's view from `views` through the
+    /// index `view_at` returns for it.
+    ///
+    /// `buffers` — the data buffers the views reference, in the numbering the views use — are
+    /// adopted through the builder's buffer storage, and every gathered view is rebased onto
+    /// the indices they land at as it is written, so the whole append is one view per row with no
+    /// byte copy and no intermediate array. `view_at` is only called for valid rows; null rows get
+    /// an empty view.
+    ///
+    /// When the builder is configured to compact buffers, utilization is measured from the views
+    /// the gather actually references — duplicate indices count once — and each buffer is
+    /// adopted, sliced, or rewritten accordingly, so callers never need a
+    /// canonicalize-and-compact fallback.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `view_at` returns an index out of bounds of `views`, or if a gathered view
+    /// references a buffer index outside `buffers`.
+    pub fn append_views_gathered(
+        &mut self,
+        buffers: impl IntoIterator<Item = ByteBuffer>,
+        views: &[BinaryView],
+        validity: &Mask,
+        view_at: impl Fn(usize) -> usize,
+    ) {
+        if self.compacts_buffers() {
+            return self.append_views_gathered_compacted(
+                buffers.into_iter().collect(),
+                views,
+                validity,
+                view_at,
+            );
+        }
+
+        let mapping = self.push_buffers(buffers);
+
+        self.views_builder.reserve(validity.len());
+        match validity {
+            Mask::AllTrue(len) => self
+                .views_builder
+                .extend_trusted((0..*len).map(|row| remap_view(views[view_at(row)], &mapping))),
+            Mask::AllFalse(len) => self.views_builder.push_n(BinaryView::empty_view(), *len),
+            Mask::Values(values) => {
+                let bits = values.bit_buffer();
+                let start = self.views_builder.len();
+                self.views_builder
+                    .push_n(BinaryView::empty_view(), bits.len());
+                let gathered = &mut self.views_builder[start..];
+                bits.for_each_set_index(|row| {
+                    gathered[row] = remap_view(views[view_at(row)], &mapping);
+                });
+            }
+        }
+
+        self.nulls.append_validity_mask(validity);
+        debug_assert_eq!(self.nulls.len(), self.views_builder.len());
+    }
+
+    /// The compacting arm of [`append_views_gathered`](Self::append_views_gathered): marks the
+    /// source views the gather references, measures each buffer's utilization from just those —
+    /// so entries gathered by many rows count once — and adopts the buffers through
+    /// [`push_buffers_compacted`](Self::push_buffers_compacted). Each referenced source view is
+    /// remapped once, so rows sharing an entry of a rewritten buffer share one copy of its bytes.
+    fn append_views_gathered_compacted(
+        &mut self,
+        buffers: Vec<ByteBuffer>,
+        views: &[BinaryView],
+        validity: &Mask,
+        view_at: impl Fn(usize) -> usize,
+    ) {
+        let mut referenced = vec![false; views.len()];
+        match validity {
+            Mask::AllTrue(len) => (0..*len).for_each(|row| referenced[view_at(row)] = true),
+            Mask::AllFalse(_) => {}
+            Mask::Values(values) => values
+                .bit_buffer()
+                .for_each_set_index(|row| referenced[view_at(row)] = true),
+        }
+
+        let mut utilizations = unmeasured_utilizations(&buffers);
+        for (view, _) in views.iter().zip(&referenced).filter(|(_, used)| **used) {
+            measure_view(&mut utilizations, view);
+        }
+        let slots = self.push_buffers_compacted(buffers, &utilizations);
+
+        let mut remapped = vec![BinaryView::empty_view(); views.len()];
+        for (idx, view) in views.iter().enumerate() {
+            if referenced[idx] {
+                remapped[idx] = self.remap_view_compacted(*view, &slots);
+            }
+        }
+
+        self.views_builder.reserve(validity.len());
+        match validity {
+            Mask::AllTrue(len) => self
+                .views_builder
+                .extend_trusted((0..*len).map(|row| remapped[view_at(row)])),
+            Mask::AllFalse(len) => self.views_builder.push_n(BinaryView::empty_view(), *len),
+            Mask::Values(values) => {
+                let bits = values.bit_buffer();
+                let start = self.views_builder.len();
+                self.views_builder
+                    .push_n(BinaryView::empty_view(), bits.len());
+                let gathered = &mut self.views_builder[start..];
+                bits.for_each_set_index(|row| gathered[row] = remapped[view_at(row)]);
+            }
+        }
+
+        self.nulls.append_validity_mask(validity);
+        debug_assert_eq!(self.nulls.len(), self.views_builder.len());
+    }
+
+    /// Appends `len` rows that are `fill` everywhere except at the given patch rows.
+    ///
+    /// `buffers` — the data buffers `fill` and the patch views reference, in the numbering they
+    /// use — are adopted through the builder's buffer storage and the views are rebased onto
+    /// the indices they land at. `patches` yields `(row, view)` pairs with rows below `len`; the
+    /// fill rows cost one bulk view fill and each patch one view write, with no byte copy.
+    /// Validity is appended exactly as given — invalid rows keep whichever view they got.
+    ///
+    /// This append deliberately adopts the supplied buffers as-is, even when the builder is
+    /// configured for compaction. Callers should use it only when retaining those buffers is
+    /// acceptable.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `validity` is not `len` long, a patch row is out of bounds, or a view references
+    /// a buffer index outside `buffers`.
+    pub fn append_views_scattered(
+        &mut self,
+        buffers: impl IntoIterator<Item = ByteBuffer>,
+        len: usize,
+        fill: BinaryView,
+        patches: impl Iterator<Item = (usize, BinaryView)>,
+        validity: &Mask,
+    ) {
+        assert_eq!(validity.len(), len, "Must have one validity entry per row");
+        let mapping = self.push_buffers(buffers);
+
+        let start = self.views_builder.len();
+        self.views_builder.push_n(remap_view(fill, &mapping), len);
+        let scattered = &mut self.views_builder[start..];
+        for (row, view) in patches {
+            scattered[row] = remap_view(view, &mapping);
+        }
+
+        self.nulls.append_validity_mask(validity);
+        debug_assert_eq!(self.nulls.len(), self.views_builder.len());
+    }
+
+    /// Appends values laid end-to-end in `bytes`, one per entry of `lengths`.
+    ///
+    /// The builder adopts `bytes` as a data buffer without copying it (splitting it only past the
+    /// `u32` view-offset limit) and builds the views directly into its own storage, so the whole
+    /// append costs one view per row. Every length is consumed, including those for null rows, so
+    /// the lengths must describe `bytes` exactly; bytes belonging to null rows are not retained
+    /// when compaction rewrites the buffer.
+    ///
+    /// When the builder is configured to compact buffers, the utilization is measured from the
+    /// lengths alone — only values too long to inline reference the buffer — and a heap below
+    /// the threshold is rewritten to just those values instead of adopted, so callers never need
+    /// a canonicalize-and-compact fallback.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `lengths` and `validity` disagree in length, if the lengths do not describe
+    /// `bytes` exactly, or if this builder deduplicates buffers and already holds `bytes`.
+    pub fn append_buffer_with_lengths<P: NativePType + AsPrimitive<usize>>(
+        &mut self,
+        bytes: ByteBuffer,
+        lengths: &[P],
+        validity: &Mask,
+    ) {
+        assert_eq!(
+            lengths.len(),
+            validity.len(),
+            "Must have one length per validity entry"
+        );
+        self.append_buffer_views(&bytes, lengths.len(), validity, |i| lengths[i].as_());
+    }
+
+    /// [`append_buffer_with_lengths`](Self::append_buffer_with_lengths) for values described by
+    /// an offsets buffer instead of lengths.
+    ///
+    /// `offsets` are absolute positions into `bytes` — the layout a
+    /// [`VarBinArray`](crate::arrays::VarBinArray) stores — so there is one more offset than there
+    /// are values, and only the `offsets[0]..offsets[last]` range of `bytes` is adopted, again
+    /// without copying.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `offsets` does not hold exactly one more entry than `validity`, or if the offsets
+    /// are not monotonically non-decreasing positions within `bytes`.
+    pub fn append_buffer_with_offsets<P: NativePType + AsPrimitive<usize>>(
+        &mut self,
+        bytes: ByteBuffer,
+        offsets: &[P],
+        validity: &Mask,
+    ) {
+        assert_eq!(
+            offsets.len(),
+            validity.len() + 1,
+            "Must have one more offset than validity entries"
+        );
+        let first: usize = offsets[0].as_();
+        let last: usize = offsets[offsets.len() - 1].as_();
+        let bytes = bytes.slice(first..last);
+        // Wrapping keeps corrupt non-monotonic offsets from panicking on the subtraction itself;
+        // the wrapped length then fails the in-bounds checks of the view-building loop.
+        self.append_buffer_views(&bytes, validity.len(), validity, |i| {
+            AsPrimitive::<usize>::as_(offsets[i + 1])
+                .wrapping_sub(AsPrimitive::<usize>::as_(offsets[i]))
+        });
+    }
+
+    /// Shared tail of the bulk buffer appends: builds the views straight into the builder's views
+    /// storage, then adopts the buffer segments and the validity.
+    fn append_buffer_views(
+        &mut self,
+        bytes: &ByteBuffer,
+        count: usize,
+        validity: &Mask,
+        len_at: impl Fn(usize) -> usize,
+    ) {
+        self.flush_in_progress();
+
+        // A compacting builder measures utilization before adopting the buffer. Only values too
+        // long to inline reference the heap, so the measurement is one pass over the lengths and
+        // never touches the bytes. Heaps past the single-buffer limit are adopted as they are:
+        // they roll over into multiple buffers, and per-segment accounting is not worth the rare
+        // >2GiB case.
+        if self.compacts_buffers() && bytes.len() <= MAX_BUFFER_LEN {
+            let referenced: usize = match validity.bit_buffer() {
+                AllOr::All => (0..count)
+                    .map(&len_at)
+                    .filter(|len| *len > BinaryView::MAX_INLINED_SIZE)
+                    .sum(),
+                AllOr::None => 0,
+                AllOr::Some(b) => {
+                    let mut sum = 0;
+                    b.for_each_set_index(|idx| {
+                        let len = len_at(idx);
+                        if len > BinaryView::MAX_INLINED_SIZE {
+                            sum += len;
+                        }
+                    });
+                    sum
+                }
+            };
+            #[expect(clippy::cast_precision_loss)]
+            if (referenced as f64) < self.compaction_threshold * (bytes.len() as f64) {
+                return self
+                    .append_buffer_views_rewritten(bytes, count, validity, len_at, referenced);
+            }
+        }
+
+        let start_index = self.completed.len();
+        let segments = extend_views(
+            &mut self.views_builder,
+            start_index,
+            MAX_BUFFER_LEN,
+            bytes,
+            count,
+            len_at,
+        );
+
+        let expected_completed_len = start_index as usize + segments.len();
+        self.completed.extend_from_slice_unchecked(&segments);
+        assert_eq!(
+            self.completed.len() as usize,
+            expected_completed_len,
+            "Some buffers already exist",
+        );
+
+        self.nulls.append_validity_mask(validity);
+        debug_assert_eq!(self.nulls.len(), self.views_builder.len());
+    }
+
+    /// The under-utilized arm of [`append_buffer_views`](Self::append_buffer_views): copies only
+    /// the values that actually reference the heap into a compact buffer, sized `referenced`,
+    /// instead of adopting the whole heap. A fully-inlined append pushes no buffer at all.
+    fn append_buffer_views_rewritten(
+        &mut self,
+        bytes: &ByteBuffer,
+        count: usize,
+        validity: &Mask,
+        len_at: impl Fn(usize) -> usize,
+        referenced: usize,
+    ) {
+        let buf_index = self.completed.len();
+        let mut compact = ByteBufferMut::with_capacity_in(referenced, self.allocator.clone());
+        self.views_builder.reserve(count);
+
+        let data = bytes.as_slice();
+        let mut offset = 0usize;
+        for (i, is_valid) in validity.iter().enumerate() {
+            let len = len_at(i);
+            let value = &data[offset..offset + len];
+            let view = if !is_valid {
+                BinaryView::empty_view()
+            } else if len > BinaryView::MAX_INLINED_SIZE {
+                // In `u32` range: `referenced <= bytes.len() <= MAX_BUFFER_LEN` (checked by the
+                // caller), and `compact` never grows past `referenced`.
+                #[expect(clippy::cast_possible_truncation)]
+                let view = BinaryView::make_view(value, buf_index, compact.len() as u32);
+                compact.extend_from_slice(value);
+                view
+            } else {
+                BinaryView::make_view(value, buf_index, 0)
+            };
+            self.views_builder.push(view);
+            offset += len;
+        }
+        assert_eq!(
+            offset,
+            data.len(),
+            "value lengths must describe the byte heap exactly"
+        );
+
+        if !compact.is_empty() {
+            let pushed_index = self.completed.push(compact.freeze());
+            assert_eq!(pushed_index, buf_index, "Buffer already exists");
+        }
+
+        self.nulls.append_validity_mask(validity);
+        debug_assert_eq!(self.nulls.len(), self.views_builder.len());
     }
 
     /// Finishes the builder directly into a [`VarBinViewArray`].
@@ -244,20 +741,16 @@ impl VarBinViewBuilder {
 
         let validity = self.nulls.finish_with_nullability(self.dtype.nullability());
 
+        let views = std::mem::replace(
+            &mut self.views_builder,
+            BufferMut::empty_aligned_in(Alignment::of::<BinaryView>(), self.allocator.clone()),
+        )
+        .freeze();
+
         // SAFETY: the builder methods check safety at each step.
         unsafe {
-            VarBinViewArray::new_unchecked(
-                std::mem::take(&mut self.views_builder).freeze(),
-                buffers.finish(),
-                self.dtype.clone(),
-                validity,
-            )
+            VarBinViewArray::new_unchecked(views, buffers.finish(), self.dtype.clone(), validity)
         }
-    }
-
-    // Pushes a validity mask into the builder not affecting the views or buffers
-    fn push_only_validity_mask(&mut self, validity_mask: &Mask) {
-        self.nulls.append_validity_mask(validity_mask);
     }
 
     pub(crate) fn append_varbinview_array(
@@ -269,7 +762,7 @@ impl VarBinViewBuilder {
 
         let mask = array.varbinview_validity().execute_mask(array.len(), ctx)?;
 
-        self.push_only_validity_mask(&mask);
+        self.nulls.append_validity_mask(&mask);
 
         let view_adjustment =
             self.completed
@@ -298,16 +791,14 @@ impl VarBinViewBuilder {
                         .push_n(BinaryView::empty_view(), array.len());
                 }
                 Mask::Values(v) => {
-                    for (idx, (&view, is_valid)) in
-                        array.views().iter().zip(v.bit_buffer().iter()).enumerate()
-                    {
-                        let new_view = if !is_valid {
-                            BinaryView::empty_view()
-                        } else {
-                            self.push_view(view, &adjustment, array, idx)
-                        };
-                        self.views_builder.push(new_view);
-                    }
+                    let views = array.views();
+                    let start = self.views_builder.len();
+                    self.views_builder
+                        .push_n(BinaryView::empty_view(), array.len());
+                    v.bit_buffer().for_each_set_index(|idx| {
+                        let new_view = self.push_view(views[idx], &adjustment, array, idx);
+                        self.views_builder[start + idx] = new_view;
+                    });
                 }
             },
         }
@@ -374,10 +865,6 @@ impl ArrayBuilder for VarBinViewBuilder {
         self.nulls.reserve_exact(additional);
     }
 
-    unsafe fn set_validity_unchecked(&mut self, validity: Mask) {
-        self.nulls = LazyBitBufferBuilder::from_validity_mask(validity);
-    }
-
     fn finish(&mut self) -> ArrayRef {
         self.finish_into_varbinview().into_array()
     }
@@ -388,7 +875,8 @@ impl ArrayBuilder for VarBinViewBuilder {
 }
 
 impl VarBinViewBuilder {
-    #[inline]
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     fn push_view(
         &mut self,
         view: BinaryView,
@@ -405,6 +893,53 @@ impl VarBinViewBuilder {
             let (new_buf_idx, new_offset) = self.append_value_to_buffer(&bytes);
             BinaryView::make_view(bytes.as_slice(), new_buf_idx, new_offset)
         }
+    }
+}
+
+/// Rebases a view built against a local buffer numbering onto the builder indices those buffers
+/// landed at, i.e. `mapping[i]` is where the caller's buffer `i` went. Inlined views carry no
+/// buffer reference and pass through unchanged.
+#[inline]
+fn remap_view(view: BinaryView, mapping: &[u32]) -> BinaryView {
+    if view.is_inlined() {
+        view
+    } else {
+        let view_ref = view.as_view();
+        view_ref
+            .with_buffer_and_offset(mapping[view_ref.buffer_index as usize], view_ref.offset)
+            .into()
+    }
+}
+
+/// Where a caller's buffer went under `VarBinViewBuilder::push_buffers_compacted`.
+enum CompactedSlot {
+    /// Adopted whole at this index.
+    Kept { index: u32 },
+    /// Adopted at this index as the slice starting `shift` bytes in, so view offsets shift down.
+    Sliced { index: u32, shift: u32 },
+    /// Not adopted: each referenced view's bytes are copied out of the source buffer into the
+    /// builder's own storage.
+    Rewrite { source: ByteBuffer },
+}
+
+/// One unmeasured [`BufferUtilization`] per buffer, ready for [`measure_view`] passes.
+fn unmeasured_utilizations(buffers: &[ByteBuffer]) -> Vec<BufferUtilization> {
+    buffers
+        .iter()
+        .map(|buffer| {
+            // Views address at most `u32` offsets, so measuring an oversized buffer against the
+            // saturated length under-reports utilization, which can only compact harder — and its
+            // unaddressable tail is dead weight worth compacting anyway.
+            BufferUtilization::zero(u32::try_from(buffer.len()).unwrap_or(u32::MAX))
+        })
+        .collect()
+}
+
+/// Counts `view`'s bytes against the buffer it references; inlined views reference none.
+fn measure_view(utilizations: &mut [BufferUtilization], view: &BinaryView) {
+    if !view.is_inlined() {
+        let view_ref = view.as_view();
+        utilizations[view_ref.buffer_index as usize].add(view_ref.offset, view_ref.size);
     }
 }
 
@@ -429,12 +964,14 @@ impl CompletedBuffers {
         }
     }
 
+    /// Push a new block, returning the index it landed at (or, when deduplicating, the index of
+    /// the identical block already held).
     fn push(&mut self, block: ByteBuffer) -> u32 {
         match self {
             Self::Default(buffers) => {
                 assert!(buffers.len() < u32::MAX as usize, "Too many blocks");
                 buffers.push(block);
-                self.len()
+                self.len() - 1
             }
             Self::Deduplicated(buffers) => buffers.push(block),
         }
@@ -864,7 +1401,10 @@ impl RewritingViewAdjustment {
 
 #[cfg(test)]
 mod tests {
+    use vortex_buffer::BufferAllocatorRef;
+    use vortex_buffer::ByteBuffer;
     use vortex_error::VortexResult;
+    use vortex_mask::Mask;
 
     use crate::IntoArray;
     use crate::VortexSessionExecute;
@@ -876,10 +1416,437 @@ mod tests {
     use crate::dtype::DType;
     use crate::dtype::Nullability;
 
+    /// A long-enough value that a view over it must reference a data buffer.
+    const LONG: &str = "a value that is far too long to inline";
+
+    /// The heap is adopted zero-copy as a data buffer, the views are built against it in place,
+    /// and the append composes with staged in-progress bytes on either side.
+    #[test]
+    fn test_append_buffer_with_lengths() {
+        let mut ctx = array_session().create_execution_ctx();
+        let mut builder = VarBinViewBuilder::with_capacity_in(
+            DType::Utf8(Nullability::Nullable),
+            8,
+            BufferAllocatorRef::statically_allocated(),
+        );
+
+        // Stages an in-progress buffer the bulk append has to flush first.
+        builder.append_value(LONG);
+
+        let heap = ByteBuffer::copy_from([LONG.as_bytes(), b"", b"tiny"].concat());
+        let heap_ptr = heap.as_ptr();
+        let lengths = [u32::try_from(LONG.len()).unwrap(), 0, 4];
+        builder.append_buffer_with_lengths(heap, &lengths, &Mask::from_iter([true, false, true]));
+
+        builder.append_value("tail");
+
+        let actual = builder.finish_into_varbinview();
+        // The adopted heap sits after the flushed in-progress buffer, untouched.
+        assert_eq!(actual.data_buffers()[1].as_host().as_ptr(), heap_ptr);
+
+        let expected = <VarBinViewArray as FromIterator<_>>::from_iter([
+            Some(LONG),
+            Some(LONG),
+            None,
+            Some("tiny"),
+            Some("tail"),
+        ]);
+        assert_arrays_eq!(actual, expected, &mut ctx);
+    }
+
+    /// Offsets need not start at zero: only the referenced range of the heap is adopted.
+    #[test]
+    fn test_append_buffer_with_offsets() {
+        let mut ctx = array_session().create_execution_ctx();
+        let mut builder = VarBinViewBuilder::with_capacity_in(
+            DType::Utf8(Nullability::Nullable),
+            8,
+            BufferAllocatorRef::statically_allocated(),
+        );
+
+        let heap = ByteBuffer::copy_from(format!("..{LONG}tiny!!"));
+        let long_len = u32::try_from(LONG.len()).unwrap();
+        let offsets = [2u32, 2 + long_len, 2 + long_len, 2 + long_len + 4];
+        builder.append_buffer_with_offsets(
+            heap.clone(),
+            &offsets,
+            &Mask::from_iter([true, false, true]),
+        );
+
+        let actual = builder.finish_into_varbinview();
+        // Zero-copy adoption of just the `offsets[0]..offsets[last]` range.
+        // SAFETY: offset 2 is in bounds of the heap.
+        assert_eq!(actual.data_buffers()[0].as_host().as_ptr(), unsafe {
+            heap.as_ptr().add(2)
+        });
+        assert_eq!(
+            actual.data_buffers()[0].len(),
+            LONG.len() + 4,
+            "only the referenced range must be adopted"
+        );
+
+        let expected =
+            <VarBinViewArray as FromIterator<_>>::from_iter([Some(LONG), None, Some("tiny")]);
+        assert_arrays_eq!(actual, expected, &mut ctx);
+    }
+
+    /// A compacting builder must measure the heap it is handed: values short enough to inline
+    /// never reference it, so an under-utilized heap is rewritten to just the referencing values.
+    #[test]
+    fn test_append_buffer_with_lengths_compacts_underutilized_heap() {
+        let mut ctx = array_session().create_execution_ctx();
+        let mut builder = VarBinViewBuilder::with_compaction_in(
+            DType::Utf8(Nullability::Nullable),
+            4,
+            1.0,
+            BufferAllocatorRef::statically_allocated(),
+        );
+
+        let heap = ByteBuffer::copy_from([b"short".as_slice(), LONG.as_bytes(), b"tiny"].concat());
+        let lengths = [5u32, u32::try_from(LONG.len()).unwrap(), 4];
+        builder.append_buffer_with_lengths(heap, &lengths, &Mask::new_true(3));
+
+        let actual = builder.finish_into_varbinview();
+        assert_eq!(actual.data_buffers().len(), 1);
+        assert_eq!(
+            actual.data_buffers()[0].len(),
+            LONG.len(),
+            "the compact buffer must hold only the non-inlined values"
+        );
+
+        let expected = <VarBinViewArray as FromIterator<_>>::from_iter([
+            Some("short"),
+            Some(LONG),
+            Some("tiny"),
+        ]);
+        assert_arrays_eq!(actual, expected, &mut ctx);
+    }
+
+    /// Rewriting an under-utilized heap must consume null values' spans without retaining their
+    /// bytes or producing views that reference them.
+    #[test]
+    fn test_append_buffer_with_lengths_compaction_skips_null_bytes() {
+        let mut ctx = array_session().create_execution_ctx();
+        let mut builder = VarBinViewBuilder::with_compaction_in(
+            DType::Utf8(Nullability::Nullable),
+            2,
+            1.0,
+            BufferAllocatorRef::statically_allocated(),
+        );
+
+        let heap = ByteBuffer::copy_from([LONG.as_bytes(), LONG.as_bytes()].concat());
+        let lengths = [u32::try_from(LONG.len()).unwrap(); 2];
+        builder.append_buffer_with_lengths(heap, &lengths, &Mask::from_iter([false, true]));
+
+        let actual = builder.finish_into_varbinview();
+        assert_eq!(actual.data_buffers().len(), 1);
+        assert_eq!(
+            actual.data_buffers()[0].len(),
+            LONG.len(),
+            "the compact buffer must omit bytes belonging to null rows"
+        );
+
+        let expected = <VarBinViewArray as FromIterator<_>>::from_iter([None::<&str>, Some(LONG)]);
+        assert_arrays_eq!(actual, expected, &mut ctx);
+    }
+
+    /// `push_buffers` returns where each buffer landed, and a deduplicating builder maps a
+    /// re-pushed buffer back to its existing index instead of holding it twice.
+    #[test]
+    fn test_push_buffers_deduplicates() {
+        let mut builder = VarBinViewBuilder::with_buffer_deduplication_in(
+            DType::Utf8(Nullability::Nullable),
+            8,
+            BufferAllocatorRef::statically_allocated(),
+        );
+
+        let first = ByteBuffer::copy_from(LONG);
+        let second = ByteBuffer::copy_from("another value far too long to inline");
+
+        assert_eq!(
+            builder.push_buffers([first.clone(), second.clone()]),
+            [0, 1]
+        );
+        assert_eq!(builder.push_buffers([second, first]), [1, 0]);
+        assert_eq!(builder.completed_block_count(), 2);
+    }
+
+    /// Gathered views are rebased onto wherever the pushed buffers landed, and null rows never
+    /// resolve their index.
+    #[test]
+    fn test_append_views_gathered() {
+        let mut ctx = array_session().create_execution_ctx();
+        let dictionary = <VarBinViewArray as FromIterator<_>>::from_iter([
+            Some("tiny"),
+            Some(LONG),
+            Some("small"),
+        ]);
+        let buffers = dictionary
+            .data_buffers()
+            .iter()
+            .map(|buffer| buffer.as_host().clone())
+            .collect::<Vec<_>>();
+
+        let mut builder = VarBinViewBuilder::with_capacity_in(
+            DType::Utf8(Nullability::Nullable),
+            8,
+            BufferAllocatorRef::statically_allocated(),
+        );
+        // Stages an in-progress buffer that the gather has to flush ahead of its own buffers.
+        builder.append_value(LONG);
+
+        let codes: [usize; 4] = [1, 0, usize::MAX, 2];
+        let views = dictionary.views();
+        builder.append_views_gathered(
+            buffers,
+            views,
+            &Mask::from_iter([true, true, false, true]),
+            // The null row's code is garbage; the builder must not look it up.
+            |row| codes[row],
+        );
+
+        let expected = <VarBinViewArray as FromIterator<_>>::from_iter([
+            Some(LONG),
+            Some(LONG),
+            Some("tiny"),
+            None,
+            Some("small"),
+        ]);
+        assert_arrays_eq!(builder.finish_into_varbinview(), expected, &mut ctx);
+    }
+
+    /// Scattered patches overwrite the fill view at their rows, and both are rebased onto the
+    /// adopted buffers.
+    #[test]
+    fn test_append_views_scattered() {
+        use crate::arrays::varbinview::build_views::BinaryView;
+
+        let mut ctx = array_session().create_execution_ctx();
+        let patch_values =
+            <VarBinViewArray as FromIterator<_>>::from_iter([Some(LONG), Some("tiny")]);
+        let mut buffers = patch_values
+            .data_buffers()
+            .iter()
+            .map(|buffer| buffer.as_host().clone())
+            .collect::<Vec<_>>();
+
+        let fill_bytes = ByteBuffer::copy_from("a fill value too long to inline");
+        buffers.push(fill_bytes.clone());
+        let fill = BinaryView::make_view(
+            fill_bytes.as_slice(),
+            u32::try_from(buffers.len() - 1).unwrap(),
+            0,
+        );
+
+        let mut builder = VarBinViewBuilder::with_capacity_in(
+            DType::Utf8(Nullability::Nullable),
+            8,
+            BufferAllocatorRef::statically_allocated(),
+        );
+        let views = patch_values.views();
+        builder.append_views_scattered(
+            buffers,
+            5,
+            fill,
+            [(1usize, views[0]), (3usize, views[1])].into_iter(),
+            &Mask::from_iter([true, true, false, true, true]),
+        );
+
+        let expected = <VarBinViewArray as FromIterator<_>>::from_iter([
+            Some("a fill value too long to inline"),
+            Some(LONG),
+            None,
+            Some("tiny"),
+            Some("a fill value too long to inline"),
+        ]);
+        assert_arrays_eq!(builder.finish_into_varbinview(), expected, &mut ctx);
+    }
+
+    /// A compacting builder must measure the buffers a gather hands it: with the middle
+    /// dictionary value never referenced, adopting the heap whole would keep its bytes alive.
+    /// Duplicate codes must share one rewritten copy, and null rows must not resolve their code.
+    #[test]
+    fn test_append_views_gathered_compacts_unreferenced_values() {
+        const DEAD: &str = "a dead value nobody gathers, far too long to inline";
+        const OTHER: &str = "another value far too long to inline";
+
+        let mut ctx = array_session().create_execution_ctx();
+        let dictionary =
+            <VarBinViewArray as FromIterator<_>>::from_iter([Some(LONG), Some(DEAD), Some(OTHER)]);
+        assert_eq!(dictionary.data_buffers().len(), 1);
+        let buffers = dictionary
+            .data_buffers()
+            .iter()
+            .map(|buffer| buffer.as_host().clone())
+            .collect::<Vec<_>>();
+
+        let mut builder = VarBinViewBuilder::with_compaction_in(
+            DType::Utf8(Nullability::Nullable),
+            8,
+            1.0,
+            BufferAllocatorRef::statically_allocated(),
+        );
+        let codes: [usize; 5] = [2, 0, usize::MAX, 2, 0];
+        builder.append_views_gathered(
+            buffers,
+            dictionary.views(),
+            &Mask::from_iter([true, true, false, true, true]),
+            |row| codes[row],
+        );
+
+        let actual = builder.finish_into_varbinview();
+        assert_eq!(actual.data_buffers().len(), 1);
+        assert_eq!(
+            actual.data_buffers()[0].len(),
+            LONG.len() + OTHER.len(),
+            "the rewritten buffer must hold each referenced value exactly once"
+        );
+
+        let expected = <VarBinViewArray as FromIterator<_>>::from_iter([
+            Some(OTHER),
+            Some(LONG),
+            None,
+            Some(OTHER),
+            Some(LONG),
+        ]);
+        assert_arrays_eq!(actual, expected, &mut ctx);
+    }
+
+    /// A gather that references only a contiguous tail of the heap must adopt just that slice,
+    /// zero-copy.
+    #[test]
+    fn test_append_views_gathered_slices_contiguous_range() {
+        const TAIL: &str = "the referenced tail value, too long to inline";
+
+        let mut ctx = array_session().create_execution_ctx();
+        let dictionary = <VarBinViewArray as FromIterator<_>>::from_iter([Some(LONG), Some(TAIL)]);
+        let heap = dictionary.data_buffers()[0].as_host().clone();
+
+        let mut builder = VarBinViewBuilder::with_compaction_in(
+            DType::Utf8(Nullability::Nullable),
+            8,
+            1.0,
+            BufferAllocatorRef::statically_allocated(),
+        );
+        builder.append_views_gathered(
+            [heap.clone()],
+            dictionary.views(),
+            &Mask::new_true(2),
+            |_| 1,
+        );
+
+        let actual = builder.finish_into_varbinview();
+        assert_eq!(actual.data_buffers().len(), 1);
+        assert_eq!(actual.data_buffers()[0].len(), TAIL.len());
+        // SAFETY: LONG.len() is in bounds of the heap.
+        assert_eq!(actual.data_buffers()[0].as_host().as_ptr(), unsafe {
+            heap.as_ptr().add(LONG.len())
+        });
+
+        let expected = <VarBinViewArray as FromIterator<_>>::from_iter([Some(TAIL), Some(TAIL)]);
+        assert_arrays_eq!(actual, expected, &mut ctx);
+    }
+
+    /// A buffer whose referenced share clears the threshold is adopted whole, zero-copy.
+    #[test]
+    fn test_append_views_gathered_keeps_utilized_buffer() {
+        const SHORTER: &str = "a shorter long value";
+
+        let mut ctx = array_session().create_execution_ctx();
+        let dictionary =
+            <VarBinViewArray as FromIterator<_>>::from_iter([Some(LONG), Some(SHORTER)]);
+        let heap = dictionary.data_buffers()[0].as_host().clone();
+
+        let mut builder = VarBinViewBuilder::with_compaction_in(
+            DType::Utf8(Nullability::Nullable),
+            8,
+            0.5,
+            BufferAllocatorRef::statically_allocated(),
+        );
+        builder.append_views_gathered(
+            [heap.clone()],
+            dictionary.views(),
+            &Mask::new_true(1),
+            |_| 0,
+        );
+
+        let actual = builder.finish_into_varbinview();
+        assert_eq!(actual.data_buffers().len(), 1);
+        assert_eq!(actual.data_buffers()[0].as_host().as_ptr(), heap.as_ptr());
+        assert_eq!(actual.data_buffers()[0].len(), heap.len());
+
+        let expected = <VarBinViewArray as FromIterator<_>>::from_iter([Some(LONG)]);
+        assert_arrays_eq!(actual, expected, &mut ctx);
+    }
+
+    /// An all-null gather references nothing, so a compacting builder must not retain any of the
+    /// buffers — and must never resolve a code.
+    #[test]
+    fn test_append_views_gathered_all_null_drops_buffers() {
+        let mut ctx = array_session().create_execution_ctx();
+        let dictionary = <VarBinViewArray as FromIterator<_>>::from_iter([Some(LONG)]);
+        let buffers = dictionary
+            .data_buffers()
+            .iter()
+            .map(|buffer| buffer.as_host().clone())
+            .collect::<Vec<_>>();
+
+        let mut builder = VarBinViewBuilder::with_compaction_in(
+            DType::Utf8(Nullability::Nullable),
+            8,
+            1.0,
+            BufferAllocatorRef::statically_allocated(),
+        );
+        builder.append_views_gathered(buffers, dictionary.views(), &Mask::new_false(3), |_| {
+            usize::MAX
+        });
+
+        let actual = builder.finish_into_varbinview();
+        assert!(
+            actual.data_buffers().is_empty(),
+            "an all-null gather must not retain any buffers"
+        );
+
+        let expected = <VarBinViewArray as FromIterator<_>>::from_iter([None::<&str>, None, None]);
+        assert_arrays_eq!(actual, expected, &mut ctx);
+    }
+
+    /// A fully-inlined heap has zero utilization; a compacting builder must not retain it at all.
+    #[test]
+    fn test_append_buffer_with_lengths_drops_fully_inlined_heap() {
+        let mut ctx = array_session().create_execution_ctx();
+        let mut builder = VarBinViewBuilder::with_compaction_in(
+            DType::Utf8(Nullability::Nullable),
+            4,
+            1.0,
+            BufferAllocatorRef::statically_allocated(),
+        );
+
+        let heap = ByteBuffer::copy_from(b"shorttinysmall".as_slice());
+        builder.append_buffer_with_lengths(heap, &[5u32, 4, 5], &Mask::new_true(3));
+
+        let actual = builder.finish_into_varbinview();
+        assert!(
+            actual.data_buffers().is_empty(),
+            "a fully-inlined append must not retain any value bytes"
+        );
+
+        let expected = <VarBinViewArray as FromIterator<_>>::from_iter([
+            Some("short"),
+            Some("tiny"),
+            Some("small"),
+        ]);
+        assert_arrays_eq!(actual, expected, &mut ctx);
+    }
+
     #[test]
     fn test_utf8_builder() {
         let mut ctx = array_session().create_execution_ctx();
-        let mut builder = VarBinViewBuilder::with_capacity(DType::Utf8(Nullability::Nullable), 10);
+        let mut builder = VarBinViewBuilder::with_capacity_in(
+            DType::Utf8(Nullability::Nullable),
+            10,
+            BufferAllocatorRef::statically_allocated(),
+        );
 
         builder.append_value("Hello");
         builder.append_null();
@@ -908,13 +1875,20 @@ mod tests {
     fn test_utf8_builder_with_extend() {
         let mut ctx = array_session().create_execution_ctx();
         let array = {
-            let mut builder =
-                VarBinViewBuilder::with_capacity(DType::Utf8(Nullability::Nullable), 10);
+            let mut builder = VarBinViewBuilder::with_capacity_in(
+                DType::Utf8(Nullability::Nullable),
+                10,
+                BufferAllocatorRef::statically_allocated(),
+            );
             builder.append_null();
             builder.append_value("Hello2");
             builder.finish()
         };
-        let mut builder = VarBinViewBuilder::with_capacity(DType::Utf8(Nullability::Nullable), 10);
+        let mut builder = VarBinViewBuilder::with_capacity_in(
+            DType::Utf8(Nullability::Nullable),
+            10,
+            BufferAllocatorRef::statically_allocated(),
+        );
 
         builder.append_value("Hello1");
         array.append_to_builder(&mut builder, &mut ctx).unwrap();
@@ -936,16 +1910,22 @@ mod tests {
     #[test]
     fn test_buffer_deduplication() -> VortexResult<()> {
         let array = {
-            let mut builder =
-                VarBinViewBuilder::with_capacity(DType::Utf8(Nullability::Nullable), 10);
+            let mut builder = VarBinViewBuilder::with_capacity_in(
+                DType::Utf8(Nullability::Nullable),
+                10,
+                BufferAllocatorRef::statically_allocated(),
+            );
             builder.append_value("This is a long string that should not be inlined");
             builder.append_value("short string");
             builder.finish_into_varbinview()
         };
 
         assert_eq!(array.data_buffers().len(), 1);
-        let mut builder =
-            VarBinViewBuilder::with_buffer_deduplication(DType::Utf8(Nullability::Nullable), 10);
+        let mut builder = VarBinViewBuilder::with_buffer_deduplication_in(
+            DType::Utf8(Nullability::Nullable),
+            10,
+            BufferAllocatorRef::statically_allocated(),
+        );
 
         let mut ctx = array_session().create_execution_ctx();
 
@@ -961,8 +1941,11 @@ mod tests {
         assert_eq!(builder.completed_block_count(), 1);
 
         let array2 = {
-            let mut builder =
-                VarBinViewBuilder::with_capacity(DType::Utf8(Nullability::Nullable), 10);
+            let mut builder = VarBinViewBuilder::with_capacity_in(
+                DType::Utf8(Nullability::Nullable),
+                10,
+                BufferAllocatorRef::statically_allocated(),
+            );
             builder.append_value("This is a long string that should not be inlined");
             builder.finish_into_varbinview()
         };
@@ -986,8 +1969,11 @@ mod tests {
         use crate::scalar::Scalar;
 
         // Test with Utf8 builder.
-        let mut utf8_builder =
-            VarBinViewBuilder::with_capacity(DType::Utf8(Nullability::Nullable), 10);
+        let mut utf8_builder = VarBinViewBuilder::with_capacity_in(
+            DType::Utf8(Nullability::Nullable),
+            10,
+            BufferAllocatorRef::statically_allocated(),
+        );
 
         // Test appending a valid utf8 value.
         let utf8_scalar1 = Scalar::utf8("hello", Nullability::Nullable);
@@ -1007,8 +1993,11 @@ mod tests {
         assert_arrays_eq!(&array, &expected, &mut ctx);
 
         // Test with Binary builder.
-        let mut binary_builder =
-            VarBinViewBuilder::with_capacity(DType::Binary(Nullability::Nullable), 10);
+        let mut binary_builder = VarBinViewBuilder::with_capacity_in(
+            DType::Binary(Nullability::Nullable),
+            10,
+            BufferAllocatorRef::statically_allocated(),
+        );
 
         let binary_scalar = Scalar::binary(vec![1u8, 2, 3], Nullability::Nullable);
         binary_builder.append_scalar(&binary_scalar).unwrap();
@@ -1022,8 +2011,11 @@ mod tests {
         assert_arrays_eq!(&binary_array, &expected, &mut ctx);
 
         // Test wrong dtype error.
-        let mut builder =
-            VarBinViewBuilder::with_capacity(DType::Utf8(Nullability::NonNullable), 10);
+        let mut builder = VarBinViewBuilder::with_capacity_in(
+            DType::Utf8(Nullability::NonNullable),
+            10,
+            BufferAllocatorRef::statically_allocated(),
+        );
         let wrong_scalar = Scalar::from(42i32);
         assert!(builder.append_scalar(&wrong_scalar).is_err());
     }
@@ -1056,12 +2048,13 @@ mod tests {
         use super::BufferGrowthStrategy;
         use super::VarBinViewBuilder;
 
-        let mut builder = VarBinViewBuilder::new(
+        let mut builder = VarBinViewBuilder::new_in(
             DType::Binary(Nullability::Nullable),
             10,
             Default::default(),
             BufferGrowthStrategy::exponential(1024, 4096),
             0.0,
+            BufferAllocatorRef::statically_allocated(),
         );
 
         // Create a value larger than max_size

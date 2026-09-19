@@ -9,11 +9,13 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use parking_lot::Mutex;
 use smol::block_on;
+use vortex_utils::parallelism::get_available_parallelism;
 
 use crate::runtime::BlockingRuntime;
 use crate::runtime::Executor;
 use crate::runtime::Handle;
 pub use crate::runtime::pool::CurrentThreadWorkerPool;
+use crate::runtime::smol::SmolExecutor;
 
 /// A current thread runtime allows callers to much more explicitly drive Vortex futures than with
 /// a Tokio runtime.
@@ -30,7 +32,7 @@ pub use crate::runtime::pool::CurrentThreadWorkerPool;
 /// with the desired number of worker threads that will drive work on behalf of the runtime.
 #[derive(Clone, Default)]
 pub struct CurrentThreadRuntime {
-    executor: Arc<smol::Executor<'static>>,
+    executor: Arc<SmolExecutor>,
 }
 
 impl CurrentThreadRuntime {
@@ -67,9 +69,11 @@ impl CurrentThreadRuntime {
 
         // We create an MPMC result channel and spawn a task to drive the stream and send results.
         // This allows multiple worker threads to drive the execution while all waiting for results
-        // on the channel.
-        let (result_tx, result_rx) = kanal::bounded_async(1);
-        let driver = self.executor.spawn(async move {
+        // on the channel. Channel buffers up to one item per core so calling threads can get a
+        // ready item without every one of them having to become an executor.
+        let capacity = get_available_parallelism().unwrap_or(1).max(1);
+        let (result_tx, result_rx) = kanal::bounded_async(capacity);
+        let driver = self.executor.async_executor().spawn(async move {
             futures::pin_mut!(stream);
             while let Some(item) = stream.next().await {
                 // If all receivers are dropped, we stop driving the stream.
@@ -117,7 +121,7 @@ impl BlockingRuntime for CurrentThreadRuntime {
 
 /// An iterator that wraps up a stream to drive it using the current thread execution.
 pub struct CurrentThreadIterator<'a, T> {
-    executor: Arc<smol::Executor<'static>>,
+    executor: Arc<SmolExecutor>,
     stream: BoxStream<'a, T>,
 }
 
@@ -131,7 +135,7 @@ impl<T> Iterator for CurrentThreadIterator<'_, T> {
 
 /// An iterator that drives a stream from multiple threads.
 pub struct ThreadSafeIterator<T> {
-    executor: Arc<smol::Executor<'static>>,
+    executor: Arc<SmolExecutor>,
     results: kanal::AsyncReceiver<T>,
     /// Handle to the task driving the stream. Once the stream ends, the first consumer to
     /// observe it joins the task so a panic raised while driving the stream is re-raised rather
@@ -154,23 +158,31 @@ impl<T> Iterator for ThreadSafeIterator<T> {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // If driver already has an item, take it without driving the executor
+        match self.results.try_recv() {
+            Ok(Some(item)) => return Some(item),
+            Ok(None) => {}
+            Err(_) => return self.get_task_error(),
+        }
+
         match block_on(self.executor.run(self.results.recv())) {
             Ok(item) => Some(item),
-            // The result channel closes when the driver task finishes. Join the task so a panic
-            // raised while driving the stream is re-raised here instead of being lost. The first
-            // consumer to observe closure joins it; any later consumer just sees the stream end.
-            Err(_) => {
-                let task = self.driver.lock().take();
-                if let Some(task) = task {
-                    block_on(self.executor.run(task));
-                }
-                None
-            }
+            Err(_) => self.get_task_error(),
         }
     }
 }
 
-#[expect(clippy::if_then_some_else_none)] // Clippy is wrong when if/else has await.
+impl<T> ThreadSafeIterator<T> {
+    // Join current task so panics are re-raised
+    fn get_task_error(&self) -> Option<T> {
+        let task = self.driver.lock().take();
+        if let Some(task) = task {
+            block_on(self.executor.run(task));
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::any::Any;

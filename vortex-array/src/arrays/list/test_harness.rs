@@ -4,20 +4,21 @@
 use std::sync::Arc;
 
 use itertools::Itertools;
+use vortex_buffer::BufferAllocatorRef;
 use vortex_error::VortexResult;
 
 use crate::arrays::ListArray;
 use crate::builders::ArrayBuilder;
 use crate::builders::ListBuilder;
 use crate::dtype::DType;
-use crate::dtype::IntegerPType;
+use crate::dtype::OffsetBuilderPType;
 use crate::scalar::Scalar;
 
 impl ListArray {
     /// This is a convenience method to create a list array from an iterator of iterators.
     /// This method is slow however since each element is first converted to a scalar and then
     /// appended to the array.
-    pub fn from_iter_slow<O: IntegerPType, I: IntoIterator>(
+    pub fn from_iter_slow<O: OffsetBuilderPType, I: IntoIterator>(
         iter: I,
         dtype: Arc<DType>,
     ) -> VortexResult<ListArray>
@@ -26,11 +27,12 @@ impl ListArray {
         <I::Item as IntoIterator>::Item: Into<Scalar>,
     {
         let iter = iter.into_iter();
-        let mut builder = ListBuilder::<O>::with_capacity(
+        let mut builder = ListBuilder::<O>::with_capacity_in(
             Arc::clone(&dtype),
             crate::dtype::Nullability::NonNullable,
             2 * iter.size_hint().0,
             iter.size_hint().0,
+            BufferAllocatorRef::static_ref(),
         );
 
         for v in iter {
@@ -44,7 +46,7 @@ impl ListArray {
         Ok(builder.finish_into_list())
     }
 
-    pub fn from_iter_opt_slow<O: IntegerPType, I: IntoIterator<Item = Option<T>>, T>(
+    pub fn from_iter_opt_slow<O: OffsetBuilderPType, I: IntoIterator<Item = Option<T>>, T>(
         iter: I,
         dtype: Arc<DType>,
     ) -> VortexResult<ListArray>
@@ -53,11 +55,12 @@ impl ListArray {
         T::Item: Into<Scalar>,
     {
         let iter = iter.into_iter();
-        let mut builder = ListBuilder::<O>::with_capacity(
+        let mut builder = ListBuilder::<O>::with_capacity_in(
             Arc::clone(&dtype),
             crate::dtype::Nullability::Nullable,
             2 * iter.size_hint().0,
             iter.size_hint().0,
+            BufferAllocatorRef::static_ref(),
         );
 
         for v in iter {

@@ -46,11 +46,10 @@ fn test_dict_compressed() -> VortexResult<()> {
     Ok(())
 }
 
-#[cfg(feature = "unstable_encodings")]
 #[test]
-fn test_onpair_in_default_scheme_list() {
+fn test_all_schemes_includes_onpair() {
     use crate::SchemeExt;
-    use crate::schemes::string::OnPairScheme;
+    use crate::schemes::string::onpair::OnPairScheme;
 
     let ids: Vec<_> = crate::ALL_SCHEMES.iter().map(|s| s.id()).collect();
     assert!(
@@ -59,12 +58,11 @@ fn test_onpair_in_default_scheme_list() {
     );
 }
 
-#[cfg(feature = "unstable_encodings")]
 #[test]
-fn test_onpair_compressed() -> VortexResult<()> {
+fn test_default_btrblocks_compressor_selects_onpair() -> VortexResult<()> {
     // Dictionary-style string corpus: high lexical overlap, short rows.
     // OnPair beats FSST on this corpus, so it wins the sample-based
-    // comparison even though both are registered by default.
+    // comparison even though both are registered.
     let mut strings = Vec::with_capacity(1000);
     for i in 0..1000 {
         strings.push(Some(format!(
@@ -83,8 +81,8 @@ fn test_onpair_compressed() -> VortexResult<()> {
     Ok(())
 }
 
-/// FSST is registered in the default scheme list (alongside OnPair), and an
-/// FSST-only builder still produces an FSST array.
+/// FSST is registered in the default scheme list, and an FSST-only builder
+/// still produces an FSST array.
 #[test]
 fn test_fsst_in_default_scheme_list() -> VortexResult<()> {
     use crate::BtrBlocksCompressorBuilder;

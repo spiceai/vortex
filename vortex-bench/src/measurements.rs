@@ -351,11 +351,12 @@ pub struct CompressionTimingMeasurement {
 impl ToJson for CompressionTimingMeasurement {
     fn to_json(&self) -> serde_json::Value {
         let (name, engine) = match self.format {
+            Format::ArrowIpc => (format!("arrow-ipc {}", self.name), Engine::Vortex),
             Format::OnDiskVortex => (self.name.to_string(), Engine::Vortex),
-            Format::Parquet => (format!("parquet_rs-zstd {}", self.name), Engine::Arrow),
-            Format::Lance => (format!("lance {}", self.name), Engine::Arrow),
+            Format::Parquet => (format!("parquet_rs-zstd {}", self.name), Engine::Vortex),
+            Format::Lance => (format!("lance {}", self.name), Engine::Vortex),
             _ => vortex_panic!(
-                "CompressionTimingMeasurement only supports vortex, lance, and parquet formats"
+                "CompressionTimingMeasurement only supports arrow-ipc, vortex, lance, and parquet formats"
             ),
         };
 
@@ -397,8 +398,8 @@ impl ToJson for CustomUnitMeasurement {
     fn to_json(&self) -> serde_json::Value {
         let engine = match self.format {
             Format::OnDiskVortex | Format::VortexCompact => Engine::Vortex,
-            Format::Parquet => Engine::Arrow,
-            Format::Lance => Engine::Arrow,
+            Format::Parquet => Engine::Vortex,
+            Format::Lance => Engine::Vortex,
             _ => Engine::Vortex, // Default to Vortex for other formats.
         };
 
@@ -523,4 +524,24 @@ pub struct MemoryMeasurementJson {
     pub commit_id: String,
     pub target: Target,
     pub env_triple: TripleJson,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compression_timing_json_supports_arrow_ipc() {
+        let measurement = CompressionTimingMeasurement {
+            name: "compress time/demo".to_string(),
+            format: Format::ArrowIpc,
+            time: Duration::from_nanos(42),
+        };
+
+        let json = measurement.to_json();
+
+        assert_eq!(json["name"], "arrow-ipc compress time/demo");
+        assert_eq!(json["target"]["format"], "arrow-ipc");
+        assert_eq!(json["value"], 42.0);
+    }
 }

@@ -6,6 +6,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use arrow_array::RecordBatch;
+use arrow_select::concat::concat_batches;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use parquet::arrow::AsyncArrowWriter;
@@ -32,7 +34,7 @@ use vortex::array::arrays::Struct;
 use vortex::array::arrays::StructArray;
 use vortex::array::arrays::VarBinViewArray;
 use vortex::array::arrays::struct_::StructArrayExt;
-use vortex::array::builders::builder_with_capacity;
+use vortex::array::builders::builder_with_capacity_in;
 use vortex::array::stream::ArrayStreamAdapter;
 use vortex::array::stream::ArrayStreamExt;
 use vortex::compressor::BtrBlocksCompressorBuilder;
@@ -52,10 +54,10 @@ use vortex::layout::layouts::compressed::CompressingStrategy;
 use vortex::layout::layouts::flat::writer::FlatLayoutStrategy;
 use vortex::session::VortexSession;
 use vortex::utils::aliases::hash_set::HashSet;
-use vortex_arrow::FromArrowArray;
-use vortex_arrow::FromArrowType;
-use vortex_geo::extension::GeoMetadata;
-use vortex_geo::extension::WellKnownBinary;
+use vortex::utils::parallelism::get_available_parallelism;
+use vortex_arrow::ArrowSessionExt;
+use vortex_spatial::extension::SpatialMetadata;
+use vortex_spatial::extension::WellKnownBinary;
 use wkb::Endianness;
 use wkb::reader::read_wkb;
 use wkb::writer::WriteOptions;
@@ -64,6 +66,7 @@ use wkb::writer::write_geometry;
 use crate::CompactionStrategy;
 use crate::Format;
 use crate::SESSION;
+use crate::retain_edition_encodings;
 use crate::utils::file::idempotent_async;
 
 /// Memory budget per concurrent conversion stream in GB. This is somewhat arbitary.
@@ -71,9 +74,6 @@ const MEMORY_PER_STREAM_GB: u64 = 4;
 
 /// Minimum number of concurrent conversion streams.
 const MIN_CONCURRENCY: u64 = 1;
-
-/// Maximum number of concurrent conversion streams. This is somewhat arbitary.
-const MAX_CONCURRENCY: u64 = 16;
 
 /// Returns the available system memory in bytes.
 fn available_memory_bytes() -> u64 {
@@ -83,14 +83,15 @@ fn available_memory_bytes() -> u64 {
 /// Calculate appropriate concurrency based on available memory.
 fn calculate_concurrency() -> usize {
     let available_gb = available_memory_bytes() / (1024 * 1024 * 1024);
-    let concurrency = (available_gb / MEMORY_PER_STREAM_GB).clamp(MIN_CONCURRENCY, MAX_CONCURRENCY);
+    let max_concurrency = get_available_parallelism().unwrap_or(1) as u64;
+    let concurrency = (available_gb / MEMORY_PER_STREAM_GB).clamp(MIN_CONCURRENCY, max_concurrency);
 
     info!(
         "Available memory: {}GB, maximum concurrency is: {}",
         available_gb, concurrency
     );
 
-    concurrency as usize
+    usize::try_from(concurrency).unwrap_or(1)
 }
 
 /// Read a Parquet file and return it as a Vortex [`ChunkedArray`].
@@ -98,16 +99,69 @@ fn calculate_concurrency() -> usize {
 /// Note: This loads the entire file into memory. For large files, use the streaming conversion like
 /// in [`parquet_to_vortex_stream`] instead.
 pub async fn parquet_to_vortex_chunks(parquet_path: PathBuf) -> anyhow::Result<ChunkedArray> {
+    parquet_to_vortex_chunks_with_batch_size(parquet_path, None).await
+}
+
+/// Read a Parquet file as a Vortex [`ChunkedArray`] with chunks of exactly `batch_size` rows.
+///
+/// With `batch_size` set, the source batches are concatenated and re-sliced on exact boundaries,
+/// so every chunk but the last has the requested length. Setting the Arrow reader's batch size
+/// is not enough on its own: the reader also breaks at the source file's row group boundaries,
+/// so a file whose row groups are not a multiple of the batch size still yields short batches.
+///
+/// This matters when comparing against a format whose physical partitioning is explicit. Chunk
+/// size becomes the Vortex file's partition size, and small chunks mean many small compressed
+/// blocks — and, on the GPU, many small kernel launches.
+///
+/// `None` keeps whatever batches the Parquet reader produces.
+pub async fn parquet_to_vortex_chunks_with_batch_size(
+    parquet_path: PathBuf,
+    batch_size: Option<usize>,
+) -> anyhow::Result<ChunkedArray> {
     let file = File::open(parquet_path).await?;
     let builder = ParquetRecordBatchStreamBuilder::new(file).await?;
-    let reader = builder.build()?;
 
-    let chunks: Vec<ArrayRef> = parquet_to_vortex_stream(reader)
-        .map(|r| r.map_err(anyhow::Error::from))
+    let Some(batch_size) = batch_size.filter(|size| *size > 0) else {
+        let chunks: Vec<ArrayRef> = parquet_to_vortex_stream(builder.build()?)
+            .map(|r| r.map_err(anyhow::Error::from))
+            .try_collect()
+            .await?;
+        return Ok(ChunkedArray::from_iter(chunks));
+    };
+
+    let batches: Vec<RecordBatch> = builder
+        .with_batch_size(batch_size)
+        .build()?
+        .map_err(anyhow::Error::from)
         .try_collect()
         .await?;
 
+    let schema = batches
+        .first()
+        .map(RecordBatch::schema)
+        .ok_or_else(|| anyhow::anyhow!("cannot convert an empty Parquet file"))?;
+    let combined = concat_batches(&schema, &batches)?;
+
+    let mut chunks = Vec::with_capacity(combined.num_rows().div_ceil(batch_size));
+    for start in (0..combined.num_rows()).step_by(batch_size) {
+        let len = batch_size.min(combined.num_rows() - start);
+        chunks.push(record_batch_to_vortex(combined.slice(start, len))?);
+    }
+
     Ok(ChunkedArray::from_iter(chunks))
+}
+
+/// Convert one Arrow [`RecordBatch`] into a canonical Vortex array.
+fn record_batch_to_vortex(batch: RecordBatch) -> VortexResult<ArrayRef> {
+    let schema = batch.schema();
+    let chunk = SESSION.arrow().from_arrow_record_batch(batch, &schema)?;
+    let mut ctx = VortexSession::default().create_execution_ctx();
+    let mut builder = builder_with_capacity_in(chunk.dtype(), chunk.len(), ctx.allocator());
+
+    // Canonicalize the chunk.
+    chunk.append_to_builder(builder.as_mut(), &mut ctx)?;
+
+    Ok(builder.finish())
 }
 
 /// Create a streaming Vortex array from a Parquet reader.
@@ -118,18 +172,9 @@ pub fn parquet_to_vortex_stream(
     reader: ParquetRecordBatchStream<File>,
 ) -> impl futures::Stream<Item = VortexResult<ArrayRef>> {
     reader.map(move |result| {
-        result.map_err(|e| vortex_err!(External: e)).and_then(|rb| {
-            let chunk = ArrayRef::from_arrow(rb, false)?;
-            let mut builder = builder_with_capacity(chunk.dtype(), chunk.len());
-
-            // Canonicalize the chunk.
-            chunk.append_to_builder(
-                builder.as_mut(),
-                &mut VortexSession::default().create_execution_ctx(),
-            )?;
-
-            Ok(builder.finish())
-        })
+        result
+            .map_err(|e| vortex_err!(External: e))
+            .and_then(record_batch_to_vortex)
     })
 }
 
@@ -145,10 +190,15 @@ pub async fn convert_parquet_file_to_vortex(
     let builder = ParquetRecordBatchStreamBuilder::new(file).await?;
 
     // GeoParquet geometry tagging.
-    let geo_columns = geoparquet_columns(builder.metadata());
-    let dtype = tag_geo_dtype(DType::from_arrow(builder.schema().as_ref()), &geo_columns)?;
+    let spatial_columns = geoparquet_columns(builder.metadata());
+    let dtype = tag_spatial_dtype(
+        SESSION
+            .arrow()
+            .from_arrow_schema(builder.schema().as_ref())?,
+        &spatial_columns,
+    )?;
     let stream = parquet_to_vortex_stream(builder.build()?)
-        .map(move |chunk| chunk.and_then(|chunk| tag_geo_array(chunk, &geo_columns)));
+        .map(move |chunk| chunk.and_then(|chunk| tag_spatial_array(chunk, &spatial_columns)));
 
     let mut output_file = OpenOptions::new()
         .write(true)
@@ -198,8 +248,10 @@ fn write_options_for(
 
     let mut builder = WriteStrategyBuilder::default();
     if matches!(compaction, CompactionStrategy::Compact) {
-        builder =
-            builder.with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact());
+        builder = builder.with_btrblocks_builder(retain_edition_encodings(
+            &SESSION,
+            BtrBlocksCompressorBuilder::default().with_compact(),
+        ));
     }
     for name in binary_fields {
         builder = builder.with_field_writer(FieldPath::from_name(name), no_dict_layout());
@@ -211,7 +263,7 @@ fn write_options_for(
 fn no_dict_layout() -> Arc<dyn LayoutStrategy> {
     Arc::new(CompressingStrategy::new(
         ChunkedLayoutStrategy::new(FlatLayoutStrategy::default()),
-        BtrBlocksCompressorBuilder::default().build(),
+        retain_edition_encodings(&SESSION, BtrBlocksCompressorBuilder::default()).build(),
     ))
 }
 
@@ -302,7 +354,10 @@ pub async fn write_parquet_as_vortex(
 }
 
 /// Add GeoParquet `geo` file metadata to externally-sourced parquet we don't generate (e.g. SpatialBench `zone`).
-pub async fn add_geoparquet_metadata(parquet_path: &Path, geo_json: &str) -> anyhow::Result<()> {
+pub async fn add_geoparquet_metadata(
+    parquet_path: &Path,
+    geoparquet_json: &str,
+) -> anyhow::Result<()> {
     let builder = ParquetRecordBatchStreamBuilder::new(File::open(parquet_path).await?).await?;
     let already_tagged = builder
         .metadata()
@@ -321,7 +376,10 @@ pub async fn add_geoparquet_metadata(parquet_path: &Path, geo_json: &str) -> any
     while let Some(batch) = reader.try_next().await? {
         writer.write(&batch).await?;
     }
-    writer.append_key_value_metadata(KeyValue::new("geo".to_string(), Some(geo_json.to_string())));
+    writer.append_key_value_metadata(KeyValue::new(
+        "geo".to_string(),
+        Some(geoparquet_json.to_string()),
+    ));
     writer.close().await?;
     tokio::fs::rename(&tmp_path, parquet_path).await?;
     Ok(())
@@ -334,7 +392,7 @@ fn geoparquet_columns(metadata: &ParquetMetaData) -> HashSet<String> {
         .key_value_metadata()
         .and_then(|kvs| kvs.iter().find(|kv| kv.key == "geo"))
         .and_then(|kv| kv.value.as_deref())
-        .and_then(|geo| serde_json::from_str::<serde_json::Value>(geo).ok())
+        .and_then(|metadata| serde_json::from_str::<serde_json::Value>(metadata).ok())
         .and_then(|value| {
             value
                 .get("columns")
@@ -344,15 +402,18 @@ fn geoparquet_columns(metadata: &ParquetMetaData) -> HashSet<String> {
         .unwrap_or_default()
 }
 
-/// The erased `vortex.geo.wkb` extension dtype over a binary `storage` dtype.
+/// The erased `vortex.st.wkb` extension dtype over a binary `storage` dtype.
 fn wkb_ext_dtype(storage: &DType) -> VortexResult<ExtDTypeRef> {
-    Ok(ExtDType::<WellKnownBinary>::try_new(GeoMetadata { crs: None }, storage.clone())?.erased())
+    Ok(
+        ExtDType::<WellKnownBinary>::try_new(SpatialMetadata { crs: None }, storage.clone())?
+            .erased(),
+    )
 }
 
-/// Re-type the named binary columns of a struct `dtype` as `vortex.geo.wkb`, so the column
+/// Re-type the named binary columns of a struct `dtype` as `vortex.st.wkb`, so the column
 /// self-describes as geometry.
-fn tag_geo_dtype(dtype: DType, geo_columns: &HashSet<String>) -> VortexResult<DType> {
-    if geo_columns.is_empty() {
+fn tag_spatial_dtype(dtype: DType, spatial_columns: &HashSet<String>) -> VortexResult<DType> {
+    if spatial_columns.is_empty() {
         return Ok(dtype);
     }
     let DType::Struct(fields, nullability) = &dtype else {
@@ -363,7 +424,7 @@ fn tag_geo_dtype(dtype: DType, geo_columns: &HashSet<String>) -> VortexResult<DT
         .iter()
         .zip(fields.fields())
         .map(|(name, field)| {
-            if geo_columns.contains(name.as_ref()) && field.is_binary() {
+            if spatial_columns.contains(name.as_ref()) && field.is_binary() {
                 Ok(DType::Extension(wkb_ext_dtype(&field)?))
             } else {
                 Ok(field)
@@ -376,10 +437,10 @@ fn tag_geo_dtype(dtype: DType, geo_columns: &HashSet<String>) -> VortexResult<DT
     ))
 }
 
-/// Wrap the named binary columns of a struct `chunk` as `vortex.geo.wkb` extension arrays, storing
+/// Wrap the named binary columns of a struct `chunk` as `vortex.st.wkb` extension arrays, storing
 /// their WKB little-endian.
-fn tag_geo_array(chunk: ArrayRef, geo_columns: &HashSet<String>) -> VortexResult<ArrayRef> {
-    if geo_columns.is_empty() {
+fn tag_spatial_array(chunk: ArrayRef, spatial_columns: &HashSet<String>) -> VortexResult<ArrayRef> {
+    if spatial_columns.is_empty() {
         return Ok(chunk);
     }
     let Some(struct_array) = chunk.as_opt::<Struct>() else {
@@ -391,7 +452,7 @@ fn tag_geo_array(chunk: ArrayRef, geo_columns: &HashSet<String>) -> VortexResult
     let mut ctx = SESSION.create_execution_ctx();
     let mut tagged = Vec::with_capacity(names.len());
     for (name, field) in names.iter().zip(struct_array.iter_unmasked_fields()) {
-        if geo_columns.contains(name.as_ref()) && field.dtype().is_binary() {
+        if spatial_columns.contains(name.as_ref()) && field.dtype().is_binary() {
             let ext = wkb_ext_dtype(field.dtype())?;
             let little_endian = wkb_field_to_little_endian(field, &mut ctx)?;
             tagged.push(ExtensionArray::try_new(ext, little_endian)?.into_array());

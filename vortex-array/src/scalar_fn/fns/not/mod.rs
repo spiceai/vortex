@@ -15,6 +15,7 @@ use crate::IntoArray;
 use crate::arrays::Bool;
 use crate::arrays::BoolArray;
 use crate::arrays::ConstantArray;
+use crate::arrays::ScalarFnArray;
 use crate::arrays::bool::BoolArrayExt;
 use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
@@ -25,10 +26,22 @@ use crate::scalar_fn::EmptyOptions;
 use crate::scalar_fn::ExecutionArgs;
 use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::ScalarFnVTable;
+use crate::scalar_fn::ScalarFnVTableExt;
 
 /// Expression that logically inverts boolean values.
 #[derive(Clone)]
 pub struct Not;
+
+impl Not {
+    /// Creates a lazy boolean inversion of `input`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `input` is not boolean data.
+    pub fn try_new(input: ArrayRef) -> VortexResult<ScalarFnArray> {
+        ScalarFnArray::try_new(Not.bind(EmptyOptions), vec![input])
+    }
+}
 
 impl ScalarFnVTable for Not {
     type Options = EmptyOptions;
@@ -98,21 +111,24 @@ impl ScalarFnVTable for Not {
         child.execute::<ArrayRef>(ctx)?.not()
     }
 
-    fn is_null_sensitive(&self, _options: &Self::Options) -> bool {
-        false
+    fn is_strict(&self, _options: &Self::Options) -> bool {
+        true
     }
 
-    fn is_fallible(&self, _options: &Self::Options) -> bool {
-        false
+    fn is_infallible(&self, _options: &Self::Options) -> bool {
+        true
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use vortex_error::VortexResult;
+
     use crate::IntoArray;
     use crate::VortexSessionExecute;
     use crate::array_session;
     use crate::arrays::bool::BoolArrayExt;
+    use crate::assert_arrays_eq;
     use crate::dtype::DType;
     use crate::dtype::Nullability;
     use crate::expr::col;
@@ -121,6 +137,30 @@ mod tests {
     use crate::expr::root;
     use crate::expr::test_harness;
     use crate::scalar_fn::fns::not::BoolArray;
+
+    #[test]
+    fn is_strict() {
+        assert!(
+            not(root())
+                .as_scalar()
+                .is_some_and(|f| f.signature().is_strict())
+        );
+    }
+
+    #[test]
+    fn preserves_nulls() -> VortexResult<()> {
+        let mut ctx = array_session().create_execution_ctx();
+        let input = BoolArray::from_iter([Some(false), None, Some(true)]).into_array();
+
+        let result = input.apply(&not(root()))?;
+
+        assert_arrays_eq!(
+            result,
+            BoolArray::from_iter([Some(true), None, Some(false)]),
+            &mut ctx
+        );
+        Ok(())
+    }
 
     #[test]
     fn invert_booleans() {

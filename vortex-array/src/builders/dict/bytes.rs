@@ -8,7 +8,9 @@ use std::sync::Arc;
 
 use num_traits::AsPrimitive;
 use vortex_array::ExecutionCtx;
+use vortex_buffer::Alignment;
 use vortex_buffer::BitBufferMut;
+use vortex_buffer::BufferAllocatorRef;
 use vortex_buffer::BufferMut;
 use vortex_buffer::ByteBuffer;
 use vortex_buffer::ByteBufferMut;
@@ -31,7 +33,7 @@ use crate::arrays::PrimitiveArray;
 use crate::arrays::VarBin;
 use crate::arrays::VarBinView;
 use crate::arrays::VarBinViewArray;
-use crate::arrays::varbin::VarBinArrayExt;
+use crate::arrays::varbin::VarBinArraySlotsExt;
 use crate::arrays::varbinview::build_views::BinaryView;
 use crate::dtype::DType;
 use crate::dtype::PType;
@@ -50,29 +52,58 @@ pub struct BytesDictBuilder<Code> {
     dtype: DType,
     max_dict_bytes: usize,
     max_dict_len: usize,
+    allocator: BufferAllocatorRef,
 }
 
-pub fn bytes_dict_builder(dtype: DType, constraints: &DictConstraints) -> Box<dyn DictEncoder> {
+pub fn bytes_dict_builder(
+    dtype: DType,
+    constraints: &DictConstraints,
+    allocator: BufferAllocatorRef,
+) -> Box<dyn DictEncoder> {
     match constraints.max_len as u64 {
-        max if max <= u8::MAX as u64 => Box::new(BytesDictBuilder::<u8>::new(dtype, constraints)),
-        max if max <= u16::MAX as u64 => Box::new(BytesDictBuilder::<u16>::new(dtype, constraints)),
-        max if max <= u32::MAX as u64 => Box::new(BytesDictBuilder::<u32>::new(dtype, constraints)),
-        _ => Box::new(BytesDictBuilder::<u64>::new(dtype, constraints)),
+        max if max <= u8::MAX as u64 => Box::new(BytesDictBuilder::<u8>::new_in(
+            dtype,
+            constraints,
+            allocator,
+        )),
+        max if max <= u16::MAX as u64 => Box::new(BytesDictBuilder::<u16>::new_in(
+            dtype,
+            constraints,
+            allocator,
+        )),
+        max if max <= u32::MAX as u64 => Box::new(BytesDictBuilder::<u32>::new_in(
+            dtype,
+            constraints,
+            allocator,
+        )),
+        _ => Box::new(BytesDictBuilder::<u64>::new_in(
+            dtype,
+            constraints,
+            allocator,
+        )),
     }
 }
 
 impl<Code: UnsignedPType> BytesDictBuilder<Code> {
-    pub fn new(dtype: DType, constraints: &DictConstraints) -> Self {
+    pub fn new_in(
+        dtype: DType,
+        constraints: &DictConstraints,
+        allocator: BufferAllocatorRef,
+    ) -> Self {
         Self {
             lookup: Some(HashTable::new()),
-            views: BufferMut::<BinaryView>::empty(),
+            views: BufferMut::<BinaryView>::empty_aligned_in(
+                Alignment::of::<BinaryView>(),
+                allocator.clone(),
+            ),
             null_code: OnceCell::new(),
-            values: BufferMut::empty(),
-            values_nulls: BitBufferMut::empty(),
+            values: BufferMut::empty_aligned_in(Alignment::of::<u8>(), allocator.clone()),
+            values_nulls: BitBufferMut::empty_in(allocator.clone()),
             hasher: DefaultHashBuilder::default(),
             dtype,
-            max_dict_bytes: constraints.max_bytes,
+            max_dict_bytes: constraints.max_bytes.min(u32::MAX as usize),
             max_dict_len: constraints.max_len,
+            allocator,
         }
     }
 
@@ -172,7 +203,7 @@ impl<Code: UnsignedPType> BytesDictBuilder<Code> {
         F: FnMut(usize) -> &'a [u8],
     {
         let mut local_lookup = self.lookup.take().vortex_expect("Must have a lookup dict");
-        let mut codes: BufferMut<Code> = BufferMut::with_capacity(len);
+        let mut codes = BufferMut::<Code>::with_capacity_in(len, self.allocator.clone());
 
         match validity_mask.bit_buffer() {
             AllOr::All => {
@@ -286,9 +317,25 @@ impl<Code: UnsignedPType> DictEncoder for BytesDictBuilder<Code> {
     }
 
     fn reset(&mut self) -> ArrayRef {
-        let views = mem::take(&mut self.views).freeze();
-        let buffer = mem::take(&mut self.values).freeze();
-        let value_nulls = mem::take(&mut self.values_nulls).freeze();
+        if let Some(lookup) = self.lookup.as_mut() {
+            lookup.clear();
+        }
+        self.null_code = OnceCell::new();
+        let views = mem::replace(
+            &mut self.views,
+            BufferMut::empty_aligned_in(Alignment::of::<BinaryView>(), self.allocator.clone()),
+        )
+        .freeze();
+        let buffer = mem::replace(
+            &mut self.values,
+            BufferMut::empty_aligned_in(Alignment::of::<u8>(), self.allocator.clone()),
+        )
+        .freeze();
+        let value_nulls = mem::replace(
+            &mut self.values_nulls,
+            BitBufferMut::empty_in(self.allocator.clone()),
+        )
+        .freeze();
 
         // SAFETY: we build the views explicitly and the bytes should be checked before feeding
         //  to the encoder.
@@ -314,10 +361,12 @@ mod test {
     use std::sync::LazyLock;
 
     use vortex_buffer::Buffer;
+    use vortex_buffer::BufferAllocatorRef;
     use vortex_buffer::ByteBuffer;
     use vortex_error::VortexResult;
     use vortex_session::VortexSession;
 
+    use super::BytesDictBuilder;
     use crate::IntoArray;
     use crate::VortexSessionExecute;
     use crate::arrays::PrimitiveArray;
@@ -325,8 +374,11 @@ mod test {
     use crate::arrays::VarBinViewArray;
     use crate::arrays::dict::DictArraySlotsExt;
     use crate::arrays::varbinview::BinaryView;
+    use crate::assert_arrays_eq;
     use crate::buffer::BufferHandle;
+    use crate::builders::dict::UNCONSTRAINED;
     use crate::builders::dict::dict_encode;
+    use crate::builders::dict::dict_encoder_in;
     use crate::dtype::DType;
     use crate::dtype::Nullability;
     use crate::validity::Validity;
@@ -429,5 +481,39 @@ mod test {
         let codes = dict.codes().clone().execute::<PrimitiveArray>(&mut ctx)?;
         assert_eq!(codes.as_slice::<u8>(), &[0, 0, 1, 1, 0, 1, 0, 1]);
         Ok(())
+    }
+
+    #[test]
+    fn reset_clears_dict() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let first = VarBinViewArray::from_iter_str(["one", "two"]).into_array();
+        let mut encoder = dict_encoder_in(&first, &UNCONSTRAINED, ctx.allocator().clone());
+
+        assert_arrays_eq!(
+            encoder.encode(&first, &mut ctx)?,
+            PrimitiveArray::from_iter([0u64, 1]),
+            &mut ctx
+        );
+        assert_arrays_eq!(encoder.reset(), first, &mut ctx);
+
+        let second = VarBinViewArray::from_iter_str(["one", "three"]).into_array();
+        assert_arrays_eq!(
+            encoder.encode(&second, &mut ctx)?,
+            PrimitiveArray::from_iter([0u64, 1]),
+            &mut ctx
+        );
+        assert_arrays_eq!(encoder.reset(), second, &mut ctx);
+
+        Ok(())
+    }
+
+    #[test]
+    fn max_dict_bytes_cannot_exceed_the_view_offset_range() {
+        let builder = BytesDictBuilder::<u32>::new_in(
+            DType::Utf8(Nullability::NonNullable),
+            &UNCONSTRAINED,
+            BufferAllocatorRef::statically_allocated(),
+        );
+        assert_eq!(builder.max_dict_bytes, u32::MAX as usize);
     }
 }

@@ -27,8 +27,9 @@ vortex = { workspace = true, features = ["tokio"] }
 vortex-duckdb = { workspace = true }
 
 [dev-dependencies]
-datafusion = { workspace = true }
+datafusion = { workspace = true, features = ["parquet"] }
 datafusion-functions-nested.workspace = true
+futures = { workspace = true }
 indicatif = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 vortex-datafusion = { workspace = true }

@@ -24,7 +24,7 @@ class BenchmarkBuilder:
         workspace_root: Path | None = None,
         config: BuildConfig | None = None,
         verbose: bool = False,
-    ):
+    ) -> None:
         self.workspace_root = workspace_root or get_workspace_root()
         self.config = config or BuildConfig()
         self.verbose = verbose
@@ -47,12 +47,15 @@ class BenchmarkBuilder:
 
         for backend in backends:
             binary_name = backend.binary_name
+            package_name = backend.package_name
             console.print(f"[blue]Building {binary_name}...[/blue]")
 
             cmd = [
                 "cargo",
                 "build",
-                "-p",
+                "--package",
+                package_name,
+                "--bin",
                 binary_name,
                 "--profile",
                 self.config.profile,

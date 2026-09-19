@@ -22,6 +22,7 @@ use vortex_error::VortexResult;
 
 use crate::BitPacked;
 use crate::BitPackedArrayExt;
+use crate::FL_CHUNK_SIZE;
 use crate::unpack_iter::BitPacked as BitPackedUnpack;
 use crate::unpack_iter::BitUnpackedChunks;
 
@@ -39,7 +40,11 @@ pub fn unpack_primitive_array<T: BitPackedUnpack>(
     array: ArrayView<'_, BitPacked>,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<PrimitiveArray> {
-    let mut builder = PrimitiveBuilder::with_capacity(array.dtype().nullability(), array.len());
+    let mut builder = PrimitiveBuilder::with_capacity_in(
+        array.dtype().nullability(),
+        array.len(),
+        ctx.allocator(),
+    );
     unpack_into_primitive_builder::<T>(array, &mut builder, ctx)?;
     assert_eq!(builder.len(), array.len());
     Ok(builder.finish_into_primitive())
@@ -102,7 +107,7 @@ where
     F: BitPackedUnpack,
     T: NativePType,
     M: Fn(F) -> T,
-    D: FnOnce(&mut BitUnpackedChunks<F>, &mut [MaybeUninit<T>], &M),
+    D: FnOnce(&mut BitUnpackedChunks<'_, F>, &mut [MaybeUninit<T>], &M),
 {
     if array.is_empty() {
         return Ok(());
@@ -119,7 +124,8 @@ where
     // SAFETY: `decode` writes a value to every slot in this range.
     let uninit_slice = unsafe { uninit_range.slice_uninit_mut(0, len) };
 
-    let mut chunks = array.unpacked_chunks::<F>()?;
+    let mut scratch = [const { MaybeUninit::<F>::uninit() }; FL_CHUNK_SIZE];
+    let mut chunks = array.unpacked_chunks::<F>(&mut scratch)?;
     decode(&mut chunks, uninit_slice, &map);
 
     if let Some(patches) = array.patches() {
@@ -292,22 +298,24 @@ mod tests {
             Validity::NonNullable,
         )?;
 
-        let mut listview_builder = ListViewBuilder::<u64, u32>::with_capacity(
+        let mut listview_builder = ListViewBuilder::<u64, u32>::with_capacity_in(
             Arc::clone(&element_dtype),
             Nullability::NonNullable,
             0,
             0,
+            ctx.allocator(),
         );
         list.clone()
             .into_array()
             .append_to_builder(&mut listview_builder, &mut ctx)?;
         assert_arrays_eq!(listview_builder.finish(), list, &mut ctx);
 
-        let mut list_builder = ListBuilder::<u64>::with_capacity(
+        let mut list_builder = ListBuilder::<u64>::with_capacity_in(
             Arc::clone(&element_dtype),
             Nullability::NonNullable,
             0,
             0,
+            ctx.allocator(),
         );
         list.clone()
             .into_array()
@@ -321,8 +329,13 @@ mod tests {
             Buffer::from_iter(std::iter::repeat_n(64u32, 48)).into_array(),
             Validity::NonNullable,
         )?;
-        let mut list_builder =
-            ListBuilder::<u64>::with_capacity(element_dtype, Nullability::NonNullable, 0, 0);
+        let mut list_builder = ListBuilder::<u64>::with_capacity_in(
+            element_dtype,
+            Nullability::NonNullable,
+            0,
+            0,
+            vortex_buffer::BufferAllocatorRef::static_ref(),
+        );
         listview
             .into_array()
             .append_to_builder(&mut list_builder, &mut ctx)?;
@@ -450,7 +463,10 @@ mod tests {
         let empty: PrimitiveArray = PrimitiveArray::from_iter(Vec::<u32>::new());
         let bitpacked = encode(&empty, 0);
 
-        let mut builder = PrimitiveBuilder::<u32>::new(Nullability::NonNullable);
+        let mut builder = PrimitiveBuilder::<u32>::new_in(
+            Nullability::NonNullable,
+            vortex_buffer::BufferAllocatorRef::static_ref(),
+        );
         unpack_map_into_builder(
             bitpacked.as_view(),
             &mut builder,
@@ -479,7 +495,11 @@ mod tests {
         let bitpacked = encode(&array, 3);
 
         // Unpack into a new builder.
-        let mut builder = PrimitiveBuilder::<u32>::with_capacity(Nullability::Nullable, 5);
+        let mut builder = PrimitiveBuilder::<u32>::with_capacity_in(
+            Nullability::Nullable,
+            5,
+            vortex_buffer::BufferAllocatorRef::static_ref(),
+        );
         unpack_map_into_builder(
             bitpacked.as_view(),
             &mut builder,
@@ -517,7 +537,11 @@ mod tests {
         );
 
         // Unpack into a new builder.
-        let mut builder = PrimitiveBuilder::<u32>::with_capacity(Nullability::NonNullable, 100);
+        let mut builder = PrimitiveBuilder::<u32>::with_capacity_in(
+            Nullability::NonNullable,
+            100,
+            vortex_buffer::BufferAllocatorRef::static_ref(),
+        );
         unpack_map_into_builder(
             bitpacked.as_view(),
             &mut builder,

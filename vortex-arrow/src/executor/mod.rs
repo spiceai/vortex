@@ -35,15 +35,14 @@ use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::arrays::List;
 use vortex_array::arrays::VarBin;
-use vortex_array::arrays::list::ListArrayExt;
-use vortex_array::arrays::varbin::VarBinArrayExt;
+use vortex_array::arrays::list::ListArraySlotsExt;
+use vortex_array::arrays::varbin::VarBinArraySlotsExt;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::PType;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
 
-use crate::dtype::to_data_type_naive;
 use crate::executor::bool::to_arrow_bool;
 use crate::executor::byte::to_arrow_byte_array;
 use crate::executor::byte_view::to_arrow_byte_view;
@@ -133,7 +132,7 @@ pub(crate) fn execute_arrow_naive(
 
     let resolved_type: DataType = match data_type {
         Some(dt) => dt.clone(),
-        None => infer_nearest_arrow_type(&array)?,
+        None => infer_nearest_arrow_type(&array, ctx)?,
     };
 
     let arrow = match &resolved_type {
@@ -193,7 +192,9 @@ pub(crate) fn execute_arrow_naive(
         dt @ (DataType::Date32 | DataType::Date64) => to_arrow_date(array, dt, ctx),
         dt @ (DataType::Time32(_) | DataType::Time64(_)) => to_arrow_time(array, dt, ctx),
         dt @ DataType::Timestamp(..) => to_arrow_timestamp(array, dt, ctx),
-        DataType::Map(entries_field, ordered) => to_arrow_map(array, entries_field, *ordered, ctx),
+        DataType::Map(entries_field, keys_sorted) => {
+            to_arrow_map(array, entries_field, *keys_sorted, ctx)
+        }
         DataType::FixedSizeBinary(_)
         | DataType::Duration(_)
         | DataType::Interval(_)
@@ -213,11 +214,11 @@ pub(crate) fn execute_arrow_naive(
 
 /// Determine the preferred (cheapest) Arrow type for an array.
 ///
-/// For most arrays, this returns the canonical Arrow type from `dtype.to_arrow_dtype()`.
+/// For most arrays, this returns the canonical Arrow type for the array's dtype.
 /// However, some encodings have cheaper Arrow representations:
 /// - `VarBinArray`: Uses `Utf8`/`Binary` (offset-based) instead of `Utf8View`/`BinaryView`
 /// - `ListArray`: Uses `List` instead of `ListView`
-fn infer_nearest_arrow_type(array: &ArrayRef) -> VortexResult<DataType> {
+fn infer_nearest_arrow_type(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<DataType> {
     // VarBinArray: use offset-based Binary/Utf8 instead of View types
     if let Some(varbin) = array.as_opt::<VarBin>() {
         let offsets_ptype = PType::try_from(varbin.offsets().dtype())?;
@@ -236,12 +237,13 @@ fn infer_nearest_arrow_type(array: &ArrayRef) -> VortexResult<DataType> {
     if let Some(list) = array.as_opt::<List>() {
         let offsets_ptype = PType::try_from(list.offsets().dtype())?;
         let use_large = matches!(offsets_ptype, PType::I64 | PType::U64);
-        // Recursively get the preferred type for elements
-        let elem_dtype = infer_nearest_arrow_type(list.elements())?;
-        let field = FieldRef::new(Field::new_list_field(
-            elem_dtype,
-            list.elements().dtype().is_nullable(),
-        ));
+        // Recursively get the preferred field for elements, so extension elements keep the
+        // `ARROW:extension:name` metadata their export plugin assigns.
+        let field = FieldRef::new(infer_nearest_arrow_field(
+            list.elements(),
+            Field::LIST_FIELD_DEFAULT_NAME,
+            ctx,
+        )?);
 
         return Ok(if use_large {
             DataType::LargeList(field)
@@ -250,6 +252,121 @@ fn infer_nearest_arrow_type(array: &ArrayRef) -> VortexResult<DataType> {
         });
     }
 
-    // Everything else: use canonical dtype conversion
-    to_data_type_naive(array.dtype())
+    // Everything else: defer to the session's canonical conversion, which additionally resolves
+    // extension dtypes (including ones nested inside containers) through their export plugins.
+    Ok(infer_nearest_arrow_field(array, "", ctx)?
+        .data_type()
+        .clone())
+}
+
+/// Determine the preferred (cheapest) Arrow [`Field`] for an array.
+///
+/// Unlike [`infer_nearest_arrow_type`] this preserves the Field-level `ARROW:extension:name`
+/// metadata that export plugins assign, which a bare [`DataType`] cannot carry.
+pub(crate) fn infer_nearest_arrow_field(
+    array: &ArrayRef,
+    name: &str,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<Field> {
+    // Only the encodings with a cheaper-than-canonical Arrow type need the inference; every other
+    // dtype goes through the session, which is the only thing that knows how to map extensions.
+    if array.is::<VarBin>() || array.is::<List>() {
+        let data_type = infer_nearest_arrow_type(array, ctx)?;
+        return Ok(Field::new(name, data_type, array.dtype().is_nullable()));
+    }
+    ctx.session()
+        .clone()
+        .arrow()
+        .to_arrow_field(name, array.dtype())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_schema::DataType;
+    use arrow_schema::Field;
+    use arrow_schema::TimeUnit;
+    use rstest::rstest;
+    use vortex_array::ArrayRef;
+    use vortex_array::IntoArray;
+    use vortex_array::VortexSessionExecute;
+    use vortex_array::array_session;
+    use vortex_array::arrays::BoolArray;
+    use vortex_array::arrays::PrimitiveArray;
+    use vortex_array::arrays::VarBinViewArray;
+
+    use crate::ArrowSessionExt;
+
+    fn utf8() -> ArrayRef {
+        VarBinViewArray::from_iter_str(["a", "bb"]).into_array()
+    }
+
+    fn primitive() -> ArrayRef {
+        PrimitiveArray::from_iter([1i32, 2]).into_array()
+    }
+
+    fn boolean() -> ArrayRef {
+        BoolArray::from_iter([true, false]).into_array()
+    }
+
+    fn list_target() -> DataType {
+        DataType::List(Arc::new(Field::new("item", DataType::Int32, true)))
+    }
+
+    /// Must error rather than panic inside `execute::<T>`.
+    #[rstest]
+    #[case::bool_from_utf8(utf8(), DataType::Boolean)]
+    #[case::bool_from_primitive(primitive(), DataType::Boolean)]
+    #[case::null_from_utf8(utf8(), DataType::Null)]
+    #[case::null_from_primitive(primitive(), DataType::Null)]
+    #[case::decimal_from_utf8(utf8(), DataType::Decimal128(10, 2))]
+    #[case::decimal_from_primitive(primitive(), DataType::Decimal128(10, 2))]
+    #[case::list_from_utf8(utf8(), list_target())]
+    #[case::list_from_primitive(primitive(), list_target())]
+    #[case::list_view_from_primitive(
+        primitive(),
+        DataType::ListView(Arc::new(Field::new("item", DataType::Int32, true)))
+    )]
+    #[case::fixed_size_list_from_utf8(
+        utf8(),
+        DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, true)), 2)
+    )]
+    #[case::byte_from_primitive(primitive(), DataType::Utf8)]
+    #[case::byte_from_bool(boolean(), DataType::Binary)]
+    fn incompatible_target_returns_error(#[case] array: ArrayRef, #[case] target: DataType) {
+        let session = array_session();
+        let mut ctx = session.create_execution_ctx();
+        let field = Field::new("f", target.clone(), array.dtype().is_nullable());
+
+        let result = session.arrow().execute_arrow(array, Some(&field), &mut ctx);
+
+        assert!(
+            result.is_err(),
+            "expected an error exporting to {target:?}, got Ok"
+        );
+    }
+
+    /// Cross-class conversions that are genuinely supported must keep working.
+    #[rstest]
+    #[case::bool_to_int32(boolean(), DataType::Int32)]
+    #[case::bool_to_float64(boolean(), DataType::Float64)]
+    #[case::primitive_to_int64(primitive(), DataType::Int64)]
+    #[case::primitive_to_date32(primitive(), DataType::Date32)]
+    #[case::primitive_to_timestamp(primitive(), DataType::Timestamp(TimeUnit::Microsecond, None))]
+    #[case::utf8_to_binary(utf8(), DataType::Binary)]
+    #[case::utf8_to_large_utf8(utf8(), DataType::LargeUtf8)]
+    fn supported_cross_class_target_still_works(#[case] array: ArrayRef, #[case] target: DataType) {
+        let session = array_session();
+        let mut ctx = session.create_execution_ctx();
+        let field = Field::new("f", target.clone(), array.dtype().is_nullable());
+
+        let result = session.arrow().execute_arrow(array, Some(&field), &mut ctx);
+
+        assert!(
+            result.is_ok(),
+            "expected {target:?} export to succeed, got {:?}",
+            result.err()
+        );
+    }
 }

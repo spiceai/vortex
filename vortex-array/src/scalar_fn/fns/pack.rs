@@ -23,6 +23,7 @@ use crate::dtype::FieldNames;
 use crate::dtype::Nullability;
 use crate::dtype::StructFields;
 use crate::expr::Expression;
+use crate::expr::display::ExprDisplay;
 use crate::expr::lit;
 use crate::scalar_fn::Arity;
 use crate::scalar_fn::ChildName;
@@ -105,13 +106,13 @@ impl ScalarFnVTable for Pack {
     fn fmt_sql(
         &self,
         options: &Self::Options,
-        expr: &Expression,
+        expr: &dyn ExprDisplay,
         f: &mut Formatter<'_>,
     ) -> std::fmt::Result {
         write!(f, "pack(")?;
-        for (i, (name, child)) in options.names.iter().zip(expr.children().iter()).enumerate() {
+        for (i, name) in options.names.iter().enumerate() {
             write!(f, "{}: ", name)?;
-            child.fmt_sql(f)?;
+            Display::fmt(expr.display_child(i), f)?;
             if i + 1 < options.names.len() {
                 write!(f, ", ")?;
             }
@@ -150,13 +151,13 @@ impl ScalarFnVTable for Pack {
             .execute(ctx)
     }
 
-    // This applies a nullability
-    fn is_null_sensitive(&self, _instance: &Self::Options) -> bool {
-        true
+    fn is_strict(&self, _instance: &Self::Options) -> bool {
+        // A null field value does not force the packed struct row to be null.
+        false
     }
 
-    fn is_fallible(&self, _instance: &Self::Options) -> bool {
-        false
+    fn is_infallible(&self, _instance: &Self::Options) -> bool {
+        true
     }
 }
 

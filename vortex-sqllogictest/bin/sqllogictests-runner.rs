@@ -21,6 +21,10 @@ use sqllogictest::harness::Arguments;
 use sqllogictest::harness::Failed;
 use sqllogictest::harness::Trial;
 use sqllogictest::strict_column_validator;
+use vortex::VortexSessionDefault;
+use vortex::editions::CORE_2026_08_3;
+use vortex::editions::EditionSessionExt;
+use vortex::session::VortexSession;
 use vortex_datafusion::VortexFormatFactory;
 use vortex_datafusion::VortexTableOptions;
 use vortex_sqllogictest::duckdb::DuckDB;
@@ -44,18 +48,18 @@ enum Mode {
     Complete,
 }
 
-/// Builds a single-threaded Tokio runtime for one test file.
+/// Builds a single-threaded Tokio runtime for one DataFusion test file.
 ///
 /// `libtest-mimic` runs each trial on its own thread, so a current-thread
-/// runtime keeps blocking DuckDB calls and async DataFusion work isolated per
-/// file instead of contending for shared multi-threaded runtime workers.
+/// runtime keeps async DataFusion work isolated per file instead of contending
+/// for shared multi-threaded runtime workers.
 fn build_runtime() -> anyhow::Result<tokio::runtime::Runtime> {
     Ok(tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?)
 }
 
-/// Runs or completes a single `.slt` file against DataFusion reading Vortex files.
+/// Runs or completes a single `.slt` file against DataFusion.
 fn drive_datafusion(path: &Path, work_dir: &Path, mode: Mode) -> anyhow::Result<()> {
     reset_dir(work_dir)?;
     let _guard = WorkDirGuard::new(work_dir.to_path_buf());
@@ -63,20 +67,25 @@ fn drive_datafusion(path: &Path, work_dir: &Path, mode: Mode) -> anyhow::Result<
 
     let rt = build_runtime()?;
     rt.block_on(async {
-        let config = SessionConfig::default().with_option_extension(VortexTableOptions::default());
-        let factory = Arc::new(VortexFormatFactory::new());
+        // Keep EXPLAIN plans independent of the host's CPU count.
+        let config = SessionConfig::default()
+            .with_target_partitions(4)
+            .with_option_extension(VortexTableOptions::default());
+        let vortex_session = VortexSession::default();
+        vortex_session.enable_edition(CORE_2026_08_3)?;
+        let factory = Arc::new(VortexFormatFactory::new_with_session(vortex_session));
         let session_state_builder = SessionStateBuilder::new()
             .with_config(config)
             .with_default_features()
             .with_table_factory(
                 factory.get_ext().to_uppercase(),
                 Arc::new(DefaultTableFactory::new()),
-            )
-            .with_file_formats(vec![factory]);
+            );
+        let mut session_state = session_state_builder.build();
+        session_state.register_file_format(factory, false)?;
         // The workspace builds `datafusion` without the `nested_expressions` feature, so array
         // functions (e.g. `make_array`, `array_length`) are not registered by default. Register
         // them explicitly so SLT files can construct and query list columns.
-        let mut session_state = session_state_builder.build();
         datafusion_functions_nested::register_all(&mut session_state)?;
         let session = SessionContext::new_with_state(session_state).enable_url_table();
 
@@ -96,14 +105,17 @@ fn drive_datafusion(path: &Path, work_dir: &Path, mode: Mode) -> anyhow::Result<
     })
 }
 
-/// Runs or completes a single `.slt` file against DuckDB reading Vortex files.
+/// Runs or completes a single `.slt` file against DuckDB.
 fn drive_duckdb(path: &Path, work_dir: &Path, mode: Mode) -> anyhow::Result<()> {
     reset_dir(work_dir)?;
     let _guard = WorkDirGuard::new(work_dir.to_path_buf());
     let work_dir = work_dir.to_string_lossy().into_owned();
 
-    let rt = build_runtime()?;
-    rt.block_on(async {
+    // Deliberately not a Tokio runtime. DuckDB scans drive Vortex's own runtime, and a Vortex
+    // runtime driven from a thread inside `tokio::runtime::Runtime::block_on` loses the wakeups
+    // that complete its I/O and stalls forever (#9817). `AsyncDB::run` for DuckDB is synchronous
+    // and no DuckDB `.slt` uses the `sleep` or `system` directives, so nothing here needs Tokio.
+    futures::executor::block_on(async {
         let mut runner = Runner::new(|| async {
             DuckDB::try_new().map(|db| PathNormalizing::new(db, work_dir.clone()))
         });
@@ -156,20 +168,29 @@ fn engines_for(path: &Path) -> (bool, bool) {
     (datafusion, duckdb)
 }
 
-fn is_tpch(path: &Path) -> bool {
-    path.components().any(|c| c.as_os_str() == "tpch")
+/// Suites whose tables come from a `generate_data.sh` script rather than the
+/// test itself: the `slt/` subdirectory holding the suite, and a file whose
+/// Vortex and Parquet versions both have to exist for the suite to run.
+const GENERATED_DATASETS: &[(&str, &str)] = &[
+    ("tpch", "tpch/data/lineitem"),
+    ("clickbench", "clickbench/data/hits"),
+];
+
+/// Whether `path` belongs to a generated-data suite whose data is absent.
+fn missing_generated_data(path: &Path) -> bool {
+    GENERATED_DATASETS.iter().any(|(dir, fixture)| {
+        path.components().any(|c| c.as_os_str() == *dir)
+            && !["vortex", "parquet"]
+                .into_iter()
+                .all(|format| SLT_ROOT.join(format!("{fixture}.{format}")).exists())
+    })
 }
 
 /// Rewrites the expected output of each file in place, completing from a single
 /// reference engine per file (DuckDB for `duckdb/` files, DataFusion otherwise).
-fn complete_files(
-    args: &Arguments,
-    files: &[PathBuf],
-    slt_root: &Path,
-    has_tpch_data: bool,
-) -> anyhow::Result<()> {
+fn complete_files(args: &Arguments, files: &[PathBuf], slt_root: &Path) -> anyhow::Result<()> {
     for path in files {
-        if is_tpch(path) && !has_tpch_data {
+        if missing_generated_data(path) {
             continue;
         }
         let name = path
@@ -213,22 +234,21 @@ fn main() -> anyhow::Result<ExitCode> {
     };
     let args = Arguments::from_iter(raw_args);
 
-    let has_tpch_data = SLT_ROOT.join("tpch/data/lineitem.vortex").exists();
-
     let mut files = list_files(SLT_ROOT.as_path())?;
     files.sort();
 
     if complete {
-        complete_files(&args, &files, SLT_ROOT.as_path(), has_tpch_data)?;
+        complete_files(&args, &files, SLT_ROOT.as_path())?;
         return Ok(ExitCode::SUCCESS);
     }
 
     let mut trials = Vec::new();
     for path in files {
         let (run_datafusion, run_duckdb) = engines_for(&path);
-        // TPC-H trials are ignored (rather than removed) when the generated data
-        // is absent, so `--list` and the run summary still account for them.
-        let ignored = is_tpch(&path) && !has_tpch_data;
+        // TPC-H and ClickBench trials are ignored (rather than removed) when the
+        // generated data is absent, so `--list` and the run summary still
+        // account for them.
+        let ignored = missing_generated_data(&path);
         let name = path
             .strip_prefix(SLT_ROOT.as_path())
             .unwrap_or(&path)

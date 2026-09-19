@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use vortex_buffer::BitBuffer;
 use vortex_buffer::Buffer;
+use vortex_buffer::BufferAllocatorRef;
 use vortex_buffer::buffer;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
@@ -20,13 +21,15 @@ use crate::arrays::DecimalArray;
 use crate::arrays::ExtensionArray;
 use crate::arrays::FixedSizeListArray;
 use crate::arrays::ListViewArray;
+use crate::arrays::MapArray;
 use crate::arrays::NullArray;
 use crate::arrays::PrimitiveArray;
 use crate::arrays::StructArray;
+use crate::arrays::UnionArray;
 use crate::arrays::VarBinViewArray;
 use crate::arrays::VariantArray;
 use crate::arrays::varbinview::BinaryView;
-use crate::builders::builder_with_capacity;
+use crate::builders::builder_with_capacity_in;
 use crate::dtype::DType;
 use crate::dtype::DecimalType;
 use crate::dtype::Nullability;
@@ -125,7 +128,21 @@ pub(crate) fn constant_canonicalize(
                 array.len(),
             ))
         }
-        DType::List(..) => Canonical::List(constant_canonical_list_array(scalar, array.len())),
+        DType::List(..) => Canonical::List(constant_canonical_list_array(
+            scalar,
+            array.len(),
+            ctx.allocator(),
+        )),
+        DType::Map(map_dtype, nullability) => {
+            let entries_scalar = Scalar::try_new(
+                DType::List(Arc::new(map_dtype.entries_dtype()), *nullability),
+                scalar.value().cloned(),
+            )?;
+            Canonical::Map(MapArray::try_new(
+                map_dtype.clone(),
+                constant_canonical_list_array(&entries_scalar, array.len(), ctx.allocator()),
+            )?)
+        }
         DType::FixedSizeList(element_dtype, list_size, _) => {
             let value = scalar.as_list();
 
@@ -135,6 +152,7 @@ pub(crate) fn constant_canonicalize(
                 *list_size,
                 value.dtype().nullability(),
                 array.len(),
+                ctx.allocator(),
             ))
         }
         DType::Struct(struct_dtype, _) => {
@@ -164,7 +182,7 @@ pub(crate) fn constant_canonicalize(
                 StructArray::new_unchecked(fields, struct_dtype.clone(), array.len(), validity)
             })
         }
-        DType::Union(..) => todo!("TODO(connor)[Union]: unimplemented"),
+        DType::Union(..) => Canonical::Union(UnionArray::constant(scalar, array.len())?),
         DType::Variant(_) => Canonical::Variant(VariantArray::try_new(
             array.array().clone().into_array(),
             None,
@@ -236,18 +254,23 @@ fn constant_canonical_byte_view(
 ///
 /// We basically just project the list scalar value into list view components. If the caller wants
 /// a fully decompressed and non-overlapping array, they can rebuild the array.
-fn constant_canonical_list_array(scalar: &Scalar, len: usize) -> ListViewArray {
+fn constant_canonical_list_array(
+    scalar: &Scalar,
+    len: usize,
+    allocator: &BufferAllocatorRef,
+) -> ListViewArray {
     let list = scalar.as_list();
 
     // Since "canonicalize" only applies to the top level array, we can simply have 1 scalar in our
     // child `elements` and have all list views point to that scalar.
     let elements = if let Some(elements) = list.elements() {
         // Extract the list elements out of the scalar into a new array.
-        let mut builder = builder_with_capacity(
+        let mut builder = builder_with_capacity_in(
             list.dtype()
                 .as_list_element_opt()
                 .vortex_expect("list scalar somehow did not have a list DType"),
             list.len(),
+            allocator,
         );
         for scalar in &elements {
             builder
@@ -290,13 +313,15 @@ fn constant_canonical_fixed_size_list_array(
     list_size: u32,
     list_nullability: Nullability,
     len: usize,
+    allocator: &BufferAllocatorRef,
 ) -> FixedSizeListArray {
     match values {
         None => {
             // Even though the scalar is null, we still have to allocate the correct amount of space
             // for the given `DType`.
             let elements_len = list_size as usize * len;
-            let mut element_builder = builder_with_capacity(element_dtype, elements_len);
+            let mut element_builder =
+                builder_with_capacity_in(element_dtype, elements_len, allocator);
             element_builder.append_defaults(elements_len);
             let elements = element_builder.finish();
 
@@ -307,7 +332,8 @@ fn constant_canonical_fixed_size_list_array(
             }
         }
         Some(values) => {
-            let mut elements_builder = builder_with_capacity(element_dtype, len * values.len());
+            let mut elements_builder =
+                builder_with_capacity_in(element_dtype, len * values.len(), allocator);
 
             for _ in 0..len {
                 for v in &values {
@@ -350,7 +376,8 @@ mod tests {
     use crate::arrays::VarBinArray;
     use crate::arrays::VarBinViewArray;
     use crate::arrays::fixed_size_list::FixedSizeListArrayExt;
-    use crate::arrays::listview::ListViewArrayExt;
+    use crate::arrays::fixed_size_list::FixedSizeListArraySlotsExt;
+    use crate::arrays::listview::ListViewArraySlotsExt;
     use crate::arrays::listview::ListViewRebuildMode;
     use crate::arrays::struct_::StructArrayExt;
     use crate::assert_arrays_eq;

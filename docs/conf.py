@@ -1,10 +1,13 @@
 import doctest
 import os
 import re
+import sys
 from pathlib import Path
 
 import hawkmoth.docstring
 from sphinx.util import logging
+
+sys.path.insert(0, str(Path(__file__).parent / "_ext"))
 
 log = logging.getLogger("vortex.docs.conf")
 
@@ -23,7 +26,6 @@ author = "Vortex contributors"
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
 
 extensions = [
-    "breathe",  # C++ API (Doxygen -> Sphinx bridge)
     "hawkmoth",  # C API
     "myst_parser",  # Markdown support
     "sphinx.ext.autodoc",
@@ -31,17 +33,12 @@ extensions = [
     "sphinx.ext.doctest",
     "sphinx.ext.intersphinx",
     "sphinx.ext.napoleon",
-    "sphinx_copybutton",
-    "sphinx_design",
-    "sphinx_inline_tabs",
-    "sphinxcontrib.bibtex",
-    "sphinxcontrib.mermaid",
-    "sphinxext.opengraph",
+    "vortex_theme",
 ]
 
 templates_path = ["_templates"]
 html_show_sourcelink = False
-exclude_patterns = ["_build", "Thumbs.db", ".DS_Store", "README.md"]
+exclude_patterns = ["_build", "Thumbs.db", ".DS_Store", "README.md", "AGENTS.md"]
 
 intersphinx_mapping = {
     "python": ("https://docs.python.org/3", None),
@@ -54,7 +51,20 @@ intersphinx_mapping = {
 git_root = Path(__file__).parent.parent
 
 nitpicky = True  # ensures all :class:, :obj:, etc. links are valid
-nitpick_ignore = []
+nitpick_ignore = [
+    # `vortex.store.CosStore` / `GoosefsStore` are re-exported through private modules,
+    # and the `ObjectStore` type alias resolves to those private paths. The public
+    # classes are fully documented in `opendal.rst`; the private paths are intentionally not.
+    ("py:class", "vortex.store._cos.CosStore"),
+    ("py:class", "vortex.store._goosefs.GoosefsStore"),
+    # `vortex.store.CosStore` / `GoosefsStore` / `HfStore` are the native classes re-exported
+    # through private modules, so annotations resolve to their `vortex._lib` module paths. The
+    # public classes are fully documented in `opendal.rst` / `huggingface.rst`; the native paths
+    # are intentionally not.
+    ("py:class", "vortex._lib.CosStore"),
+    ("py:class", "vortex._lib.GoosefsStore"),
+    ("py:class", "vortex._lib.HfStore"),
+]
 
 doctest_global_setup = "import pyarrow; import vortex; import vortex as vx; import random; random.seed(a=0)"
 doctest_default_flags = (
@@ -71,59 +81,14 @@ myst_heading_anchors = 3
 # -- Options for HTML output -------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#options-for-html-output
 
-html_theme = "pydata_sphinx_theme"
-html_static_path = ["_static"]
-html_css_files = ["style.css"]
+html_theme = "vortex"
+html_theme_path = ["_theme"]
+html_baseurl = "https://docs.vortex.dev/"
+html_static_path = ["_static", "_build/_gen_static"]
+html_extra_path = ["_headers"]  # Cloudflare Pages CSP headers
 html_favicon = "_static/vortex_logo.svg"  # relative to _static/
 
-# -- Options for PyData Sphinx Theme ----------------------------------------
-
-html_theme_options = {
-    "logo": {
-        "image_light": "_static/vortex_logo.svg",
-        "image_dark": "_static/vortex_logo_dark_theme.svg",
-    },
-    "github_url": "https://github.com/vortex-data/vortex",
-    "icon_links": [
-        {
-            "name": "PyPI",
-            "url": "https://pypi.org/project/vortex-data",
-            "icon": "fa-brands fa-python",
-        },
-        {
-            "name": "Crates.io",
-            "url": "https://crates.io/crates/vortex",
-            "icon": "fa-brands fa-rust",
-        },
-    ],
-    "header_links_before_dropdown": 7,
-    "navbar_align": "left",
-    "show_nav_level": 2,
-    "navigation_depth": 3,
-    "show_toc_level": 2,
-}
-
-# -- Options for OpenGraph ---------------------------------------------------
-
-ogp_site_url = "https://docs.vortex.dev"
-ogp_image = "https://docs.vortex.dev/_static/vortex_logo.svg"
-
-# -- Options for Sphinx BibTEX -------------------------------------------
-
-bibtex_bibfiles = ["references.bib"]
-
-# -- Options for Breathe C++ API gen ------------------------------------
-
-_doxygen_xml_dir = str(Path(__file__).parent / "_build" / "doxygen-cpp" / "xml")
-
-os.makedirs(os.path.dirname(_doxygen_xml_dir), exist_ok=True)
-
-# if not shutil.which("doxygen"):
-#    raise RuntimeError("doxygen is required to build the docs but was not found on PATH")
-# subprocess.run(["doxygen", "Doxyfile.cpp"], cwd=Path(__file__).parent, check=True)
-
-breathe_projects = {"vortex-cpp": _doxygen_xml_dir}
-breathe_default_project = "vortex-cpp"
+os.makedirs(Path(__file__).parent / "_build" / "_gen_static", exist_ok=True)
 
 # -- Options for hawkmoth C API gen ----------------------------
 
@@ -151,7 +116,7 @@ hawkmoth_transform_default = "c_to_rust"
 C_DOCS: set[str] | None = None
 
 
-def _replace_rust_references(app, lines, transform, options):
+def _replace_rust_references(app, lines, transform, options) -> None:
     """Replace Rust references with C equivalents in hawkmoth docstrings.
 
     See: https://hawkmoth.readthedocs.io/en/stable/extending.html#event-hawkmoth-process-docstring
@@ -189,7 +154,7 @@ def _replace_rust_references(app, lines, transform, options):
     # Pattern to match [`crate::path::to::function`]
     pattern = r"\[`([^:]+::)*?(vx_[^`]+)`\]"
 
-    def replace_match(match):
+    def replace_match(match) -> str:
         # Extract the function name (already starts with vx_)
         # TODO(ngates): detect if the reference is a function or a type
         func_name = match.group(2)
@@ -218,7 +183,7 @@ def _replace_rust_references(app, lines, transform, options):
         lines[i] = re.sub(pattern, replace_match, line)
 
 
-def _post_process(app, builder):
+def _post_process(app, builder) -> None:
     """Post-process the documentation after writing."""
     global C_DOCS
     if C_DOCS:
@@ -235,7 +200,9 @@ os.environ["COLUMNS"] = "80"
 os.environ["POLARS_TABLE_WIDTH"] = "80"
 
 
-def _convert_python_fenced_blocks_from_rust_to_valid_reST_blocks(app, what, name, obj, options, lines: list[str]):
+def _convert_python_fenced_blocks_from_rust_to_valid_reST_blocks(
+    app, what, name, obj, options, lines: list[str]
+) -> None:
     """Remove Markdown-style code fences from Python docs written in Rust.
 
     We would like `cargo test` to Just Work (TM). Unfortunately, by default, it executes any
@@ -287,7 +254,7 @@ def _convert_python_fenced_blocks_from_rust_to_valid_reST_blocks(app, what, name
             in_block = False
 
 
-def _resolve_breathe_cpp_references(app, env, node, contnode):
+def _resolve_breathe_cpp_references(app, env, node, contnode) -> object | None:
     """Resolve relative C++ references emitted by Breathe.
 
     Breathe emits cross-namespace parameter types with relative qualifiers (e.g. ``scalar::Scalar``
@@ -310,7 +277,7 @@ def _resolve_breathe_cpp_references(app, env, node, contnode):
     )
 
 
-def setup(app):
+def setup(app) -> None:
     app.connect("hawkmoth-process-docstring", _replace_rust_references)
     app.connect("write-started", _post_process)
     app.connect("autodoc-process-docstring", _convert_python_fenced_blocks_from_rust_to_valid_reST_blocks)
