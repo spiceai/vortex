@@ -16,9 +16,9 @@ impl OperationsVTable<Extension> for Extension {
         index: usize,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Scalar> {
-        Ok(Scalar::extension_ref(
+        Scalar::try_extension_ref(
             array.ext_dtype().clone(),
             array.storage_array().execute_scalar(index, ctx)?,
-        ))
+        )
     }
 }
