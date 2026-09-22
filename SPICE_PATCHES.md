@@ -79,14 +79,22 @@ reading the new upstream code and re-implementing the fix, not resolving conflic
 | # | Patch | Old origin | What changed upstream |
 |---|---|---|---|
 | 6 | Avoid session lock re-entry in writer init | `c536c9aed` (#29) | `vortex-file/src/writer.rs` is +369/-44 lines different at `0.85.0`; nothing to cherry-pick onto. Still a **GAP** — no guard test exists in the Spice main repo either. |
-| 7, 15, 16 | `vortex.date`→`vortex.timestamp` array + scalar casts, timestamp validation via `storage_range` | `7e5b08151` (#28), this branch's `3c5246867` (#93) | `CastReduce::cast` signature changed from `fn cast(array: &ExtensionArray, ...)` to `fn cast(array: ArrayView<'_, Extension>, ...)`. The exact function Spice added (`cast_temporal_date_to_timestamp`) doesn't exist at `0.85.0`. Real conflicts in `vortex-array/src/arrays/extension/compute/cast.rs` and `vortex-array/src/extension/datetime/{timestamp,mod}.rs`. High priority: row 15/16 guard spiceai/spiceai#13624 (wrongly pruned files / silently wrong data). |
-| 4 | Fixed-offset timezone resolution | `6cdea73d6` (#75), `5b4bee108` (#78) | `vortex-array/src/extension/datetime/timezone.rs` is **deleted** in the merge-conflict sense at `0.85.0` (moved/restructured) — real conflicts also in `vortex-array/src/scalar/constructor.rs` and `vortex-duckdb/src/convert/{dtype,scalar}.rs`. The previous ledger's Verify (`test -f timezone.rs`) never actually proved this row; re-verify the real behavior once re-ported. |
 | 10 (real fix) | `UncompressedSizeInBytes` in `vortex-array/src/arrays/dict/take.rs` + `stats/mod.rs` | `a9ef29dea` (previously **not in the ledger at all** — the old ledger cited only the vendored, out-of-scope `6712e9ffa`) | `0.85.0` moved this into a new `vortex-array/src/aggregate_fn/fns/uncompressed_size_in_bytes/mod.rs` implementing `AggregateFnVTable`. Plausible the redesign already subsumes this fix; re-verify against the new module rather than assuming either way. |
 | 11 | Intra-file decode parallelism | `26b274c72` (#62) | Real conflicts in `vortex-file/Cargo.toml`, `vortex-file/src/tests.rs`; `vortex-layout/src/scan/split_by.rs` also changed upstream (small diff, not yet compared line-by-line). Perf-only; still a ledger **GAP** (no guard). |
 | — | Cache `ArrayKernels` as a per-`ExecutionCtx` snapshot | `ccaa55627` | Real conflict in `vortex-array/src/executor.rs`. Perf-only. Not previously in the ledger. |
 | — | Restore `load_full` + `HashMap` import "dropped in rebase" | `ab4f0b177` | `vortex-array/src/arc_swap_map.rs` is deleted at `0.85.0` (modify/delete conflict) — check whether the underlying function this restored still has a reason to exist before re-porting; may be moot. Not previously in the ledger. |
-| — | Migrate extension date-cast + Arrow Map test to ctx execute APIs | `d41e094cf` | Conflicts in `cast.rs` (same `ArrayView` signature issue as row 7) and `vortex-arrow/src/convert.rs`. Bundle with the row 7/15/16 re-port and the Map-alias re-port below — touches both areas. Not previously in the ledger. |
 | — | Restore lint checks on forks | `bb80c537b` | Conflicts across `.github/workflows/ci.yml`, `cast.rs`, `vortex-datafusion/src/persistent/sink.rs` (the last is out of scope). Low priority — CI config for this fork, not behavior Spice depends on. |
+
+## Applied — re-ported as fresh implementations (not clean cherry-picks)
+
+These landed as new commits against `0.85.0` rather than cherry-picks, since the code they touch was restructured. Each is behaviorally verified, not just compiled.
+
+| # | Patch | New commit | Old origin | Verify |
+|---|---|---|---|---|
+| 4 | Fixed-offset timezone resolution (`resolve_timezone`, threaded through scalar validation, `Display`, and `TemporalMetadata::to_jiff`; `Scalar::try_extension_ref` through the 4 sites that built extension scalars infallibly on a read path) | `dc9892190` | `6cdea73d6` (#75), `5b4bee108` (#78) | `cargo test -p vortex-array --lib extension::datetime::timezone extension::datetime::matcher` — **ran, 42 pass** |
+| 7, 15, 16 | `vortex.date`→`vortex.timestamp` array + scalar casts via a shared `DateToTimestamp`, `Timestamp::storage_range` replacing Jiff-`Span`-based validation | `dc9892190` (supersedes this branch's earlier `a98a78c1b`, which used a `legacy_session()` workaround instead of the proper `CastKernel` split found in this row's own later Spice history) | `7e5b08151` (#28), this branch's `3c5246867` (#93) | `cargo test -p vortex-array --lib arrays::extension::compute::cast scalar::typed_view::extension` — **ran, all pass**; full crate: `cargo test -p vortex-array -p vortex-datetime-parts --lib` — **3428 + 72 pass, 0 failed** |
+
+Not ported: the DuckDB `TIMESTAMP_TZ` dtype/scalar `is_utc_timezone` gate (`vortex-duckdb/src/convert/{dtype,scalar}.rs`) — `vortex-duckdb` is not a crate Spice's `Cargo.toml` consumes, directly or transitively. Fork hygiene, not something Spice's re-pin needs; left open.
 
 ## Untracked in the previous ledger — needs its own audit
 
