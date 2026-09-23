@@ -20,6 +20,68 @@ loss surfaced not as a build failure but as a runtime write error on a released 
 
 This file is the list that upgrade work checks against.
 
+## This branch: `spiceai-55` (upstream `0.86.1`, DataFusion 55.1.0 / Arrow 59.2)
+
+Built by merging upstream tag `0.86.1` into `spiceai-54` (`git branch spiceai-55
+origin/spiceai-0.86`, tip `3a4c695c0`) rather than a fresh cherry-pick re-cut — the merge
+mechanically carries every `spiceai-54` commit forward, so nothing needs to be individually
+re-selected the way a re-cut does. `Cargo.toml` pins `datafusion = "55.1.0"`,
+`arrow-*`/`parquet = "59.2"`. `cargo check`/`cargo test --lib` on `vortex-array`,
+`vortex-io`, `vortex-scan`, `vortex-session`, `vortex-utils`, `vortex-btrblocks`,
+`vortex-datafusion` are clean (0 failures across 249 lib tests); the `vortex-io
+--features tokio --test cancel_stress` mechanical guard for rows 1–3 could not be run in
+this environment (`cargo` hit `ENOSPC` mid-compile — a full disk shared with concurrent
+builds on the same machine, unrelated to this branch) — treat rows 1–3 as grep-verified
+only, not behaviorally re-confirmed, until that test is run somewhere with disk headroom.
+
+**Reconciliation with `spiceai-54-vortex-0.85.0` + PR spiceai/vortex#101**
+(spiceai/spiceai#13570): a separate, independently-run 0.79.0→0.85.0 re-cut (still
+DataFusion 54 / Arrow 58.3) exists on `origin/spiceai-54-vortex-0.85.0`, with two more
+commits on top on `viktor/vortex-0.85.0-map-and-cast-fixes` (PR #101, open). That work is a
+**subset** of what landed here, checked patch-by-patch:
+
+- Row 14 (Arrow `Map`): PR #101 independently confirmed upstream's native `Map` type
+  (`vortex-array/src/dtype/map.rs`) supersedes the old alias, via
+  `cargo test -p vortex-arrow --lib map` (17 pass). Same conclusion this branch reached
+  independently for `0.86.1`; native `Map` is present here too.
+- Rows 7/15/16 (date→timestamp array + scalar casts): PR #101 re-implemented
+  `cast_date_days_to_timestamp_{nanoseconds,seconds_nullable}` against `0.85.0`'s
+  `CastReduce::cast(array: ArrayView<'_, Extension>, ...)` signature. `spiceai-55` has the
+  *same* two test names in `vortex-array/src/arrays/extension/compute/cast.rs`, landed
+  independently via the `0.86.1` merge resolution — convergent evidence the fix is right.
+- Row 13 (`set_available_parallelism`) and the untracked 2026-09-11 IN-list rewrite series
+  (`6c9ffc507`, `2f1a22ada`, `af1c5b301`, `f73241661`, `95d40c8bb`, `aff66352b`) and
+  `4e2d62654` (absolute split concurrency, #87): all are ancestors of `spiceai-54`'s tip and
+  so are carried into `spiceai-55` by construction (`git merge-base --is-ancestor <sha>
+  spiceai-55` — not re-run after the disk filled, but true by the merge's construction: no
+  commit reachable from `spiceai-54` can be dropped by a `git merge` of it). The 0.85.0
+  re-cut explicitly deferred all of these ("budget a dedicated session" for the IN-list
+  series) — they are **not yet on that line**, so `spiceai-55` is currently ahead of it.
+- Row 4 (timezone) and row 6 (writer lock re-entry): the 0.85.0 ledger marks both
+  "needs re-porting" (real conflicts, not attempted). This branch has
+  `vortex-array/src/extension/datetime/timezone.rs` (199 lines vs. `0.86.1`, lib tests
+  pass) and `vortex-file/src/writer.rs`'s `new_array_context` now calls
+  `session.arrays()` once into a local and reuses it — the reentrant-lock shape row 6
+  fixed no longer exists structurally, upstream, independent of either fork's patch. No
+  dedicated regression test for either in this branch (same gap the 0.85.0 ledger notes).
+- Row 9 (pushdown bubbles `TRUE` for an unsupported node) and row 10
+  (`UncompressedSizeInBytes`): the 0.85.0 ledger correctly notes `vortex-datafusion` is
+  vendored into Spice's main repo as `crates/vortex` and not taken from this fork — out of
+  scope here too. Checked row 9 directly on `spiceai-55`: `vortex-datafusion/src/convert/exprs.rs`
+  still carries only the **TODO comment** ("Don't return an error when we have an
+  unsupported node, bubble up TRUE..."), not the behavior — consistent with "vendored
+  elsewhere, not this fork's problem," but worth flagging since the comment could be
+  mistaken for the fix being present.
+
+Net: `spiceai-55` is a content superset of `spiceai-54-vortex-0.85.0` + PR #101 for every
+patch currently landed on either line, and is additionally already on the target
+`0.86.1`/DataFusion 55.1/Arrow 59.2. The trade-off is git-history shape: this is one merge
+commit rather than individually cherry-picked commits per patch, so a future re-cut auditor
+has to read this section (and the merge diff) rather than `git log --oneline` a dedicated
+`-patches` branch. If the team wants the cherry-pick provenance restored, the individual
+original SHAs are unchanged in `spiceai-54`'s history and can still be cherry-picked onto a
+fresh `0.86.1` branch using this section as the row-by-row map.
+
 ## Convention
 
 Follow what the DataFusion fork does:
@@ -54,7 +116,7 @@ exists: a grep proves presence, a test proves behaviour.
 | 15 | `vortex.date` → `vortex.timestamp` **scalar** cast | this change | Row 7 covers arrays only. A scan casts a file's `min`/`max` statistic — a scalar — through the same expression, and `Scalar::cast` routed an extension source through the *target's* storage type: `date[days]` failed the scan outright, and `date[ms]` shares `i64` with `timestamp[ns]`, so it silently returned an instant 10^6 too small and pruned files that held matching rows (spiceai/spiceai#13624) | `cargo test -p vortex-array --lib scalar::typed_view::extension::tests::test_ext_scalar_cast` | No |
 | 16 | Timestamp validation uses `storage_range`, and rendering never aborts | this change | `Timestamp` validated a storage value, and rendered one, by building a Jiff span from it, and a span's limits are not a timestamp's. They stop one short of `i64::MIN` nanoseconds — 1677-09-21, an instant a `timestamp[ns]` array holds — so a scalar built from such a column's statistic was refused although the array carried it. They also run *past* the last instant, and the unchecked constructors abort outside them, so `i64::MAX` seconds panicked rather than being reported. `unpack_native` now checks `Timestamp::storage_range`, which is also the range row 15's conversion targets, so the two cannot drift apart. `Display` still uses a span for seconds through microseconds, whose limits enclose the timestamp's, but only the *checked* constructors plus `checked_add`, and it takes nanoseconds through `Timestamp::from_nanosecond`, whose range covers every `i64`; a count that denotes no instant renders as itself, since a `Display` impl cannot report a failure. Reachable from any read, or any formatting, of such a value | `cargo test -p vortex-array --lib extension::datetime::timestamp` | Proposed — upstream defect, not Spice behaviour |
 | 8 | N-ary `CASE WHEN` expression | `4bfa4331b` (#12), `df23c3797` | Expression support required by pushdown | — (needs a check) | Possibly upstream |
-| 9 | Unsupported pushdown node bubbles `TRUE` | `8044a8470` (#8) | Pushdown erroring instead of degrading to "keep row"; empty `IN` list | — (needs a check) | No |
+| 9 | Unsupported pushdown node bubbles `TRUE` | `8044a8470` (#8) | Pushdown erroring instead of degrading to "keep row"; empty `IN` list | Out of scope for this fork: `vortex-datafusion` is vendored into Spice's main repo as `crates/vortex`, not taken from here. Only a leftover TODO comment survives in this fork's `vortex-datafusion/src/convert/exprs.rs`; the behavior itself is not implemented on this branch and was never expected to be | No (vendored elsewhere) |
 | 10 | `UncompressedSizeInBytes` statistic handling | `6712e9ffa` (#3) | Incorrect statistic propagation | — (needs a check) | No |
 | 11 | Intra-file decode parallelism | `9d3aafb06`, `26b274c72` (#62) | Scan throughput on large chunk spans | — (needs a check) | Possibly upstream |
 | 12 | Restore lint checks on forks | `bb80c537b` | Fork CI not running lints | — (CI config) | No |
