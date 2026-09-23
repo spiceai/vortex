@@ -63,10 +63,13 @@ content in favor of this rewrite, not by a code-level resolution. The actual cod
 | 9 | Pushdown TRUE-bubbling / empty `IN` list | `8044a8470` (#8) | Both touched files are in `vortex-datafusion`, which Spice vendors directly into `crates/vortex` in the main repo (`vortex-datafusion = { path = "crates/vortex" }`) and does not take from this fork at all. Not fork state. |
 | 10 (partial) | `UncompressedSizeInBytes` in `vortex-datafusion/src/persistent/format.rs` | `6712e9ffa` (#3) | Same as row 9 — vendored, out of scope for this fork. |
 | 5 | Balanced `list_contains` OR tree | `d694abda6` (#37) | The function this commit added (`or_arrays_balanced`/`array_depth`) no longer exists anywhere in `spiceai-54`'s own later history — superseded internally by the untracked Sept-11 series (see below), which itself converges with `0.85.0`'s own `vortex_utils::iter::ReduceBalancedIterExt`. Dead code; nothing to carry. |
-| 14 (old origin only) | Original Arrow Map alias | `1a6dc54f1` | Superseded by the Aug-26 restoration pair (see **Needs re-porting** below); its files (`vortex-array/src/arrow/*`) predate the `vortex-arrow` crate split and no longer exist. |
 | — | `ea3890528` "duckdb 1.5.5 (#8895)" | — | Not a Spice patch: identical to upstream's own `0.80.0` release commit (`037b1a8778db`), already superseded by landing on `0.85.0`. |
 | — | `68badd689` "TableStrategy hides panic... (#8672)" | — | Not a Spice patch: `(cherry picked from commit 4abe3d04f...)`, authored by a Vortex/spiraldb maintainer, cherry-picked onto `spiceai-54` ahead of a release. Already upstream. |
 | — | `b5498e8e1` "get CI green" (#81), `8d2efe7a7` style import sort | — | CI/lint housekeeping for subsystems Spice doesn't build (java/, python/, ffi/) or trivial reformatting of files already changed upstream. Not carried; not fork state Spice depends on. |
+| — | `ab4f0b177` "restore load_full + HashMap import dropped in rebase" | — | `vortex-array/src/arc_swap_map.rs` doesn't exist at `0.85.0` at all (not moved, gone), and `grep -rn "load_full"` across `vortex-array/src` finds zero matches. Spice's own fix for a Spice-only prior rebase mistake in a file structure that no longer exists. Nothing to port. |
+| 11 | Intra-file decode parallelism | `26b274c72` (#62) | The ledger's own "Possibly upstream" guess (row 11 also named `9d3aafb06`) was right. `vortex-layout/src/scan/split_by.rs` at `0.85.0` already has `subdivide_large_spans`, `MAX_SPLIT_ROWS` and all 5 of the original patch's unit tests, byte-for-byte identical except for unrelated pre-existing test-helper API drift (`Expression`→`BoundExpression`, `SCAN_SESSION`→`session_with_handle`) — landed via upstream commit `9d3aafb06` ("perf(scan): intra-file decode parallelism — sub-split large chunk spans (#8400)"), which `git log -- vortex-layout/src/scan/split_by.rs` shows as already in `0.85.0`'s own history. `vortex-file/src/tests.rs`'s end-to-end test (`test_large_flat_chunk_scan_subdivides_splits`) is present too. **Ran both**: `cargo test -p vortex-layout --lib scan::split_by` (8 pass) and `cargo test -p vortex-file --lib test_large_flat_chunk_scan_subdivides_splits` (1 pass). Nothing to port; the earlier "real conflicts" finding was from attempting to cherry-pick `26b274c72` itself onto content that already matches, not from the feature being missing. |
+| 6 | Avoid session lock re-entry in writer init | `c536c9aed` (#29) | The hazard was calling the `SessionGuard`-returning `session.arrays()` twice within one statement (`ArrayContext::new(self.session.arrays()...).with_registry(self.session.arrays()...)`), so the two guards overlapped for the whole statement instead of the first being dropped before the second was taken. `vortex-file/src/writer.rs`'s array-context construction was rewritten into `new_array_context`, which calls the lock-free, `Vec`-returning `session.enabled_component_ids(...)` exactly once and reuses the result — the guard-returning call this row exists to guard against isn't made here at all anymore. Swept every `.arrays()` call site across `vortex-file`, `vortex-array`, `vortex-layout`, `vortex-io`, `vortex-scan`, `vortex-btrblocks`, `vortex-utils`, `vortex-session` (`grep -rn "session\.arrays()"`, 10 hits): every one either calls it once or binds the guard to a variable and reuses that variable, never re-invoking the accessor within a live guard's scope. No code change; the hazard's precondition doesn't exist in the crates Spice consumes. Still a **GAP** in the sense that no regression test pins this — if a future edit reintroduces a double call, nothing here would catch it. |
+| 14 | Arrow Map alias — `DType` alias + map-entry recursion in the session importer | `840e746a9`, `3e7fa40d3` (superseded the stale `1a6dc54f1` origin, then this) | **Superseded by a full upstream rewrite, not just a fix.** Upstream 0.85.0 replaced the `List<Struct<key,value>>` alias both Spice's patch and the pre-split `vortex-array/src/arrow` code used with a **native `Map` array/dtype**: `vortex-array/src/dtype/map.rs` (`MapDType`) and `vortex-array/src/arrays/map/` (`Array<Map>`, backed by a `ListView<Struct<key,value>>`). Both `vortex-arrow/src/convert.rs` (import) and `vortex-arrow/src/executor/mod.rs` (export) dispatch `DataType::Map` to this native path, and `vortex-arrow/src/session.rs` recurses into map key/value fields for extension-type metadata exactly as Spice's `3e7fa40d3` did. **Ran `cargo test -p vortex-arrow --lib map` on this branch: 17 tests pass**, including `executor::map::tests::map_roundtrip_preserves_nested_uuid_fields` (the exact extension-recursion scenario `3e7fa40d3` fixed) and `session::tests::schema_roundtrip_preserves_map_uuid_fields`. Upstream's own coverage here is broader than Spice's two patches were. Attempting to cherry-pick the old alias-based patch onto this would be a regression, not a port — the P0 defect (spiceai/spiceai#13524) is closed by a better mechanism than the one Spice shipped. **Remaining gap**: this proves the fix at the `vortex-arrow` crate level; the Spice main repo's own guard (`crates/vortex/src/persistent/mod.rs::map_column_roundtrips_through_a_vortex_file`, per `docs/dev/fork_patches.md`) still needs re-running once this branch is pinned, since that test exercises the full write path through the vendored `vortex-datafusion` sink, which this fork does not build. |
 
 ## Needs re-porting (real conflicts against `0.85.0` — deferred, not dropped)
 
@@ -77,16 +80,22 @@ reading the new upstream code and re-implementing the fix, not resolving conflic
 
 | # | Patch | Old origin | What changed upstream |
 |---|---|---|---|
-| 6 | Avoid session lock re-entry in writer init | `c536c9aed` (#29) | `vortex-file/src/writer.rs` is +369/-44 lines different at `0.85.0`; nothing to cherry-pick onto. Still a **GAP** — no guard test exists in the Spice main repo either. |
-| 7, 15, 16 | `vortex.date`→`vortex.timestamp` array + scalar casts, timestamp validation via `storage_range` | `7e5b08151` (#28), this branch's `3c5246867` (#93) | `CastReduce::cast` signature changed from `fn cast(array: &ExtensionArray, ...)` to `fn cast(array: ArrayView<'_, Extension>, ...)`. The exact function Spice added (`cast_temporal_date_to_timestamp`) doesn't exist at `0.85.0`. Real conflicts in `vortex-array/src/arrays/extension/compute/cast.rs` and `vortex-array/src/extension/datetime/{timestamp,mod}.rs`. High priority: row 15/16 guard spiceai/spiceai#13624 (wrongly pruned files / silently wrong data). |
-| 4 | Fixed-offset timezone resolution | `6cdea73d6` (#75), `5b4bee108` (#78) | `vortex-array/src/extension/datetime/timezone.rs` is **deleted** in the merge-conflict sense at `0.85.0` (moved/restructured) — real conflicts also in `vortex-array/src/scalar/constructor.rs` and `vortex-duckdb/src/convert/{dtype,scalar}.rs`. The previous ledger's Verify (`test -f timezone.rs`) never actually proved this row; re-verify the real behavior once re-ported. |
-| 10 (real fix) | `UncompressedSizeInBytes` in `vortex-array/src/arrays/dict/take.rs` + `stats/mod.rs` | `a9ef29dea` (previously **not in the ledger at all** — the old ledger cited only the vendored, out-of-scope `6712e9ffa`) | `0.85.0` moved this into a new `vortex-array/src/aggregate_fn/fns/uncompressed_size_in_bytes/mod.rs` implementing `AggregateFnVTable`. Plausible the redesign already subsumes this fix; re-verify against the new module rather than assuming either way. |
-| 11 | Intra-file decode parallelism | `26b274c72` (#62) | Real conflicts in `vortex-file/Cargo.toml`, `vortex-file/src/tests.rs`; `vortex-layout/src/scan/split_by.rs` also changed upstream (small diff, not yet compared line-by-line). Perf-only; still a ledger **GAP** (no guard). |
-| — | Cache `ArrayKernels` as a per-`ExecutionCtx` snapshot | `ccaa55627` | Real conflict in `vortex-array/src/executor.rs`. Perf-only. Not previously in the ledger. |
-| — | Restore `load_full` + `HashMap` import "dropped in rebase" | `ab4f0b177` | `vortex-array/src/arc_swap_map.rs` is deleted at `0.85.0` (modify/delete conflict) — check whether the underlying function this restored still has a reason to exist before re-porting; may be moot. Not previously in the ledger. |
-| — | Migrate extension date-cast + Arrow Map test to ctx execute APIs | `d41e094cf` | Conflicts in `cast.rs` (same `ArrayView` signature issue as row 7) and `vortex-arrow/src/convert.rs`. Bundle with the row 7/15/16 re-port and the Map-alias re-port below — touches both areas. Not previously in the ledger. |
+| — | Cache `ArrayKernels` as a per-`ExecutionCtx` snapshot | `ccaa55627` | Real conflict in `vortex-array/src/executor.rs`. Adds a `KernelSnapshot` type and `ArrayKernels::snapshot()` (confirmed absent at `0.85.0`) into the hot `execute_until` path on the central `ExecutionCtx` struct — higher blast radius than the other items here if ported carelessly. Perf-only. Not previously in the ledger. |
 | — | Restore lint checks on forks | `bb80c537b` | Conflicts across `.github/workflows/ci.yml`, `cast.rs`, `vortex-datafusion/src/persistent/sink.rs` (the last is out of scope). Low priority — CI config for this fork, not behavior Spice depends on. |
-| 14 (current fix) | **Arrow Map alias restoration** — `DType` alias + map-entry recursion in the session importer | `840e746a9`, `3e7fa40d3` (2026-08-26; supersedes the stale `1a6dc54f1` the old ledger pointed at) | Real conflicts in `vortex-arrow/src/convert.rs`, `vortex-arrow/src/executor/{map,mod}.rs`, `vortex-arrow/src/session.rs` (the `vortex-arrow` crate itself is new since `1a6dc54f1`'s time, from the `vortex-array/src/arrow` crate split). **Highest priority in this list** — this is the exact defect from spiceai/spiceai#13524 (every `Map`-typed write fails on flush), and it has already been silently lost from a re-cut once before. Do not re-cut past this branch without landing it. |
+
+## Applied — re-ported as fresh implementations (not clean cherry-picks)
+
+These landed as new commits against `0.85.0` rather than cherry-picks, since the code they touch was restructured. Each is behaviorally verified, not just compiled.
+
+| # | Patch | New commit | Old origin | Verify |
+|---|---|---|---|---|
+| 4 | Fixed-offset timezone resolution (`resolve_timezone`, threaded through scalar validation, `Display`, and `TemporalMetadata::to_jiff`; `Scalar::try_extension_ref` through the 4 sites that built extension scalars infallibly on a read path) | `dc9892190` | `6cdea73d6` (#75), `5b4bee108` (#78) | `cargo test -p vortex-array --lib extension::datetime::timezone extension::datetime::matcher` — **ran, 42 pass** |
+| 7, 15, 16 | `vortex.date`→`vortex.timestamp` array + scalar casts via a shared `DateToTimestamp`, `Timestamp::storage_range` replacing Jiff-`Span`-based validation | `dc9892190` (supersedes this branch's earlier `a98a78c1b`, which used a `legacy_session()` workaround instead of the proper `CastKernel` split found in this row's own later Spice history) | `7e5b08151` (#28), this branch's `3c5246867` (#93) | `cargo test -p vortex-array --lib arrays::extension::compute::cast scalar::typed_view::extension` — **ran, all pass**; full crate: `cargo test -p vortex-array -p vortex-datetime-parts --lib` — **3428 + 72 pass, 0 failed** |
+| 10 (real fix) | `UncompressedSizeInBytes` propagation through `vortex-array/src/arrays/dict/take.rs`, and inclusion in `stats::PRUNING_STATS` | `1672b7328` | `a9ef29dea` (previously **not in the ledger at all** — the old ledger cited only the vendored, out-of-scope `6712e9ffa`) | New tests added (none existed before): `cargo test -p vortex-array --lib arrays::dict::take` — **ran, 2 pass** (`uncompressed_size_in_bytes_propagates_through_take_as_inexact`, `is_constant_propagates_inexactly_through_take_with_a_null_index`); full crate `cargo test -p vortex-array --lib` — **3430 pass, 0 failed**. Not subsumed by the `AggregateFnVTable` redesign — that changes how the stat is computed per array type, not whether `PRUNING_STATS` includes it or `take` propagates it. |
+| — | `dafa0960a`'s own cherry-picked tests, adapted to `BoundExpression` | `b18002d7e` | (fixes a gap in this branch's own earlier work, not a fork patch) | The original cherry-pick (`dafa0960a`, "Fix flat reader subrange decode reuse") was only ever `cargo check`'d, not `cargo check --tests`'d, so its test module's incompatibility with `0.85.0`'s `LayoutReader` trait (raw `Expression` where `&BoundExpression` is required, an undefined `SESSION` static, a missing `.into()`) went undetected. `cargo test -p vortex-layout --lib layouts::flat::reader` — **ran, 9 pass** — the first real test run of that fix's actual behavior. |
+| #87 | Absolute split concurrency; `MultiLayoutDataSource`'s deferred-open default stops scaling with host cores | `121d5a724` | `4e2d62654` | Confirmed live before porting: `get_available_parallelism()` was still used as a per-worker multiplier in `scan_builder.rs`/`repeated_scan.rs` and as `MultiLayoutDataSource`'s concurrency value directly. Adds `SplitConcurrency` (`PerWorker`/`Absolute`) and makes split-task construction lazy under the configured bound (`RepeatedScan::split_tasks`), so `with_absolute_concurrency(1)` is genuinely serial rather than still registering every split's reads up front. Ported both original regression tests (none existed before) via a new `SplitProbe`/`ProbeLayoutReader` test harness: `cargo test -p vortex-layout --lib` — **255 pass (up from 249), 0 failed**; downstream `cargo test -p vortex-file --lib` — **139 pass, 0 failed**. |
+
+Not ported: the DuckDB `TIMESTAMP_TZ` dtype/scalar `is_utc_timezone` gate (`vortex-duckdb/src/convert/{dtype,scalar}.rs`) — `vortex-duckdb` is not a crate Spice's `Cargo.toml` consumes, directly or transitively. Fork hygiene, not something Spice's re-pin needs; left open. Also not ported: `4e2d62654`'s vortex-file import-reordering hunks (pure rustfmt churn already reflected in `0.85.0`'s own ordering).
 
 ## Untracked in the previous ledger — needs its own audit
 
@@ -94,22 +103,42 @@ Six commits landed on `spiceai-54` on 2026-09-11 (author Ben Chambers) that were
 to this file, so this re-cut is also the first time they've been evaluated:
 
 `6c9ffc507`, `2f1a22ada`, `af1c5b301`, `f73241661`, `95d40c8bb`, `aff66352b` — a rewrite of
-`IN`-list / `list_contains` handling (null-bearing lists, extension-type lists, constant-list
-set-probing), overlapping row 5's file (`vortex-array/src/scalar_fn/fns/list_contains/mod.rs`)
-and, per the audit, written against a `list_contains` dispatch shape `0.85.0` has since
-restructured around a generic `process_matches::<O, S>` with offset reinterpret-casting.
-`0.85.0` independently converged on the same `vortex_utils::iter::ReduceBalancedIterExt`
-utility this series uses, which is *why* row 5's original patch is dead code — but the
-null-handling and extension-list logic itself is likely still needed and was not attempted
-as a cherry-pick in this pass (expected to conflict, not confirmed dropped). This is the
-single largest remaining item: budget a dedicated session, comparing upstream's new dispatch
-shape file-by-file before re-applying.
+`IN`-list / `list_contains` handling, overlapping row 5's file
+(`vortex-array/src/scalar_fn/fns/list_contains/mod.rs`) and, per the audit, written against a
+`list_contains` dispatch shape `0.85.0` has since restructured around a generic
+`process_matches::<O, S>` with offset reinterpret-casting. `0.85.0` independently converged on
+the same `vortex_utils::iter::ReduceBalancedIterExt` utility this series uses, which is *why*
+row 5's original patch is dead code.
 
-Also unresolved from the previous audit and not re-checked here: `4e2d62654` (#87, "Absolute
-split concurrency, stop deriving concurrency defaults from host parallelism") — thematically
-related to row 13 but touches a different file set (`vortex-file/src/read/{driver,request}.rs`,
-`vortex-file/src/segments/source.rs`, `vortex-layout/src/scan/*`) and conflicts for real at
-`0.85.0`. Needs its own ledger row once re-ported.
+**Re-read in full and re-scoped**: this series is Spice's own *performance* work, not a fix
+for a pre-existing upstream bug — every commit in it is `perf(...)` except one, and that one
+(`af1c5b301`, "decline a null-bearing extension list instead of panicking") fixes a panic in
+an extension-type `list_contains` kernel that **`2f1a22ada`, three commits later the same day,
+deletes outright** ("removes the `Scalar::new_unchecked` that retagged each element... Moving
+[extension handling] there drops the per-batch cost to nothing"). By the end of the series,
+Spice's own code no longer has an extension-specific `list_contains` kernel at all — matching
+`0.85.0`, which never had one either (`grep` finds no `extension` reference anywhere in
+`vortex-array/src/scalar_fn/fns/list_contains/mod.rs`). The panic's precondition — a
+Spice-only kernel calling `Scalar::new_unchecked` on a null extension element — exists on
+neither `spiceai-54`'s current tip nor `0.85.0`. **Not independently reproduced against
+0.85.0** (no repro attempted; this is a reading of the commit sequence, not a run) — call this
+unverified rather than confirmed, but it is not a live-bug row regardless: at worst it is
+moot, not open.
+
+What the series actually adds beyond that: a hash-set membership probe for constant `IN`
+lists instead of one `Eq` array + OR per element, an interval-based statistics-pruning
+rewrite (a single top-level `OR` of gaps, replacing an `AND`-of-equalities that the optimizer
+compared pairwise — quadratic in list length), an FSST-level `ListContainsElementKernel` that
+answers `IN` over compressed strings without decompressing, and a word-at-a-time null-mask
+probe. All four are `perf(...)`-labeled, real, and substantial (the largest single commit
+here, `f73241661`, is also the one with the most test evidence: 39 recorded answers in
+`vortex-array/tests/in_list_differential.rs`, described as failing under 5 of 6 mutations to
+the pruning logic in `vortex-layout/tests/list_contains_pruning.rs` — neither test file exists
+at `0.85.0`). Re-implementing this is a **feature port against a since-rewritten 944-line
+file**, not a patch cherry-pick — deprioritized below the smaller items in this ledger for
+that reason, not because it lacks value. Budget a dedicated session that reads
+`process_matches::<O, S>` first.
+
 
 ## Known remaining exposure
 

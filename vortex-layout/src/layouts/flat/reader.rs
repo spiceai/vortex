@@ -312,7 +312,7 @@ mod test {
         let (ptr, eof) = SequenceId::root().split();
         let layout = FlatLayoutStrategy::default()
             .write_stream(
-                array_ctx,
+                array_ctx.into(),
                 Arc::new(segments),
                 array.to_array_stream().sequenced(ptr),
                 eof,
@@ -381,7 +381,7 @@ mod test {
         #[case] pattern: RegressedQueryPattern,
     ) -> VortexResult<()> {
         block_on(|handle| async {
-            let session = SESSION.clone().with_handle(handle);
+            let session = new_session().with_handle(handle);
             let mut ctx = session.create_execution_ctx();
             let requests = Arc::new(AtomicUsize::new(0));
 
@@ -393,10 +393,17 @@ mod test {
                         Arc::clone(&requests),
                     )
                     .await?;
-                    let first =
-                        reader.projection_evaluation(&(0..3), &root(), MaskFuture::new_true(3))?;
-                    let second =
-                        reader.projection_evaluation(&(3..6), &root(), MaskFuture::new_true(3))?;
+                    let identity = root().bind(reader.dtype())?;
+                    let first = reader.projection_evaluation(
+                        &(0..3),
+                        &identity,
+                        MaskFuture::new_true(3),
+                    )?;
+                    let second = reader.projection_evaluation(
+                        &(3..6),
+                        &identity,
+                        MaskFuture::new_true(3),
+                    )?;
 
                     let (first, second): (VortexResult<ArrayRef>, VortexResult<ArrayRef>) =
                         futures::join!(first, second);
@@ -410,7 +417,7 @@ mod test {
                         Arc::clone(&requests),
                     )
                     .await?;
-                    let filter = not_eq(root(), lit(0_i32));
+                    let filter = not_eq(root(), lit(0_i32)).bind(reader.dtype())?;
                     let first =
                         reader.filter_evaluation(&(0..3), &filter, MaskFuture::new_true(3))?;
                     let second =
@@ -427,13 +434,14 @@ mod test {
                         Arc::clone(&requests),
                     )
                     .await?;
-                    let filter = gt(root(), lit(1_i32));
+                    let filter = gt(root(), lit(1_i32)).bind(reader.dtype())?;
+                    let identity = root().bind(reader.dtype())?;
                     let first_mask =
                         reader.filter_evaluation(&(0..3), &filter, MaskFuture::new_true(3))?;
                     let second_mask =
                         reader.filter_evaluation(&(3..6), &filter, MaskFuture::new_true(3))?;
-                    let first = reader.projection_evaluation(&(0..3), &root(), first_mask)?;
-                    let second = reader.projection_evaluation(&(3..6), &root(), second_mask)?;
+                    let first = reader.projection_evaluation(&(0..3), &identity, first_mask)?;
+                    let second = reader.projection_evaluation(&(3..6), &identity, second_mask)?;
 
                     let (first, second): (VortexResult<ArrayRef>, VortexResult<ArrayRef>) =
                         futures::join!(first, second);
@@ -446,14 +454,15 @@ mod test {
                     let expected = source.clone().apply(&projection)?;
                     let reader =
                         counted_flat_reader(&session, source, Arc::clone(&requests)).await?;
+                    let bound_projection = projection.bind(reader.dtype())?;
                     let first = reader.projection_evaluation(
                         &(0..3),
-                        &projection,
+                        &bound_projection,
                         MaskFuture::new_true(3),
                     )?;
                     let second = reader.projection_evaluation(
                         &(3..6),
-                        &projection,
+                        &bound_projection,
                         MaskFuture::new_true(3),
                     )?;
 
@@ -484,12 +493,14 @@ mod test {
                         .filter(Mask::from_iter([false, true, true]))?;
                     let reader =
                         counted_flat_reader(&session, source, Arc::clone(&requests)).await?;
+                    let filter = filter.bind(reader.dtype())?;
+                    let identity = root().bind(reader.dtype())?;
                     let first_mask =
                         reader.filter_evaluation(&(0..3), &filter, MaskFuture::new_true(3))?;
                     let second_mask =
                         reader.filter_evaluation(&(3..6), &filter, MaskFuture::new_true(3))?;
-                    let first = reader.projection_evaluation(&(0..3), &root(), first_mask)?;
-                    let second = reader.projection_evaluation(&(3..6), &root(), second_mask)?;
+                    let first = reader.projection_evaluation(&(0..3), &identity, first_mask)?;
+                    let second = reader.projection_evaluation(&(3..6), &identity, second_mask)?;
 
                     let (first, second): (VortexResult<ArrayRef>, VortexResult<ArrayRef>) =
                         futures::join!(first, second);
@@ -521,12 +532,16 @@ mod test {
                         .apply(&projection)?;
                     let reader =
                         counted_flat_reader(&session, source, Arc::clone(&requests)).await?;
+                    let filter = filter.bind(reader.dtype())?;
+                    let bound_projection = projection.bind(reader.dtype())?;
                     let first_mask =
                         reader.filter_evaluation(&(0..3), &filter, MaskFuture::new_true(3))?;
                     let second_mask =
                         reader.filter_evaluation(&(3..6), &filter, MaskFuture::new_true(3))?;
-                    let first = reader.projection_evaluation(&(0..3), &projection, first_mask)?;
-                    let second = reader.projection_evaluation(&(3..6), &projection, second_mask)?;
+                    let first =
+                        reader.projection_evaluation(&(0..3), &bound_projection, first_mask)?;
+                    let second =
+                        reader.projection_evaluation(&(3..6), &bound_projection, second_mask)?;
 
                     let (first, second): (VortexResult<ArrayRef>, VortexResult<ArrayRef>) =
                         futures::join!(first, second);
