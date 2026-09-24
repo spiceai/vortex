@@ -19,6 +19,7 @@ from .store import (
     AzureStore,
     CosStore,
     GCSStore,
+    GoosefsStore,
     HfStore,
     HTTPStore,
     LocalStore,
@@ -34,7 +35,7 @@ if TYPE_CHECKING:
 def open(
     path: str,
     *,
-    store: AzureStore | CosStore | GCSStore | HfStore | HTTPStore | LocalStore | MemoryStore | S3Store | None = None,
+    store: AzureStore | CosStore | GCSStore | GoosefsStore | HfStore | HTTPStore | LocalStore | MemoryStore | S3Store | None = None,
     without_segment_cache: bool = False,
 ) -> VortexFile:
     """
