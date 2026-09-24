@@ -10,7 +10,9 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 use tracing::trace;
 use vortex_array::ArrayRef;
+use vortex_array::IntoArray;
 use vortex_array::MaskFuture;
+use vortex_array::RecursiveCanonical;
 use vortex_array::VortexSessionExecute;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::FieldMask;
@@ -63,7 +65,7 @@ impl FlatReader {
         }
     }
 
-    /// Register the segment request and return a future that would resolve into the deserialised array.
+    /// Register the segment request and return a future that resolves into a fully decoded array.
     fn array_future(&self) -> SharedArrayFuture {
         let row_count =
             usize::try_from(self.layout.row_count()).vortex_expect("row count must fit in usize");
@@ -96,6 +98,18 @@ impl FlatReader {
                     let array = parts
                         .decode(&dtype, row_count, &ctx, &session)
                         .map_err(Arc::new)?;
+
+                    // The encoded segment cache avoids I/O, while this cache
+                    // removes all deserialization and value-decoding work from
+                    // a hit. `RecursiveCanonical` is required here: a
+                    // top-level canonical struct or list can otherwise retain
+                    // compressed children.
+                    let mut execution_ctx = session.create_execution_ctx();
+                    let array = array
+                        .execute::<RecursiveCanonical>(&mut execution_ctx)
+                        .map_err(Arc::new)?
+                        .0
+                        .into_array();
 
                     if let Some(cache) = decoded_segment_cache.as_ref()
                         && let Err(error) = cache.put(segment_id, array.clone()).await
@@ -268,7 +282,9 @@ mod test {
     use vortex_array::MaskFuture;
     use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::BoolArray;
+    use vortex_array::arrays::ConstantArray;
     use vortex_array::arrays::PrimitiveArray;
+    use vortex_array::arrays::StructArray;
     use vortex_array::arrays::VarBinArray;
     use vortex_array::assert_arrays_eq;
     use vortex_array::dtype::DType;
@@ -417,7 +433,19 @@ mod test {
             let session = SESSION.clone().with_handle(handle);
             let mut execution_ctx = session.create_execution_ctx();
             let segments = Arc::new(TestSegments::default());
-            let input = buffer![1, 2, 3, 4].into_array();
+            // The cache must recursively materialize a nested array. A
+            // canonical struct alone is insufficient because its constant
+            // fields are still encoded until `RecursiveCanonical` executes.
+            let input = StructArray::try_new(
+                ["id", "comment"].into(),
+                vec![
+                    ConstantArray::new(42_i32, 4).into_array(),
+                    ConstantArray::new("cached fully decoded", 4).into_array(),
+                ],
+                4,
+                Validity::NonNullable,
+            )?
+            .into_array();
             let (ptr, eof) = SequenceId::root().split();
             let layout = FlatLayoutStrategy::default()
                 .write_stream(
@@ -453,6 +481,12 @@ mod test {
             );
             assert_eq!(decoded_cache.gets.load(Ordering::Relaxed), 2);
             assert_eq!(decoded_cache.puts.load(Ordering::Relaxed), 1);
+            assert!(
+                decoded_cache.arrays.lock().values().all(|array| array
+                    .depth_first_traversal()
+                    .all(|node| node.is_canonical())),
+                "the cache must contain recursively canonical arrays"
+            );
 
             Ok(())
         })

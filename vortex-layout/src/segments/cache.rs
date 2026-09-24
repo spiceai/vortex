@@ -35,17 +35,20 @@ pub trait SegmentCache: Send + Sync {
     async fn put(&self, id: SegmentId, buffer: ByteBuffer) -> VortexResult<()>;
 }
 
-/// Cache for decoded array segments.
+/// Cache for fully decoded array segments.
 ///
 /// A decoded cache sits above a [`SegmentCache`]: a hit returns an array before
 /// Vortex asks the segment source for encoded bytes. Segment identifiers are
 /// local to their source, so implementations that serve more than one source
-/// must qualify the identifier with the source's identity.
+/// must qualify the identifier with the source's identity. Values stored here
+/// are recursively canonicalized: every array and nested child is in Vortex's
+/// uncompressed canonical representation, so a hit only clones the cached
+/// [`ArrayRef`].
 #[async_trait]
 pub trait DecodedSegmentCache: Send + Sync {
-    /// Return a decoded segment, or `None` on cache miss.
+    /// Return a fully decoded canonical segment, or `None` on cache miss.
     async fn get(&self, id: SegmentId) -> VortexResult<Option<ArrayRef>>;
-    /// Store a decoded segment in the cache.
+    /// Store a fully decoded canonical segment in the cache.
     async fn put(&self, id: SegmentId, array: ArrayRef) -> VortexResult<()>;
 }
 
