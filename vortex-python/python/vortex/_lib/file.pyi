@@ -9,7 +9,7 @@ from typing_extensions import override
 
 from vortex.type_aliases import IntoProjection
 
-from . import CosStore, HfStore
+from . import CosStore, GoosefsStore, HfStore
 from .arrays import Array
 from .dataset import VortexDataset
 from .dtype import DType
@@ -61,6 +61,6 @@ class VortexFile:
 def open(
     path: str,
     *,
-    store: ObjectStore | CosStore | HfStore | None = None,
+    store: ObjectStore | CosStore | GoosefsStore | HfStore | None = None,
     without_segment_cache: bool = False,
 ) -> VortexFile: ...
