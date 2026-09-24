@@ -21,6 +21,8 @@ use vortex_session::VortexSession;
 use crate::dtype::DType;
 use crate::dtype::DecimalDType;
 use crate::dtype::FieldDType;
+use crate::dtype::FieldNames;
+use crate::dtype::MapDType;
 use crate::dtype::PType;
 use crate::dtype::StructFields;
 use crate::dtype::UnionVariants;
@@ -68,7 +70,7 @@ impl StructFields {
         buffer: FlatBuffer,
         session: VortexSession,
     ) -> VortexResult<Self> {
-        let names = fb_struct
+        let names: FieldNames = fb_struct
             .names()
             .ok_or_else(|| vortex_err!("failed to parse struct names from flatbuffer"))?
             .iter()
@@ -86,6 +88,14 @@ impl StructFields {
                 ))
             })
             .collect::<Vec<_>>();
+
+        if names.len() != dtypes.len() {
+            vortex_bail!(
+                "length mismatch between struct names ({}) and dtypes ({})",
+                names.len(),
+                dtypes.len()
+            );
+        }
 
         Ok(StructFields::from_fields(names, dtypes))
     }
@@ -125,6 +135,32 @@ impl UnionVariants {
             .collect();
 
         UnionVariants::try_from_fields(names, dtypes, type_ids)
+    }
+}
+
+impl MapDType {
+    /// Creates a map dtype from a flatbuffer-defined object and its underlying buffer.
+    fn from_fb(
+        fb_map: fbd::Map<'_>,
+        buffer: FlatBuffer,
+        session: VortexSession,
+    ) -> VortexResult<Self> {
+        let key = fb_map
+            .key_type()
+            .ok_or_else(|| vortex_err!("failed to parse map key type from flatbuffer"))?;
+        let value = fb_map
+            .value_type()
+            .ok_or_else(|| vortex_err!("failed to parse map value type from flatbuffer"))?;
+
+        MapDType::try_from_fields(
+            FieldDType::from(ViewedDType::from_fb_loc(
+                key._tab.loc(),
+                buffer.clone(),
+                session.clone(),
+            )),
+            FieldDType::from(ViewedDType::from_fb_loc(value._tab.loc(), buffer, session)),
+            fb_map.keys_sorted(),
+        )
     }
 }
 
@@ -220,6 +256,13 @@ impl TryFrom<ViewedDType> for DType {
                     fb_fixed_size_list.nullable().into(),
                 ))
             }
+            fb::Type::Map => {
+                let fb_map = fb
+                    .type__as_map()
+                    .ok_or_else(|| vortex_err!("failed to parse map from flatbuffer"))?;
+                let map = MapDType::from_fb(fb_map, vfdt.buffer().clone(), vfdt.session.clone())?;
+                Ok(Self::Map(map, fb_map.nullable().into()))
+            }
             fb::Type::Struct_ => {
                 let fb_struct = fb
                     .type__as_struct_()
@@ -270,7 +313,7 @@ impl TryFrom<ViewedDType> for DType {
                         vortex_err!("failed to parse extension metadata from flatbuffer")
                     })?
                     .bytes();
-                let ext_dtype = if let Some(vtable) = vfdt.session.dtypes().registry().find(&id) {
+                let ext_dtype = if let Some(vtable) = vfdt.session.dtypes().registry().get(&id) {
                     vtable.deserialize(metadata, storage_dtype)?
                 } else if vfdt.session.allows_unknown() {
                     ForeignExtDType::from_parts(id, metadata.to_vec(), storage_dtype)?
@@ -352,6 +395,20 @@ impl WriteFlatBuffer for DType {
                     &fb::FixedSizeListArgs {
                         element_type,
                         size: *size,
+                        nullable: (*n).into(),
+                    },
+                )
+                .as_union_value()
+            }
+            Self::Map(map, n) => {
+                let key_type = Some(map.key_dtype().write_flatbuffer(fbb)?);
+                let value_type = Some(map.value_dtype().write_flatbuffer(fbb)?);
+                fb::Map::create(
+                    fbb,
+                    &fb::MapArgs {
+                        key_type,
+                        value_type,
+                        keys_sorted: map.keys_sorted(),
                         nullable: (*n).into(),
                     },
                 )
@@ -448,6 +505,7 @@ impl WriteFlatBuffer for DType {
             Self::Binary(_) => fb::Type::Binary,
             Self::List(..) => fb::Type::List,
             Self::FixedSizeList(..) => fb::Type::FixedSizeList,
+            Self::Map(..) => fb::Type::Map,
             Self::Struct(..) => fb::Type::Struct_,
             Self::Union(..) => fb::Type::Union,
             Self::Variant(_) => fb::Type::Variant,
@@ -507,8 +565,11 @@ impl TryFrom<fb::PType> for PType {
 mod test {
     use std::sync::Arc;
 
+    use flatbuffers::FlatBufferBuilder;
     use flatbuffers::root;
+    use vortex_buffer::ByteBuffer;
     use vortex_flatbuffers::FlatBuffer;
+    use vortex_flatbuffers::WriteFlatBuffer;
     use vortex_flatbuffers::WriteFlatBufferExt;
 
     use crate::dtype::DType;
@@ -569,6 +630,21 @@ mod test {
             ),
             Nullability::NonNullable,
         ));
+        let inner_map = DType::map(
+            DType::Primitive(PType::I32, Nullability::NonNullable),
+            DType::Utf8(Nullability::Nullable),
+            true,
+            Nullability::NonNullable,
+        )
+        .unwrap();
+        let map = DType::map(
+            inner_map,
+            DType::Utf8(Nullability::Nullable),
+            false,
+            Nullability::Nullable,
+        )
+        .unwrap();
+        roundtrip_dtype(DType::struct_([("map", map)], Nullability::NonNullable));
         roundtrip_dtype(DType::Variant(Nullability::Nullable));
     }
 
@@ -676,6 +752,48 @@ mod test {
         let viewed = DType::try_from(view).unwrap();
         assert_eq!(eager, viewed);
         assert_eq!(viewed, eager);
+    }
+
+    #[test]
+    fn test_struct_malformed_flatbuffer() {
+        let mut fbb = FlatBufferBuilder::new();
+        let names = fbb.create_vector::<flatbuffers::WIPOffset<&str>>(&[]);
+        let dtype_offsets = (0..3)
+            .map(|_| {
+                DType::Primitive(PType::I32, Nullability::NonNullable)
+                    .write_flatbuffer(&mut fbb)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let dtypes = fbb.create_vector(&dtype_offsets);
+
+        let struct_table = fb::Struct_::create(
+            &mut fbb,
+            &fb::Struct_Args {
+                names: Some(names),
+                dtypes: Some(dtypes),
+                nullable: false,
+            },
+        );
+
+        let dtype = fb::DType::create(
+            &mut fbb,
+            &fb::DTypeArgs {
+                type_type: fb::Type::Struct_,
+                type_: Some(struct_table.as_union_value()),
+            },
+        );
+        fbb.finish_minimal(dtype);
+        let (vec, start) = fbb.collapse();
+        let end = vec.len();
+        let buffer = FlatBuffer::align_from(ByteBuffer::from(vec).slice(start..end));
+
+        let root_fb = root::<fb::DType>(&buffer).unwrap();
+        let view = ViewedDType::from_fb_loc(root_fb._tab.loc(), buffer, SESSION.clone());
+
+        let result = DType::try_from(view);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("length mismatch"));
     }
 
     /// A malformed flatbuffer (here, `dtypes.len() != type_ids.len()`) must round-trip

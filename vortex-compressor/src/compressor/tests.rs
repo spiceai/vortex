@@ -4,6 +4,7 @@
 use std::sync::LazyLock;
 
 use parking_lot::Mutex;
+use vortex_array::ArrayId;
 use vortex_array::ArrayRef;
 use vortex_array::Canonical;
 use vortex_array::ExecutionCtx;
@@ -11,8 +12,16 @@ use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::BoolArray;
 use vortex_array::arrays::Constant;
+use vortex_array::arrays::Map;
 use vortex_array::arrays::NullArray;
 use vortex_array::arrays::PrimitiveArray;
+use vortex_array::assert_arrays_eq;
+use vortex_array::builders::MapBuilder;
+use vortex_array::dtype::DType;
+use vortex_array::dtype::MapDType;
+use vortex_array::dtype::Nullability;
+use vortex_array::dtype::PType;
+use vortex_array::scalar::Scalar;
 use vortex_array::validity::Validity;
 use vortex_buffer::buffer;
 use vortex_error::VortexResult;
@@ -63,6 +72,10 @@ impl Scheme for DirectRatioScheme {
         matches_integer_primitive(canonical)
     }
 
+    fn produced_encodings(&self) -> Vec<ArrayId> {
+        Vec::new()
+    }
+
     fn expected_compression_ratio(
         &self,
         _data: &ArrayAndStats,
@@ -95,6 +108,10 @@ impl Scheme for ImmediateAlwaysUseScheme {
         matches_integer_primitive(canonical)
     }
 
+    fn produced_encodings(&self) -> Vec<ArrayId> {
+        Vec::new()
+    }
+
     fn expected_compression_ratio(
         &self,
         _data: &ArrayAndStats,
@@ -125,6 +142,10 @@ impl Scheme for CallbackAlwaysUseScheme {
 
     fn matches(&self, canonical: &Canonical) -> bool {
         matches_integer_primitive(canonical)
+    }
+
+    fn produced_encodings(&self) -> Vec<ArrayId> {
+        Vec::new()
     }
 
     fn expected_compression_ratio(
@@ -161,6 +182,10 @@ impl Scheme for CallbackSkipScheme {
         matches_integer_primitive(canonical)
     }
 
+    fn produced_encodings(&self) -> Vec<ArrayId> {
+        Vec::new()
+    }
+
     fn expected_compression_ratio(
         &self,
         _data: &ArrayAndStats,
@@ -193,6 +218,10 @@ impl Scheme for CallbackRatioScheme {
 
     fn matches(&self, canonical: &Canonical) -> bool {
         matches_integer_primitive(canonical)
+    }
+
+    fn produced_encodings(&self) -> Vec<ArrayId> {
+        Vec::new()
     }
 
     fn expected_compression_ratio(
@@ -229,6 +258,10 @@ impl Scheme for HugeRatioScheme {
         matches_integer_primitive(canonical)
     }
 
+    fn produced_encodings(&self) -> Vec<ArrayId> {
+        Vec::new()
+    }
+
     fn expected_compression_ratio(
         &self,
         _data: &ArrayAndStats,
@@ -259,6 +292,10 @@ impl Scheme for ZeroBytesSamplingScheme {
 
     fn matches(&self, canonical: &Canonical) -> bool {
         matches_integer_primitive(canonical)
+    }
+
+    fn produced_encodings(&self) -> Vec<ArrayId> {
+        Vec::new()
     }
 
     fn expected_compression_ratio(
@@ -470,6 +507,10 @@ impl Scheme for ThresholdObservingScheme {
         matches_integer_primitive(canonical)
     }
 
+    fn produced_encodings(&self) -> Vec<ArrayId> {
+        Vec::new()
+    }
+
     fn expected_compression_ratio(
         &self,
         _data: &ArrayAndStats,
@@ -505,6 +546,10 @@ impl Scheme for CallbackMatchingRatioScheme {
 
     fn matches(&self, canonical: &Canonical) -> bool {
         matches_integer_primitive(canonical)
+    }
+
+    fn produced_encodings(&self) -> Vec<ArrayId> {
+        Vec::new()
     }
 
     fn expected_compression_ratio(
@@ -702,5 +747,101 @@ fn sampling_uses_scheme_stats_options() -> VortexResult<()> {
         &mut exec_ctx,
     )?;
     assert!(matches!(score, EstimateScore::FiniteCompression(ratio) if ratio.is_finite()));
+    Ok(())
+}
+
+type MapEntryFixture<'a> = (i32, Option<&'a str>);
+type MapRowFixture<'a> = Option<Vec<MapEntryFixture<'a>>>;
+
+fn map_array_from_rows(rows: &[MapRowFixture<'_>], keys_sorted: bool) -> VortexResult<ArrayRef> {
+    let map_dtype = MapDType::try_new(
+        DType::Primitive(PType::I32, Nullability::NonNullable),
+        DType::Utf8(Nullability::Nullable),
+        keys_sorted,
+    )?;
+    let dtype = DType::Map(map_dtype.clone(), Nullability::Nullable);
+    let mut builder = MapBuilder::<u64, u64>::with_capacity_in(
+        map_dtype,
+        Nullability::Nullable,
+        rows.len(),
+        vortex_buffer::BufferAllocatorRef::static_ref(),
+    );
+
+    for row in rows {
+        let scalar = match row {
+            Some(entries) => {
+                let entries = entries
+                    .iter()
+                    .map(|(key, value)| {
+                        let key = Scalar::primitive(*key, Nullability::NonNullable);
+                        let value = value.map_or_else(
+                            || Scalar::null(DType::Utf8(Nullability::Nullable)),
+                            |value| Scalar::utf8(value, Nullability::Nullable),
+                        );
+                        (key, value)
+                    })
+                    .collect::<Vec<_>>();
+                Scalar::try_map(dtype.clone(), entries)?
+            }
+            None => Scalar::null(dtype.clone()),
+        };
+        builder.append_value(scalar.as_map())?;
+    }
+
+    Ok(builder.finish_into_map().into_array())
+}
+
+#[test]
+fn map_compression_preserves_mixed_rows() -> VortexResult<()> {
+    let array = map_array_from_rows(
+        &[
+            Some(vec![(1, Some("one")), (2, None)]),
+            None,
+            Some(vec![]),
+            Some(vec![(1, Some("dup-old")), (1, Some("dup-new"))]),
+        ],
+        false,
+    )?;
+    let mut exec_ctx = SESSION.create_execution_ctx();
+
+    let compressed = compressor().compress(&array, &mut exec_ctx)?;
+
+    assert!(compressed.is::<Map>());
+    assert_eq!(compressed.dtype(), array.dtype());
+    assert_arrays_eq!(&compressed, &array, &mut exec_ctx);
+    Ok(())
+}
+
+#[test]
+fn all_null_map_compression_preserves_values() -> VortexResult<()> {
+    let array = map_array_from_rows(&[None, None, None], false)?;
+    let mut exec_ctx = SESSION.create_execution_ctx();
+
+    let compressed = compressor().compress(&array, &mut exec_ctx)?;
+
+    assert_eq!(compressed.dtype(), array.dtype());
+    assert_arrays_eq!(&compressed, &array, &mut exec_ctx);
+    Ok(())
+}
+
+#[test]
+fn map_compression_preserves_repeated_entry_children() -> VortexResult<()> {
+    let rows = (0..64)
+        .map(|idx| {
+            Some(vec![
+                (idx % 4, Some("alpha")),
+                (idx % 4, Some("beta")),
+                (idx % 4, Some("alpha")),
+            ])
+        })
+        .collect::<Vec<_>>();
+    let array = map_array_from_rows(&rows, true)?;
+    let mut exec_ctx = SESSION.create_execution_ctx();
+
+    let compressed = compressor().compress(&array, &mut exec_ctx)?;
+
+    assert!(compressed.is::<Map>());
+    assert_eq!(compressed.dtype(), array.dtype());
+    assert_arrays_eq!(&compressed, &array, &mut exec_ctx);
     Ok(())
 }

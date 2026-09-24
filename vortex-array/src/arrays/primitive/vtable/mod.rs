@@ -4,7 +4,6 @@
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
-use vortex_error::vortex_panic;
 
 use crate::ArrayParts;
 use crate::ArrayRef;
@@ -13,6 +12,7 @@ use crate::ExecutionResult;
 use crate::array::Array;
 use crate::array::ArrayView;
 use crate::array::VTable;
+use crate::arrays::fixed_width::vtable as fixed_width;
 use crate::arrays::primitive::PrimitiveData;
 use crate::buffer::BufferHandle;
 use crate::builders::ArrayBuilder;
@@ -21,7 +21,6 @@ use crate::dtype::DType;
 use crate::dtype::PType;
 use crate::match_each_native_ptype;
 use crate::serde::ArrayChildren;
-use crate::validity::Validity;
 mod kernel;
 mod operations;
 mod validity;
@@ -34,7 +33,7 @@ use vortex_session::registry::CachedId;
 
 use crate::EqMode;
 use crate::array::ArrayId;
-use crate::arrays::primitive::array::SLOT_NAMES;
+use crate::arrays::primitive::array::PrimitiveSlots;
 use crate::arrays::primitive::compute::rules::RULES;
 use crate::hash::ArrayEq;
 use crate::hash::ArrayHash;
@@ -74,17 +73,11 @@ impl VTable for Primitive {
     }
 
     fn buffer(array: ArrayView<'_, Self>, idx: usize) -> BufferHandle {
-        match idx {
-            0 => array.buffer_handle().clone(),
-            _ => vortex_panic!("PrimitiveArray buffer index {idx} out of bounds"),
-        }
+        fixed_width::buffer("PrimitiveArray", array.buffer_handle(), idx)
     }
 
     fn buffer_name(_array: ArrayView<'_, Self>, idx: usize) -> Option<String> {
-        match idx {
-            0 => Some("values".to_string()),
-            _ => None,
-        }
+        fixed_width::buffer_name(idx)
     }
 
     fn with_buffers(
@@ -92,13 +85,8 @@ impl VTable for Primitive {
         array: ArrayView<'_, Self>,
         buffers: &[BufferHandle],
     ) -> VortexResult<ArrayParts<Self>> {
-        vortex_ensure!(
-            buffers.len() == 1,
-            "Expected 1 buffer, got {}",
-            buffers.len()
-        );
         let mut data = array.data().clone();
-        data.buffer = buffers[0].clone();
+        data.buffer = fixed_width::single_buffer(buffers)?;
         Ok(
             ArrayParts::new(self.clone(), array.dtype().clone(), array.len(), data)
                 .with_slots(array.slots().iter().cloned().collect()),
@@ -128,7 +116,8 @@ impl VTable for Primitive {
             data.len(),
             len
         );
-        let validity = crate::array::child_to_validity(slots[0].as_ref(), *nullability);
+        let validity =
+            crate::array::child_to_validity(slots[PrimitiveSlots::VALIDITY].as_ref(), *nullability);
         if let Some(validity_len) = validity.maybe_len() {
             vortex_ensure!(
                 validity_len == len,
@@ -157,19 +146,9 @@ impl VTable for Primitive {
                 metadata.len()
             );
         }
-        if buffers.len() != 1 {
-            vortex_bail!("Expected 1 buffer, got {}", buffers.len());
-        }
-        let buffer = buffers[0].clone();
+        let buffer = fixed_width::single_buffer(buffers)?;
 
-        let validity = if children.is_empty() {
-            Validity::from(dtype.nullability())
-        } else if children.len() == 1 {
-            let validity = children.get(0, &Validity::DTYPE, len)?;
-            Validity::Array(validity)
-        } else {
-            vortex_bail!("Expected 0 or 1 child, got {}", children.len());
-        };
+        let validity = fixed_width::deserialize_validity(dtype.nullability(), len, children)?;
 
         let ptype = PType::try_from(dtype)?;
 
@@ -188,21 +167,14 @@ impl VTable for Primitive {
             );
         }
 
-        vortex_ensure!(
-            buffer.is_aligned_to(Alignment::new(ptype.byte_width())),
-            "PrimitiveArray::build: Buffer (align={}) must be aligned to {}",
-            buffer.alignment(),
-            ptype.byte_width()
-        );
-
-        // SAFETY: checked ahead of time
+        // SAFETY: the buffer length and alignment are checked above.
         let slots = PrimitiveData::make_slots(&validity, len);
         let data = unsafe { PrimitiveData::new_unchecked_from_handle(buffer, ptype, validity) };
         Ok(ArrayParts::new(self.clone(), dtype.clone(), len, data).with_slots(slots))
     }
 
     fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {
-        SLOT_NAMES[idx].to_string()
+        PrimitiveSlots::NAMES[idx].to_string()
     }
 
     fn execute(array: Array<Self>, _ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {

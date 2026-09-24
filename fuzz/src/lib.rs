@@ -7,6 +7,7 @@ mod array;
 pub mod compress;
 pub mod error;
 pub mod fsst_like;
+mod row;
 
 // File module only available for native builds (requires vortex-file which uses tokio)
 #[cfg(not(target_arch = "wasm32"))]
@@ -31,9 +32,23 @@ pub use fsst_like::run_fsst_like_fuzz;
 pub use gpu::FuzzCompressGpu;
 #[cfg(feature = "cuda")]
 pub use gpu::run_compress_gpu;
+pub use row::FuzzRowEncode;
+pub use row::run_row_encode;
 
 pub const FUZZ_ARRAY_MAX_LEN: usize = 2048;
 pub const FUZZ_FILE_ARRAY_MAX_LEN: usize = 16_384;
+
+fn enable_latest_core_edition(session: &vortex_session::VortexSession) {
+    use vortex::editions::CORE_2026_08_3;
+    use vortex::editions::EditionSessionExt;
+    use vortex_error::VortexExpect;
+    use vortex_error::vortex_err;
+
+    session
+        .enable_edition(CORE_2026_08_3)
+        .map_err(|error| vortex_err!("{error}"))
+        .vortex_expect("latest core edition is registered");
+}
 
 // Runtime initialization - platform-specific
 #[cfg(not(target_arch = "wasm32"))]
@@ -58,6 +73,7 @@ mod native_runtime {
             session = session.with::<vortex_cuda::CudaSession>();
             vortex_cuda::initialize_cuda(&session.cuda_session());
         }
+        super::enable_latest_core_edition(&session);
         session
     });
 }
@@ -78,8 +94,11 @@ mod wasm_runtime {
     use vortex_io::session::RuntimeSessionExt;
     use vortex_session::VortexSession;
 
-    pub static SESSION: LazyLock<VortexSession> =
-        LazyLock::new(|| VortexSession::default().with_handle(WasmRuntime::handle()));
+    pub static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
+        let session = VortexSession::default().with_handle(WasmRuntime::handle());
+        super::enable_latest_core_edition(&session);
+        session
+    });
 }
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -94,8 +113,30 @@ mod wasi_runtime {
     use vortex::VortexSessionDefault;
     use vortex_session::VortexSession;
 
-    pub static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::default);
+    pub static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
+        let session = VortexSession::default();
+        super::enable_latest_core_edition(&session);
+        session
+    });
 }
 
 #[cfg(all(target_arch = "wasm32", not(target_os = "unknown")))]
 pub use wasi_runtime::SESSION;
+
+#[cfg(test)]
+mod tests {
+    use vortex::editions::CORE_2026_08_3;
+    use vortex::editions::EditionSessionExt;
+
+    use super::SESSION;
+
+    #[test]
+    fn fuzz_session_uses_latest_core_edition() {
+        assert!(
+            SESSION
+                .enabled_editions()
+                .editions()
+                .contains(&CORE_2026_08_3)
+        );
+    }
+}

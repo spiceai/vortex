@@ -8,16 +8,18 @@ from typing import TYPE_CHECKING, final
 
 import pyarrow as pa
 
-from ._lib import file as _file  # pyright: ignore[reportMissingModuleSource]
-from ._lib.arrays import Array  # pyright: ignore[reportMissingModuleSource]
-from ._lib.dtype import DType  # pyright: ignore[reportMissingModuleSource]
-from ._lib.expr import Expr  # pyright: ignore[reportMissingModuleSource]
-from ._lib.iter import ArrayIterator  # pyright: ignore[reportMissingModuleSource]
+from ._lib import file as _file
+from ._lib.arrays import Array
+from ._lib.dtype import DType
+from ._lib.expr import Expr
+from ._lib.iter import ArrayIterator
 from .dataset import VortexDataset
 from .scan import RepeatedScan
 from .store import (
     AzureStore,
+    CosStore,
     GCSStore,
+    HfStore,
     HTTPStore,
     LocalStore,
     MemoryStore,
@@ -32,7 +34,7 @@ if TYPE_CHECKING:
 def open(
     path: str,
     *,
-    store: AzureStore | GCSStore | HTTPStore | LocalStore | MemoryStore | S3Store | None = None,
+    store: AzureStore | CosStore | GCSStore | HfStore | HTTPStore | LocalStore | MemoryStore | S3Store | None = None,
     without_segment_cache: bool = False,
 ) -> VortexFile:
     """
@@ -64,7 +66,7 @@ def open(
 
 @final
 class VortexFile:
-    def __init__(self, file: _file.VortexFile):
+    def __init__(self, file: _file.VortexFile) -> None:
         self._file = file
 
     def __len__(self) -> int:
@@ -74,6 +76,11 @@ class VortexFile:
     def dtype(self) -> DType:
         """The dtype of the file."""
         return self._file.dtype
+
+    @property
+    def path(self) -> str:
+        """The path or URL this file was opened from."""
+        return self._file.path
 
     def splits(self) -> list[tuple[int, int]]:
         return self._file.splits()
@@ -121,20 +128,20 @@ class VortexFile:
         >>> vxf.scan().read_all().to_arrow_array()
         <pyarrow.lib.StructArray object at ...>
         -- is_valid: all not null
-        -- child 0 type: int64
-          [
-            25,
-            31,
-            null,
-            57,
-            null
-          ]
-        -- child 1 type: string_view
+        -- child 0 type: string_view
           [
             "Joseph",
             null,
             "Angela",
             "Mikhail",
+            null
+          ]
+        -- child 1 type: int64
+          [
+            25,
+            31,
+            null,
+            57,
             null
           ]
 
@@ -158,13 +165,13 @@ class VortexFile:
         >>> vxf.scan(expr=ve.column("age") > 35).read_all().to_arrow_array()
         <pyarrow.lib.StructArray object at ...>
         -- is_valid: all not null
-        -- child 0 type: int64
-          [
-            57
-          ]
-        -- child 1 type: string_view
+        -- child 0 type: string_view
           [
             "Mikhail"
+          ]
+        -- child 1 type: int64
+          [
+            57
           ]
         """
         return self._file.scan(projection, expr=expr, limit=limit, indices=indices, batch_size=batch_size)
@@ -202,6 +209,7 @@ class VortexFile:
         limit: int | None = None,
         expr: Expr | None = None,
         batch_size: int | None = None,
+        schema: pa.Schema | None = None,
     ) -> RecordBatchReader:
         """Scan the Vortex file as a :class:`pyarrow.RecordBatchReader`.
 
@@ -214,9 +222,12 @@ class VortexFile:
             The predicate used to filter rows. The filter columns need not appear in the projection.
         batch_size : :class:`int` | None
             The number of rows to read per chunk.
+        schema : :class:`pyarrow.Schema` | None
+            The Arrow schema to return. Use ``pyarrow.string()`` for ``StringArray`` fields.
+            Use ``pyarrow.binary()`` for ``BinaryArray`` fields.
 
         """
-        return self._file.to_arrow(projection, expr=expr, limit=limit, batch_size=batch_size)
+        return self._file.to_arrow(projection, expr=expr, limit=limit, batch_size=batch_size, schema=schema)
 
     def to_dataset(self) -> VortexDataset:
         """Scan the Vortex file using the :class:`pyarrow.dataset.Dataset` API."""
@@ -242,17 +253,17 @@ class VortexFile:
             reader = self.to_arrow(projection=with_columns, expr=vx_predicate, limit=n_rows)
 
             for batch in reader:
-                batch = pl.DataFrame._from_arrow(batch, rechunk=False)  # pyright: ignore[reportPrivateUsage]
+                batch = pl.DataFrame._from_arrow(batch, rechunk=False)
                 # TODO(ngates): set sortedness on DataFrame based on stats?
                 yield batch
 
             # Make sure we always yield at least one empty DataFrame
-            yield pl.DataFrame._from_arrow(  # pyright: ignore[reportPrivateUsage]
-                data=pa.RecordBatch.from_arrays(  # pyright: ignore[reportUnknownMemberType]
-                    [pa.array([], type=field.type) for field in reader.schema],  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType, reportUnknownVariableType]
+            yield pl.DataFrame._from_arrow(
+                data=pa.RecordBatch.from_arrays(
+                    [pa.array([], type=field.type) for field in reader.schema],
                     schema=reader.schema,
                 ),
             )
 
         # https://github.com/pola-rs/polars/pull/24125
-        return register_io_source(_io_source, schema=schema)  # pyright: ignore[reportArgumentType]
+        return register_io_source(_io_source, schema=schema)  # ty: ignore[invalid-argument-type]

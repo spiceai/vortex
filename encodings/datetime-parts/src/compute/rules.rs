@@ -143,7 +143,7 @@ impl ArrayParentReduceRule<DateTimeParts> for DTPComparisonPushDownRule {
 
 /// Try to extract the days value from a constant timestamp.
 /// Returns None if the constant is not a timestamp or has non-zero seconds/subseconds.
-fn try_extract_days_constant(array: &ArrayRef) -> Option<i64> {
+fn try_extract_days_constant(array: &ArrayRef) -> Option<i32> {
     let constant = array.as_constant()?;
 
     // Extract the timestamp value
@@ -185,7 +185,6 @@ mod tests {
     use vortex_array::array_session;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::arrays::TemporalArray;
-    use vortex_array::arrays::scalar_fn::ScalarFnFactoryExt;
     use vortex_array::extension::datetime::TimeUnit;
     use vortex_array::extension::datetime::TimestampOptions;
     use vortex_array::optimizer::ArrayOptimizer;
@@ -282,9 +281,9 @@ mod tests {
 
         // Compare: dtp <= day 1 (midnight)
         let constant = midnight_constant(1, TimeUnit::Seconds, len);
-        let comparison = Binary
-            .try_new_array(len, Operator::Lte, [dtp.into_array(), constant])
-            .unwrap();
+        let comparison = Binary::try_new(dtp.into_array(), constant, Operator::Lte)
+            .unwrap()
+            .into_array();
 
         // Optimize should push down to days
         let optimized = comparison.optimize().unwrap();
@@ -310,16 +309,17 @@ mod tests {
         let lower = midnight_constant(1, TimeUnit::Seconds, len);
         let upper = midnight_constant(3, TimeUnit::Seconds, len);
 
-        let between = Between
-            .try_new_array(
-                len,
-                BetweenOptions {
-                    lower_strict: StrictComparison::NonStrict,
-                    upper_strict: StrictComparison::NonStrict,
-                },
-                [dtp.into_array(), lower, upper],
-            )
-            .unwrap();
+        let between = Between::try_new(
+            dtp.into_array(),
+            lower,
+            upper,
+            BetweenOptions {
+                lower_strict: StrictComparison::NonStrict,
+                upper_strict: StrictComparison::NonStrict,
+            },
+        )
+        .unwrap()
+        .into_array();
 
         // Optimize should push down to days
         let optimized = between.optimize().unwrap();
@@ -337,9 +337,9 @@ mod tests {
 
         // Compare against non-midnight constant (day 1 at noon)
         let constant = non_midnight_constant(1, 43200, TimeUnit::Seconds, len);
-        let comparison = Binary
-            .try_new_array(len, Operator::Lte, [dtp.into_array(), constant])
-            .unwrap();
+        let comparison = Binary::try_new(dtp.into_array(), constant, Operator::Lte)
+            .unwrap()
+            .into_array();
 
         // Optimize should NOT push down (constant has non-zero seconds)
         let optimized = comparison.optimize().unwrap();
@@ -372,9 +372,9 @@ mod tests {
 
         // Compare against midnight constant
         let constant = midnight_constant(1, TimeUnit::Seconds, len);
-        let comparison = Binary
-            .try_new_array(len, Operator::Lte, [dtp.into_array(), constant])
-            .unwrap();
+        let comparison = Binary::try_new(dtp.into_array(), constant, Operator::Lte)
+            .unwrap()
+            .into_array();
 
         // Should still compute correctly (just not optimized via pushdown)
         let optimized = comparison.optimize().unwrap();

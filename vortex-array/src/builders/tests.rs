@@ -1,29 +1,171 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::alloc::Layout;
+use std::ptr::NonNull;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
+use allocator_api2::alloc::AllocError;
+use allocator_api2::alloc::Allocator;
+use allocator_api2::alloc::Global;
 use rstest::rstest;
+use vortex_buffer::Buffer;
+use vortex_buffer::BufferAllocatorRef;
+use vortex_buffer::buffer;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
-use vortex_mask::Mask;
 
+use crate::ArrayRef;
 use crate::Canonical;
 use crate::ExecutionCtx;
+use crate::RecursiveCanonical;
 use crate::VortexSessionExecute;
 use crate::array::IntoArray;
 use crate::array_session;
+use crate::arrays::Chunked;
+use crate::arrays::ChunkedArray;
+use crate::arrays::Constant;
+use crate::arrays::ConstantArray;
+use crate::arrays::Extension;
+use crate::arrays::ExtensionArray;
+use crate::arrays::FixedSizeList;
+use crate::arrays::FixedSizeListArray;
+use crate::arrays::List;
+use crate::arrays::ListArray;
+use crate::arrays::ListView;
+use crate::arrays::ListViewArray;
+use crate::arrays::Primitive;
+use crate::arrays::PrimitiveArray;
+use crate::arrays::Struct;
+use crate::arrays::StructArray;
+use crate::arrays::chunked::ChunkedArrayExt;
+use crate::arrays::extension::ExtensionArraySlotsExt;
+use crate::arrays::fixed_size_list::FixedSizeListArraySlotsExt;
+use crate::arrays::list::ListArraySlotsExt;
+use crate::arrays::listview::ListViewArraySlotsExt;
+use crate::arrays::struct_::StructArrayExt;
+use crate::assert_arrays_eq;
 use crate::builders::ArrayBuilder;
-use crate::builders::builder_with_capacity;
+use crate::builders::ListBuilder;
+use crate::builders::builder_with_capacity_in;
 use crate::dtype::DType;
 use crate::dtype::DecimalDType;
 use crate::dtype::Nullability;
 use crate::dtype::PType;
 use crate::dtype::StructFields;
+use crate::dtype::extension::ExtDTypeRef;
 use crate::dtype::half::f16;
 use crate::extension::datetime::TimeUnit;
 use crate::extension::datetime::Timestamp;
 use crate::scalar::Scalar;
+use crate::validity::Validity;
+
+#[derive(Debug)]
+struct CountingAllocator {
+    allocations: Arc<AtomicUsize>,
+}
+
+// SAFETY: this forwards memory operations to Global and only counts allocations.
+unsafe impl Allocator for CountingAllocator {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        self.allocations.fetch_add(1, Ordering::Relaxed);
+        Global.allocate(layout)
+    }
+
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        // SAFETY: ptr and layout came from Global.
+        unsafe { Global.deallocate(ptr, layout) }
+    }
+}
+
+#[test]
+#[allow(deprecated, unused_qualifications)]
+fn deprecated_builder_constructors_keep_their_signatures() {
+    let _: fn(Nullability) -> super::BoolBuilder = super::BoolBuilder::new;
+    let _: fn(Nullability, usize) -> super::BoolBuilder = super::BoolBuilder::with_capacity;
+    let _: fn(Nullability) -> super::PrimitiveBuilder<i32> = super::PrimitiveBuilder::<i32>::new;
+    let _: fn(Nullability, usize) -> super::PrimitiveBuilder<i32> =
+        super::PrimitiveBuilder::<i32>::with_capacity;
+    let _: fn(DecimalDType, Nullability) -> super::DecimalBuilder =
+        super::DecimalBuilder::new::<i128>;
+    let _: fn(usize, DecimalDType, Nullability) -> super::DecimalBuilder =
+        super::DecimalBuilder::with_capacity::<i128>;
+    let _: fn(ExtDTypeRef) -> super::ExtensionBuilder = super::ExtensionBuilder::new;
+    let _: fn(ExtDTypeRef, usize) -> super::ExtensionBuilder =
+        super::ExtensionBuilder::with_capacity;
+    let _: fn(Arc<DType>, u32, Nullability) -> super::FixedSizeListBuilder =
+        super::FixedSizeListBuilder::new;
+    let _: fn(Arc<DType>, u32, Nullability, usize) -> super::FixedSizeListBuilder =
+        super::FixedSizeListBuilder::with_capacity;
+    let _: fn(Arc<DType>, Nullability) -> super::ListBuilder<u32> = super::ListBuilder::<u32>::new;
+    let _: fn(Arc<DType>, Nullability, usize, usize) -> super::ListBuilder<u32> =
+        super::ListBuilder::<u32>::with_capacity;
+    let _: fn(Arc<DType>, Nullability) -> super::ListViewBuilder<u32, u32> =
+        super::ListViewBuilder::<u32, u32>::new;
+    let _: fn(Arc<DType>, Nullability, usize, usize) -> super::ListViewBuilder<u32, u32> =
+        super::ListViewBuilder::<u32, u32>::with_capacity;
+    let _: fn(crate::dtype::MapDType, Nullability) -> super::MapBuilder<u32, u32> =
+        super::MapBuilder::<u32, u32>::new;
+    let _: fn(crate::dtype::MapDType, Nullability, usize) -> super::MapBuilder<u32, u32> =
+        super::MapBuilder::<u32, u32>::with_capacity;
+    let _: fn(StructFields, Nullability) -> super::StructBuilder = super::StructBuilder::new;
+    let _: fn(StructFields, Nullability, usize) -> super::StructBuilder =
+        super::StructBuilder::with_capacity;
+    let _: fn(DType) -> super::VarBinBuilder<i32> = super::VarBinBuilder::<i32>::new;
+    let _: fn(DType, usize) -> super::VarBinBuilder<i32> =
+        super::VarBinBuilder::<i32>::with_capacity;
+    let _: fn(DType, usize, usize) -> super::VarBinBuilder<i32> =
+        super::VarBinBuilder::<i32>::with_capacity_bytes;
+    let _: fn(DType, usize) -> super::VarBinViewBuilder = super::VarBinViewBuilder::with_capacity;
+    let _: fn(DType, usize) -> super::VarBinViewBuilder =
+        super::VarBinViewBuilder::with_buffer_deduplication;
+    let _: fn(DType, usize, f64) -> super::VarBinViewBuilder =
+        super::VarBinViewBuilder::with_compaction;
+    let _: fn(
+        DType,
+        usize,
+        super::CompletedBuffers,
+        super::BufferGrowthStrategy,
+        f64,
+    ) -> super::VarBinViewBuilder = super::VarBinViewBuilder::new;
+    let _: fn(&DType, usize) -> Box<dyn ArrayBuilder> = super::builder_with_capacity;
+    let _: fn(&DType, usize, &BufferAllocatorRef) -> Box<dyn ArrayBuilder> =
+        super::builder_with_capacity_in;
+}
+
+#[test]
+fn builder_reuses_its_allocator_after_finish() {
+    let allocations = Arc::new(AtomicUsize::new(0));
+    let allocator = BufferAllocatorRef::new(CountingAllocator {
+        allocations: Arc::clone(&allocations),
+    });
+    let dtype = DType::Struct(
+        StructFields::from_iter([
+            (
+                "number",
+                DType::Primitive(PType::I32, Nullability::Nullable),
+            ),
+            ("text", DType::Utf8(Nullability::Nullable)),
+        ]),
+        Nullability::Nullable,
+    );
+    let mut builder = builder_with_capacity_in(&dtype, 1, &allocator);
+
+    builder.append_null();
+    drop(builder.finish());
+    let first = allocations.load(Ordering::Relaxed);
+
+    builder.append_null();
+    drop(builder.finish());
+    let second = allocations.load(Ordering::Relaxed);
+
+    assert!(
+        second - first >= 5,
+        "all nested buffers must reuse the allocator"
+    );
+}
 
 /// Test that `append_zeros` produces the same result as manually appending `Scalar::default_value`.
 ///
@@ -79,12 +221,14 @@ fn test_append_zeros_matches_default_value(#[case] dtype: DType) {
     let num_elements = 5;
 
     // Builder 1: Use append_zeros.
-    let mut builder_zeros = builder_with_capacity(&dtype, num_elements);
+    let mut builder_zeros =
+        builder_with_capacity_in(&dtype, num_elements, BufferAllocatorRef::static_ref());
     builder_zeros.append_zeros(num_elements);
     let array_zeros = builder_zeros.finish();
 
     // Builder 2: Manually append default values.
-    let mut builder_manual = builder_with_capacity(&dtype, num_elements);
+    let mut builder_manual =
+        builder_with_capacity_in(&dtype, num_elements, BufferAllocatorRef::static_ref());
     let default_scalar = Scalar::zero_value(&dtype);
     for _ in 0..num_elements {
         builder_manual.append_scalar(&default_scalar).unwrap();
@@ -179,7 +323,7 @@ fn test_append_zeros_matches_default_value(#[case] dtype: DType) {
 )]
 #[should_panic(expected = "non-nullable")]
 fn test_append_nulls_panics_on_non_nullable(#[case] dtype: DType, #[case] count: usize) {
-    let mut builder = builder_with_capacity(&dtype, count);
+    let mut builder = builder_with_capacity_in(&dtype, count, BufferAllocatorRef::static_ref());
     builder.append_nulls(count);
 }
 
@@ -192,7 +336,7 @@ fn test_append_nulls_panics_on_non_nullable(#[case] dtype: DType, #[case] count:
 #[case::nullable_utf8(DType::Utf8(Nullability::Nullable), true)]
 #[case::non_nullable_utf8(DType::Utf8(Nullability::NonNullable), false)]
 fn test_append_defaults_behavior(#[case] dtype: DType, #[case] should_be_null: bool) {
-    let mut builder = builder_with_capacity(&dtype, 3);
+    let mut builder = builder_with_capacity_in(&dtype, 3, BufferAllocatorRef::static_ref());
     builder.append_defaults(3);
     let array = builder.finish();
 
@@ -231,8 +375,8 @@ where
     F: FnMut(&mut dyn ArrayBuilder),
 {
     // Create two identical builders.
-    let mut builder1 = builder_with_capacity(dtype, 10);
-    let mut builder2 = builder_with_capacity(dtype, 10);
+    let mut builder1 = builder_with_capacity_in(dtype, 10, BufferAllocatorRef::static_ref());
+    let mut builder2 = builder_with_capacity_in(dtype, 10, BufferAllocatorRef::static_ref());
 
     // Fill both builders with the same data.
     fill_builder(builder1.as_mut());
@@ -526,7 +670,8 @@ fn test_to_canonical_f32() {
 ))]
 fn test_append_scalar_comprehensive(#[case] dtype: DType) {
     let num_elements = 3;
-    let mut builder = builder_with_capacity(&dtype, num_elements * 2);
+    let mut builder =
+        builder_with_capacity_in(&dtype, num_elements * 2, BufferAllocatorRef::static_ref());
 
     // Create test scalars based on the dtype.
     let scalars = create_test_scalars_for_dtype(&dtype, num_elements);
@@ -631,6 +776,9 @@ fn create_test_scalars_for_dtype(dtype: &DType, count: usize) -> Vec<Scalar> {
                     .collect();
                 Scalar::fixed_size_list(Arc::clone(element_dtype), elements, *n)
             }
+            DType::Map(..) => {
+                panic!("map builders are not supported until MapArray exists")
+            }
             DType::Struct(fields, n) => {
                 // Create struct scalars with field values.
                 let field_values: Vec<Scalar> = fields
@@ -700,7 +848,7 @@ fn assert_scalars_equal(actual: &Scalar, expected: &Scalar, dtype: &DType, index
 #[case::utf8(DType::Utf8(Nullability::Nullable))]
 #[case::binary(DType::Binary(Nullability::Nullable))]
 fn test_append_scalar_mixed_nulls(#[case] dtype: DType) {
-    let mut builder = builder_with_capacity(&dtype, 6);
+    let mut builder = builder_with_capacity_in(&dtype, 6, BufferAllocatorRef::static_ref());
 
     // Create a pattern of valid, null, valid, null, valid.
     let test_scalars = create_test_scalars_for_dtype(&dtype, 3);
@@ -778,7 +926,11 @@ fn test_append_scalar_mixed_nulls(#[case] dtype: DType) {
 #[test]
 fn test_append_scalar_wrong_dtype_rejection() {
     // Test bool builder rejecting i32 scalar.
-    let mut bool_builder = builder_with_capacity(&DType::Bool(Nullability::NonNullable), 1);
+    let mut bool_builder = builder_with_capacity_in(
+        &DType::Bool(Nullability::NonNullable),
+        1,
+        BufferAllocatorRef::static_ref(),
+    );
     let i32_scalar = Scalar::from(42i32);
     assert!(
         bool_builder.append_scalar(&i32_scalar).is_err(),
@@ -786,8 +938,11 @@ fn test_append_scalar_wrong_dtype_rejection() {
     );
 
     // Test i32 builder rejecting string scalar.
-    let mut i32_builder =
-        builder_with_capacity(&DType::Primitive(PType::I32, Nullability::NonNullable), 1);
+    let mut i32_builder = builder_with_capacity_in(
+        &DType::Primitive(PType::I32, Nullability::NonNullable),
+        1,
+        BufferAllocatorRef::static_ref(),
+    );
     let string_scalar = Scalar::utf8("test", Nullability::NonNullable);
     assert!(
         i32_builder.append_scalar(&string_scalar).is_err(),
@@ -795,7 +950,11 @@ fn test_append_scalar_wrong_dtype_rejection() {
     );
 
     // Test string builder rejecting binary scalar.
-    let mut string_builder = builder_with_capacity(&DType::Utf8(Nullability::NonNullable), 1);
+    let mut string_builder = builder_with_capacity_in(
+        &DType::Utf8(Nullability::NonNullable),
+        1,
+        BufferAllocatorRef::static_ref(),
+    );
     let binary_scalar = Scalar::binary(vec![0u8, 1, 2], Nullability::NonNullable);
     assert!(
         string_builder.append_scalar(&binary_scalar).is_err(),
@@ -808,7 +967,7 @@ fn test_append_scalar_wrong_dtype_rejection() {
 #[test]
 fn test_append_scalar_repeated_same_instance() {
     let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-    let mut builder = builder_with_capacity(&dtype, 5);
+    let mut builder = builder_with_capacity_in(&dtype, 5, BufferAllocatorRef::static_ref());
 
     let scalar = Scalar::primitive(42i32, Nullability::NonNullable);
 
@@ -834,66 +993,368 @@ fn test_append_scalar_repeated_same_instance() {
     }
 }
 
-/// Test that `set_validity` correctly overrides a builder's validity across all mask variants.
+/// Builders only promise a canonical *top level*, so a child array that is long enough to be worth
+/// a chunk must come back out of the builder in the encoding it went in with.
 ///
-/// `set_validity` moves the mask's buffer into the builder rather than copying it, so the
-/// `sliced_offset` case is important: slicing a `Mask::Values` at a non-byte-aligned boundary
-/// yields a buffer with a non-zero bit offset, which the move path must preserve.
+/// Each case appends the same array twice, which additionally checks that the two chunks are
+/// stitched back together into a [`ChunkedArray`] rather than being decoded and concatenated.
 #[rstest]
-#[case::all_true(Mask::new_true(8), vec![true; 8])]
-#[case::all_false(Mask::new_false(8), vec![false; 8])]
-#[case::values(
-    Mask::from_iter([true, false, true, true, false, false, true, false]),
-    vec![true, false, true, true, false, false, true, false]
+#[case::struct_field(
+    StructArray::try_from_iter([("a", constant_i32())])
+        .vortex_expect("struct array")
+        .into_array(),
+    |array: &ArrayRef| array.as_::<Struct>().unmasked_field(0).clone()
 )]
-#[case::sliced_offset(
-    Mask::from_iter([
-        false, false, false, // dropped by the slice
-        true, false, true, true, false, false, true, false, // kept: indices 3..11
-        true, true, true, true, true, // dropped by the slice
-    ])
-    .slice(3..11),
-    vec![true, false, true, true, false, false, true, false]
+#[case::list_elements(
+    ListViewArray::new(
+        constant_i32(),
+        (0..CHUNK_LEN as u64).collect::<Buffer<_>>().into_array(),
+        Buffer::full(1u64, CHUNK_LEN).into_array(),
+        Validity::NonNullable,
+    )
+    .into_array(),
+    |array: &ArrayRef| array.as_::<ListView>().elements().clone()
 )]
-fn test_set_validity_overrides_validity(
-    #[case] mask: Mask,
-    #[case] expected: Vec<bool>,
+#[case::fixed_size_list_elements(
+    FixedSizeListArray::new(
+        constant_i32(),
+        2,
+        Validity::NonNullable,
+        CHUNK_LEN / 2,
+    )
+    .into_array(),
+    |array: &ArrayRef| array.as_::<FixedSizeList>().elements().clone()
+)]
+#[case::extension_storage(
+    ExtensionArray::new(
+        Timestamp::new(TimeUnit::Milliseconds, Nullability::NonNullable).erased(),
+        ConstantArray::new(
+            Scalar::primitive(0i64, Nullability::NonNullable),
+            CHUNK_LEN,
+        )
+        .into_array(),
+    )
+    .into_array(),
+    |array: &ArrayRef| array.as_::<Extension>().storage().clone()
+)]
+fn test_children_are_not_canonicalized(
+    #[case] array: ArrayRef,
+    #[case] child_of: fn(&ArrayRef) -> ArrayRef,
 ) -> VortexResult<()> {
-    let dtype = DType::Primitive(PType::I32, Nullability::Nullable);
-    let mut builder = builder_with_capacity(&dtype, mask.len());
-    builder.append_zeros(mask.len());
-
-    builder.set_validity(mask);
-
-    let validity = builder.finish().validity()?;
     let mut ctx = array_session().create_execution_ctx();
-    for (i, &valid) in expected.iter().enumerate() {
-        assert_eq!(
-            validity.execute_is_valid(i, &mut ctx)?,
-            valid,
-            "validity mismatch at index {i}"
-        );
-    }
+
+    let mut builder = builder_with_capacity_in(array.dtype(), 0, BufferAllocatorRef::static_ref());
+    array.append_to_builder(builder.as_mut(), &mut ctx)?;
+    array.append_to_builder(builder.as_mut(), &mut ctx)?;
+    let built = builder.finish();
+
+    let child = child_of(&built);
+    let chunked = child.as_::<Chunked>();
+    assert_eq!(
+        chunked.nchunks(),
+        2,
+        "expected one chunk per appended array"
+    );
+    assert!(
+        chunked.iter_chunks().all(|chunk| chunk.is::<Constant>()),
+        "the constant-encoded child was decoded by the builder",
+    );
+
+    let expected = ChunkedArray::try_new(vec![array.clone(), array], built.dtype().clone())?;
+    assert_arrays_eq!(&built, &expected, &mut ctx);
+
     Ok(())
 }
 
-/// Test that `set_validity` is a no-op on a non-nullable builder.
+/// A child is chunked on the boundaries it is appended on, however small the appends. Appending
+/// scalars instead is what asks the builder to copy the values into one canonical child.
 #[test]
-fn test_set_validity_noop_when_non_nullable() -> VortexResult<()> {
-    let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-    let mut builder = builder_with_capacity(&dtype, 4);
-    builder.append_zeros(4);
-
-    // Providing an all-false mask must not make the non-nullable array invalid.
-    builder.set_validity(Mask::new_false(4));
-
-    let validity = builder.finish().validity()?;
+fn test_children_are_chunked_on_the_boundaries_they_are_appended_on() -> VortexResult<()> {
     let mut ctx = array_session().create_execution_ctx();
-    for i in 0..4 {
-        assert!(
-            validity.execute_is_valid(i, &mut ctx)?,
-            "index {i} should remain valid"
-        );
+
+    let elements = ConstantArray::new(1i32, 2).into_array();
+    let array = FixedSizeListArray::new(elements, 2, Validity::NonNullable, 1).into_array();
+
+    let mut builder = builder_with_capacity_in(array.dtype(), 0, BufferAllocatorRef::static_ref());
+    for _ in 0..CHUNK_LEN {
+        array.append_to_builder(builder.as_mut(), &mut ctx)?;
     }
+    let built = builder.finish();
+
+    assert_eq!(built.len(), CHUNK_LEN);
+    assert_eq!(
+        built
+            .as_::<FixedSizeList>()
+            .elements()
+            .as_::<Chunked>()
+            .nchunks(),
+        CHUNK_LEN,
+        "one chunk per appended array",
+    );
+
+    // The same values appended as scalars land in a single canonical child.
+    let mut builder = builder_with_capacity_in(array.dtype(), 0, BufferAllocatorRef::static_ref());
+    let scalar = array.execute_scalar(0, &mut ctx)?;
+    for _ in 0..CHUNK_LEN {
+        builder.append_scalar(&scalar)?;
+    }
+    let built_from_scalars = builder.finish();
+
+    assert!(
+        built_from_scalars
+            .as_::<FixedSizeList>()
+            .elements()
+            .is::<Primitive>()
+    );
+    assert_arrays_eq!(&built_from_scalars, &built, &mut ctx);
+
+    Ok(())
+}
+
+/// A builder that mixes appended arrays with scalar appends must keep the two in order.
+#[test]
+fn test_struct_builder_interleaves_arrays_and_scalars() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+
+    let array = StructArray::try_from_iter([("a", constant_i32())])?.into_array();
+    let scalar = Scalar::struct_(
+        array.dtype().clone(),
+        vec![Scalar::primitive(1i32, Nullability::NonNullable)],
+    );
+
+    let mut builder = builder_with_capacity_in(array.dtype(), 0, BufferAllocatorRef::static_ref());
+    builder.append_scalar(&scalar)?;
+    array.append_to_builder(builder.as_mut(), &mut ctx)?;
+    builder.append_scalar(&scalar)?;
+    let built = builder.finish();
+
+    let scalar_array = StructArray::try_from_iter([(
+        "a",
+        PrimitiveArray::new(buffer![1i32], Validity::NonNullable),
+    )])?
+    .into_array();
+    let expected = ChunkedArray::try_new(
+        vec![scalar_array.clone(), array, scalar_array],
+        built.dtype().clone(),
+    )?;
+    assert_arrays_eq!(&built, &expected, &mut ctx);
+
+    Ok(())
+}
+
+/// An arbitrary array length. Nested builders treat no length specially, so the tests only need a
+/// length long enough to tell chunks apart.
+const CHUNK_LEN: usize = 64;
+
+/// A nested builder's own validity is accumulated the same way its children are: an appended
+/// array's validity is kept as it arrived rather than executed into a mask and copied bit by bit.
+#[test]
+fn test_appended_validity_is_not_materialized() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+
+    let array = StructArray::try_from_iter_with_validity(
+        [("a", iota(CHUNK_LEN))],
+        Validity::from_iter((0..CHUNK_LEN).map(|i| i % 3 != 0)),
+    )?
+    .into_array();
+
+    let mut builder = builder_with_capacity_in(array.dtype(), 0, BufferAllocatorRef::static_ref());
+    array.append_to_builder(builder.as_mut(), &mut ctx)?;
+    array.append_to_builder(builder.as_mut(), &mut ctx)?;
+    let built = builder.finish();
+
+    let Validity::Array(validity) = built.validity()? else {
+        panic!("expected array-backed validity");
+    };
+    assert!(
+        validity.is::<Chunked>(),
+        "the two appended validities should have been concatenated, not copied into one buffer",
+    );
+
+    let expected = ChunkedArray::try_new(vec![array.clone(), array], built.dtype().clone())?;
+    assert_arrays_eq!(&built, &expected, &mut ctx);
+
+    Ok(())
+}
+
+/// A non-canonical array of [`CHUNK_LEN`] `i32` values.
+fn constant_i32() -> ArrayRef {
+    ConstantArray::new(0i32, CHUNK_LEN).into_array()
+}
+
+/// Two lists of [`CHUNK_LEN`] elements each, so that appending them chunks the elements.
+fn two_lists_of_chunk_len() -> ListViewArray {
+    ListViewArray::new(
+        iota(2 * CHUNK_LEN),
+        u64s([0, CHUNK_LEN]),
+        u64s([CHUNK_LEN, CHUNK_LEN]),
+        Validity::NonNullable,
+    )
+}
+
+/// `0..n` as an `i32` array, so that the values of one chunk are distinguishable from the next.
+fn iota(n: usize) -> ArrayRef {
+    (0..n)
+        .map(|i| i32::try_from(i).vortex_expect("iota value fits in an i32"))
+        .collect::<Buffer<_>>()
+        .into_array()
+}
+
+/// A `u64` array of list offsets or sizes.
+fn u64s(values: impl IntoIterator<Item = usize>) -> ArrayRef {
+    values
+        .into_iter()
+        .map(|v| u64::try_from(v).vortex_expect("list offset fits in a u64"))
+        .collect::<Buffer<_>>()
+        .into_array()
+}
+
+/// Once a list builder keeps its elements as chunks, `elements_builder.len()` is a running total
+/// across those chunks — every offset appended afterwards has to be rebased onto it.
+///
+/// The two cases cover the two bulk paths into the elements builder: appending a `ListViewArray`
+/// rebases the view's own offsets, while appending a `ListArray` slices the elements first.
+#[rstest]
+#[case::from_listview(two_lists_of_chunk_len().into_array())]
+#[case::from_list(
+    ListArray::new(
+        iota(2 * CHUNK_LEN),
+        u64s([0, CHUNK_LEN, 2 * CHUNK_LEN]),
+        Validity::NonNullable,
+    )
+    .into_array()
+)]
+fn test_list_offsets_are_rebased_across_element_chunks(
+    #[case] lists: ArrayRef,
+) -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+
+    let mut builder = builder_with_capacity_in(
+        &DType::List(
+            Arc::new(DType::Primitive(PType::I32, Nullability::NonNullable)),
+            Nullability::NonNullable,
+        ),
+        0,
+        BufferAllocatorRef::static_ref(),
+    );
+    lists.append_to_builder(builder.as_mut(), &mut ctx)?;
+    lists.append_to_builder(builder.as_mut(), &mut ctx)?;
+    let built = builder.finish();
+
+    assert!(
+        built.as_::<ListView>().elements().is::<Chunked>(),
+        "the elements should have been kept as chunks",
+    );
+
+    let expected = ChunkedArray::try_new(vec![lists.clone(), lists], built.dtype().clone())?;
+    assert_arrays_eq!(&built, &expected, &mut ctx);
+
+    Ok(())
+}
+
+/// `ListBuilder` computes each offset from the running element count as well, and reaches the
+/// elements builder through `append_array_as_list` rather than a bulk append.
+#[test]
+fn test_list_builder_offsets_are_rebased_across_element_chunks() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let element_dtype = Arc::new(DType::Primitive(PType::I32, Nullability::NonNullable));
+
+    let mut builder = ListBuilder::<u64>::with_capacity_in(
+        element_dtype,
+        Nullability::NonNullable,
+        0,
+        0,
+        BufferAllocatorRef::static_ref(),
+    );
+    for value in 0..3i32 {
+        builder
+            .append_array_as_list(&ConstantArray::new(value, CHUNK_LEN).into_array(), &mut ctx)?;
+    }
+    let built = builder.finish();
+
+    assert!(built.as_::<List>().elements().is::<Chunked>());
+
+    let expected = ListArray::new(
+        (0..3i32)
+            .flat_map(|value| std::iter::repeat_n(value, CHUNK_LEN))
+            .collect::<Buffer<_>>()
+            .into_array(),
+        u64s((0..=3).map(|i| i * CHUNK_LEN)),
+        Validity::NonNullable,
+    );
+    assert_arrays_eq!(&built, &expected, &mut ctx);
+
+    Ok(())
+}
+
+/// A nested builder's own validity buffer is independent of its chunked child, so nulls appended
+/// alongside chunks must survive.
+#[rstest]
+#[case::fixed_size_list(
+    FixedSizeListArray::new(
+        iota(CHUNK_LEN),
+        4,
+        Validity::from_iter((0..CHUNK_LEN / 4).map(|i| i % 3 != 0)),
+        CHUNK_LEN / 4,
+    )
+    .into_array(),
+    |array: &ArrayRef| array.as_::<FixedSizeList>().elements().clone()
+)]
+#[case::struct_(
+    StructArray::try_from_iter_with_validity(
+        [("a", iota(CHUNK_LEN))],
+        Validity::from_iter((0..CHUNK_LEN).map(|i| i % 3 != 0)),
+    )
+    .vortex_expect("struct array")
+    .into_array(),
+    |array: &ArrayRef| array.as_::<Struct>().unmasked_field(0).clone()
+)]
+fn test_validity_survives_chunked_children(
+    #[case] array: ArrayRef,
+    #[case] child_of: fn(&ArrayRef) -> ArrayRef,
+) -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+
+    let mut builder = builder_with_capacity_in(array.dtype(), 0, BufferAllocatorRef::static_ref());
+    array.append_to_builder(builder.as_mut(), &mut ctx)?;
+    builder.append_nulls(1);
+    array.append_to_builder(builder.as_mut(), &mut ctx)?;
+    let built = builder.finish();
+
+    assert!(child_of(&built).is::<Chunked>());
+
+    let mut null = builder_with_capacity_in(array.dtype(), 1, BufferAllocatorRef::static_ref());
+    null.append_nulls(1);
+    let expected = ChunkedArray::try_new(
+        vec![array.clone(), null.finish(), array],
+        built.dtype().clone(),
+    )?;
+    assert_arrays_eq!(&built, &expected, &mut ctx);
+
+    Ok(())
+}
+
+/// Consumers that genuinely need a fully-decoded tree ask for it, and must still get one.
+#[test]
+fn test_chunked_children_canonicalize_recursively() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+
+    let array = StructArray::try_from_iter([("a", constant_i32())])?.into_array();
+    let mut builder = builder_with_capacity_in(array.dtype(), 0, BufferAllocatorRef::static_ref());
+    array.append_to_builder(builder.as_mut(), &mut ctx)?;
+    array.append_to_builder(builder.as_mut(), &mut ctx)?;
+    let built = builder.finish();
+
+    let recursive = built.clone().execute::<RecursiveCanonical>(&mut ctx)?.0;
+    assert!(
+        recursive
+            .clone()
+            .into_array()
+            .as_::<Struct>()
+            .unmasked_field(0)
+            .is::<Primitive>()
+    );
+    assert_arrays_eq!(&recursive.into_array(), &built, &mut ctx);
+
     Ok(())
 }

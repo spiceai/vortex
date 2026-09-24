@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 from collections.abc import Callable
-from typing import TypeAlias, Unpack, overload
+from typing import TypeAlias, Unpack, cast, overload
 
-from .._lib import store as _store  # pyright: ignore[reportMissingModuleSource]
+from .._lib import store as _store
 from ._aws import S3Config, S3Credential, S3CredentialProvider, S3Store
 from ._azure import (
     AzureAccessKey,
@@ -16,13 +16,18 @@ from ._azure import (
     AzureStore,
 )
 from ._client import ClientConfig
+from ._cos import CosStore
 from ._gcs import GCSConfig, GCSCredential, GCSCredentialProvider, GCSStore
+from ._goosefs import GoosefsStore
+from ._hf import HfStore
 from ._http import HTTPStore
 from ._local import LocalStore
 from ._memory import MemoryStore
 from ._retry import BackoffConfig, RetryConfig
 
-ObjectStore: TypeAlias = AzureStore | GCSStore | HTTPStore | S3Store | LocalStore | MemoryStore
+ObjectStore: TypeAlias = (
+    AzureStore | CosStore | GoosefsStore | GCSStore | HfStore | HTTPStore | S3Store | LocalStore | MemoryStore
+)
 """All supported ObjectStore implementations."""
 
 
@@ -89,6 +94,12 @@ def from_url(  # type: ignore[misc] # docstring in pyi file
     - ``gs://bucket/path`` -> :class:`~vortex.store.GCSStore`
     - ``az://account/container/path`` -> :class:`~vortex.store.AzureStore` (also
       supports ``adl``, ``azure``, ``abfs``, ``abfss``)
+    - ``cos://bucket/path`` -> OpenDAL-backed Tencent Cloud COS store (configure
+      via environment variables such as
+      ``TENCENTCLOUD_SECRET_ID`` / ``TENCENTCLOUD_SECRET_KEY`` and ``COS_ENDPOINT``)
+    - ``goosefs://master-addr:port/path`` -> OpenDAL-backed Tencent Cloud GooseFS store
+      (configure via environment variable ``GOOSEFS_MASTER_ADDR`` or pass
+      ``master_addr`` in properties)
     - ``http://mydomain/path`` -> :class:`~vortex.store.HTTPStore`
     - ``https://mydomain/path`` -> :class:`~vortex.store.HTTPStore`
 
@@ -116,13 +127,16 @@ def from_url(  # type: ignore[misc] # docstring in pyi file
         kwargs: per-store configuration passed down to store-specific builders.
 
     """
-    return _store.from_url(  # pyright: ignore[reportCallIssue, reportUnknownVariableType]
-        url,
-        config=config,  # pyright: ignore[reportArgumentType]
-        client_options=client_options,
-        retry_config=retry_config,
-        credential_provider=credential_provider,  # pyright: ignore[reportArgumentType]
-        **kwargs,  # pyright: ignore[reportArgumentType]
+    return cast(
+        ObjectStore,
+        _store.from_url(  # ty: ignore[no-matching-overload]
+            url,
+            config=config,
+            client_options=client_options,
+            retry_config=retry_config,
+            credential_provider=credential_provider,
+            **kwargs,
+        ),
     )
 
 
@@ -139,6 +153,10 @@ __all__ = [
     "BackoffConfig",
     "ClientConfig",
     "RetryConfig",
+    # COS (OpenDAL-backed)
+    "CosStore",
+    # GooseFS (OpenDAL-backed)
+    "GoosefsStore",
     # GCS
     "GCSConfig",
     "GCSCredential",
@@ -146,6 +164,8 @@ __all__ = [
     "GCSStore",
     # HTTP
     "HTTPStore",
+    # Hugging Face Hub
+    "HfStore",
     # Local
     "LocalStore",
     "MemoryStore",

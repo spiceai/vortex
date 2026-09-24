@@ -24,7 +24,7 @@ use crate::arrays::chunked::ChunkedArrayExt;
 use crate::arrays::dict_test::gen_dict_primitive_chunks;
 use crate::arrays::struct_::StructArrayExt;
 use crate::assert_arrays_eq;
-use crate::builders::builder_with_capacity;
+use crate::builders::builder_with_capacity_in;
 use crate::dtype::DType;
 use crate::dtype::Nullability;
 use crate::dtype::PType;
@@ -54,7 +54,8 @@ fn builder_kernel_path_canonicalizes_primitive_chunks() {
     let dtype = array.dtype().clone();
     let len = array.len();
 
-    let builder = builder_with_capacity(&dtype, len);
+    let builder =
+        builder_with_capacity_in(&dtype, len, vortex_buffer::BufferAllocatorRef::static_ref());
     // Clone the array into the builder path — the test also holds `array` so refcount > 1 on
     // entry, which previously caused `take_slot_unchecked` to silently keep slots populated.
     let mut builder = execute_into_builder(array.clone(), builder, &mut ctx).unwrap();
@@ -93,7 +94,8 @@ fn builder_kernel_nested_chunked_of_chunked() {
 
     let dtype = outer.dtype().clone();
     let len = outer.len();
-    let builder = builder_with_capacity(&dtype, len);
+    let builder =
+        builder_with_capacity_in(&dtype, len, vortex_buffer::BufferAllocatorRef::static_ref());
     let mut builder = execute_into_builder(outer, builder, &mut ctx).unwrap();
     let output = builder.finish();
 
@@ -120,13 +122,15 @@ fn builder_kernel_path_repeated_shared_chunked_dict_execution() {
         .into_array();
 
     let first = {
-        let builder = builder_with_capacity(&dtype, len);
+        let builder =
+            builder_with_capacity_in(&dtype, len, vortex_buffer::BufferAllocatorRef::static_ref());
         let mut builder = execute_into_builder(array.clone(), builder, &mut ctx).unwrap();
         builder.finish()
     };
 
     let second = {
-        let builder = builder_with_capacity(&dtype, len);
+        let builder =
+            builder_with_capacity_in(&dtype, len, vortex_buffer::BufferAllocatorRef::static_ref());
         let mut builder = execute_into_builder(array, builder, &mut ctx).unwrap();
         builder.finish()
     };
@@ -177,7 +181,11 @@ fn execute_path_nested_chunked_dict_of_dict_into_canonical() {
     let keep_alive = outer.clone();
 
     let expected = {
-        let mut builder = builder_with_capacity(outer.dtype(), outer.len());
+        let mut builder = builder_with_capacity_in(
+            outer.dtype(),
+            outer.len(),
+            vortex_buffer::BufferAllocatorRef::static_ref(),
+        );
         inner_1
             .append_to_builder(builder.as_mut(), &mut ctx)
             .unwrap();
@@ -213,7 +221,7 @@ fn with_slot_rewrites_chunk_and_offsets() {
     let array = array.as_::<Chunked>();
 
     assert_eq!(array.nchunks(), 3);
-    assert_eq!(array.chunk_offsets(), [0, 3, 6, 9]);
+    assert_eq!(array.chunk_offset_values(), [0, 3, 6, 9]);
     assert_arrays_eq!(
         array.chunk(0).clone(),
         PrimitiveArray::from_iter([1u64, 2, 3]),
@@ -376,10 +384,12 @@ pub fn pack_nested_structs() -> VortexResult<()> {
     )?
     .into_array();
     let canonical_struct = chunked.execute::<StructArray>(&mut ctx)?;
-    let canonical_varbin = canonical_struct.unmasked_fields()[0]
+    let canonical_varbin = canonical_struct
+        .unmasked_field(0)
         .clone()
         .execute::<VarBinViewArray>(&mut ctx)?;
-    let original_varbin = struct_array.unmasked_fields()[0]
+    let original_varbin = struct_array
+        .unmasked_field(0)
         .clone()
         .execute::<VarBinViewArray>(&mut ctx)?;
     assert_arrays_eq!(original_varbin, canonical_varbin, &mut ctx);

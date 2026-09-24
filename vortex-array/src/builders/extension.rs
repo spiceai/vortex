@@ -3,9 +3,9 @@
 
 use std::any::Any;
 
+use vortex_buffer::BufferAllocatorRef;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
-use vortex_mask::Mask;
 
 use crate::ArrayRef;
 use crate::ExecutionCtx;
@@ -13,8 +13,8 @@ use crate::IntoArray;
 use crate::arrays::ExtensionArray;
 use crate::arrays::extension::ExtensionArrayExt;
 use crate::builders::ArrayBuilder;
+use crate::builders::ChildBuilder;
 use crate::builders::DEFAULT_BUILDER_CAPACITY;
-use crate::builders::builder_with_capacity;
 use crate::canonical::Canonical;
 use crate::dtype::DType;
 use crate::dtype::extension::ExtDTypeRef;
@@ -24,19 +24,35 @@ use crate::scalar::Scalar;
 /// The builder for building a [`ExtensionArray`].
 pub struct ExtensionBuilder {
     dtype: DType,
-    storage: Box<dyn ArrayBuilder>,
+    storage: ChildBuilder,
 }
 
 impl ExtensionBuilder {
     /// Creates a new `ExtensionBuilder` with a capacity of [`DEFAULT_BUILDER_CAPACITY`].
+    #[deprecated(note = "use `new_in` with an explicit allocator")]
     pub fn new(ext_dtype: ExtDTypeRef) -> Self {
-        Self::with_capacity(ext_dtype, DEFAULT_BUILDER_CAPACITY)
+        Self::new_in(ext_dtype, BufferAllocatorRef::static_ref())
+    }
+
+    /// Creates a new `ExtensionBuilder` with the default capacity using `allocator`.
+    pub fn new_in(ext_dtype: ExtDTypeRef, allocator: &BufferAllocatorRef) -> Self {
+        Self::with_capacity_in(ext_dtype, DEFAULT_BUILDER_CAPACITY, allocator)
     }
 
     /// Creates a new `ExtensionBuilder` with the given `capacity`.
+    #[deprecated(note = "use `with_capacity_in` with an explicit allocator")]
     pub fn with_capacity(ext_dtype: ExtDTypeRef, capacity: usize) -> Self {
+        Self::with_capacity_in(ext_dtype, capacity, BufferAllocatorRef::static_ref())
+    }
+
+    /// Creates a new `ExtensionBuilder` with `capacity` using `allocator`.
+    pub fn with_capacity_in(
+        ext_dtype: ExtDTypeRef,
+        capacity: usize,
+        allocator: &BufferAllocatorRef,
+    ) -> Self {
         Self {
-            storage: builder_with_capacity(ext_dtype.storage_dtype(), capacity),
+            storage: ChildBuilder::with_capacity(ext_dtype.storage_dtype(), capacity, allocator),
             dtype: DType::Extension(ext_dtype),
         }
     }
@@ -53,9 +69,7 @@ impl ExtensionBuilder {
         array: &ExtensionArray,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<()> {
-        array
-            .storage_array()
-            .append_to_builder(self.storage.as_mut(), ctx)
+        self.storage.append_array(array.storage_array(), ctx)
     }
 
     /// Finishes the builder directly into a [`ExtensionArray`].
@@ -116,10 +130,6 @@ impl ArrayBuilder for ExtensionBuilder {
         self.storage.reserve_exact(capacity)
     }
 
-    unsafe fn set_validity_unchecked(&mut self, validity: Mask) {
-        unsafe { self.storage.set_validity_unchecked(validity) };
-    }
-
     fn finish(&mut self) -> ArrayRef {
         self.finish_into_extension().into_array()
     }
@@ -147,7 +157,8 @@ mod tests {
         let mut ctx = array_session().create_execution_ctx();
         let ext_dtype = Date::new(TimeUnit::Days, Nullability::Nullable).erased();
 
-        let mut builder = ExtensionBuilder::new(ext_dtype.clone());
+        let mut builder =
+            ExtensionBuilder::new_in(ext_dtype.clone(), BufferAllocatorRef::static_ref());
 
         // Test appending a valid extension value.
         let storage1 = Scalar::from(Some(42i32));
@@ -177,7 +188,7 @@ mod tests {
         assert_eq!(array.len(), 3);
 
         // Test wrong dtype error.
-        let mut builder = ExtensionBuilder::new(ext_dtype);
+        let mut builder = ExtensionBuilder::new_in(ext_dtype, BufferAllocatorRef::static_ref());
         let wrong_scalar = Scalar::from(true);
         assert!(builder.append_scalar(&wrong_scalar).is_err());
     }

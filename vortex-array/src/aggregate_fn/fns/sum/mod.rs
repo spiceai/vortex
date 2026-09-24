@@ -15,10 +15,13 @@ use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
-use self::bool::accumulate_bool;
-use self::constant::multiply_constant;
-use self::decimal::accumulate_decimal;
-use self::primitive::accumulate_primitive;
+pub(crate) use self::bool::accumulate_bool;
+pub(crate) use self::constant::multiply_constant;
+pub(crate) use self::decimal::accumulate_decimal;
+pub(crate) use self::primitive::accumulate_primitive;
+pub(crate) use self::primitive::sum_float_all;
+pub(crate) use self::primitive::sum_signed_all;
+pub(crate) use self::primitive::sum_unsigned_all;
 use crate::ArrayRef;
 use crate::Canonical;
 use crate::Columnar;
@@ -351,7 +354,7 @@ pub enum SumState {
     },
 }
 
-fn make_zero_state(return_dtype: &DType) -> SumState {
+pub(crate) fn make_zero_state(return_dtype: &DType) -> SumState {
     match return_dtype {
         DType::Primitive(ptype, _) => match ptype {
             PType::U8 | PType::U16 | PType::U32 | PType::U64 => SumState::Unsigned(0),
@@ -367,6 +370,7 @@ fn make_zero_state(return_dtype: &DType) -> SumState {
 }
 
 /// Checked add for u64, returning true if overflow occurred.
+#[allow(clippy::inline_always)]
 #[inline(always)]
 fn checked_add_u64(acc: &mut u64, val: u64) -> bool {
     match acc.checked_add(val) {
@@ -379,6 +383,7 @@ fn checked_add_u64(acc: &mut u64, val: u64) -> bool {
 }
 
 /// Checked add for i64, returning true if overflow occurred.
+#[allow(clippy::inline_always)]
 #[inline(always)]
 fn checked_add_i64(acc: &mut i64, val: i64) -> bool {
     match acc.checked_add(val) {
@@ -476,10 +481,14 @@ mod tests {
                 .checked_add(&rhs.as_primitive())
                 .map(Scalar::from)
                 .unwrap_or_else(|| Scalar::null(sum_dtype.as_nullable())),
-            DType::Decimal(..) => lhs
+            // Add widens the result precision, so restate the sum in the accumulator's own
+            // decimal type, treating a value that no longer fits as an overflow.
+            DType::Decimal(decimal_dtype, _) => lhs
                 .as_decimal()
-                .checked_binary_numeric(&rhs.as_decimal(), NumericOperator::Add)
-                .map(Scalar::from)
+                .checked_binary_numeric(&rhs.as_decimal(), NumericOperator::Add)?
+                .and_then(|scalar| scalar.as_decimal().decimal_value())
+                .filter(|value| value.fits_in_precision(*decimal_dtype))
+                .map(|value| Scalar::decimal(value, *decimal_dtype, Nullable))
                 .unwrap_or_else(|| Scalar::null(sum_dtype.as_nullable())),
             _ => unreachable!("Sum will always be a decimal or a primitive dtype"),
         })

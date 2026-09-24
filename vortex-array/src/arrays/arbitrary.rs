@@ -28,10 +28,13 @@ use crate::builders::ArrayBuilder;
 use crate::builders::DecimalBuilder;
 use crate::builders::FixedSizeListBuilder;
 use crate::builders::ListViewBuilder;
+use crate::builders::MapBuilder;
 use crate::dtype::DType;
 use crate::dtype::IntegerPType;
+use crate::dtype::MapDType;
 use crate::dtype::NativePType;
 use crate::dtype::Nullability;
+use crate::dtype::OffsetBuilderPType;
 use crate::dtype::PType;
 use crate::match_each_decimal_value_type;
 use crate::scalar::Scalar;
@@ -141,7 +144,11 @@ fn random_array_chunk(
         d @ DType::Decimal(decimal, n) => {
             let elem_len = chunk_len.unwrap_or(u.int_in_range(0..=20)?);
             match_each_decimal_value_type!(DecimalType::smallest_decimal_value_type(decimal), |D| {
-                let mut builder = DecimalBuilder::new::<D>(*decimal, *n);
+                let mut builder = DecimalBuilder::new_in::<D>(
+                    *decimal,
+                    *n,
+                    vortex_buffer::BufferAllocatorRef::static_ref(),
+                );
                 for _i in 0..elem_len {
                     let random_decimal = random_scalar(u, d)?;
                     builder.append_scalar(&random_decimal).vortex_expect(
@@ -156,6 +163,9 @@ fn random_array_chunk(
         DType::List(elem_dtype, null) => random_list(u, elem_dtype, *null, chunk_len),
         DType::FixedSizeList(elem_dtype, list_size, null) => {
             random_fixed_size_list(u, elem_dtype, *list_size, *null, chunk_len)
+        }
+        DType::Map(map_dtype, nullability) => {
+            random_map(u, map_dtype.clone(), *nullability, chunk_len)
         }
         DType::Struct(sdt, n) => {
             let first_array = sdt
@@ -197,6 +207,46 @@ fn random_array_chunk(
     }
 }
 
+fn random_map(
+    u: &mut Unstructured,
+    map_dtype: MapDType,
+    nullability: Nullability,
+    chunk_len: Option<usize>,
+) -> Result<ArrayRef> {
+    let array_length = chunk_len.unwrap_or(u.int_in_range(0..=20)?);
+    let key_dtype = map_dtype.key_dtype();
+    let value_dtype = map_dtype.value_dtype();
+    let dtype = DType::Map(map_dtype.clone(), nullability);
+    let mut builder = MapBuilder::<u64, u64>::with_capacity_in(
+        map_dtype,
+        nullability,
+        array_length,
+        vortex_buffer::BufferAllocatorRef::static_ref(),
+    );
+
+    for _ in 0..array_length {
+        if nullability == Nullability::Nullable && u.arbitrary::<bool>()? {
+            builder.append_null();
+        } else {
+            let entry_count = u.int_in_range(0..=20)?;
+            let entries = (0..entry_count)
+                .map(|_| {
+                    let key = random_scalar(u, &key_dtype)?;
+                    let value = random_scalar(u, &value_dtype)?;
+                    Ok((key, value))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let scalar = Scalar::try_map(dtype.clone(), entries)
+                .vortex_expect("generated map scalar should be valid");
+            builder
+                .append_scalar(&scalar)
+                .vortex_expect("generated map scalar should append");
+        }
+    }
+
+    Ok(builder.finish_into_map().into_array())
+}
+
 /// Creates a random fixed-size list array.
 ///
 /// If the `chunk_len` is specified, the length of the array will be equal to the chunk length.
@@ -209,8 +259,13 @@ fn random_fixed_size_list(
 ) -> Result<ArrayRef> {
     let array_length = chunk_len.unwrap_or(u.int_in_range(0..=20)?);
 
-    let mut builder =
-        FixedSizeListBuilder::with_capacity(Arc::clone(elem_dtype), list_size, null, array_length);
+    let mut builder = FixedSizeListBuilder::with_capacity_in(
+        Arc::clone(elem_dtype),
+        list_size,
+        null,
+        array_length,
+        vortex_buffer::BufferAllocatorRef::static_ref(),
+    );
 
     for _ in 0..array_length {
         if null == Nullability::Nullable && u.arbitrary::<bool>()? {
@@ -238,17 +293,11 @@ fn random_list(
     // Worst-case total elements: each list can have up to 20 elements.
     let max_total_elements = array_length as u64 * 20;
 
-    match u.int_in_range(0..=5)? {
-        0 if i16::max_value_as_u64() >= max_total_elements => {
-            random_list_with_offset_type::<i16>(u, elem_dtype, null, array_length)
-        }
-        1 if i32::max_value_as_u64() >= max_total_elements => {
+    match u.int_in_range(0..=3)? {
+        0 if i32::max_value_as_u64() >= max_total_elements => {
             random_list_with_offset_type::<i32>(u, elem_dtype, null, array_length)
         }
-        3 if u16::max_value_as_u64() >= max_total_elements => {
-            random_list_with_offset_type::<u16>(u, elem_dtype, null, array_length)
-        }
-        4 if u32::max_value_as_u64() >= max_total_elements => {
+        1 if u32::max_value_as_u64() >= max_total_elements => {
             random_list_with_offset_type::<u32>(u, elem_dtype, null, array_length)
         }
         // i64 and u64 always fit; also the fallback for when narrower types don't.
@@ -262,15 +311,20 @@ fn random_list(
     }
 }
 
-/// Creates a random list array with the given [`IntegerPType`] for the internal offsets child.
-fn random_list_with_offset_type<O: IntegerPType>(
+/// Creates a random list array with the given [`OffsetBuilderPType`] for the internal offsets child.
+fn random_list_with_offset_type<O: OffsetBuilderPType>(
     u: &mut Unstructured,
     elem_dtype: &Arc<DType>,
     null: Nullability,
     array_length: usize,
 ) -> Result<ArrayRef> {
-    let mut builder =
-        ListViewBuilder::<O, O>::with_capacity(Arc::clone(elem_dtype), null, array_length, 10);
+    let mut builder = ListViewBuilder::<O, O>::with_capacity_in(
+        Arc::clone(elem_dtype),
+        null,
+        array_length,
+        10,
+        vortex_buffer::BufferAllocatorRef::static_ref(),
+    );
 
     for _ in 0..array_length {
         if null == Nullability::Nullable && u.arbitrary::<bool>()? {

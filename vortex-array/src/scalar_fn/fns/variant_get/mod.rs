@@ -20,18 +20,20 @@ use crate::ExecutionCtx;
 use crate::IntoArray;
 use crate::arrays::ChunkedArray;
 use crate::arrays::ConstantArray;
+use crate::arrays::ScalarFnArray;
 use crate::arrays::VariantArray;
 use crate::builders::builder_with_capacity_in;
 use crate::dtype::DType;
 use crate::dtype::FieldName;
 use crate::dtype::Nullability;
-use crate::expr::Expression;
+use crate::expr::display::ExprDisplay;
 use crate::scalar::Scalar;
 use crate::scalar_fn::Arity;
 use crate::scalar_fn::ChildName;
 use crate::scalar_fn::ExecutionArgs;
 use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::ScalarFnVTable;
+use crate::scalar_fn::ScalarFnVTableExt;
 
 /// Extracts a field/index path from Variant values.
 ///
@@ -41,6 +43,17 @@ use crate::scalar_fn::ScalarFnVTable;
 /// but must fall back to the core Variant value for paths not represented by shredded storage.
 #[derive(Clone)]
 pub struct VariantGet;
+
+impl VariantGet {
+    /// Creates a lazy extraction from Variant `input`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `input` is not Variant data.
+    pub fn try_new(input: ArrayRef, options: VariantGetOptions) -> VortexResult<ScalarFnArray> {
+        ScalarFnArray::try_new(VariantGet.bind(options), vec![input])
+    }
+}
 
 impl ScalarFnVTable for VariantGet {
     type Options = VariantGetOptions;
@@ -92,11 +105,11 @@ impl ScalarFnVTable for VariantGet {
     fn fmt_sql(
         &self,
         options: &Self::Options,
-        expr: &Expression,
+        expr: &dyn ExprDisplay,
         f: &mut Formatter<'_>,
     ) -> fmt::Result {
         write!(f, "variant_get(")?;
-        expr.child(0).fmt_sql(f)?;
+        Display::fmt(expr.display_child(0), f)?;
         let path = options.path().to_string();
         write!(f, ", \"{}\"", StringEscape(&path))?;
         if let Some(dtype) = options.dtype() {
@@ -131,7 +144,7 @@ impl ScalarFnVTable for VariantGet {
             .map_or(DType::Variant(Nullability::Nullable), DType::as_nullable);
 
         if !dtype.is_variant() {
-            let mut builder = builder_with_capacity_in(ctx.allocator(), &dtype, input.len());
+            let mut builder = builder_with_capacity_in(&dtype, input.len(), ctx.allocator());
             for idx in 0..input.len() {
                 let scalar = input.execute_scalar(idx, ctx)?;
                 let output = variant_get_scalar(&scalar, options, &dtype)?;
@@ -153,6 +166,10 @@ impl ScalarFnVTable for VariantGet {
 
         let array = ChunkedArray::try_new(chunks, dtype)?.into_array();
         VariantArray::try_new(array, None).map(|array| array.into_array())
+    }
+
+    fn is_strict(&self, _options: &Self::Options) -> bool {
+        true
     }
 }
 
@@ -408,7 +425,7 @@ mod tests {
     use crate::arrays::ConstantArray;
     use crate::arrays::PrimitiveArray;
     use crate::arrays::VariantArray;
-    use crate::arrays::variant::VariantArrayExt;
+    use crate::arrays::variant::VariantArraySlotsExt;
     use crate::assert_arrays_eq;
     use crate::assert_nth_scalar_is_null;
     use crate::dtype::DType;
@@ -448,9 +465,8 @@ mod tests {
         let dtype = DType::Variant(Nullability::Nullable);
         let chunks = rows
             .into_iter()
-            .map(|row| ConstantArray::new(row.cast(&dtype).unwrap(), 1).into_array())
-            .collect();
-        ChunkedArray::try_new(chunks, dtype).map(|array| array.into_array())
+            .map(|row| ConstantArray::new(row.cast(&dtype).unwrap(), 1).into_array());
+        ChunkedArray::try_new(chunks, dtype.clone()).map(|array| array.into_array())
     }
 
     /// Test-only syntax for keeping `variant_get` cases compact without committing

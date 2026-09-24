@@ -19,7 +19,6 @@ use vortex_array::expr::lit;
 use vortex_array::expr::root;
 use vortex_array::scalar_fn::fns::operators::Operator;
 use vortex_btrblocks::BtrBlocksCompressorBuilder;
-use vortex_buffer::ByteBufferMut;
 use vortex_error::VortexExpect;
 use vortex_error::vortex_panic;
 use vortex_file::OpenOptionsSessionExt;
@@ -72,20 +71,34 @@ fuzz_target!(|fuzz: FuzzFileAction| -> Corpus {
         ),
     };
 
-    let mut full_buff = ByteBufferMut::empty();
+    let mut full_buff = Vec::new();
     let _footer = write_options
         .blocking(&*RUNTIME)
         .write(&mut full_buff, array_data.to_array_iterator())
         .vortex_expect("file write should succeed in fuzz test");
 
-    let mut output = SESSION
+    let file = SESSION
         .open_options()
         .open_buffer(full_buff)
-        .vortex_expect("open_buffer should succeed in fuzz test")
+        .vortex_expect("open_buffer should succeed in fuzz test");
+    let projection = projection_expr
+        .unwrap_or_else(root)
+        .optimize_recursive(file.dtype())
+        .and_then(|expr| expr.bind(file.dtype()))
+        .vortex_expect("projection should bind in fuzz test");
+    let filter = filter_expr
+        .map(|filter| {
+            filter
+                .optimize_recursive(file.dtype())
+                .and_then(|expr| expr.bind(file.dtype()))
+        })
+        .transpose()
+        .vortex_expect("filter should bind in fuzz test");
+    let mut output = file
         .scan()
         .vortex_expect("scan should succeed in fuzz test")
-        .with_projection(projection_expr.unwrap_or_else(root))
-        .with_some_filter(filter_expr)
+        .with_projection(projection)
+        .with_some_filter(filter)
         .into_array_iter(&*RUNTIME)
         .vortex_expect("into_array_iter should succeed in fuzz test")
         .try_collect::<_, Vec<_>, _>()

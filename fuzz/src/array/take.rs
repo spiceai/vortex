@@ -11,7 +11,7 @@ use vortex_array::arrays::StructArray;
 use vortex_array::arrays::VarBinViewArray;
 use vortex_array::arrays::bool::BoolArrayExt;
 use vortex_array::arrays::struct_::StructArrayExt;
-use vortex_array::builders::builder_with_capacity;
+use vortex_array::builders::builder_with_capacity_in;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::DecimalDType;
 use vortex_array::dtype::NativeDecimalType;
@@ -115,9 +115,10 @@ pub fn take_canonical_array(
             .into_array())
         }
         DType::List(..) | DType::FixedSizeList(..) => {
-            let mut builder = builder_with_capacity(
+            let mut builder = builder_with_capacity_in(
                 &array.dtype().union_nullability(nullable),
                 indices_slice_non_opt.len(),
+                ctx.allocator(),
             );
             for idx in indices {
                 if let Some(idx) = idx {
@@ -147,6 +148,20 @@ pub fn take_canonical_array(
                 validity,
             )
             .map(|a| a.into_array())
+        }
+        DType::Map(..) => {
+            let result_dtype = array.dtype().union_nullability(nullable);
+            let mut builder =
+                builder_with_capacity_in(&result_dtype, indices.len(), ctx.allocator());
+            for idx in indices {
+                if let Some(idx) = idx {
+                    builder
+                        .append_scalar(&array.execute_scalar(*idx, ctx)?.cast(&result_dtype)?)?;
+                } else {
+                    builder.append_null();
+                }
+            }
+            Ok(builder.finish())
         }
         d @ (DType::Null | DType::Union(..) | DType::Variant(_) | DType::Extension(_)) => {
             unreachable!("DType {d} not supported for fuzzing")

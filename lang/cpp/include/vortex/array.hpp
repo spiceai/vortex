@@ -6,6 +6,7 @@
 #include "vortex/dtype.hpp"
 #include "vortex/error.hpp"
 #include "vortex/expression.hpp"
+#include "vortex/scalar.hpp"
 #include "vortex/session.hpp"
 
 #include <vortex.h>
@@ -135,7 +136,7 @@ public:
      * Import an Arrow array. Consumes both "array" and "schema", do not use
      * or release them afterwards. For a record batch pass nullable = false.
      */
-    static Array from_arrow(ArrowArray *array, ArrowSchema *schema, bool nullable);
+    static Array from_arrow(const Session &session, ArrowArray *array, ArrowSchema *schema, bool nullable);
 
     size_t size() const;
     bool nullable() const;
@@ -210,6 +211,8 @@ public:
 
     // Bulk view over Binary values.
     BytesView bytes(const Session &session) const;
+
+    Scalar scalar_at(const Session &session, size_t index) const;
 
 private:
     friend struct detail::Access;

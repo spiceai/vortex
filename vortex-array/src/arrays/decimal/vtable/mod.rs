@@ -8,7 +8,6 @@ use vortex_buffer::Alignment;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
-use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
 
 use crate::ArrayParts;
@@ -19,6 +18,7 @@ use crate::array::Array;
 use crate::array::ArrayView;
 use crate::array::VTable;
 use crate::arrays::decimal::DecimalData;
+use crate::arrays::fixed_width::vtable as fixed_width;
 use crate::buffer::BufferHandle;
 use crate::builders::ArrayBuilder;
 use crate::builders::DecimalBuilder;
@@ -27,7 +27,6 @@ use crate::dtype::DecimalType;
 use crate::dtype::NativeDecimalType;
 use crate::match_each_decimal_value_type;
 use crate::serde::ArrayChildren;
-use crate::validity::Validity;
 mod kernel;
 mod operations;
 mod validity;
@@ -38,7 +37,7 @@ use vortex_session::registry::CachedId;
 
 use crate::EqMode;
 use crate::array::ArrayId;
-use crate::arrays::decimal::array::SLOT_NAMES;
+use crate::arrays::decimal::array::DecimalSlots;
 use crate::arrays::decimal::compute::rules::RULES;
 use crate::hash::ArrayEq;
 use crate::hash::ArrayHash;
@@ -85,17 +84,11 @@ impl VTable for Decimal {
     }
 
     fn buffer(array: ArrayView<'_, Self>, idx: usize) -> BufferHandle {
-        match idx {
-            0 => array.values.clone(),
-            _ => vortex_panic!("DecimalArray buffer index {idx} out of bounds"),
-        }
+        fixed_width::buffer("DecimalArray", &array.values, idx)
     }
 
     fn buffer_name(_array: ArrayView<'_, Self>, idx: usize) -> Option<String> {
-        match idx {
-            0 => Some("values".to_string()),
-            _ => None,
-        }
+        fixed_width::buffer_name(idx)
     }
 
     fn with_buffers(
@@ -103,13 +96,8 @@ impl VTable for Decimal {
         array: ArrayView<'_, Self>,
         buffers: &[BufferHandle],
     ) -> VortexResult<ArrayParts<Self>> {
-        vortex_ensure!(
-            buffers.len() == 1,
-            "Expected 1 buffer, got {}",
-            buffers.len()
-        );
         let mut data = array.data().clone();
-        data.values = buffers[0].clone();
+        data.values = fixed_width::single_buffer(buffers)?;
         Ok(
             ArrayParts::new(self.clone(), array.dtype().clone(), array.len(), data)
                 .with_slots(array.slots().iter().cloned().collect()),
@@ -145,7 +133,8 @@ impl VTable for Decimal {
             data.len(),
             len
         );
-        let validity = crate::array::child_to_validity(slots[0].as_ref(), *nullability);
+        let validity =
+            crate::array::child_to_validity(slots[DecimalSlots::VALIDITY].as_ref(), *nullability);
         if let Some(validity_len) = validity.maybe_len() {
             vortex_ensure!(
                 validity_len == len,
@@ -164,25 +153,14 @@ impl VTable for Decimal {
         dtype: &DType,
         len: usize,
         metadata: &[u8],
-
         buffers: &[BufferHandle],
         children: &dyn ArrayChildren,
         _session: &VortexSession,
     ) -> VortexResult<ArrayParts<Self>> {
         let metadata = DecimalMetadata::decode(metadata)?;
-        if buffers.len() != 1 {
-            vortex_bail!("Expected 1 buffer, got {}", buffers.len());
-        }
-        let values = buffers[0].clone();
+        let values = fixed_width::single_buffer(buffers)?;
 
-        let validity = if children.is_empty() {
-            Validity::from(dtype.nullability())
-        } else if children.len() == 1 {
-            let validity = children.get(0, &Validity::DTYPE, len)?;
-            Validity::Array(validity)
-        } else {
-            vortex_bail!("Expected 0 or 1 child, got {}", children.len());
-        };
+        let validity = fixed_width::deserialize_validity(dtype.nullability(), len, children)?;
 
         let Some(decimal_dtype) = dtype.as_decimal_opt() else {
             vortex_bail!("Expected Decimal dtype, got {:?}", dtype)
@@ -202,7 +180,7 @@ impl VTable for Decimal {
     }
 
     fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {
-        SLOT_NAMES[idx].to_string()
+        DecimalSlots::NAMES[idx].to_string()
     }
 
     fn execute(array: Array<Self>, _ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {

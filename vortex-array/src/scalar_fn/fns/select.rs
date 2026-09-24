@@ -19,11 +19,14 @@ use vortex_session::registry::CachedId;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::IntoArray;
+use crate::arrays::Constant;
+use crate::arrays::ConstantArray;
 use crate::arrays::StructArray;
 use crate::arrays::struct_::StructArrayExt;
 use crate::dtype::DType;
 use crate::dtype::FieldName;
 use crate::dtype::FieldNames;
+use crate::expr::display::ExprDisplay;
 use crate::expr::expression::Expression;
 use crate::expr::field::DisplayFieldNames;
 use crate::expr::get_item;
@@ -104,10 +107,10 @@ impl ScalarFnVTable for Select {
     fn fmt_sql(
         &self,
         selection: &FieldSelection,
-        expr: &Expression,
+        expr: &dyn ExprDisplay,
         f: &mut Formatter<'_>,
     ) -> std::fmt::Result {
-        expr.child(0).fmt_sql(f)?;
+        Display::fmt(expr.display_child(0), f)?;
         match selection {
             FieldSelection::Include(fields) => {
                 write!(f, "{{{}}}", DisplayFieldNames(fields))
@@ -148,7 +151,19 @@ impl ScalarFnVTable for Select {
         args: &dyn ExecutionArgs,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
-        let child = args.get(0)?.execute::<StructArray>(ctx)?;
+        let child = args.get(0)?;
+        if let Some(constant) = child.as_opt::<Constant>() {
+            let child_struct_dtype = child
+                .dtype()
+                .as_struct_fields_opt()
+                .ok_or_else(|| vortex_err!("Select child not a struct dtype"))?;
+            let included = selection.normalize_to_included_fields(child_struct_dtype.names())?;
+            let scalar = constant.scalar().as_struct().project(included.as_ref())?;
+
+            return Ok(ConstantArray::new(scalar, child.len()).into_array());
+        }
+
+        let child = child.execute::<StructArray>(ctx)?;
 
         let result = match selection {
             FieldSelection::Include(f) => child.project(f.as_ref()),
@@ -232,13 +247,13 @@ impl ScalarFnVTable for Select {
         Ok(None)
     }
 
-    fn is_null_sensitive(&self, _instance: &FieldSelection) -> bool {
+    fn is_strict(&self, _options: &FieldSelection) -> bool {
         true
     }
 
-    fn is_fallible(&self, _instance: &FieldSelection) -> bool {
-        // If this type-checks its infallible.
-        false
+    fn is_infallible(&self, _instance: &FieldSelection) -> bool {
+        // If this type-checks, it is infallible.
+        true
     }
 }
 
@@ -307,10 +322,15 @@ impl Display for FieldSelection {
 #[cfg(test)]
 mod tests {
     use vortex_buffer::buffer;
+    use vortex_error::VortexResult;
 
+    use crate::ArrayRef;
     use crate::IntoArray;
     use crate::VortexSessionExecute;
     use crate::array_session;
+    use crate::arrays::Constant;
+    use crate::arrays::ConstantArray;
+    use crate::arrays::ScalarFnArray;
     use crate::arrays::struct_::StructArrayExt;
     use crate::dtype::DType;
     use crate::dtype::FieldName;
@@ -323,6 +343,9 @@ mod tests {
     use crate::expr::select;
     use crate::expr::select_exclude;
     use crate::expr::test_harness;
+    use crate::scalar::Scalar;
+    use crate::scalar_fn::ScalarFnVTableExt;
+    use crate::scalar_fn::fns::select::FieldSelection;
     use crate::scalar_fn::fns::select::Select;
     use crate::scalar_fn::fns::select::StructArray;
 
@@ -425,6 +448,46 @@ mod tests {
                 .normalize_to_included_fields(&field_names)
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn execute_constant_struct_stays_constant() -> VortexResult<()> {
+        let field_count = 128usize;
+        let names = (0..field_count)
+            .map(|idx| FieldName::from(format!("f{idx}")))
+            .collect::<Vec<_>>();
+        let dtypes = vec![I32.into(); field_count];
+        let fields = StructFields::new(FieldNames::from(names), dtypes);
+        let scalar = Scalar::struct_(
+            DType::Struct(fields, Nullability::NonNullable),
+            (0..128).map(Scalar::from),
+        );
+        let array = ConstantArray::new(scalar, 1_000_000).into_array();
+        let mut ctx = array_session().create_execution_ctx();
+
+        let item: ArrayRef = ScalarFnArray::try_new(
+            Select.bind(FieldSelection::Include(FieldNames::from(["f97", "f3"]))),
+            vec![array],
+        )?
+        .into_array()
+        .execute(&mut ctx)?;
+
+        let constant = item.as_::<Constant>();
+        assert_eq!(constant.len(), 1_000_000);
+        assert_eq!(
+            constant.scalar(),
+            &Scalar::struct_(
+                DType::Struct(
+                    StructFields::new(
+                        FieldNames::from(["f97", "f3"]),
+                        vec![I32.into(), I32.into()],
+                    ),
+                    Nullability::NonNullable,
+                ),
+                [Scalar::from(97), Scalar::from(3)],
+            )
+        );
+        Ok(())
     }
 
     #[test]

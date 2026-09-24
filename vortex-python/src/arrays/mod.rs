@@ -15,6 +15,8 @@ use std::ptr::NonNull;
 
 use arrow_array::Array as ArrowArray;
 use arrow_array::ArrayRef as ArrowArrayRef;
+use arrow_schema::DataType;
+use arrow_schema::Field;
 use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::PyIndexError;
 use pyo3::exceptions::PyNotImplementedError;
@@ -62,6 +64,7 @@ use crate::arrays::native::PyNativeArray;
 use crate::arrays::py::PyPythonArray;
 use crate::arrays::py::PythonArray;
 use crate::arrays::py::PythonVTable;
+use crate::arrow::FromPyArrow;
 use crate::arrow::ToPyArrow;
 use crate::dtype::PyDType;
 use crate::error::PyVortexError;
@@ -144,23 +147,25 @@ fn array_metadata_tuple<'py>(
     py: Python<'py>,
     array: &ArrayRef,
 ) -> PyVortexResult<Bound<'py, PyTuple>> {
-    let metadata = session().array_serialize(array)?.ok_or_else(|| {
+    let serialization = session().array_serialize(array)?.ok_or_else(|| {
         PyValueError::new_err(format!(
-            "Array {} does not support metadata serialization",
+            "Array {} does not support serialization",
             array.encoding_id()
         ))
     })?;
     let dtype = array.dtype().write_flatbuffer_bytes()?;
 
-    let buffers = array
-        .buffer_handles()
+    let buffers = serialization
+        .buffers
         .iter()
-        .map(|handle| export_buffer(py, handle).map(|cap| cap.into_any()))
+        .map(|buffer| {
+            export_buffer(py, &BufferHandle::new_host(buffer.clone())).map(|cap| cap.into_any())
+        })
         .collect::<PyResult<Vec<_>>>()?;
     let buffers = PyList::new(py, buffers)?;
 
-    let children = array
-        .children()
+    let children = serialization
+        .children
         .iter()
         .map(|child| array_metadata_tuple(py, child).map(|tuple| tuple.into_any()))
         .collect::<PyVortexResult<Vec<_>>>()?;
@@ -169,10 +174,12 @@ fn array_metadata_tuple<'py>(
     PyTuple::new(
         py,
         [
-            array.encoding_id().to_string().into_py_any(py)?,
+            serialization.serialized_id.to_string().into_py_any(py)?,
             PyBytes::new(py, dtype.as_slice()).into_any().into(),
             array.len().into_py_any(py)?,
-            PyBytes::new(py, metadata.as_slice()).into_any().into(),
+            PyBytes::new(py, serialization.metadata.as_slice())
+                .into_any()
+                .into(),
             buffers.into_any().into(),
             children.into_any().into(),
         ],
@@ -429,6 +436,12 @@ impl PyArray {
     /// .. seealso::
     ///     :meth:`.to_arrow_table`
     ///
+    /// Parameters
+    /// ----------
+    /// arrow_type : :class:`pyarrow.DataType`, optional
+    ///     The Arrow type to return. By default, UTF-8 data returns a ``StringViewArray`` and
+    ///     binary data returns a ``BinaryViewArray``.
+    ///
     /// Returns
     /// -------
     /// :class:`pyarrow.Array`
@@ -448,24 +461,50 @@ impl PyArray {
     ///   3
     /// ]
     /// ```
-    fn to_arrow_array<'py>(self_: &'py Bound<'py, Self>) -> PyVortexResult<Bound<'py, PyAny>> {
+    /// Export a ``StringArray`` instead of a ``StringViewArray``:
+    ///
+    /// ```python
+    /// >>> import pyarrow
+    /// >>> import vortex as vx
+    /// >>> vx.array(["hello", "world"]).to_arrow_array(arrow_type=pyarrow.string())
+    /// <pyarrow.lib.StringArray object at ...>
+    /// [
+    ///   "hello",
+    ///   "world"
+    /// ]
+    /// ```
+    #[pyo3(signature = (*, arrow_type = None))]
+    fn to_arrow_array<'py>(
+        self_: &'py Bound<'py, Self>,
+        arrow_type: Option<&Bound<'py, PyAny>>,
+    ) -> PyVortexResult<Bound<'py, PyAny>> {
         // NOTE(ngates): for struct arrays, we could also return a RecordBatchStreamReader.
         let array = PyArrayRef::extract(self_.as_any().as_borrowed())?.into_inner();
         let py = self_.py();
+        let target_field = arrow_type
+            .map(|arrow_type| DataType::from_pyarrow(&arrow_type.as_borrowed()))
+            .transpose()?
+            .map(|data_type| Field::new("", data_type, array.dtype().is_nullable()));
 
         if let Some(chunked_array) = array.as_opt::<Chunked>() {
             // We figure out a single Arrow Data Type to convert all chunks into, otherwise
             // the preferred type of each chunk may be different.
-            let arrow_field = session()
-                .arrow()
-                .to_arrow_field("", chunked_array.dtype())?;
+            let inferred_field;
+            let arrow_field = if let Some(target_field) = target_field.as_ref() {
+                target_field
+            } else {
+                inferred_field = session()
+                    .arrow()
+                    .to_arrow_field("", chunked_array.dtype())?;
+                &inferred_field
+            };
 
             let chunks = chunked_array
                 .iter_chunks()
                 .map(|chunk| -> PyVortexResult<_> {
                     Ok(session().arrow().execute_arrow(
                         chunk.clone(),
-                        Some(&arrow_field),
+                        Some(arrow_field),
                         &mut session().create_execution_ctx(),
                     )?)
                 })
@@ -491,7 +530,11 @@ impl PyArray {
         } else {
             Ok(session()
                 .arrow()
-                .execute_arrow(array, None, &mut session().create_execution_ctx())?
+                .execute_arrow(
+                    array,
+                    target_field.as_ref(),
+                    &mut session().create_execution_ctx(),
+                )?
                 .into_data()
                 .to_pyarrow(py)?
                 .into_bound(py))
@@ -728,7 +771,7 @@ impl PyArray {
     /// ...     {'name': 'Mikhail', 'age': 57},
     /// ... ])
     /// >>> array.scalar_at(2).as_py()
-    /// {'age': 33, 'name': 'Angela'}
+    /// {'name': 'Angela', 'age': 33}
     /// ```
     ///
     /// Retrieve a missing element from an array of structures:

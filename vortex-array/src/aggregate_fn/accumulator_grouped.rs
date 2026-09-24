@@ -26,8 +26,9 @@ use crate::arrays::ChunkedArray;
 use crate::arrays::FixedSizeListArray;
 use crate::arrays::ListViewArray;
 use crate::arrays::fixed_size_list::FixedSizeListArrayExt;
-use crate::arrays::listview::ListViewArrayExt;
-use crate::builders::builder_with_capacity;
+use crate::arrays::fixed_size_list::FixedSizeListArraySlotsExt;
+use crate::arrays::listview::ListViewArraySlotsExt;
+use crate::builders::builder_with_capacity_in;
 use crate::builtins::ArrayBuiltins;
 use crate::columnar::AnyColumnar;
 use crate::dtype::DType;
@@ -272,7 +273,10 @@ impl<V: AggregateFnVTable> DynGroupedAccumulator for GroupedAccumulator<V> {
     }
 
     fn flush(&mut self) -> VortexResult<ArrayRef> {
-        let states = std::mem::take(&mut self.partials);
+        let mut states = std::mem::take(&mut self.partials);
+        if states.len() == 1 {
+            return Ok(states.pop().vortex_expect("checked one partial"));
+        }
         Ok(ChunkedArray::try_new(states, self.partial_dtype.clone())?.into_array())
     }
 
@@ -357,7 +361,8 @@ impl<V: AggregateFnVTable> GroupedAccumulator<V> {
             self.options.clone(),
             self.dtype.clone(),
         )?;
-        let mut states = builder_with_capacity(&self.partial_dtype, grouped.len());
+        let mut states =
+            builder_with_capacity_in(&self.partial_dtype, grouped.len(), ctx.allocator());
         let group_ranges = grouped.group_ranges(ctx)?;
         let group_validity = grouped.group_validity(ctx)?;
 
@@ -415,5 +420,70 @@ fn fixed_size_list_group_ranges(groups: &FixedSizeListArray) -> GroupRanges {
     GroupRanges::FixedSizeList {
         len: groups.len(),
         size: groups.list_size() as usize,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use vortex_error::VortexResult;
+
+    use crate::ArrayRef;
+    use crate::IntoArray;
+    use crate::aggregate_fn::DynGroupedAccumulator;
+    use crate::aggregate_fn::GroupedAccumulator;
+    use crate::aggregate_fn::NumericalAggregateOpts;
+    use crate::aggregate_fn::fns::count::Count;
+    use crate::arrays::Chunked;
+    use crate::arrays::PrimitiveArray;
+    use crate::dtype::DType;
+    use crate::dtype::Nullability::NonNullable;
+    use crate::dtype::PType;
+
+    fn accumulator() -> VortexResult<GroupedAccumulator<Count>> {
+        GroupedAccumulator::try_new(
+            Count,
+            NumericalAggregateOpts::default(),
+            DType::Primitive(PType::I32, NonNullable),
+        )
+    }
+
+    fn state(values: impl IntoIterator<Item = u64>) -> ArrayRef {
+        PrimitiveArray::from_iter(values).into_array()
+    }
+
+    #[test]
+    fn test_flush_single_partial_returns_original_array() -> VortexResult<()> {
+        let mut accumulator = accumulator()?;
+        let state = state([1, 2, 3]);
+        accumulator.push_result(state.clone())?;
+
+        let flushed = accumulator.flush()?;
+
+        assert!(ArrayRef::ptr_eq(&flushed, &state));
+        Ok(())
+    }
+
+    #[test]
+    fn test_flush_multiple_partials_returns_chunked_array() -> VortexResult<()> {
+        let mut accumulator = accumulator()?;
+        accumulator.push_result(state([1, 2]))?;
+        accumulator.push_result(state([3, 4]))?;
+
+        let flushed = accumulator.flush()?;
+
+        assert!(flushed.is::<Chunked>());
+        assert_eq!(flushed.len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn test_flush_without_partials_returns_empty_chunked_array() -> VortexResult<()> {
+        let mut accumulator = accumulator()?;
+
+        let flushed = accumulator.flush()?;
+
+        assert!(flushed.is::<Chunked>());
+        assert!(flushed.is_empty());
+        Ok(())
     }
 }

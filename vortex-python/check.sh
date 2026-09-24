@@ -17,13 +17,11 @@ pushd $ROOT/vortex-python
 maturin develop
 ruff format --check
 ruff check
-basedpyright
+uvx ty check .
 popd
 
 pushd $ROOT/docs
-make clean # Sphinx is bad at cache invalidation. Best not to rely on it.
-make html
-make doctest
+make check
 popd
 
 pushd $ROOT/vortex-python

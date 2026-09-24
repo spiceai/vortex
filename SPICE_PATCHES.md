@@ -59,7 +59,7 @@ exists: a grep proves presence, a test proves behaviour.
 | 11 | Intra-file decode parallelism | `9d3aafb06`, `26b274c72` (#62) | Scan throughput on large chunk spans | — (needs a check) | Possibly upstream |
 | 12 | Restore lint checks on forks | `bb80c537b` | Fork CI not running lints | — (CI config) | No |
 | 13 | `set_available_parallelism` | this change | Scan and writer fan-out sized from the machine's core count rather than what the host process is entitled to (spiceai/spiceai#12328) | `cargo test -p vortex-utils --test parallelism_declared --test parallelism_declared_too_late` | Proposed — additive, detection unchanged |
-| 14 | Arrow `Map` alias | `1a6dc54f1` (`lukim/map`) | `Map` columns unwritable: `Array encoding not implemented for Arrow data type Map(...)` on every flush (spiceai/spiceai#13524) | `cargo test -p vortex-arrow --lib map_array_roundtrips_through_the_list_alias` | No |
+| 14 | Arrow `Map` alias | `1a6dc54f1` (`lukim/map`) | `Map` columns unwritable: `Array encoding not implemented for Arrow data type Map(...)` on every flush (spiceai/spiceai#13524) | `cargo test -p vortex-arrow --lib executor::map` | Yes — 0.86.1 native `Map` (`#9111`) |
 
 **Confidence:** rows 1–4, 13 and 14 are verified against the branches. Rows 5–12 are seeded from an
 audit of non-merge commits on `spiceai-54` authored by Spice engineers; their descriptions

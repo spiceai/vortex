@@ -26,6 +26,12 @@ use vortex_bench::runner::filter_queries;
 use vortex_bench::setup_logging_and_tracing;
 use vortex_bench::v3;
 
+const S3_HTTP_INIT_SQL: [&str; 3] = [
+    "SET http_retries = 8",
+    "SET http_retry_wait_ms = 250",
+    "SET http_retry_backoff = 2",
+];
+
 /// Common arguments shared across benchmarks
 #[derive(Parser)]
 struct Args {
@@ -59,10 +65,9 @@ struct Args {
     #[arg(short)]
     output_path: Option<PathBuf>,
 
-    /// Additionally write v3 JSONL records to this path. See
-    /// `benchmarks-website/planning/02-contracts.md`.
-    #[arg(long)]
-    gh_json_v3: Option<PathBuf>,
+    /// Additionally write benchmark ingest JSONL records to this path.
+    #[arg(long = "ingest-jsonl")]
+    ingest_output: Option<PathBuf>,
 
     #[arg(long, default_value_t = false)]
     track_memory: bool,
@@ -82,6 +87,12 @@ struct Args {
     /// Print EXPLAIN output for each query instead of running benchmarks.
     #[arg(long, default_value_t = false)]
     explain: bool,
+
+    /// Print the selected query indices, one per line, and exit
+    /// Knowledge of query ids lies only in this binary so we need
+    /// orchestrator to know whan queries to run one by one.
+    #[arg(long, default_value_t = false)]
+    print_queries: bool,
 
     #[arg(
         long,
@@ -105,6 +116,13 @@ fn main() -> anyhow::Result<()> {
         args.queries.as_ref(),
         args.exclude_queries.as_ref(),
     );
+
+    if args.print_queries {
+        for (query_idx, _) in &filtered_queries {
+            println!("{query_idx}");
+        }
+        return Ok(());
+    }
 
     if args.formats.is_empty() {
         anyhow::bail!("provide a format with --formats");
@@ -159,6 +177,11 @@ fn main() -> anyhow::Result<()> {
     )?;
 
     let benchmark_name = benchmark.dataset().to_string();
+    let mut duckdb_init_sql = Vec::new();
+    if benchmark.data_url().scheme() == "s3" {
+        duckdb_init_sql.extend(S3_HTTP_INIT_SQL.map(String::from));
+    }
+    duckdb_init_sql.extend(benchmark.engine_init_sql(Engine::DuckDB));
 
     let mode = if args.explain {
         BenchmarkMode::Explain
@@ -178,7 +201,7 @@ fn main() -> anyhow::Result<()> {
                 args.delete_duckdb_database,
                 args.threads,
             )?;
-            ctx.set_init_sql(benchmark.engine_init_sql(Engine::DuckDB))?;
+            ctx.set_init_sql(duckdb_init_sql.clone())?;
             ctx.register_tables(&*benchmark, format)?;
 
             // Duckdb doesn't support octet_length for strings but we need this
@@ -189,6 +212,7 @@ fn main() -> anyhow::Result<()> {
         },
         |ctx, query_idx, format, query| {
             set_global_labels(vec![
+                ("engine", "duckdb".to_string()),
                 ("format", format.to_string()),
                 ("benchmark_name", benchmark_name.clone()),
                 ("query_idx", query_idx.to_string()),
@@ -203,7 +227,7 @@ fn main() -> anyhow::Result<()> {
     )?;
 
     if !args.explain {
-        if let Some(path) = args.gh_json_v3.as_ref() {
+        if let Some(path) = args.ingest_output.as_ref() {
             v3::write_jsonl_to_path(path, &runner.v3_records())?;
         }
 

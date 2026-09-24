@@ -11,6 +11,7 @@ use crate::arrays::ConstantArray;
 use crate::arrays::Extension;
 use crate::arrays::ExtensionArray;
 use crate::arrays::Filter;
+use crate::arrays::dict::TakeReduceAdaptor;
 use crate::arrays::extension::ExtensionArrayExt;
 use crate::arrays::filter::FilterReduceAdaptor;
 use crate::arrays::slice::SliceReduceAdaptor;
@@ -50,6 +51,7 @@ pub(crate) const PARENT_RULES: ParentRuleSet<Extension> = ParentRuleSet::new(&[
     ParentRuleSet::lift(&FilterReduceAdaptor(Extension)),
     ParentRuleSet::lift(&MaskReduceAdaptor(Extension)),
     ParentRuleSet::lift(&SliceReduceAdaptor(Extension)),
+    ParentRuleSet::lift(&TakeReduceAdaptor(Extension)),
 ]);
 
 /// Push filter operations into the storage array of an extension array.
@@ -97,7 +99,6 @@ mod tests {
     use crate::arrays::ScalarFn;
     use crate::arrays::extension::ExtensionArrayExt;
     use crate::arrays::scalar_fn::ScalarFnArrayExt;
-    use crate::arrays::scalar_fn::ScalarFnFactoryExt;
     use crate::dtype::DType;
     use crate::dtype::Nullability;
     use crate::dtype::PType;
@@ -227,9 +228,9 @@ mod tests {
         let storage = buffer![15i64, 25, 35].into_array();
         let ext_array = ExtensionArray::new(ext_dtype, storage).into_array();
 
-        let scalar_fn_array = Binary
-            .try_new_array(3, Operator::Lt, [constant_ext, ext_array])
-            .unwrap();
+        let scalar_fn_array = Binary::try_new(constant_ext, ext_array, Operator::Lt)
+            .unwrap()
+            .into_array();
 
         let optimized = scalar_fn_array.optimize_recursive(&SESSION).unwrap();
         let scalar_fn = optimized.as_opt::<ScalarFn>().unwrap();
@@ -289,9 +290,9 @@ mod tests {
         let const_scalar = Scalar::extension::<TestExt2>(EmptyMetadata, Scalar::from(25i64));
         let const_array = ConstantArray::new(const_scalar, 3).into_array();
 
-        let scalar_fn_array = Binary
-            .try_new_array(3, Operator::Lt, [ext_array, const_array])
-            .unwrap();
+        let scalar_fn_array = Binary::try_new(ext_array, const_array, Operator::Lt)
+            .unwrap()
+            .into_array();
 
         let optimized = scalar_fn_array.optimize().unwrap();
 
@@ -314,9 +315,9 @@ mod tests {
         let ext_array2 = ExtensionArray::new(ext_dtype, storage2).into_array();
 
         // Both children are extension arrays (not constants)
-        let scalar_fn_array = Binary
-            .try_new_array(3, Operator::Lt, [ext_array1, ext_array2])
-            .unwrap();
+        let scalar_fn_array = Binary::try_new(ext_array1, ext_array2, Operator::Lt)
+            .unwrap()
+            .into_array();
 
         let optimized = scalar_fn_array.optimize().unwrap();
 
@@ -337,9 +338,9 @@ mod tests {
         // Create a non-extension constant (plain primitive)
         let const_array = ConstantArray::new(Scalar::from(25i64), 3).into_array();
 
-        let scalar_fn_array = Binary
-            .try_new_array(3, Operator::Lt, [ext_array, const_array])
-            .unwrap();
+        let scalar_fn_array = Binary::try_new(ext_array, const_array, Operator::Lt)
+            .unwrap()
+            .into_array();
 
         let optimized = scalar_fn_array.optimize().unwrap();
 

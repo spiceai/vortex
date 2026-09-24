@@ -14,7 +14,7 @@ use vortex_array::MaskFuture;
 use vortex_array::VortexSessionExecute;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::FieldMask;
-use vortex_array::expr::Expression;
+use vortex_array::expr::BoundExpression;
 use vortex_array::serde::SerializedArray;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
@@ -111,7 +111,7 @@ impl LayoutReader for FlatReader {
         split_range: &SplitRange,
         splits: &mut RowSplits,
     ) -> VortexResult<()> {
-        split_range.check_bounds(self.layout.row_count)?;
+        split_range.check_bounds(self.layout.row_count())?;
         splits.push(split_range.root_row_range().end);
         Ok(())
     }
@@ -119,7 +119,7 @@ impl LayoutReader for FlatReader {
     fn pruning_evaluation(
         &self,
         _row_range: &Range<u64>,
-        _expr: &Expression,
+        _expr: &BoundExpression,
         mask: Mask,
     ) -> VortexResult<MaskFuture> {
         Ok(MaskFuture::ready(mask))
@@ -128,7 +128,7 @@ impl LayoutReader for FlatReader {
     fn filter_evaluation(
         &self,
         row_range: &Range<u64>,
-        expr: &Expression,
+        expr: &BoundExpression,
         mask: MaskFuture,
     ) -> VortexResult<MaskFuture> {
         let row_range = usize::try_from(row_range.start)
@@ -157,7 +157,7 @@ impl LayoutReader for FlatReader {
                 // We have the choice to apply the filter or the expression first, we apply the
                 // expression first so that it can try pushing down itself and then the filter
                 // after this.
-                let array = array.apply(&expr)?;
+                let array = array.apply_bound(&expr)?;
                 let array = array.filter(mask.clone())?;
                 let mut ctx = session.create_execution_ctx();
                 let array_mask = array.null_as_false().execute(&mut ctx)?;
@@ -165,7 +165,7 @@ impl LayoutReader for FlatReader {
                 mask.intersect_by_rank(&array_mask)
             } else {
                 // Run over the full array, with a simpler bitand at the end.
-                let array = array.apply(&expr)?;
+                let array = array.apply_bound(&expr)?;
                 let mut ctx = session.create_execution_ctx();
                 let array_mask = array.null_as_false().execute(&mut ctx)?;
 
@@ -187,7 +187,7 @@ impl LayoutReader for FlatReader {
     fn projection_evaluation(
         &self,
         row_range: &Range<u64>,
-        expr: &Expression,
+        expr: &BoundExpression,
         mask: MaskFuture,
     ) -> VortexResult<BoxFuture<'static, VortexResult<ArrayRef>>> {
         let row_range = usize::try_from(row_range.start)
@@ -218,7 +218,7 @@ impl LayoutReader for FlatReader {
             }
 
             // Evaluate the projection expression.
-            array = array.apply(&expr)?;
+            array = array.apply_bound(&expr)?;
 
             Ok(array)
         }
@@ -272,7 +272,7 @@ mod test {
     use crate::segments::TestSegments;
     use crate::sequence::SequenceId;
     use crate::sequence::SequentialArrayStreamExt;
-    use crate::test::SESSION;
+    use crate::test::new_session;
 
     #[derive(Clone)]
     struct CountingSegmentSource {
@@ -312,7 +312,7 @@ mod test {
         let (ptr, eof) = SequenceId::root().split();
         let layout = FlatLayoutStrategy::default()
             .write_stream(
-                array_ctx,
+                array_ctx.into(),
                 Arc::new(segments),
                 array.to_array_stream().sequenced(ptr),
                 eof,
@@ -326,7 +326,7 @@ mod test {
     #[test]
     fn flat_identity() -> VortexResult<()> {
         block_on(|handle| async {
-            let session = SESSION.clone().with_handle(handle);
+            let session = new_session().with_handle(handle);
             let mut ctx = session.create_execution_ctx();
             let array_ctx = ArrayContext::empty();
             let segments = Arc::new(TestSegments::default());
@@ -335,7 +335,7 @@ mod test {
                 PrimitiveArray::new(buffer![1, 2, 3, 4, 5], Validity::AllValid).into_array();
             let layout = FlatLayoutStrategy::default()
                 .write_stream(
-                    array_ctx,
+                    array_ctx.into(),
                     Arc::<TestSegments>::clone(&segments),
                     array.to_array_stream().sequenced(ptr),
                     eof,
@@ -348,11 +348,12 @@ mod test {
                 "vortex.flat(i32?, rows=5, segments=[0])"
             );
 
-            let result = layout
-                .new_reader("".into(), segments, &session, &Default::default())?
+            let reader = layout.new_reader("".into(), segments, &session, &Default::default())?;
+            let expr = root().bind(reader.dtype())?;
+            let result = reader
                 .projection_evaluation(
                     &(0..layout.row_count()),
-                    &root(),
+                    &expr,
                     MaskFuture::new_true(layout.row_count().try_into()?),
                 )?
                 .await?;
@@ -380,7 +381,7 @@ mod test {
         #[case] pattern: RegressedQueryPattern,
     ) -> VortexResult<()> {
         block_on(|handle| async {
-            let session = SESSION.clone().with_handle(handle);
+            let session = new_session().with_handle(handle);
             let mut ctx = session.create_execution_ctx();
             let requests = Arc::new(AtomicUsize::new(0));
 
@@ -392,10 +393,17 @@ mod test {
                         Arc::clone(&requests),
                     )
                     .await?;
-                    let first =
-                        reader.projection_evaluation(&(0..3), &root(), MaskFuture::new_true(3))?;
-                    let second =
-                        reader.projection_evaluation(&(3..6), &root(), MaskFuture::new_true(3))?;
+                    let projection = root().bind(reader.dtype())?;
+                    let first = reader.projection_evaluation(
+                        &(0..3),
+                        &projection,
+                        MaskFuture::new_true(3),
+                    )?;
+                    let second = reader.projection_evaluation(
+                        &(3..6),
+                        &projection,
+                        MaskFuture::new_true(3),
+                    )?;
 
                     let (first, second): (VortexResult<ArrayRef>, VortexResult<ArrayRef>) =
                         futures::join!(first, second);
@@ -409,7 +417,7 @@ mod test {
                         Arc::clone(&requests),
                     )
                     .await?;
-                    let filter = not_eq(root(), lit(0_i32));
+                    let filter = not_eq(root(), lit(0_i32)).bind(reader.dtype())?;
                     let first =
                         reader.filter_evaluation(&(0..3), &filter, MaskFuture::new_true(3))?;
                     let second =
@@ -426,13 +434,14 @@ mod test {
                         Arc::clone(&requests),
                     )
                     .await?;
-                    let filter = gt(root(), lit(1_i32));
+                    let filter = gt(root(), lit(1_i32)).bind(reader.dtype())?;
+                    let projection = root().bind(reader.dtype())?;
                     let first_mask =
                         reader.filter_evaluation(&(0..3), &filter, MaskFuture::new_true(3))?;
                     let second_mask =
                         reader.filter_evaluation(&(3..6), &filter, MaskFuture::new_true(3))?;
-                    let first = reader.projection_evaluation(&(0..3), &root(), first_mask)?;
-                    let second = reader.projection_evaluation(&(3..6), &root(), second_mask)?;
+                    let first = reader.projection_evaluation(&(0..3), &projection, first_mask)?;
+                    let second = reader.projection_evaluation(&(3..6), &projection, second_mask)?;
 
                     let (first, second): (VortexResult<ArrayRef>, VortexResult<ArrayRef>) =
                         futures::join!(first, second);
@@ -445,6 +454,7 @@ mod test {
                     let expected = source.clone().apply(&projection)?;
                     let reader =
                         counted_flat_reader(&session, source, Arc::clone(&requests)).await?;
+                    let projection = projection.bind(reader.dtype())?;
                     let first = reader.projection_evaluation(
                         &(0..3),
                         &projection,
@@ -483,12 +493,14 @@ mod test {
                         .filter(Mask::from_iter([false, true, true]))?;
                     let reader =
                         counted_flat_reader(&session, source, Arc::clone(&requests)).await?;
+                    let filter = filter.bind(reader.dtype())?;
+                    let projection = root().bind(reader.dtype())?;
                     let first_mask =
                         reader.filter_evaluation(&(0..3), &filter, MaskFuture::new_true(3))?;
                     let second_mask =
                         reader.filter_evaluation(&(3..6), &filter, MaskFuture::new_true(3))?;
-                    let first = reader.projection_evaluation(&(0..3), &root(), first_mask)?;
-                    let second = reader.projection_evaluation(&(3..6), &root(), second_mask)?;
+                    let first = reader.projection_evaluation(&(0..3), &projection, first_mask)?;
+                    let second = reader.projection_evaluation(&(3..6), &projection, second_mask)?;
 
                     let (first, second): (VortexResult<ArrayRef>, VortexResult<ArrayRef>) =
                         futures::join!(first, second);
@@ -520,6 +532,8 @@ mod test {
                         .apply(&projection)?;
                     let reader =
                         counted_flat_reader(&session, source, Arc::clone(&requests)).await?;
+                    let filter = filter.bind(reader.dtype())?;
+                    let projection = projection.bind(reader.dtype())?;
                     let first_mask =
                         reader.filter_evaluation(&(0..3), &filter, MaskFuture::new_true(3))?;
                     let second_mask =
@@ -543,7 +557,7 @@ mod test {
     #[test]
     fn flat_expr() {
         block_on(|handle| async {
-            let session = SESSION.clone().with_handle(handle);
+            let session = new_session().with_handle(handle);
             let mut ctx = session.create_execution_ctx();
             let array_ctx = ArrayContext::empty();
 
@@ -553,7 +567,7 @@ mod test {
                 PrimitiveArray::new(buffer![1, 2, 3, 4, 5], Validity::AllValid).into_array();
             let layout = FlatLayoutStrategy::default()
                 .write_stream(
-                    array_ctx,
+                    array_ctx.into(),
                     Arc::<TestSegments>::clone(&segments),
                     array.to_array_stream().sequenced(ptr),
                     eof,
@@ -562,10 +576,11 @@ mod test {
                 .await
                 .unwrap();
 
-            let expr = gt(root(), lit(3i32));
-            let result = layout
+            let reader = layout
                 .new_reader("".into(), segments, &session, &Default::default())
-                .unwrap()
+                .unwrap();
+            let expr = gt(root(), lit(3i32)).bind(reader.dtype()).unwrap();
+            let result = reader
                 .projection_evaluation(
                     &(0..layout.row_count()),
                     &expr,
@@ -583,7 +598,7 @@ mod test {
     #[test]
     fn flat_unaligned_row_mask() {
         block_on(|handle| async {
-            let session = SESSION.clone().with_handle(handle);
+            let session = new_session().with_handle(handle);
             let mut ctx = session.create_execution_ctx();
             let array_ctx = ArrayContext::empty();
             let segments = Arc::new(TestSegments::default());
@@ -592,7 +607,7 @@ mod test {
                 PrimitiveArray::new(buffer![1, 2, 3, 4, 5], Validity::AllValid).into_array();
             let layout = FlatLayoutStrategy::default()
                 .write_stream(
-                    array_ctx,
+                    array_ctx.into(),
                     Arc::<TestSegments>::clone(&segments),
                     array.to_array_stream().sequenced(ptr),
                     eof,
@@ -601,10 +616,12 @@ mod test {
                 .await
                 .unwrap();
 
-            let result = layout
+            let reader = layout
                 .new_reader("".into(), segments, &session, &Default::default())
-                .unwrap()
-                .projection_evaluation(&(2..4), &root(), MaskFuture::new_true(2))
+                .unwrap();
+            let expr = root().bind(reader.dtype()).unwrap();
+            let result = reader
+                .projection_evaluation(&(2..4), &expr, MaskFuture::new_true(2))
                 .unwrap()
                 .await
                 .unwrap();
