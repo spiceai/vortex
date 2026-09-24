@@ -9,6 +9,7 @@ use moka::future::Cache;
 use moka::future::CacheBuilder;
 use moka::policy::EvictionPolicy;
 use rustc_hash::FxBuildHasher;
+use vortex_array::ArrayRef;
 use vortex_array::buffer::BufferHandle;
 use vortex_buffer::ByteBuffer;
 use vortex_error::VortexExpect;
@@ -32,6 +33,20 @@ pub trait SegmentCache: Send + Sync {
     async fn get(&self, id: SegmentId) -> VortexResult<Option<ByteBuffer>>;
     /// Store a segment in the cache.
     async fn put(&self, id: SegmentId, buffer: ByteBuffer) -> VortexResult<()>;
+}
+
+/// Cache for decoded array segments.
+///
+/// A decoded cache sits above a [`SegmentCache`]: a hit returns an array before
+/// Vortex asks the segment source for encoded bytes. Segment identifiers are
+/// local to their source, so implementations that serve more than one source
+/// must qualify the identifier with the source's identity.
+#[async_trait]
+pub trait DecodedSegmentCache: Send + Sync {
+    /// Return a decoded segment, or `None` on cache miss.
+    async fn get(&self, id: SegmentId) -> VortexResult<Option<ArrayRef>>;
+    /// Store a decoded segment in the cache.
+    async fn put(&self, id: SegmentId, array: ArrayRef) -> VortexResult<()>;
 }
 
 /// Segment cache implementation that never stores anything.

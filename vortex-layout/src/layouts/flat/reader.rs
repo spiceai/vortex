@@ -26,6 +26,7 @@ use crate::layouts::flat::FlatLayout;
 use crate::reader::LayoutReader;
 use crate::reader::RowSplits;
 use crate::reader::SplitRange;
+use crate::segments::DecodedSegmentCache;
 use crate::segments::SegmentSource;
 
 /// The threshold of mask density below which we will evaluate the expression only over the
@@ -40,6 +41,7 @@ pub struct FlatReader {
     name: Arc<str>,
     segment_source: Arc<dyn SegmentSource>,
     session: VortexSession,
+    decoded_segment_cache: Option<Arc<dyn DecodedSegmentCache>>,
     array: OnceLock<SharedArrayFuture>,
 }
 
@@ -49,12 +51,14 @@ impl FlatReader {
         name: Arc<str>,
         segment_source: Arc<dyn SegmentSource>,
         session: VortexSession,
+        decoded_segment_cache: Option<Arc<dyn DecodedSegmentCache>>,
     ) -> Self {
         Self {
             layout,
             name,
             segment_source,
             session,
+            decoded_segment_cache,
             array: Default::default(),
         }
     }
@@ -64,16 +68,24 @@ impl FlatReader {
         let row_count =
             usize::try_from(self.layout.row_count()).vortex_expect("row count must fit in usize");
 
+        let segment_source = Arc::clone(&self.segment_source);
+        let segment_id = self.layout.segment_id();
+        let decoded_segment_cache = self.decoded_segment_cache.clone();
+
         self.array
             .get_or_init(|| {
-                let segment_fut = self.segment_source.request(self.layout.segment_id());
-
                 let ctx = self.layout.array_ctx().clone();
                 let session = self.session.clone();
                 let dtype = self.layout.dtype().clone();
                 let array_tree = self.layout.array_tree().cloned();
                 async move {
-                    let segment = segment_fut.await?;
+                    if let Some(cache) = decoded_segment_cache.as_ref()
+                        && let Ok(Some(array)) = cache.get(segment_id).await
+                    {
+                        return Ok(array);
+                    }
+
+                    let segment = segment_source.request(segment_id).await?;
                     let parts = if let Some(array_tree) = array_tree {
                         // Use the pre-stored flatbuffer from layout metadata combined with segment buffers.
                         SerializedArray::from_flatbuffer_and_segment(array_tree, segment)?
@@ -81,9 +93,19 @@ impl FlatReader {
                         // Parse the flatbuffer from the segment itself.
                         SerializedArray::try_from(segment)?
                     };
-                    parts
+                    let array = parts
                         .decode(&dtype, row_count, &ctx, &session)
-                        .map_err(Arc::new)
+                        .map_err(Arc::new)?;
+
+                    if let Some(cache) = decoded_segment_cache.as_ref()
+                        && let Err(error) = cache.put(segment_id, array.clone()).await
+                    {
+                        tracing::warn!(
+                            "Failed to store decoded segment {segment_id} in cache: {error}"
+                        );
+                    }
+
+                    Ok(array)
                 }
                 .boxed()
                 .shared()
@@ -232,10 +254,13 @@ impl LayoutReader for FlatReader {
 
 #[cfg(test)]
 mod test {
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
 
+    use async_trait::async_trait;
+    use parking_lot::Mutex;
     use rstest::rstest;
     use vortex_array::ArrayContext;
     use vortex_array::ArrayRef;
@@ -263,9 +288,11 @@ mod test {
     use vortex_mask::Mask;
     use vortex_session::VortexSession;
 
+    use crate::LayoutReaderContext;
     use crate::LayoutReaderRef;
     use crate::LayoutStrategy;
     use crate::layouts::flat::writer::FlatLayoutStrategy;
+    use crate::segments::DecodedSegmentCache;
     use crate::segments::SegmentFuture;
     use crate::segments::SegmentId;
     use crate::segments::SegmentSource;
@@ -284,6 +311,27 @@ mod test {
         fn request(&self, id: SegmentId) -> SegmentFuture {
             self.requests.fetch_add(1, Ordering::Relaxed);
             self.inner.request(id)
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingDecodedSegmentCache {
+        arrays: Mutex<HashMap<SegmentId, ArrayRef>>,
+        gets: AtomicUsize,
+        puts: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl DecodedSegmentCache for CountingDecodedSegmentCache {
+        async fn get(&self, id: SegmentId) -> VortexResult<Option<ArrayRef>> {
+            self.gets.fetch_add(1, Ordering::Relaxed);
+            Ok(self.arrays.lock().get(&id).cloned())
+        }
+
+        async fn put(&self, id: SegmentId, array: ArrayRef) -> VortexResult<()> {
+            self.puts.fetch_add(1, Ordering::Relaxed);
+            self.arrays.lock().insert(id, array);
+            Ok(())
         }
     }
 
@@ -358,6 +406,53 @@ mod test {
                 .await?;
 
             assert_arrays_eq!(result, array, &mut ctx);
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn decoded_segment_cache_skips_the_encoded_segment_source() -> VortexResult<()> {
+        block_on(|handle| async {
+            let session = SESSION.clone().with_handle(handle);
+            let mut execution_ctx = session.create_execution_ctx();
+            let segments = Arc::new(TestSegments::default());
+            let input = buffer![1, 2, 3, 4].into_array();
+            let (ptr, eof) = SequenceId::root().split();
+            let layout = FlatLayoutStrategy::default()
+                .write_stream(
+                    ArrayContext::empty(),
+                    Arc::<TestSegments>::clone(&segments),
+                    input.to_array_stream().sequenced(ptr),
+                    eof,
+                    &session,
+                )
+                .await?;
+
+            let decoded_cache = Arc::new(CountingDecodedSegmentCache::default());
+            let reader_ctx = LayoutReaderContext::new()
+                .with_decoded_segment_cache(Arc::clone(&decoded_cache) as Arc<_>);
+            let raw_requests = Arc::new(AtomicUsize::new(0));
+
+            for _ in 0..2 {
+                let source: Arc<dyn SegmentSource> = Arc::new(CountingSegmentSource {
+                    inner: (*segments).clone(),
+                    requests: Arc::clone(&raw_requests),
+                });
+                let reader = layout.new_reader("".into(), source, &session, &reader_ctx)?;
+                let result = reader
+                    .projection_evaluation(&(0..4), &root(), MaskFuture::new_true(4))?
+                    .await?;
+                assert_arrays_eq!(result, input.clone(), &mut execution_ctx);
+            }
+
+            assert_eq!(
+                raw_requests.load(Ordering::Relaxed),
+                1,
+                "only the decoded-cache miss reads the encoded segment"
+            );
+            assert_eq!(decoded_cache.gets.load(Ordering::Relaxed), 2);
+            assert_eq!(decoded_cache.puts.load(Ordering::Relaxed), 1);
 
             Ok(())
         })

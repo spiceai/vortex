@@ -15,6 +15,7 @@ use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_io::VortexReadAt;
 use vortex_io::session::RuntimeSessionExt;
+use vortex_layout::segments::DecodedSegmentCache;
 use vortex_layout::segments::InstrumentedSegmentCache;
 use vortex_layout::segments::NoOpSegmentCache;
 use vortex_layout::segments::SegmentCache;
@@ -52,6 +53,8 @@ pub struct VortexOpenOptions {
     session: VortexSession,
     /// Cache to use for file segments.
     segment_cache: Option<Arc<dyn SegmentCache>>,
+    /// Cache to use for decoded file segments.
+    decoded_segment_cache: Option<Arc<dyn DecodedSegmentCache>>,
     /// The number of bytes to read when parsing the footer.
     initial_read_size: usize,
     /// An optional, externally provided, file size.
@@ -79,6 +82,7 @@ pub trait OpenOptionsSessionExt:
         VortexOpenOptions {
             session: self.session(),
             segment_cache: None,
+            decoded_segment_cache: None,
             initial_read_size: INITIAL_READ_SIZE,
             file_size: None,
             dtype: None,
@@ -121,6 +125,18 @@ impl VortexOpenOptions {
     /// initial footer read are also inserted into an internal first-read cache.
     pub fn with_segment_cache(mut self, segment_cache: Arc<dyn SegmentCache>) -> Self {
         self.segment_cache = Some(segment_cache);
+        self
+    }
+
+    /// Configure a cache of decoded file segments.
+    ///
+    /// The cache is checked before the segment cache and the file's underlying
+    /// segment source, so a hit avoids both I/O and decoding.
+    pub fn with_decoded_segment_cache(
+        mut self,
+        decoded_segment_cache: Arc<dyn DecodedSegmentCache>,
+    ) -> Self {
+        self.decoded_segment_cache = Some(decoded_segment_cache);
         self
     }
 
@@ -206,6 +222,9 @@ impl VortexOpenOptions {
         if self.segment_cache.is_some() {
             tracing::warn!("segment cache is ignored for in-memory `open_buffer`");
         }
+        if self.decoded_segment_cache.is_some() {
+            tracing::warn!("decoded segment cache is ignored for in-memory `open_buffer`");
+        }
         if self.metrics_registry.is_some() {
             tracing::warn!("metrics registry is ignored for in-memory `open_buffer`");
         }
@@ -276,6 +295,11 @@ impl VortexOpenOptions {
         ));
 
         let file = VortexFile::new(footer, segment_source, self.session.clone());
+        let file = if let Some(decoded_segment_cache) = self.decoded_segment_cache {
+            file.with_decoded_segment_cache(decoded_segment_cache)
+        } else {
+            file
+        };
         Ok(if self.cache_layout_reader {
             file.with_caching()
         } else {

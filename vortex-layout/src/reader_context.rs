@@ -7,6 +7,8 @@ use std::sync::Arc;
 use vortex_session::registry::Id;
 use vortex_utils::aliases::hash_map::HashMap;
 
+use crate::segments::DecodedSegmentCache;
+
 /// Per-reader-tree dependency context, threaded through [`crate::VTable::new_reader`].
 ///
 /// Holds an [`Id`]-keyed registry of `Arc<dyn Any>` values. Ancestors publish via
@@ -21,12 +23,17 @@ use vortex_utils::aliases::hash_map::HashMap;
 #[derive(Clone, Default)]
 pub struct LayoutReaderContext {
     values: Arc<HashMap<Id, Arc<dyn Any + Send + Sync>>>,
+    decoded_segment_cache: Option<Arc<dyn DecodedSegmentCache>>,
 }
 
 impl std::fmt::Debug for LayoutReaderContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LayoutReaderContext")
             .field("ids", &self.values.keys().collect::<Vec<_>>())
+            .field(
+                "decoded_segment_cache",
+                &self.decoded_segment_cache.is_some(),
+            )
             .finish()
     }
 }
@@ -47,7 +54,21 @@ impl LayoutReaderContext {
         values.insert(id, value);
         Self {
             values: Arc::new(values),
+            decoded_segment_cache: self.decoded_segment_cache.clone(),
         }
+    }
+
+    /// Returns a derived context that makes `cache` available to flat readers.
+    pub fn with_decoded_segment_cache(&self, cache: Arc<dyn DecodedSegmentCache>) -> Self {
+        Self {
+            values: Arc::clone(&self.values),
+            decoded_segment_cache: Some(cache),
+        }
+    }
+
+    /// Returns the decoded segment cache configured for this reader tree.
+    pub fn decoded_segment_cache(&self) -> Option<Arc<dyn DecodedSegmentCache>> {
+        self.decoded_segment_cache.clone()
     }
 
     /// Returns the value published under `id`, downcast to `T`. Returns `None` if no

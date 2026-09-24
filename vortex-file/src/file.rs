@@ -17,9 +17,11 @@ use vortex_array::dtype::FieldMask;
 use vortex_array::expr::Expression;
 use vortex_error::VortexResult;
 use vortex_layout::LayoutReader;
+use vortex_layout::LayoutReaderContext;
 use vortex_layout::scan::layout::LayoutReaderDataSource;
 use vortex_layout::scan::scan_builder::ScanBuilder;
 use vortex_layout::scan::split_by::SplitBy;
+use vortex_layout::segments::DecodedSegmentCache;
 use vortex_layout::segments::SegmentSource;
 use vortex_scan::DataSourceRef;
 use vortex_session::VortexSession;
@@ -44,17 +46,20 @@ pub struct VortexFile {
     session: VortexSession,
     /// None id LayoutReader caching is turned off
     layout_reader_cache: Option<OnceLock<Arc<dyn LayoutReader>>>,
+    /// Cache shared by every reader tree constructed for this file.
+    decoded_segment_cache: Option<Arc<dyn DecodedSegmentCache>>,
 }
 
 fn layout_reader(
     segment_source: Arc<dyn SegmentSource>,
     footer: &Footer,
     session: &VortexSession,
+    ctx: &LayoutReaderContext,
 ) -> VortexResult<Arc<dyn LayoutReader>> {
     let root_reader = footer
         .layout()
         // TODO(ngates): we may want to allow the user pass in a name here?
-        .new_reader("".into(), segment_source, session, &Default::default())?;
+        .new_reader("".into(), segment_source, session, ctx)?;
 
     Ok(if let Some(stats) = footer.statistics().cloned() {
         Arc::new(FileStatsLayoutReader::new(
@@ -79,6 +84,7 @@ impl VortexFile {
             segment_source,
             session,
             layout_reader_cache: None,
+            decoded_segment_cache: None,
         }
     }
 
@@ -92,7 +98,14 @@ impl VortexFile {
             segment_source: self.segment_source,
             session: self.session,
             layout_reader_cache: Some(OnceLock::new()),
+            decoded_segment_cache: self.decoded_segment_cache,
         }
+    }
+
+    /// Cache decoded segments between reader trees created for this file.
+    pub fn with_decoded_segment_cache(mut self, cache: Arc<dyn DecodedSegmentCache>) -> Self {
+        self.decoded_segment_cache = Some(cache);
+        self
     }
 
     /// Returns a reference to the file's footer, which contains metadata and layout information.
@@ -134,11 +147,16 @@ impl VortexFile {
     ///
     /// Wraps the root layout in a [`FileStatsLayoutReader`] if file stats are available.
     pub fn layout_reader(&self) -> VortexResult<Arc<dyn LayoutReader>> {
+        let mut ctx = LayoutReaderContext::new();
+        if let Some(cache) = self.decoded_segment_cache.as_ref() {
+            ctx = ctx.with_decoded_segment_cache(Arc::clone(cache));
+        }
         match &self.layout_reader_cache {
             None => layout_reader(
                 Arc::clone(&self.segment_source),
                 &self.footer,
                 &self.session,
+                &ctx,
             ),
             Some(reader) => {
                 // get_or_try_init is unstable
@@ -149,6 +167,7 @@ impl VortexFile {
                         Arc::clone(&self.segment_source),
                         &self.footer,
                         &self.session,
+                        &ctx,
                     )?;
                     Ok(if let Err(val) = reader.set(Arc::clone(&inner)) {
                         val
