@@ -20,7 +20,6 @@ use futures::future::try_join;
 use futures::future::try_join_all;
 use futures::pin_mut;
 use itertools::Itertools;
-use vortex_array::ArrayContext;
 use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
@@ -39,9 +38,9 @@ use vortex_utils::aliases::DefaultHashBuilder;
 use vortex_utils::aliases::hash_map::HashMap;
 use vortex_utils::aliases::hash_set::HashSet;
 
-use crate::IntoLayout;
 use crate::LayoutRef;
 use crate::LayoutStrategy;
+use crate::LayoutWriterContext;
 use crate::layouts::struct_::StructLayout;
 use crate::segments::SegmentSinkRef;
 use crate::sequence::SendableSequentialStream;
@@ -106,7 +105,7 @@ impl StructStrategy {
 impl LayoutStrategy for StructStrategy {
     async fn write_stream(
         &self,
-        ctx: ArrayContext,
+        ctx: LayoutWriterContext,
         segment_sink: SegmentSinkRef,
         stream: SendableSequentialStream,
         mut eof: SequencePointer,
@@ -181,7 +180,7 @@ impl LayoutStrategy for StructStrategy {
             while let Some(result) = columns_vec_stream.next().await {
                 match result {
                     Ok(columns) => {
-                        for (tx, column) in column_streams_tx.iter().zip_eq(columns.into_iter()) {
+                        for (tx, column) in column_streams_tx.iter().zip_eq(columns) {
                             if tx.send(Ok(column)).await.is_err() {
                                 vortex_bail!(
                                     "struct column writer finished before all chunks were sent"
@@ -230,7 +229,7 @@ impl LayoutStrategy for StructStrategy {
                 let session = session.clone();
                 let ctx = ctx.clone();
                 let segment_sink = Arc::clone(&segment_sink);
-                handle.spawn_nested(move |h| {
+                handle.spawn_nested(move |_| {
                     // Validity is written through the validity strategy; every other field
                     // resolves to its named override or the default strategy.
                     let writer = if index == 0 && is_nullable {
@@ -241,7 +240,6 @@ impl LayoutStrategy for StructStrategy {
                             .cloned()
                             .unwrap_or_else(|| Arc::clone(&self.default))
                     };
-                    let session = session.with_handle(h);
 
                     async move {
                         writer

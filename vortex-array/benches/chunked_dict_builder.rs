@@ -9,7 +9,7 @@ use rand::distr::StandardUniform;
 use vortex_array::Canonical;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::dict_test::gen_dict_primitive_chunks;
-use vortex_array::builders::builder_with_capacity;
+use vortex_array::builders::builder_with_capacity_in;
 use vortex_array::dtype::NativePType;
 use vortex_error::VortexExpect;
 use vortex_session::VortexSession;
@@ -21,13 +21,14 @@ fn main() {
 
 static SESSION: LazyLock<VortexSession> = LazyLock::new(vortex_array::array_session);
 
+// Chunk counts sized to keep CodSpeed simulation under 1ms per benchmark.
 const BENCH_ARGS: &[(usize, usize, usize)] = &[
     (1000, 10, 10),
     (1000, 100, 10),
     (1000, 1000, 10),
-    (1000, 10, 100),
-    (1000, 100, 100),
-    (1000, 1000, 100),
+    (1000, 10, 20),
+    (1000, 100, 20),
+    (1000, 1000, 20),
 ];
 
 #[divan::bench(types = [u32, u64, f32, f64], args = BENCH_ARGS)]
@@ -42,7 +43,8 @@ fn chunked_dict_primitive_canonical_into<T: NativePType>(
     bencher
         .with_inputs(|| (&chunk, SESSION.create_execution_ctx()))
         .bench_refs(|(chunk, ctx)| {
-            let mut builder = builder_with_capacity(chunk.dtype(), len * chunk_count);
+            let mut builder =
+                builder_with_capacity_in(chunk.dtype(), len * chunk_count, ctx.allocator());
             chunk
                 .append_to_builder(builder.as_mut(), ctx)
                 .vortex_expect("append failed");

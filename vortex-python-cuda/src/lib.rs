@@ -26,6 +26,7 @@ use pyo3::types::PyDict;
 use pyo3::types::PyList;
 use pyo3::types::PyTuple;
 use vortex::VortexSessionDefault;
+use vortex::array::ArrayDeserialization;
 use vortex::array::ArrayId;
 use vortex::array::ArrayRef;
 use vortex::array::buffer::BufferHandle;
@@ -297,14 +298,17 @@ fn deserialize_metadata_tree(
     let plugin = session
         .arrays()
         .registry()
-        .find(&encoding_id)
+        .get(&encoding_id)
         .ok_or_else(|| vortex_err!("Unknown array encoding: {}", metadata.encoding_id))?;
     let decoded = plugin.deserialize(
-        &dtype,
-        metadata.len,
-        &metadata.metadata,
-        &metadata.buffers,
-        &children,
+        ArrayDeserialization::new(
+            encoding_id,
+            &dtype,
+            metadata.len,
+            &metadata.metadata,
+            &metadata.buffers,
+            &children,
+        ),
         session,
     )?;
     vortex_ensure!(

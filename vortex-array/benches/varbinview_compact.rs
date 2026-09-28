@@ -29,10 +29,11 @@ fn main() {
 
 const ARGS: &[(usize, usize)] = &[
     // (output_size, buffer_utilization_pct)
-    (1 << 12, 10),
-    (1 << 12, 90),
-    (1 << 14, 10),
-    (1 << 14, 90),
+    // Output sizes sized to keep CodSpeed simulation under 1ms per benchmark.
+    (1 << 10, 10),
+    (1 << 10, 90),
+    (1 << 11, 10),
+    (1 << 11, 90),
 ];
 
 static SESSION: LazyLock<VortexSession> = LazyLock::new(array_session);
@@ -92,7 +93,11 @@ fn compact_sliced_impl(bencher: Bencher, (output_size, utilization_pct): (usize,
 
 /// Creates a base VarBinViewArray with mix of inlined and outlined strings.
 fn build_varbinview_fixture(len: usize) -> VarBinViewArray {
-    let mut builder = VarBinViewBuilder::with_capacity(DType::Utf8(Nullability::NonNullable), len);
+    let mut builder = VarBinViewBuilder::with_capacity_in(
+        DType::Utf8(Nullability::NonNullable),
+        len,
+        vortex_buffer::BufferAllocatorRef::statically_allocated(),
+    );
     let mut rng = StdRng::seed_from_u64(42);
 
     for _ in 0..len {

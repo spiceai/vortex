@@ -17,10 +17,11 @@ version = { workspace = true }
 workspace = true
 
 [dependencies]
-vortex-array = { workspace = true }
+vortex-array = { workspace = true, features = ["unstable_row_fns"] }
 vortex-arrow = { workspace = true }
 vortex-buffer = { workspace = true }
 vortex-compressor = { workspace = true }
+vortex-edition = { workspace = true }
 vortex-error = { workspace = true }
 vortex-session = { workspace = true }
 
@@ -32,5 +33,21 @@ num-traits = { workspace = true }
 prost = { workspace = true }
 
 [dev-dependencies]
+divan = { workspace = true }
+mimalloc = { workspace = true }
 rstest = { workspace = true }
 vortex-array = { workspace = true, features = ["_test-harness"] }
+vortex-btrblocks = { workspace = true }
+vortex-mask = { workspace = true }
+
+[[bench]]
+name = "cosine_similarity"
+harness = false
+
+[[bench]]
+name = "l2_norm"
+harness = false
+
+[[bench]]
+name = "inner_product"
+harness = false

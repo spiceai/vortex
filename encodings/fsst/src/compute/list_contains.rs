@@ -7,14 +7,13 @@ use vortex_array::ArrayRef;
 use vortex_array::ArrayView;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
+use vortex_array::arrays::BoolArray;
 use vortex_array::arrays::Constant;
 use vortex_array::arrays::ConstantArray;
-use vortex_array::arrays::scalar_fn::ScalarFnFactoryExt;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
 use vortex_array::scalar::Scalar;
 use vortex_array::scalar::ScalarValue;
-use vortex_array::scalar_fn::EmptyOptions;
 use vortex_array::scalar_fn::fns::list_contains::ListContains;
 use vortex_array::scalar_fn::fns::list_contains::ListContainsElementKernel;
 use vortex_buffer::ByteBuffer;
@@ -105,14 +104,10 @@ impl ListContainsElementKernel for FSST {
         let needles = element.codes().into_array();
         let len = needles.len();
 
-        ListContains
-            .try_new_array(
-                len,
-                EmptyOptions,
-                [ConstantArray::new(code_list, len).into_array(), needles],
-            )?
-            .execute(ctx)
-            .map(Some)
+        ListContains::try_new(ConstantArray::new(code_list, len).into_array(), needles)?
+            .into_array()
+            .execute::<BoolArray>(ctx)
+            .map(|array| Some(array.into_array()))
     }
 }
 
@@ -127,11 +122,9 @@ mod tests {
     use vortex_array::arrays::ConstantArray;
     use vortex_array::arrays::VarBinArray;
     use vortex_array::arrays::bool::BoolArrayExt;
-    use vortex_array::arrays::scalar_fn::ScalarFnFactoryExt;
     use vortex_array::dtype::DType;
     use vortex_array::dtype::Nullability;
     use vortex_array::scalar::Scalar;
-    use vortex_array::scalar_fn::EmptyOptions;
     use vortex_array::scalar_fn::fns::list_contains::ListContains;
     use vortex_error::VortexResult;
     use vortex_session::VortexSession;
@@ -223,13 +216,10 @@ mod tests {
         let mut results = Vec::new();
         for needles in [plain, compressed] {
             let len = needles.len();
-            let result = ListContains
-                .try_new_array(
-                    len,
-                    EmptyOptions,
-                    [ConstantArray::new(list.clone(), len).into_array(), needles],
-                )?
-                .execute::<BoolArray>(&mut ctx)?;
+            let result =
+                ListContains::try_new(ConstantArray::new(list.clone(), len).into_array(), needles)?
+                    .into_array()
+                    .execute::<BoolArray>(&mut ctx)?;
             results.push(bool_answers(&result, &mut ctx));
         }
 
@@ -395,16 +385,14 @@ mod tests {
 
         let run = |needles: vortex_array::ArrayRef| {
             let len = needles.len();
-            ListContains
-                .try_new_array(
-                    len,
-                    EmptyOptions,
-                    [
-                        ConstantArray::new(binary_list.clone(), len).into_array(),
-                        needles,
-                    ],
-                )
-                .and_then(|a| a.execute::<BoolArray>(&mut SESSION.create_execution_ctx()))
+            ListContains::try_new(
+                ConstantArray::new(binary_list.clone(), len).into_array(),
+                needles,
+            )
+            .and_then(|a| {
+                a.into_array()
+                    .execute::<BoolArray>(&mut SESSION.create_execution_ctx())
+            })
         };
 
         let varbin = run(plain);

@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+import importlib
 import importlib.metadata
 import importlib.util
+from types import ModuleType
 
 from . import _lib, arrays, dataset, expr, file, io, ray, registry, scan
-from ._lib.arrays import (  # pyright: ignore[reportMissingModuleSource]
+from ._lib.arrays import (
     AlpArray,
     AlpRdArray,
     BoolArray,
@@ -32,8 +34,8 @@ from ._lib.arrays import (  # pyright: ignore[reportMissingModuleSource]
     VarBinViewArray,
     ZigZagArray,
 )
-from ._lib.compress import compress  # pyright: ignore[reportMissingModuleSource]
-from ._lib.dtype import (  # pyright: ignore[reportMissingModuleSource]
+from ._lib.compress import compress
+from ._lib.dtype import (
     BinaryDType,
     BoolDType,
     DecimalDType,
@@ -61,12 +63,12 @@ from ._lib.dtype import (  # pyright: ignore[reportMissingModuleSource]
     uint,
     utf8,
 )
-from ._lib.iter import ArrayIterator  # pyright: ignore[reportMissingModuleSource]
-from ._lib.runtime import (  # pyright: ignore[reportMissingModuleSource]
+from ._lib.iter import ArrayIterator
+from ._lib.runtime import (
     set_worker_threads,
     worker_threads,
 )
-from ._lib.scalar import (  # pyright: ignore[reportMissingModuleSource]
+from ._lib.scalar import (
     BinaryScalar,
     BoolScalar,
     # TODO(connor): Is this missing a `DecimalScalar`?
@@ -79,17 +81,17 @@ from ._lib.scalar import (  # pyright: ignore[reportMissingModuleSource]
     Utf8Scalar,
     scalar,
 )
-from ._lib.serde import ArrayContext, SerializedArray  # pyright: ignore[reportMissingModuleSource]
+from ._lib.serde import ArrayContext, SerializedArray
 from .arrays import (
     Array,
     PyArray,
-    _unpickle_array,  # pyright: ignore[reportPrivateUsage]
+    _unpickle_array,
     array,
 )
 from .file import VortexFile, open
 from .scan import RepeatedScan
 
-assert _lib, "Ensure we eagerly import the Vortex native library"
+_ = _lib  # Ensure we eagerly import the Vortex native library.
 
 # Resolve the installed distribution version so it is available as vortex.__version__.
 
@@ -116,6 +118,17 @@ def cuda_extension_installed() -> bool:
     is usable at runtime.
     """
     return importlib.util.find_spec("vortex_cuda") is not None
+
+
+def __getattr__(name: str) -> ModuleType:
+    # `datasets` is exposed lazily and deliberately kept out of __all__: importing it pulls in the
+    # optional `vortex-data[hf]` dependencies, so it must not be imported by `from vortex import *`
+    # or by merely importing `vortex`.
+    if name == "datasets":
+        module = importlib.import_module(".datasets", __name__)
+        globals()[name] = module
+        return module
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 __all__ = [

@@ -13,6 +13,7 @@ use vortex::array::arrays::PrimitiveArray;
 use vortex::array::arrays::listview::DEFAULT_REBUILD_DENSITY_THRESHOLD;
 use vortex::array::arrays::listview::DEFAULT_TRIM_ELEMENTS_THRESHOLD;
 use vortex::array::arrays::listview::ListViewArrayExt;
+use vortex::array::arrays::listview::ListViewArraySlotsExt;
 use vortex::array::arrays::listview::ListViewDataParts;
 use vortex::array::arrays::listview::ListViewRebuildMode;
 use vortex::array::match_each_integer_ptype;
@@ -232,7 +233,7 @@ mod tests {
         chunk.set_len(0);
 
         assert_eq!(
-            format!("{}", String::try_from(&*chunk)?),
+            String::try_from(&*chunk)?,
             r#"Chunk - [1 Columns]
 - FLAT UINTEGER[]: 0 = [ ]
 "#
@@ -262,7 +263,7 @@ mod tests {
         chunk.set_len(3);
 
         assert_eq!(
-            format!("{}", String::try_from(&*chunk)?),
+            String::try_from(&*chunk)?,
             r#"Chunk - [1 Columns]
 - FLAT INTEGER[]: 3 = [ [1], [0], [3]]
 "#
@@ -293,7 +294,7 @@ mod tests {
         chunk.set_len(3);
 
         assert_eq!(
-            format!("{}", String::try_from(&*chunk)?),
+            String::try_from(&*chunk)?,
             r#"Chunk - [1 Columns]
 - FLAT INTEGER[]: 3 = [ [1], [2], [3]]
 "#
@@ -331,7 +332,7 @@ mod tests {
         chunk.set_len(4);
 
         assert_eq!(
-            format!("{}", String::try_from(&*chunk)?),
+            String::try_from(&*chunk)?,
             r#"Chunk - [1 Columns]
 - FLAT VARCHAR[]: 4 = [ [], [abc, def, NULL], NULL, []]
 "#
@@ -363,7 +364,7 @@ mod tests {
         chunk.set_len(3);
 
         assert_eq!(
-            format!("{}", String::try_from(&*chunk)?),
+            String::try_from(&*chunk)?,
             r#"Chunk - [1 Columns]
 - FLAT FLOAT[]: 3 = [ [101.0], [200.0, 202.0], [203.0]]
 "#

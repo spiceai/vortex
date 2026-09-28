@@ -5,6 +5,8 @@
 #include "vortex/common.hpp"
 #include "vortex/dtype.hpp"
 #include "vortex/error.hpp"
+#include "vortex/scalar.hpp"
+#include "vortex/session.hpp"
 
 #include <vortex.h>
 
@@ -177,9 +179,9 @@ Array Array::primitive_raw(vx_ptype ptype, const void *data, size_t len, const V
     return Access::adopt<Array>(out);
 }
 
-Array Array::from_arrow(ArrowArray *array, ArrowSchema *schema, bool nullable) {
+Array Array::from_arrow(const Session &session, ArrowArray *array, ArrowSchema *schema, bool nullable) {
     vx_error *error = nullptr;
-    const vx_array *out = vx_array_from_arrow(array, schema, nullable, &error);
+    const vx_array *out = vx_array_from_arrow(Access::c_ptr(session), array, schema, nullable, &error);
     throw_on_error(error);
     return Access::adopt<Array>(out);
 }
@@ -324,7 +326,19 @@ BytesView Array::bytes(const Session &session) const {
     return BytesView(std::move(canonical), std::move(validity), len);
 }
 
+Scalar Array::scalar_at(const Session &session, size_t index) const {
+    vx_error *error = nullptr;
+    const vx_scalar *scalar = vx_array_get_scalar(Access::c_ptr(session), handle_.get(), index, &error);
+    throw_on_error(error);
+    return Access::adopt<Scalar>(scalar);
+}
+
 bool PrimitiveView<bool>::value(size_t i) const {
+    if (i >= size_) {
+        throw VortexException("index " + std::to_string(i) + " out of bounds for view of size " +
+                                  std::to_string(size_),
+                              ErrorCode::OutOfBounds);
+    }
     return vx_array_get_bool(Access::c_ptr(canonical_), i);
 }
 

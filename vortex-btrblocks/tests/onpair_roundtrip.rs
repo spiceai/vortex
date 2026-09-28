@@ -2,11 +2,9 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 //
 //! End-to-end round-trip through the full Vortex compressor + decompressor
-//! on string arrays. Lives in `vortex-btrblocks` (gated on `unstable_encodings`)
-//! so it exercises the same code path the file writer uses, not just the
-//! OnPair crate in isolation.
+//! on string arrays. Lives in `vortex-btrblocks` so it exercises the same code path the file
+//! writer uses, not just the OnPair crate in isolation.
 
-#![cfg(feature = "unstable_encodings")]
 #![allow(
     clippy::cast_possible_truncation,
     clippy::tests_outside_test_module,
@@ -188,7 +186,7 @@ fn empty_and_short_string_roundtrip() {
 }
 
 /// Regression for the Euro2016 compress-bench panic
-/// (`onpair::decompress`: "dictionary offsets must be nondecreasing").
+/// (`onpair::decompress`: "dictionary offsets must be strictly increasing").
 ///
 /// A large, high-cardinality corpus fills the OnPair dictionary toward its
 /// 4096-entry cap, so the cascading compressor narrows `dict_offsets` to `u16`

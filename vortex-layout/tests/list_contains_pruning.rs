@@ -90,7 +90,9 @@ fn zones_pruned(
     .expect("zone map");
 
     let predicate = list_contains(lit(list), root())
-        .falsify(column_dtype, &SESSION)
+        .bind(column_dtype)
+        .expect("bind")
+        .falsify(&SESSION)
         .expect("falsify")
         .unwrap_or_else(|| panic!("{case}: no falsifier derived"));
 

@@ -29,7 +29,7 @@ pub(crate) fn new_exporter_with_flatten(
         return canonical::new_exporter(array.into_array(), cache, ctx);
     }
 
-    let chunk_offsets = array.chunk_offsets().to_vec();
+    let chunk_offsets = array.chunk_offset_values().to_vec();
     let chunks = array
         .chunks()
         .iter()
@@ -123,23 +123,23 @@ mod tests {
         )?;
         let mut chunk = DataChunk::new([LogicalType::varchar()]);
 
-        assert!(exporter.export(&mut chunk, None, None)?);
+        assert!(exporter.export(&mut chunk, None)?);
         assert_eq!(
-            format!("{}", String::try_from(&*chunk)?),
+            String::try_from(&*chunk)?,
             r#"Chunk - [1 Columns]
 - DICTIONARY VARCHAR: 2 = [ a, b]
 "#
         );
 
-        assert!(exporter.export(&mut chunk, None, None)?);
+        assert!(exporter.export(&mut chunk, None)?);
         assert_eq!(
-            format!("{}", String::try_from(&*chunk)?),
+            String::try_from(&*chunk)?,
             r#"Chunk - [1 Columns]
 - DICTIONARY VARCHAR: 3 = [ c, d, e]
 "#
         );
 
-        assert!(!exporter.export(&mut chunk, None, None)?);
+        assert!(!exporter.export(&mut chunk, None)?);
         Ok(())
     }
 }

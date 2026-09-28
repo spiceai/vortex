@@ -17,6 +17,14 @@ publish = false
 [package.metadata.cargo-shear]
 ignored = ["vortex-cuda"]
 
+[[bin]]
+name = "datafusion-bench"
+path = "src/main.rs"
+test = false
+
+[lib]
+test = false
+
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
@@ -50,7 +58,6 @@ custom-labels = { workspace = true }
 
 [features]
 cuda = ["dep:vortex-cuda"]
-unstable_encodings = ["vortex/unstable_encodings"]
 
 [lints]
 workspace = true

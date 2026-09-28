@@ -4,12 +4,9 @@ Guidance for Claude, Codex and other coding agents working in the Vortex reposit
 
 ## Task Routing
 
-- When asked to review a PR, especially via `/pr-review`, use the
-  `.agents/skills/pr-review` skill.
-- When asked a question about the PR or codebase, especially via `/query`, use the
-  `.agents/skills/query` skill.
 - When asked to investigate a CI failure, especially via `/ci-failure-analysis`, use the
-  `.agents/skills/ci-failure-analysis` skill.
+  `.agents/skills/ci-failure-analysis` skill. It is the source of truth for fetching logs,
+  classifying failures, and attributing causation.
 
 ## Overview
 
@@ -26,171 +23,165 @@ documentation in `docs/`, and benchmark tooling in `vortex-bench/` and `benchmar
   Apache Arrow-style encodings.
 - `encodings/*` contains more specialized compressed encodings.
 - `vortex-file` implements file IO. It uses `LayoutReader` from `vortex-layout`.
+- `vortex-io` holds the core async and blocking IO traits, plus the generic `object_store`
+  adapters that implement them.
+- `vortex-cloud` holds the cloud object store integration: the URL-to-`ObjectStore` registry
+  and the OpenDAL-backed services (`cos://`, `oss://`). Every binding resolves URLs through it.
 - `vortex-scan`, `vortex-session`, `vortex-datafusion`, and `vortex-duckdb` contain scan
   and execution integrations.
 - `vortex-python` contains Python bindings. RST-flavored project docs live in `docs/`.
 
-## Build
+## Scoped Guidance
 
-Prefer narrow crate builds while iterating:
+Before changing files in a subtree, read the closest nested `AGENTS.md`. In particular:
+
+- `.github/AGENTS.md` covers workflows and other GitHub configuration.
+- `docs/AGENTS.md` covers Sphinx documentation.
+
+## Verification
+
+Linting, formatting, testing, builds, benchmarks, and other verification commands are optional.
+Users decide which checks to run and when. Do not run them automatically or make task completion
+depend on them. The commands below, and verification commands in scoped guidance or contributor
+workflows, are reference instructions for when the user requests a check.
+
+When verification is requested, use the narrowest check that covers the relevant changes. CI
+already runs workspace-wide checks. Markdown, RST, Sphinx configuration, agent configuration,
+comments outside Rust code, symlinks, and other metadata with no Rust/API behavior impact do not
+need Rust checks. Targeted doc/config commands or path inspection with `ls`, `find`, and
+`git status` are available for those changes.
+
+### Rust
+
+For requested Rust linting and formatting, scope these commands to the affected crate:
 
 ```bash
-cargo build -p <crate-name>
+cargo clippy -p <crate-name> --all-targets --all-features -- -D warnings
+cargo +nightly-<pinned> fmt -p <crate-name>
 ```
 
-Use workspace-wide builds only when the change spans crate boundaries or before handing off a
-broad refactor:
+To match CI when running these commands:
 
-```bash
-cargo build --workspace
-```
+- Include `-D warnings` so clippy fails on the warnings that CI rejects.
+- Use the nightly pinned as `NIGHTLY_TOOLCHAIN` in `.github/workflows/ci.yml`. A floating
+  `+nightly` can format differently from the toolchain CI checks against, so the reformatted tree
+  still fails `fmt --check`.
 
-## Testing
+There is no separate build step: `cargo clippy --all-targets` compiles the crate.
 
-Run tests for the crate or binding you touched before broader checks:
+When the user wants Rust tests, scope them to the affected crate. Doctests cover Rust doc comments
+and crate documentation:
 
 ```bash
 cargo nextest run -p <crate-name>
+cargo test --doc -p <crate-name>
 ```
 
-if cargo-nextest is not available you can install it with
-```bash
-cargo install --locked cargo-nextest
-```
+If needed for a requested test run, install cargo-nextest with `cargo install --locked cargo-nextest`.
 
-Examples:
+### Python
 
-```bash
-cargo nextest run -p vortex-array
-make -C docs doctest
-uv run --all-packages pytest vortex-python/test
-cargo test --doc
-```
+The following applies to Python bindings and their PyO3 implementation under `vortex-python/`,
+and to CUDA bindings under `vortex-python-cuda/`. These commands use the repository root as their
+working directory.
 
-Run docs doctests from the docs directory with `make -C docs doctest` so the correct Sphinx
-Makefile target is used.
+Follow the [Python binding development workflow](CONTRIBUTING.md#python-bindings) for environment
+setup, Maturin rebuilds, targeted testing, Cargo features, and the full Python check. Keep the
+contributor guide as the source of truth for shared commands; its verification workflows are
+available when the user chooses to run them.
 
-If you touch documentation run doc tests via `cargo test --doc`.
-
-For Python binding changes under `vortex-python/`, run the narrow Python checks that match the
-files touched before broader test suites. Useful checks include:
+Python linting, formatting, and type-checking commands:
 
 ```bash
-python -m py_compile <changed-python-files>
-uv run --all-packages --reinstall-package vortex-data pytest <changed-python-tests>
+uvx ruff format --check <changed-python-files>
+uvx ruff check <changed-python-files>
+uvx ty check vortex-python vortex-python-cuda vortex-ffi/cmake/tests scripts/tests
 ```
 
-If Python docstrings, `docs/api/python/`, or Sphinx configuration change, also run the docs checks
-from a clean Sphinx environment:
+Use `uvx` for both Ruff and ty, matching CI. The command above covers both binding packages and the
+CMake and script tests. For a narrower check, pass the affected directory, such as
+`uvx ty check vortex-python` or `uvx ty check vortex-ffi/cmake/tests`. Checking the whole binding
+package covers callers affected by stub or annotation changes.
+
+ty reads Python sources and stubs and needs third-party dependencies for type information.
+`uv sync --all-packages --no-install-workspace` prepares those dependencies without building the
+Rust extensions. Runtime tests still need the installed extensions.
+
+Use targeted `# ty: ignore[rule-name]` comments for intentional violations, such as invalid-input
+tests or third-party stub limitations, and explain non-obvious suppressions. Pyright suppression
+comments do not suppress ty diagnostics. Keep shared ty configuration in the root `pyproject.toml`.
+
+Functions that only return `None`, including tests, may omit the `-> None` annotation. ty does not
+require return annotations, and Ruff's `suppress-none-returning` setting permits omitting them for
+these functions. Bare `return` and falling through are also allowed when the
+return type permits `None`; Ruff's `RET502` and `RET503` rules are explicitly disabled.
+
+When the user wants Python tests, run the targeted suite with:
 
 ```bash
-uv run --all-packages make -C docs clean html
-uv run --all-packages make -C docs clean doctest
+uv run --all-packages pytest <changed-python-tests>
 ```
 
-## Linting, Formatting, and Generated Files
+For Python docstrings, `docs/api/python/`, or Sphinx configuration changes, follow
+`docs/AGENTS.md`; the contributor guide documents clean Sphinx builds and doctests. All verification
+remains the user's choice. The Rust commands above cover PyO3 files when scoped to the affected
+binding crate (`-p vortex-python` or `-p vortex-python-cuda`).
 
-Run verification that matches the files changed. Do not run expensive Rust checks for changes that
-only touch Markdown, agent configuration, comments outside Rust code, symlinks, or other metadata
-with no Rust/API behavior impact. For docs/config-only changes, validate formatting by inspection
-or with a targeted doc/config command, and verify symlink or path changes with `ls`, `find`, and
-`git status`.
+`git diff --check` is available for checking patch whitespace.
 
-For Python binding changes under `vortex-python/`, run the relevant Python lint and type checks:
+### C++ and CUDA
+
+For requested formatting of `.cpp`, `.hpp`, `.cu`, `.cuh`, and `.h` files under `lang/cpp`,
+`vortex-cuda`, `vortex-duckdb`, and `vortex-ffi`, use the repository's `.clang-format` configuration:
 
 ```bash
-uv run basedpyright vortex-python
-uv run ruff check <changed-python-files>
+clang-format --style=file -i <changed-files>
 ```
 
-If PyO3 Rust files in `vortex-python/src/` change, include `cargo +nightly fmt --check -p
-vortex-python`. Always finish Python binding work with `git diff --check`.
+Pass only the files you changed; CI excludes vendored or generated CUDA and Arrow headers from its
+repository-wide check. clang-format is idempotent, so a `--dry-run --Werror` pass over the files
+you just formatted cannot fail and is not worth running.
 
-For Rust code, public API, feature flag, or generated-file changes, run these before stopping:
+When the user wants CMake integration tests, CI runs the Python unittest suite with:
 
 ```bash
-cargo +nightly fmt --all
-cargo clippy --all-targets --all-features
+python3 -m unittest discover -s vortex-ffi/cmake/tests -v
 ```
 
-Notes:
+These tests need CMake, Ninja, the C/C++ and Rust toolchains, and the lockfile-selected Cargo
+dependencies cached by `cargo fetch --locked`.
 
-- For `.github/` changes, follow `.github/AGENTS.md` and run
-  `yamllint --strict -c .yamllint.yaml` on changed workflow files.
-- You can try
-  `cargo fix --lib --allow-dirty --allow-staged && cargo clippy --fix --lib --allow-dirty --allow-staged`
-  to fix minor Rust diagnostics automatically when working on Rust code.
+### New and generated files
+
+These CI checks are the ones most often missed when adding files rather than editing them:
+
+- Every source file needs SPDX headers, in the comment syntax of its language:
+
+  ```text
+  SPDX-License-Identifier: Apache-2.0
+  SPDX-FileCopyrightText: Copyright the Vortex contributors
+  ```
+
+  `REUSE.toml` records the exceptions, including the CC-BY-4.0 licensing of `docs/**`.
+
+- Spelling is checked by `typos` against `_typos.toml`.
+- CI asserts `git status --porcelain` is empty after a build. Regenerate generated files with the
+  repository's tooling rather than editing them by hand, and commit the result.
+
+### Notes
+
+- For `.github/` changes, follow `.github/AGENTS.md`, which covers both the yamllint invocation and
+  the nightly toolchain pin.
 - If cargo fails with exactly `sccache: error: Operation not permitted`, rerun that command
   with `RUSTC_WRAPPER=` so rustc runs directly. Only do this for that exact error.
 
-## CI Investigation
-
-- When iterating on CI failures, fetch only failed job logs first:
-  `gh run view <run-id> --job <job-id> --log-failed`.
-- Run narrow local repro commands for the affected crate, test, docs target, or binding before
-  running workspace-wide checks.
-- If a `gh` command fails with `error connecting to api.github.com` in the sandbox, immediately
-  rerun it with escalated network permissions instead of retrying in the sandbox.
-- Verify causation from logs, diffs, and local repros before attributing a failure to a PR.
-
 ## Rust Code Style
 
-- Prefer `impl AsRef<T>` to `&T` for public interfaces where practical, for example
-  `impl AsRef<Path>`.
-- Avoid `unsafe` unless it is necessary. Prefer zero-cost safe abstractions, or cheap
-  non-zero-cost safe abstractions, over hand-written unsafe code.
-- Every new public API definition must have a doc comment. Examples are useful but not required.
-- Use `vortex_err!` to create a `VortexError` with a format string.
-- Use `vortex_bail!` to create and immediately return a `VortexError` as a `VortexResult<T>`.
-- Keep imports at the top of the module. The only exception is a `#[cfg(test)]` test module,
-  where imports should be at the top of that module.
-- Prefer imports over qualified identifiers when the name is used repeatedly.
-- Avoid function-scoped imports unless required or unless fully qualifying both sides would be
-  exceptionally verbose.
+- Follow `STYLE.md` for Rust formatting, documentation, API, error-handling, import, safety, and
+  performance conventions. Its hidden-cost accessor table is the reference for changes to
+  per-element loops; back such changes with the benchmarks it names.
 - Only write comments that explain non-obvious logic or important context. Do not comment
   self-explanatory code.
-- Keep public APIs small and consistent with neighboring crates.
-
-## Performance: avoid hidden-cost accessors in hot loops
-
-The most common performance trap in this codebase is calling a *per-element accessor that
-hides non-trivial work* inside an `O(n)` loop, instead of doing the work once over the whole
-chunk. The call site looks like a cheap getter, but each call re-pays a cost that is constant
-(or amortizable) across the loop, making the loop `O(n · k)`.
-
-Watch for these accessors used inside `for i in 0..n { ... }`:
-
-| Per-element accessor (in a loop) | Hidden cost | Bulk replacement |
-| --- | --- | --- |
-| `Validity::is_valid(i)` / `is_null(i)` | for array-backed validity, **allocates an `ExecutionCtx` and runs a scalar lookup per call** | `validity.execute_mask(len, ctx)?` once, then `Mask::value(i)` |
-| `array.scalar_at(i)` / `array.execute_scalar(i, ctx)` | per-element execution through the compute stack | canonicalize once (`execute::<PrimitiveArray>` / `as_slice`) then index |
-| `BitBuffer::value(i)` / `Mask::value(i)` accumulated into a count | recomputes the byte address each call; defeats popcount | `true_count()`, `BitBuffer::count_range(start, end)`, `set_indices()` |
-| `BitIterator::next()` to accumulate a running rank/prefix count | bit-at-a-time | `count_range` over each gap (SIMD popcount) |
-| re-deriving a value inside the loop (e.g. `self.validity()?` each iteration) | re-runs the derivation `n` times | hoist it above the loop |
-
-Decide per site — bulk is not always the answer:
-
-- **Sequential / contiguous access** over an accessor that hides amortizable work → hoist and
-  go bulk (materialize once, then index or iterate the chunk).
-- **Gather over arbitrary indices** → you cannot amortize a per-element *decode*, but you can
-  still materialize the backing buffer once (e.g. `execute_mask`) and then do cheap `O(1)`
-  random reads, avoiding per-call context/allocation.
-- **The accessor is already genuinely `O(1)`** (e.g. reading an already-materialized `Mask`/
-  slice, or a native bitmap) → leave it; bulk would not help.
-
-Even after materializing into a `Mask`/`BitBuffer`, **do not loop with `value(i)` per
-element** to act on each set bit — the per-element branch dominates. Iterate a `u64` word
-at a time with all-set / all-unset fast paths: use [`BitBuffer::for_each_set_index`]. It
-beats `for i in 0..len { if buf.value(i) {..} }` by 2-45x (more at low density) and beats
-collecting `set_indices()` by ~2x at mid/high density, while self-adapting from sparse to
-dense — see `vortex-mask/benches/mask_iteration.rs`. Reach for the cached `indices()` /
-`slices()` representations when you need them more than once; otherwise `for_each_set_index`
-needs no materialization.
-
-When you touch such a loop, back the change with a benchmark (see
-`vortex-array/benches/validity_is_valid.rs` for the `is_valid` case,
-`vortex-mask/benches/valid_counts.rs` for the popcount case, and
-`vortex-mask/benches/mask_iteration.rs` for the per-element-vs-word-vs-sparse comparison).
 
 ## Tests
 
@@ -199,8 +190,8 @@ When you touch such a loop, back the change with a benchmark (see
 - Prefer test module names `tests`, not `test`.
 - Use `assert_arrays_eq!` for array comparisons instead of element-by-element assertions.
 - Keep tests concise and focused on behavior, edge cases, and regressions.
-- If a bug fix is requested, add or identify a failing test first when practical. A test that
-  passes before and after the fix does not prove the fix.
+- If a bug fix is requested, add or identify a regression test when practical. Leave execution
+  to the user; when tests are run, a test that passes before and after the fix does not prove it.
 - If clippy lints in tests prohibit patterns that are acceptable only in test code, consider
   allowing the lint at the test module level.
 - If an existing `foo.rs` module needs many tests, promote it to a directory module:
@@ -211,23 +202,23 @@ When you touch such a loop, back the change with a benchmark (see
 
 Check new and modified lines against this list before finishing:
 
-- Running broad CI-style commands before trying a narrow local repro.
-- Using `unwrap`, `expect`, or panic-oriented assertions in tests where `VortexResult<()>` and
-  `?` would be clearer.
-- Comparing arrays element by element instead of using `assert_arrays_eq!`.
 - Adding imports inside functions when module-level imports would work.
-- Introducing `unsafe` without proving that safe Rust cannot express the same operation.
 - Updating expected test output to match buggy behavior without independently verifying the
   intended semantics.
 - Silently reducing the scope of an approved plan when implementation is harder than expected.
-- Calling a hidden-cost per-element accessor (`Validity::is_valid`, `scalar_at`, `BitBuffer::
-  value` accumulation) inside a hot loop instead of materializing once — see
-  "Performance: avoid hidden-cost accessors in hot loops".
 
 ## Summaries
 
 When summarizing work, write valid Markdown that can be copied into GitHub. Include the checks
 you ran and call out any checks you could not run.
+
+## Branches
+
+When creating a branch on the user's behalf, prefix its name with the user's established branch
+prefix, not the agent's name (for example, do not use `codex/` or `claude/`). Infer the user's
+prefix from their existing branches when possible. Otherwise, use available identity context such
+as `whoami`, Git configuration, or other information the user has provided. If the evidence is
+ambiguous, ask the user instead of inventing a prefix.
 
 ## Commits
 
