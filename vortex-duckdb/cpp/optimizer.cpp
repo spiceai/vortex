@@ -1,17 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 #include "optimizer.hpp"
+#include "multi_file_reader.hpp"
 #include "table_function.hpp"
 
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/operator/logical_limit.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 
 void FindGetsAndProjections(LogicalOperator &op, Analyses &analyses, Projections &projections) {
     using enum LogicalOperatorType;
     switch (op.type) {
     case LOGICAL_GET: {
-        if (auto &get = op.Cast<LogicalGet>(); get.function.bind == duckdb_vx_table_function_bind) {
+        if (auto &get = op.Cast<LogicalGet>(); is_vortex_scan(get.function)) {
             analyses.emplace(get.table_index, GetAnalysis {get, {}});
         }
         break;
@@ -20,12 +22,23 @@ void FindGetsAndProjections(LogicalOperator &op, Analyses &analyses, Projections
         LogicalProjection &projection = op.Cast<LogicalProjection>();
         D_ASSERT(projection.children.size() == 1);
         auto &child = *projection.children[0];
-        if (!IsPassthrough(projection) || child.type != LOGICAL_GET) {
+        if (!IsPassthrough(projection)) {
             break;
         }
-        // The GET itself is recorded when recursion reaches it below. Only
-        // passthrough projections wrapping a vortex GET act as aliases.
-        if (auto &get = child.Cast<LogicalGet>(); get.function.bind == duckdb_vx_table_function_bind) {
+        LogicalGet *get = nullptr;
+
+        // queries with LIMIT may include a STREAMING_LIMIT between PROJECTION and GET.
+        // See sqllogictest scalar_function_pushdown_limit.test
+        if (child.type == LOGICAL_LIMIT) {
+            if (auto &limit = child.Cast<LogicalLimit>();
+                limit.children.size() == 1 && limit.children[0]->type == LOGICAL_GET) {
+                get = &limit.children[0]->Cast<LogicalGet>();
+            }
+        } else if (child.type == LOGICAL_GET) {
+            get = &child.Cast<LogicalGet>();
+        }
+
+        if (get != nullptr && is_vortex_scan(get->function)) {
             projections.emplace(projection.table_index, projection);
         }
         break;

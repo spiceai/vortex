@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::fmt::Display;
 use std::fmt::Formatter;
 
 #[expect(deprecated)]
@@ -16,9 +17,11 @@ use vortex_session::registry::CachedId;
 
 use crate::ArrayRef;
 use crate::ExecutionCtx;
+use crate::arrays::ScalarFnArray;
 use crate::dtype::DType;
 use crate::dtype::Nullability;
 use crate::expr::and;
+use crate::expr::display::ExprDisplay;
 use crate::expr::expression::Expression;
 use crate::expr::lit;
 use crate::scalar_fn::Arity;
@@ -26,6 +29,7 @@ use crate::scalar_fn::ChildName;
 use crate::scalar_fn::ExecutionArgs;
 use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::ScalarFnVTable;
+use crate::scalar_fn::ScalarFnVTableExt;
 use crate::scalar_fn::SimplifyCtx;
 use crate::scalar_fn::fns::literal::Literal;
 use crate::scalar_fn::fns::operators::CompareOperator;
@@ -41,12 +45,28 @@ mod compare;
 pub use compare::*;
 mod numeric;
 pub(crate) use numeric::*;
+mod primitive_operand;
 
 use crate::scalar::NumericOperator;
 use crate::scalar::Scalar;
 
 #[derive(Clone)]
 pub struct Binary;
+
+impl Binary {
+    /// Creates a lazy binary operation over `lhs` and `rhs`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the children have different lengths or incompatible dtypes.
+    pub fn try_new(
+        lhs: ArrayRef,
+        rhs: ArrayRef,
+        operator: Operator,
+    ) -> VortexResult<ScalarFnArray> {
+        ScalarFnArray::try_new(Binary.bind(operator), vec![lhs, rhs])
+    }
+}
 
 impl ScalarFnVTable for Binary {
     type Options = Operator;
@@ -89,28 +109,14 @@ impl ScalarFnVTable for Binary {
     fn fmt_sql(
         &self,
         operator: &Operator,
-        expr: &Expression,
+        expr: &dyn ExprDisplay,
         f: &mut Formatter<'_>,
     ) -> std::fmt::Result {
         write!(f, "(")?;
-        expr.child(0).fmt_sql(f)?;
+        Display::fmt(expr.display_child(0), f)?;
         write!(f, " {} ", operator)?;
-        expr.child(1).fmt_sql(f)?;
+        Display::fmt(expr.display_child(1), f)?;
         write!(f, ")")
-    }
-
-    fn coerce_args(&self, operator: &Self::Options, args: &[DType]) -> VortexResult<Vec<DType>> {
-        let lhs = &args[0];
-        let rhs = &args[1];
-        if operator.is_arithmetic() || operator.is_comparison() {
-            let supertype = lhs.least_supertype(rhs).ok_or_else(|| {
-                vortex_error::vortex_err!("No common supertype for {} and {}", lhs, rhs)
-            })?;
-            Ok(vec![supertype.clone(), supertype])
-        } else {
-            // Boolean And/Or: no coercion
-            Ok(args.to_vec())
-        }
     }
 
     fn return_dtype(&self, operator: &Operator, arg_dtypes: &[DType]) -> VortexResult<DType> {
@@ -120,6 +126,16 @@ impl ScalarFnVTable for Binary {
         if operator.is_arithmetic() {
             if lhs.is_primitive() && lhs.eq_ignore_nullability(rhs) {
                 return Ok(lhs.with_nullability(lhs.nullability() | rhs.nullability()));
+            }
+
+            if let DType::Decimal(decimal_dtype, _) = lhs
+                && lhs.eq_ignore_nullability(rhs)
+            {
+                let numeric_op = NumericOperator::try_from(*operator)?;
+                return Ok(DType::Decimal(
+                    numeric_op_result_decimal_dtype(*decimal_dtype, numeric_op)?,
+                    lhs.nullability() | rhs.nullability(),
+                ));
             }
             vortex_bail!(
                 "incompatible types for arithmetic operation: {} {}",
@@ -252,14 +268,15 @@ impl ScalarFnVTable for Binary {
         })
     }
 
-    fn is_null_sensitive(&self, _operator: &Operator) -> bool {
-        false
+    fn is_strict(&self, operator: &Operator) -> bool {
+        // Kleene AND/OR is not strict (`false AND null = false`, `true OR null = true`), which is
+        // consistent with `validity` returning `None` for these operators above.
+        !matches!(operator, Operator::And | Operator::Or)
     }
 
-    fn is_fallible(&self, operator: &Operator) -> bool {
-        // Opt-in not out for fallibility.
+    fn is_infallible(&self, operator: &Operator) -> bool {
         // Arithmetic operations could be better modelled here.
-        let infallible = matches!(
+        matches!(
             operator,
             Operator::Eq
                 | Operator::NotEq
@@ -269,9 +286,7 @@ impl ScalarFnVTable for Binary {
                 | Operator::Lte
                 | Operator::And
                 | Operator::Or
-        );
-
-        !infallible
+        )
     }
 }
 

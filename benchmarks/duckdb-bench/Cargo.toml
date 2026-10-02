@@ -17,6 +17,13 @@ publish = false
 [package.metadata.cargo-shear]
 ignored = ["vortex-cuda"]
 
+[[bin]]
+name = "duckdb-bench"
+test = false
+
+[lib]
+test = false
+
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
@@ -30,7 +37,6 @@ vortex-duckdb = { workspace = true }
 
 [features]
 cuda = ["dep:vortex-cuda"]
-unstable_encodings = ["vortex/unstable_encodings"]
 
 [lints]
 workspace = true

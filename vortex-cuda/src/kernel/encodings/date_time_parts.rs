@@ -15,7 +15,7 @@ use vortex::array::arrays::PrimitiveArray;
 use vortex::array::arrays::TemporalArray;
 use vortex::array::arrays::primitive::PrimitiveDataParts;
 use vortex::array::buffer::BufferHandle;
-use vortex::array::match_each_signed_integer_ptype;
+use vortex::array::match_each_integer_ptype;
 use vortex::array::validity::Validity;
 use vortex::dtype::DType;
 use vortex::dtype::NativePType;
@@ -110,9 +110,9 @@ impl CudaExecute for DateTimePartsExecutor {
         let seconds_ptype = seconds_prim.ptype();
         let subseconds_ptype = subseconds_prim.ptype();
 
-        match_each_signed_integer_ptype!(days_ptype, |DaysT| {
-            match_each_signed_integer_ptype!(seconds_ptype, |SecondsT| {
-                match_each_signed_integer_ptype!(subseconds_ptype, |SubsecondsT| {
+        match_each_integer_ptype!(days_ptype, |DaysT| {
+            match_each_integer_ptype!(seconds_ptype, |SecondsT| {
+                match_each_integer_ptype!(subseconds_ptype, |SubsecondsT| {
                     decode_datetimeparts_typed::<DaysT, SecondsT, SubsecondsT>(
                         days_prim,
                         seconds_prim,
@@ -167,13 +167,11 @@ where
     let subseconds_device = ctx.ensure_on_device(subseconds_buffer).await?;
 
     // Allocate output buffer
-    let output_slice = ctx.device_alloc::<i64>(output_len)?;
-    let output_device = CudaDeviceBuffer::new(output_slice);
+    let mut output_slice = ctx.device_alloc::<i64>(output_len)?;
 
     let days_view = days_device.cuda_view::<DaysT>()?;
     let seconds_view = seconds_device.cuda_view::<SecondsT>()?;
     let subseconds_view = subseconds_device.cuda_view::<SubsecondsT>()?;
-    let output_view = output_device.as_view::<i64>();
 
     let cuda_function = ctx.load_function(
         "date_time_parts",
@@ -187,10 +185,11 @@ where
             .arg(&seconds_view)
             .arg(&subseconds_view)
             .arg(&divisor)
-            .arg(&output_view)
+            .arg(&mut output_slice)
             .arg(&array_len_u64);
     })?;
 
+    let output_device = CudaDeviceBuffer::new(output_slice);
     let output_buffer = BufferHandle::new_device(Arc::new(output_device));
     let output_primitive = PrimitiveArray::from_buffer_handle(output_buffer, PType::I64, validity);
 
@@ -285,6 +284,88 @@ mod tests {
             .vortex_expect("failed to create execution context");
 
         let dtp_array = make_datetimeparts_array(days, seconds, subseconds, time_unit);
+        let gpu_result = DateTimePartsExecutor
+            .execute(dtp_array.clone().into_array(), &mut cuda_ctx)
+            .await
+            .vortex_expect("GPU decompression failed")
+            .into_host()
+            .await?
+            .into_array();
+
+        assert_arrays_eq!(dtp_array, gpu_result, &mut ctx);
+
+        Ok(())
+    }
+
+    /// Compression narrows each component to its smallest ptype, choosing unsigned whenever the
+    /// component is non-negative. Every post-epoch timestamp column therefore decomposes into
+    /// entirely unsigned components, which is what panicked on `taxi`.
+    #[crate::test]
+    async fn test_cuda_datetimeparts_unsigned_components() -> VortexResult<()> {
+        let mut ctx = vortex_array::array_session().create_execution_ctx();
+        let mut cuda_ctx = CudaSession::create_execution_ctx(&crate::cuda_session())
+            .vortex_expect("failed to create execution context");
+
+        let len = 3;
+        let days_arr = PrimitiveArray::new(buffer![1u32, 2, 3], Validity::NonNullable).into_array();
+        let seconds_arr =
+            PrimitiveArray::new(buffer![3600u16, 0, 60], Validity::NonNullable).into_array();
+        let subseconds_arr =
+            PrimitiveArray::new(buffer![250u8, 0, 99], Validity::NonNullable).into_array();
+
+        let temporal = TemporalArray::new_timestamp(
+            PrimitiveArray::new(buffer![0i64; len], Validity::NonNullable).into_array(),
+            TimeUnit::Milliseconds,
+            None,
+        );
+        let dtp_array = DateTimeParts::try_new(
+            temporal.dtype().clone(),
+            days_arr,
+            seconds_arr,
+            subseconds_arr,
+        )?;
+
+        let gpu_result = DateTimePartsExecutor
+            .execute(dtp_array.clone().into_array(), &mut cuda_ctx)
+            .await
+            .vortex_expect("GPU decompression failed")
+            .into_host()
+            .await?
+            .into_array();
+
+        assert_arrays_eq!(dtp_array, gpu_result, &mut ctx);
+
+        Ok(())
+    }
+
+    /// Components are narrowed independently, so their signedness can differ within one array.
+    /// A timestamp column straddling the epoch narrows to unsigned days (all zero) with signed
+    /// seconds, which is only decoded correctly if each component keeps its own signedness.
+    #[crate::test]
+    async fn test_cuda_datetimeparts_mixed_signedness() -> VortexResult<()> {
+        let mut ctx = vortex_array::array_session().create_execution_ctx();
+        let mut cuda_ctx = CudaSession::create_execution_ctx(&crate::cuda_session())
+            .vortex_expect("failed to create execution context");
+
+        // Milliseconds -32_000, 0 and 31_000 split into these components.
+        let days_arr = PrimitiveArray::new(buffer![0u8, 0, 0], Validity::NonNullable).into_array();
+        let seconds_arr =
+            PrimitiveArray::new(buffer![-32i8, 0, 31], Validity::NonNullable).into_array();
+        let subseconds_arr =
+            PrimitiveArray::new(buffer![0u8, 0, 0], Validity::NonNullable).into_array();
+
+        let temporal = TemporalArray::new_timestamp(
+            PrimitiveArray::new(buffer![0i64; 3], Validity::NonNullable).into_array(),
+            TimeUnit::Milliseconds,
+            None,
+        );
+        let dtp_array = DateTimeParts::try_new(
+            temporal.dtype().clone(),
+            days_arr,
+            seconds_arr,
+            subseconds_arr,
+        )?;
+
         let gpu_result = DateTimePartsExecutor
             .execute(dtp_array.clone().into_array(), &mut cuda_ctx)
             .await

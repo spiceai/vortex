@@ -4,23 +4,19 @@
 use vortex_array::ArrayRef;
 use vortex_array::ArrayView;
 use vortex_array::IntoArray;
-use vortex_array::arrays::scalar_fn::ScalarFnFactoryExt;
-use vortex_array::scalar_fn::EmptyOptions;
 use vortex_array::scalar_fn::fns::mask::Mask as MaskExpr;
 use vortex_array::scalar_fn::fns::mask::MaskReduce;
 use vortex_error::VortexResult;
 
 use crate::ALPRD;
 use crate::ALPRDArrayExt;
+use crate::ALPRDArraySlotsExt;
 
 impl MaskReduce for ALPRD {
     #[allow(clippy::disallowed_methods)]
     fn mask(array: ArrayView<'_, Self>, mask: &ArrayRef) -> VortexResult<Option<ArrayRef>> {
-        let masked_left_parts = MaskExpr.try_new_array(
-            array.left_parts().len(),
-            EmptyOptions,
-            [array.left_parts().clone(), mask.clone()],
-        )?;
+        let masked_left_parts =
+            MaskExpr::try_new(array.left_parts().clone(), mask.clone())?.into_array();
         Ok(Some(
             ALPRD::try_new(
                 array.dtype().as_nullable(),
@@ -45,10 +41,12 @@ mod tests {
     use vortex_array::array_session;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::compute::conformance::mask::test_mask_conformance;
+    use vortex_array::dtype::NativePType;
     use vortex_session::VortexSession;
 
     use crate::ALPRDFloat;
     use crate::RDEncoder;
+    use crate::RDEncoderExt;
 
     static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
         let session = array_session();
@@ -59,7 +57,11 @@ mod tests {
     #[rstest]
     #[case(0.1f32, 0.2f32, 3e25f32)]
     #[case(0.1f64, 0.2f64, 3e100f64)]
-    fn test_mask_simple<T: ALPRDFloat>(#[case] a: T, #[case] b: T, #[case] outlier: T) {
+    fn test_mask_simple<T: ALPRDFloat + NativePType>(
+        #[case] a: T,
+        #[case] b: T,
+        #[case] outlier: T,
+    ) {
         let mut ctx = SESSION.create_execution_ctx();
         test_mask_conformance(
             &RDEncoder::new(&[a, b])
@@ -72,7 +74,7 @@ mod tests {
     #[rstest]
     #[case(0.1f32, 3e25f32)]
     #[case(0.5f64, 1e100f64)]
-    fn test_mask_with_nulls<T: ALPRDFloat>(#[case] a: T, #[case] outlier: T) {
+    fn test_mask_with_nulls<T: ALPRDFloat + NativePType>(#[case] a: T, #[case] outlier: T) {
         let mut ctx = SESSION.create_execution_ctx();
         test_mask_conformance(
             &RDEncoder::new(&[a])

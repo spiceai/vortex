@@ -3,8 +3,10 @@
 
 mod array;
 pub use array::VarBinViewArrayExt;
+pub use array::VarBinViewArraySlotsExt;
 pub use array::VarBinViewData;
 pub use array::VarBinViewDataParts;
+pub use array::VarBinViewSlots;
 pub use vtable::VarBinViewArray;
 
 pub(crate) mod compact;
@@ -22,8 +24,10 @@ pub mod build_views;
 
 mod view;
 pub use view::BinaryView;
+mod views_side;
 pub use view::Inlined;
 pub use view::Ref;
+pub(crate) use views_side::ViewsSide;
 
 #[cfg(test)]
 mod tests;

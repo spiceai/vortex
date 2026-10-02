@@ -19,14 +19,14 @@ use crate::ArrayRef;
 use crate::EqMode;
 use crate::ExecutionCtx;
 use crate::ExecutionResult;
+use crate::VortexSessionExecute;
 use crate::array::Array;
 use crate::array::ArrayId;
 use crate::array::ArrayView;
 use crate::array::VTable;
 use crate::arrays::varbinview::BinaryView;
 use crate::arrays::varbinview::VarBinViewData;
-use crate::arrays::varbinview::array::NUM_SLOTS;
-use crate::arrays::varbinview::array::SLOT_NAMES;
+use crate::arrays::varbinview::array::VarBinViewSlots;
 use crate::arrays::varbinview::compute::rules::PARENT_RULES;
 use crate::buffer::BufferHandle;
 use crate::builders::ArrayBuilder;
@@ -34,6 +34,7 @@ use crate::builders::VarBinViewBuilder;
 use crate::dtype::DType;
 use crate::hash::ArrayEq;
 use crate::hash::ArrayHash;
+use crate::match_each_varbin_builder;
 use crate::serde::ArrayChildren;
 use crate::validity::Validity;
 mod kernel;
@@ -93,8 +94,9 @@ impl VTable for VarBinView {
         slots: &[Option<ArrayRef>],
     ) -> VortexResult<()> {
         vortex_ensure!(
-            slots.len() == NUM_SLOTS,
-            "VarBinViewArray expected {NUM_SLOTS} slots, found {}",
+            slots.len() == VarBinViewSlots::COUNT,
+            "VarBinViewArray expected {} slots, found {}",
+            VarBinViewSlots::COUNT,
             slots.len()
         );
         vortex_ensure!(
@@ -167,7 +169,7 @@ impl VTable for VarBinView {
 
         buffers: &[BufferHandle],
         children: &dyn ArrayChildren,
-        _session: &VortexSession,
+        session: &VortexSession,
     ) -> VortexResult<ArrayParts<Self>> {
         if !metadata.is_empty() {
             vortex_bail!(
@@ -223,13 +225,14 @@ impl VTable for VarBinView {
             Arc::from(data_buffers),
             dtype.clone(),
             validity.clone(),
+            &mut session.create_execution_ctx(),
         )?;
         let slots = VarBinViewData::make_slots(&validity, len);
         Ok(ArrayParts::new(self.clone(), dtype.clone(), len, data).with_slots(slots))
     }
 
     fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {
-        SLOT_NAMES[idx].to_string()
+        VarBinViewSlots::NAMES[idx].to_string()
     }
 
     fn reduce_parent(
@@ -245,10 +248,15 @@ impl VTable for VarBinView {
         builder: &mut dyn ArrayBuilder,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<()> {
-        let Some(builder) = builder.as_any_mut().downcast_mut::<VarBinViewBuilder>() else {
-            vortex_bail!("append_to_builder for VarBinView requires a VarBinViewBuilder");
-        };
-        builder.append_varbinview_array(&array.into_owned(), ctx)
+        if let Some(builder) = builder.as_any_mut().downcast_mut::<VarBinViewBuilder>() {
+            return builder.append_varbinview_array(&array.into_owned(), ctx);
+        }
+        if let Some(result) =
+            match_each_varbin_builder!(builder, |builder| builder.append_varbinview(array, ctx))
+        {
+            return result;
+        }
+        vortex_bail!("append_to_builder for VarBinView requires a variable-binary builder")
     }
 
     fn execute(array: Array<Self>, _ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {

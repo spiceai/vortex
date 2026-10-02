@@ -395,13 +395,12 @@ fn main() -> VortexResult<()> {
             runtime.block_on(async {
                 let session = VortexSession::default().with_tokio();
                 for _ in 0..iters {
-                    let arrays = session
-                        .open_options()
-                        .open_path(&path)
-                        .await?
+                    let file = session.open_options().open_path(&path).await?;
+                    let dtype = file.dtype().clone();
+                    let arrays = file
                         .scan()?
-                        .with_filter(filter_expr())
-                        .with_projection(projection_expr())
+                        .with_filter(filter_expr().bind(&dtype)?)
+                        .with_projection(projection_expr().bind(&dtype)?)
                         .into_array_stream()?
                         .read_all()
                         .await?;

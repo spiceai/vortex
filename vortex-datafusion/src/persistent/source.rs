@@ -2,12 +2,12 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::fmt::Formatter;
-use std::ops::Range;
 use std::sync::Arc;
 use std::sync::Weak;
 
 use datafusion_common::Result as DFResult;
 use datafusion_common::config::ConfigOptions;
+use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_datasource::TableSchema;
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_scan_config::FileScanConfig;
@@ -29,7 +29,6 @@ use datafusion_physical_plan::filter_pushdown::PushedDownPredicate;
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use object_store::ObjectStore;
 use object_store::path::Path;
-use vortex::error::VortexExpect;
 use vortex::file::VORTEX_FILE_EXTENSION;
 use vortex::layout::LayoutReader;
 use vortex::metrics::DefaultMetricsRegistry;
@@ -37,6 +36,7 @@ use vortex::metrics::MetricsRegistry;
 use vortex::session::VortexSession;
 use vortex_utils::aliases::dash_map::DashMap;
 
+use super::opener::NaturalSplits;
 use super::opener::VortexOpener;
 use crate::VortexTableOptions;
 use crate::convert::exprs::DefaultExpressionConvertor;
@@ -190,19 +190,19 @@ pub struct VortexSource {
     /// Subset of predicates that can be pushed down into Vortex scan operations.
     /// These are expressions that Vortex can efficiently evaluate during scanning.
     pub(crate) vortex_predicate: Option<PhysicalExprRef>,
-    pub(crate) batch_size: Option<usize>,
-    _unused_df_metrics: ExecutionPlanMetricsSet,
+    /// DataFusion-native metrics exposed through `DataSourceExec`.
+    df_metrics: ExecutionPlanMetricsSet,
     /// Shared layout readers, the source only lives as long as one scan.
     ///
     /// Sharing the readers allows us to only read every layout once from the file, even across partitions.
     layout_readers: Arc<DashMap<Path, Weak<dyn LayoutReader>>>,
-    /// Shared full-file natural split ranges keyed by path.
-    natural_split_ranges: Arc<DashMap<Path, Arc<[Range<u64>]>>>,
+    /// Shared full-file natural splits keyed by path.
+    natural_splits: Arc<DashMap<Path, Arc<NaturalSplits>>>,
     expression_convertor: Arc<dyn ExpressionConvertor>,
     pub(crate) vortex_reader_factory: Option<Arc<dyn VortexReaderFactory>>,
     pub(crate) ordered: bool,
     vx_metrics_registry: Arc<dyn MetricsRegistry>,
-    file_metadata_cache: Option<Arc<dyn FileMetadataCache>>,
+    file_metadata_cache: Option<Arc<FileMetadataCache>>,
     /// Options controlling scan planning and execution behavior.
     options: VortexTableOptions,
 }
@@ -228,10 +228,9 @@ impl VortexSource {
             projection,
             full_predicate: None,
             vortex_predicate: None,
-            batch_size: None,
-            _unused_df_metrics: Default::default(),
+            df_metrics: Default::default(),
             layout_readers: Arc::new(DashMap::default()),
-            natural_split_ranges: Arc::new(DashMap::default()),
+            natural_splits: Arc::new(DashMap::default()),
             expression_convertor,
             vortex_reader_factory: None,
             vx_metrics_registry: Arc::new(DefaultMetricsRegistry::default()),
@@ -297,10 +296,7 @@ impl VortexSource {
     }
 
     /// Overrides the metadata cache used to reuse Vortex footers across scans.
-    pub fn with_file_metadata_cache(
-        mut self,
-        file_metadata_cache: Arc<dyn FileMetadataCache>,
-    ) -> Self {
+    pub fn with_file_metadata_cache(mut self, file_metadata_cache: Arc<FileMetadataCache>) -> Self {
         self.file_metadata_cache = Some(file_metadata_cache);
         self
     }
@@ -335,10 +331,6 @@ impl VortexSource {
         base_config: &FileScanConfig,
         partition: usize,
     ) -> DFResult<VortexOpener> {
-        let batch_size = self
-            .batch_size
-            .vortex_expect("batch_size must be supplied to VortexSource");
-
         let expr_adapter_factory = base_config
             .expr_adapter_factory
             .clone()
@@ -358,11 +350,11 @@ impl VortexSource {
             file_pruning_predicate: self.full_predicate.clone(),
             expr_adapter_factory,
             table_schema: self.table_schema.clone(),
-            batch_size,
             limit: base_config.limit.map(|l| l as u64),
             metrics_registry: Arc::clone(&self.vx_metrics_registry),
+            df_metrics: self.df_metrics.clone(),
             layout_readers: Arc::clone(&self.layout_readers),
-            natural_split_ranges: Arc::clone(&self.natural_split_ranges),
+            natural_splits: Arc::clone(&self.natural_splits),
             has_output_ordering: !base_config.output_ordering.is_empty() || self.ordered,
             expression_convertor: Arc::clone(&self.expression_convertor),
             file_metadata_cache: self.file_metadata_cache.clone(),
@@ -388,10 +380,9 @@ impl FileSource for VortexSource {
         )?))
     }
 
-    fn with_batch_size(&self, batch_size: usize) -> Arc<dyn FileSource> {
-        let mut source = self.clone();
-        source.batch_size = Some(batch_size);
-        Arc::new(source)
+    fn with_batch_size(&self, _batch_size: usize) -> Arc<dyn FileSource> {
+        // DataSourceExec applies BatchSplitStream after the FileSource stream.
+        Arc::new(self.clone())
     }
 
     fn filter(&self) -> Option<Arc<dyn PhysicalExpr>> {
@@ -399,7 +390,7 @@ impl FileSource for VortexSource {
     }
 
     fn metrics(&self) -> &ExecutionPlanMetricsSet {
-        &self._unused_df_metrics
+        &self.df_metrics
     }
 
     fn file_type(&self) -> &str {
@@ -541,6 +532,19 @@ impl FileSource for VortexSource {
     fn table_schema(&self) -> &TableSchema {
         &self.table_schema
     }
+
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        datafusion_physical_plan::apply_expression_roots(
+            self.full_predicate
+                .iter()
+                .chain(self.vortex_predicate.iter())
+                .chain(self.projection.iter().map(|expr| &expr.expr)),
+            f,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -610,10 +614,7 @@ mod tests {
     }
 
     fn sort_test_source(schema: Arc<Schema>) -> VortexSource {
-        VortexSource::new(
-            TableSchema::from_file_schema(schema),
-            VortexSession::default(),
-        )
+        VortexSource::new(TableSchema::from(schema), VortexSession::default())
     }
 
     fn octet_length_filter(schema: &Schema) -> PhysicalExprRef {
@@ -667,12 +668,8 @@ mod tests {
             inner: DefaultExpressionConvertor::default(),
         }) as Arc<dyn ExpressionConvertor>;
 
-        let mut source = VortexSource::new(
-            TableSchema::from_file_schema(file_schema),
-            VortexSession::default(),
-        )
-        .with_expression_convertor(Arc::clone(&expression_convertor));
-        source.batch_size = Some(100);
+        let source = VortexSource::new(TableSchema::from(file_schema), VortexSession::default())
+            .with_expression_convertor(Arc::clone(&expression_convertor));
 
         let config = FileScanConfigBuilder::new(
             ObjectStoreUrl::local_filesystem(),

@@ -22,6 +22,7 @@ use crate::arrays::BoolArray;
 use crate::arrays::Constant;
 use crate::arrays::VarBinViewArray;
 use crate::arrays::varbinview::BinaryView;
+use crate::arrays::varbinview::ViewsSide;
 use crate::dtype::DType;
 use crate::dtype::Nullability;
 use crate::scalar::Scalar;
@@ -77,50 +78,6 @@ fn constant_bytes(scalar: &Scalar) -> VortexResult<Vec<u8>> {
         _ => vortex_bail!("expected utf8 or binary scalar, got {}", scalar.dtype()),
     };
     value.ok_or_else(|| vortex_err!("null constant handled by execute_compare"))
-}
-
-/// A resolved view over a canonical [`VarBinViewArray`]: the view structs plus borrowed slices of
-/// every data buffer, supporting cheap per-lane byte access.
-struct ViewsSide<'a> {
-    views: &'a [BinaryView],
-    buffers: Vec<&'a [u8]>,
-}
-
-impl<'a> ViewsSide<'a> {
-    fn new(array: &'a VarBinViewArray) -> Self {
-        Self {
-            views: array.views(),
-            buffers: (0..array.data_buffers().len())
-                .map(|idx| array.buffer(idx).as_slice())
-                .collect(),
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.views.len()
-    }
-
-    /// The view at `index` without a bounds check.
-    ///
-    /// # Safety
-    ///
-    /// `index` must be strictly less than `self.len()`.
-    #[inline]
-    unsafe fn view_unchecked(&self, index: usize) -> &'a BinaryView {
-        // SAFETY: caller guarantees index < self.views.len().
-        unsafe { self.views.get_unchecked(index) }
-    }
-
-    /// The full bytes of `view`, which must belong to this side.
-    #[inline]
-    fn view_bytes(&self, view: &'a BinaryView) -> &'a [u8] {
-        if view.is_inlined() {
-            view.as_inlined().value()
-        } else {
-            let view = view.as_view();
-            &self.buffers[view.buffer_index as usize][view.as_range()]
-        }
-    }
 }
 
 /// The leading 8 bytes of a view: the `u32` length plus the first 4 bytes of the value

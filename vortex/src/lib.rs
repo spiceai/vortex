@@ -82,11 +82,15 @@
 //!     .write(&mut bytes, array.into_array().to_array_stream())
 //!     .await?;
 //!
-//! let filtered = session
+//! let file = session
 //!     .open_options()
-//!     .open_buffer(bytes)?
+//!     .open_buffer(bytes)?;
+//! let filter = gt(root(), lit(2u64))
+//!     .optimize_recursive(file.dtype())?
+//!     .bind(file.dtype())?;
+//! let filtered = file
 //!     .scan()?
-//!     .with_filter(gt(root(), lit(2u64)))
+//!     .with_filter(filter)
 //!     .into_array_stream()?
 //!     .read_all()
 //!     .await?;
@@ -145,7 +149,9 @@ pub mod compressor {
     pub use vortex_btrblocks::SchemeId;
 }
 
-/// Logical Vortex data types.
+/// Vortex editions: versioned sets of serialized components.
+pub mod editions;
+
 pub mod dtype {
     pub use vortex_array::dtype::*;
 }
@@ -174,6 +180,12 @@ pub mod flatbuffers {
 /// Async and blocking IO abstractions used by file readers and writers.
 pub mod io {
     pub use vortex_io::*;
+}
+
+/// Cloud object store integration: URL resolution and OpenDAL-backed services.
+#[cfg(feature = "object_store_registry")]
+pub mod cloud {
+    pub use vortex_cloud::*;
 }
 
 /// IPC serialization helpers for Vortex arrays.
@@ -253,6 +265,11 @@ pub mod encodings {
         pub use vortex_fsst::*;
     }
 
+    /// Parquet Variant array encoding.
+    pub mod parquet_variant {
+        pub use vortex_parquet_variant::*;
+    }
+
     /// Pco numeric compression encoding.
     pub mod pco {
         pub use vortex_pco::*;
@@ -305,14 +322,19 @@ impl VortexSessionDefault for VortexSession {
             .with::<MemorySession>()
             .with::<RuntimeSession>();
         vortex_arrow::initialize(&session);
+        vortex_parquet_variant::initialize(&session);
+        editions::register_default_editions(&session);
+        editions::enable_default_editions(&session);
 
-        // `MultiFileSession` holds a `moka` cache whose clock reads `std::time::Instant::now()`
-        // when constructed. `Instant` is unsupported on `wasm32` and panics with "time not
-        // implemented on this platform". Multi-file scanning is not available on wasm anyway, so
-        // only register this session variable on non-wasm targets.
-        #[cfg(all(feature = "files", not(target_arch = "wasm32")))]
+        #[cfg(feature = "files")]
         let session = {
+            // `MultiFileSession` holds a `moka` cache whose clock reads `std::time::Instant::now()`
+            // when constructed. `Instant` is unsupported on `wasm32` and panics with "time not
+            // implemented on this platform". Multi-file scanning is not available on wasm anyway, so
+            // only register this session variable on non-wasm targets.
+            #[cfg(not(target_arch = "wasm32"))]
             let session = session.with::<file::multi::MultiFileSession>();
+            // Default encodings are registered everywhere (if the `files` feature is enabled).
             file::register_default_encodings(&session);
             session
         };
@@ -328,7 +350,6 @@ impl VortexSessionDefault for VortexSession {
 mod test {
     use std::path::PathBuf;
 
-    use vortex_array::ArrayRef;
     use vortex_array::IntoArray;
     use vortex_array::VortexSessionExecute;
     use vortex_array::array_session;
@@ -360,20 +381,24 @@ mod test {
         use arrow_array::RecordBatchReader;
         use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
         use vortex::array::arrays::ChunkedArray;
-        use vortex::arrow::FromArrowArray;
-        use vortex::arrow::FromArrowType;
-        use vortex::dtype::DType;
+        use vortex::arrow::ArrowSessionExt;
+        use vortex::session::VortexSession;
+
+        let session = VortexSession::default();
 
         let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(
             "../docs/_static/example.parquet",
         )?)?
         .build()?;
 
-        let dtype = DType::from_arrow(reader.schema());
+        let dtype = session
+            .arrow()
+            .from_arrow_schema(reader.schema().as_ref())?;
         let chunks: Vec<_> = reader
             .map(|record_batch| {
                 let batch = record_batch?;
-                ArrayRef::from_arrow(batch, false)
+                let schema = batch.schema();
+                session.arrow().from_arrow_record_batch(batch, &schema)
             })
             .collect::<VortexResult<_>>()?;
         let vortex_array = ChunkedArray::try_new(chunks, dtype)?.into_array();
@@ -428,12 +453,13 @@ mod test {
         // [write]
 
         // [read]
-        let array = session
-            .open_options()
-            .open_path(path.clone())
-            .await?
+        let file = session.open_options().open_path(path.clone()).await?;
+        let filter = gt(root(), lit(2u64))
+            .optimize_recursive(file.dtype())?
+            .bind(file.dtype())?;
+        let array = file
             .scan()?
-            .with_filter(gt(root(), lit(2u64)))
+            .with_filter(filter)
             .into_array_stream()?
             .read_all()
             .await?;
@@ -527,12 +553,13 @@ mod test {
             .await?;
 
         // Read the file back, but project down to just the "value" column.
-        let projected = session
-            .open_options()
-            .open_path(path.clone())
-            .await?
+        let file = session.open_options().open_path(path.clone()).await?;
+        let projection = select(["value"], root())
+            .optimize_recursive(file.dtype())?
+            .bind(file.dtype())?;
+        let projected = file
             .scan()?
-            .with_projection(select(["value"], root()))
+            .with_projection(projection)
             .into_array_stream()?
             .read_all()
             .await?;
