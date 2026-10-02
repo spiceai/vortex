@@ -3,6 +3,7 @@
 
 use std::fmt::Display;
 use std::fmt::Formatter;
+use std::mem::MaybeUninit;
 
 use fastlanes::BitPacking;
 use vortex_array::ArrayRef;
@@ -29,6 +30,7 @@ pub mod bitpack_decompress;
 pub mod unpack_iter;
 
 use crate::BitPackedArray;
+use crate::FL_CHUNK_SIZE;
 use crate::bitpack_compress::bitpack_encode;
 use crate::unpack_iter::BitPacked as BitPackedIter;
 use crate::unpack_iter::BitUnpackedChunks;
@@ -36,12 +38,16 @@ use crate::unpack_iter::BitUnpackedChunks;
 #[array_slots(crate::BitPacked)]
 pub struct BitPackedSlots {
     /// The indices of exception values that don't fit in the bit-packed representation.
+    #[slot(0)]
     pub patch_indices: Option<ArrayRef>,
     /// The exception values that don't fit in the bit-packed representation.
+    #[slot(1)]
     pub patch_values: Option<ArrayRef>,
     /// Chunk offsets for the patch indices/values.
+    #[slot(2)]
     pub patch_chunk_offsets: Option<ArrayRef>,
     /// The validity bitmap indicating which elements are non-null.
+    #[slot(3)]
     pub validity_child: Option<ArrayRef>,
 }
 
@@ -219,17 +225,18 @@ impl BitPackedData {
     }
 
     /// Accessor for bit unpacked chunks
-    pub fn unpacked_chunks<T: BitPackedIter>(
-        &self,
+    pub fn unpacked_chunks<'a, T: BitPackedIter>(
+        &'a self,
         dtype: &DType,
         len: usize,
-    ) -> VortexResult<BitUnpackedChunks<T>> {
+        scratch: &'a mut [MaybeUninit<T>; FL_CHUNK_SIZE],
+    ) -> VortexResult<BitUnpackedChunks<'a, T>> {
         assert_eq!(
             T::PTYPE,
             self.ptype(dtype),
             "Requested type doesn't match the array ptype"
         );
-        BitUnpackedChunks::try_new(self, len)
+        BitUnpackedChunks::try_new(self, len, scratch)
     }
 
     /// Bit-width of the packed values
@@ -312,8 +319,16 @@ pub trait BitPackedArrayExt: BitPackedArraySlotsExt {
     }
 
     #[inline]
-    fn unpacked_chunks<T: BitPackedIter>(&self) -> VortexResult<BitUnpackedChunks<T>> {
-        BitPackedData::unpacked_chunks::<T>(self, self.as_ref().dtype(), self.as_ref().len())
+    fn unpacked_chunks<'a, T: BitPackedIter>(
+        &'a self,
+        scratch: &'a mut [MaybeUninit<T>; FL_CHUNK_SIZE],
+    ) -> VortexResult<BitUnpackedChunks<'a, T>> {
+        BitPackedData::unpacked_chunks::<T>(
+            self,
+            self.as_ref().dtype(),
+            self.as_ref().len(),
+            scratch,
+        )
     }
 }
 

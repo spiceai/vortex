@@ -5,7 +5,6 @@
 
 #![expect(clippy::unwrap_used)]
 
-#[allow(dead_code)]
 mod bench_config;
 mod timed_launch_strategy;
 
@@ -25,6 +24,7 @@ use vortex::dtype::DType;
 use vortex::dtype::Nullability;
 use vortex::encodings::fsst::FSST;
 use vortex::encodings::fsst::FSSTArrayExt;
+use vortex::encodings::fsst::FSSTArraySlotsExt;
 use vortex::error::VortexExpect;
 use vortex_cuda::CudaDispatchMode;
 use vortex_cuda::CudaSession;
@@ -34,6 +34,7 @@ use vortex_cuda::arrow::release_device_array;
 use vortex_cuda::executor::CudaArrayExt;
 use vortex_cuda_macros::cuda_available;
 use vortex_cuda_macros::cuda_not_available;
+use vortex_fsst::FSSTSymbolTable;
 use vortex_fsst::test_utils::make_fsst_clickbench_urls;
 
 use crate::timed_launch_strategy::TimedLaunchStrategy;
@@ -72,10 +73,16 @@ fn make_fixture(n: usize) -> FSSTBenchFixture {
         lens.as_slice::<P>().iter().map(|x| *x as u64).sum()
     });
 
-    let binary = FSST::try_new(
+    let binary = FSST::try_new_with_symbol_table(
         DType::Binary(Nullability::NonNullable),
-        fsst.symbols().clone(),
-        fsst.symbol_lengths().clone(),
+        Arc::new(
+            FSSTSymbolTable::new_padded(
+                fsst.padded_symbols().clone(),
+                fsst.padded_symbol_lengths().clone(),
+                fsst.n_symbols(),
+            )
+            .vortex_expect("construction"),
+        ),
         fsst.codes(),
         fsst.uncompressed_lengths().clone(),
         setup_ctx.execution_ctx(),

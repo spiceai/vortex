@@ -138,16 +138,6 @@ impl VTable for Patched {
         with_empty_buffers(self, array, buffers)
     }
 
-    fn child(array: ArrayView<'_, Self>, idx: usize) -> ArrayRef {
-        match idx {
-            PatchedSlots::INNER => array.inner().clone(),
-            PatchedSlots::LANE_OFFSETS => array.lane_offsets().clone(),
-            PatchedSlots::PATCH_INDICES => array.patch_indices().clone(),
-            PatchedSlots::PATCH_VALUES => array.patch_values().clone(),
-            _ => vortex_panic!("invalid child index for PatchedArray: {idx}"),
-        }
-    }
-
     fn serialize(
         array: ArrayView<'_, Self>,
         _session: &VortexSession,
@@ -375,7 +365,7 @@ mod tests {
     use crate::arrays::patched::PatchedSlots;
     use crate::arrays::patched::PatchedSlotsView;
     use crate::assert_arrays_eq;
-    use crate::builders::builder_with_capacity;
+    use crate::builders::builder_with_capacity_in;
     use crate::patches::Patches;
     use crate::serde::SerializeOptions;
     use crate::serde::SerializedArray;
@@ -467,7 +457,11 @@ mod tests {
             .unwrap()
             .into_array();
 
-        let mut builder = builder_with_capacity(array.dtype(), array.len());
+        let mut builder = builder_with_capacity_in(
+            array.dtype(),
+            array.len(),
+            vortex_buffer::BufferAllocatorRef::static_ref(),
+        );
         array.append_to_builder(builder.as_mut(), &mut ctx).unwrap();
 
         let result = builder.finish();
@@ -502,7 +496,11 @@ mod tests {
             .slice(3..1024)
             .unwrap();
 
-        let mut builder = builder_with_capacity(array.dtype(), array.len());
+        let mut builder = builder_with_capacity_in(
+            array.dtype(),
+            array.len(),
+            vortex_buffer::BufferAllocatorRef::static_ref(),
+        );
         array.append_to_builder(builder.as_mut(), &mut ctx).unwrap();
 
         let result = builder.finish();
@@ -537,7 +535,11 @@ mod tests {
             .unwrap()
             .into_array();
 
-        let mut builder = builder_with_capacity(array.dtype(), array.len());
+        let mut builder = builder_with_capacity_in(
+            array.dtype(),
+            array.len(),
+            vortex_buffer::BufferAllocatorRef::static_ref(),
+        );
         array.append_to_builder(builder.as_mut(), &mut ctx).unwrap();
 
         let result = builder.finish();
@@ -598,7 +600,12 @@ mod tests {
         let session = array_session();
         session.arrays().register(Patched);
 
-        let ctx = ArrayContext::empty().with_registry(session.arrays().registry().clone());
+        let ctx = ArrayContext::empty().with_allowed_ids(
+            session
+                .arrays()
+                .registry()
+                .read(|map| map.keys().copied().collect()),
+        );
         let serialized = array
             .serialize(&ctx, &session, &SerializeOptions::default())
             .unwrap();

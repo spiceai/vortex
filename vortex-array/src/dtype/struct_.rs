@@ -4,6 +4,7 @@
 use std::fmt::Display;
 use std::fmt::Formatter;
 use std::hash::Hash;
+use std::hash::Hasher;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -31,9 +32,8 @@ pub struct FieldDType {
 
 impl From<ViewedDType> for FieldDType {
     fn from(value: ViewedDType) -> Self {
-        Self {
-            inner: FieldDTypeInner::View(value),
-        }
+        let view = FieldDTypeInner::View(value, Arc::new(OnceLock::new()));
+        Self { inner: view }
     }
 }
 
@@ -58,26 +58,38 @@ enum FieldDTypeInner {
     /// Owned DType instance
     // TODO(ngates): we should consider making this an Arc<DType>.
     Owned(DType),
-    /// A view over a flatbuffer, parsed only when accessed.
-    View(ViewedDType),
+    /// A view over a flatbuffer, parsed on first access and cached after.
+    /// We cache it because it's requested for every field for every file.
+    /// If there are many files with wide schemas (think clickbench),
+    /// re-parsing each field is costly
+    /// This form is quite ugly because in some cases we want to panic on
+    /// parsing but return an error on others
+    View(ViewedDType, Arc<OnceLock<DType>>),
 }
 
 impl PartialEq for FieldDTypeInner {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Owned(lhs), Self::Owned(rhs)) => lhs == rhs,
-            (Self::View(lhs), Self::View(rhs)) => {
-                let lhs = DType::try_from(lhs.clone())
-                    .vortex_expect("Failed to parse FieldDType into DType");
-                let rhs = DType::try_from(rhs.clone())
-                    .vortex_expect("Failed to parse FieldDType into DType");
+            (Self::View(left_view, left_lock), Self::View(right_view, right_lock)) => {
+                let lhs = left_lock.get_or_init(|| {
+                    DType::try_from(left_view.clone())
+                        .vortex_expect("Failed to parse FieldDType into DType")
+                });
+                let rhs = right_lock.get_or_init(|| {
+                    DType::try_from(right_view.clone())
+                        .vortex_expect("Failed to parse FieldDType into DType")
+                });
 
                 lhs == rhs
             }
-            (Self::View(view), Self::Owned(owned)) | (Self::Owned(owned), Self::View(view)) => {
-                let view = DType::try_from(view.clone())
-                    .vortex_expect("Failed to parse FieldDType into DType");
-                owned == &view
+            (Self::View(view, lock), Self::Owned(owned))
+            | (Self::Owned(owned), Self::View(view, lock)) => {
+                let view = lock.get_or_init(|| {
+                    DType::try_from(view.clone())
+                        .vortex_expect("Failed to parse FieldDType into DType")
+                });
+                owned == view
             }
         }
     }
@@ -85,14 +97,16 @@ impl PartialEq for FieldDTypeInner {
 impl Eq for FieldDTypeInner {}
 
 impl Hash for FieldDTypeInner {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+    fn hash<H: Hasher>(&self, state: &mut H) {
         match self {
             FieldDTypeInner::Owned(owned) => {
                 owned.hash(state);
             }
-            FieldDTypeInner::View(view) => {
-                let owned = DType::try_from(view.clone())
-                    .vortex_expect("Failed to parse FieldDType into DType");
+            FieldDTypeInner::View(view, lock) => {
+                let owned = lock.get_or_init(|| {
+                    DType::try_from(view.clone())
+                        .vortex_expect("Failed to parse FieldDType into DType")
+                });
                 owned.hash(state);
             }
         }
@@ -108,15 +122,20 @@ impl FieldDType {
 
     /// Approximate heap bytes retained by this field's dtype.
     ///
-    /// An owned dtype is walked, since its whole subtree is materialised and retained. A view is
-    /// charged nothing: it is a shared handle onto the dtype flatbuffer plus a session handle,
-    /// both of which the owner of the buffer accounts for. Notably, a view is *not* parsed here -
-    /// [`value`](Self::value) memoises nothing, so parsing to measure would allocate a subtree
-    /// that this `FieldDType` does not retain.
+    /// An owned dtype is walked, since its whole subtree is materialised and retained. A view
+    /// is a shared handle onto the dtype flatbuffer plus a session handle, both of which the
+    /// owner of the buffer accounts for, so it is charged only for its memoisation slot and, if
+    /// [`value`](Self::value) has already populated that slot, the parsed subtree. A view is
+    /// *not* parsed here: parsing just to measure would allocate a subtree that is only retained
+    /// once something else asks for it.
     pub fn approx_heap_size(&self) -> usize {
         match &self.inner {
             FieldDTypeInner::Owned(dtype) => dtype.approx_heap_size(),
-            FieldDTypeInner::View(_) => 0,
+            FieldDTypeInner::View(_, cached) => {
+                ARC_OVERHEAD
+                    + size_of::<OnceLock<DType>>()
+                    + cached.get().map_or(0, DType::approx_heap_size)
+            }
         }
     }
 }
@@ -125,7 +144,13 @@ impl FieldDTypeInner {
     fn value(&self) -> VortexResult<DType> {
         match &self {
             FieldDTypeInner::Owned(owned) => Ok(owned.clone()),
-            FieldDTypeInner::View(view) => DType::try_from(view.clone()),
+            FieldDTypeInner::View(view, lock) => {
+                if let Some(dtype) = lock.get() {
+                    return Ok(dtype.clone());
+                }
+                let parsed = DType::try_from(view.clone())?;
+                Ok(lock.get_or_init(|| parsed).clone())
+            }
         }
     }
 }
@@ -271,9 +296,30 @@ impl PartialEq for StructFieldsInner {
 impl Eq for StructFieldsInner {}
 
 impl Hash for StructFieldsInner {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+    fn hash<H: Hasher>(&self, state: &mut H) {
         self.names.hash(state);
         self.dtypes.hash(state);
+    }
+}
+
+impl StructFields {
+    /// Check if these struct fields are equal, ignoring field dtype nullability recursively.
+    pub fn eq_ignore_nullability(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+            || (self.0.names == other.0.names
+                && self
+                    .fields()
+                    .zip_eq(other.fields())
+                    .all(|(lhs, rhs)| lhs.eq_ignore_nullability(&rhs)))
+    }
+
+    /// Hash these struct fields using the same equivalence relation as
+    /// [`Self::eq_ignore_nullability`].
+    pub(crate) fn hash_ignore_nullability<H: Hasher>(&self, state: &mut H) {
+        self.0.names.hash(state);
+        for field in self.fields() {
+            field.hash_ignore_nullability(state);
+        }
     }
 }
 
@@ -508,12 +554,17 @@ mod test {
 
     use insta::assert_snapshot;
     use itertools::Itertools;
+    use vortex_error::VortexResult;
+    use vortex_flatbuffers::FlatBuffer;
+    use vortex_flatbuffers::WriteFlatBufferExt;
 
+    use super::FieldDTypeInner;
     use crate::dtype::DType;
     use crate::dtype::FieldNames;
     use crate::dtype::Nullability;
     use crate::dtype::PType;
     use crate::dtype::StructFields;
+    use crate::dtype::test::SESSION;
 
     #[test]
     fn nullability() {
@@ -590,6 +641,36 @@ mod test {
         assert_eq!(without_a.names(), ["B"]);
         assert_eq!(without_a.field_by_index(0).unwrap(), b_type);
         assert_eq!(without_a.nfields(), 1);
+    }
+
+    #[test]
+    fn field_dtype_cache() -> VortexResult<()> {
+        let inner = DType::Struct(
+            StructFields::from_iter([("x", DType::Bool(Nullability::NonNullable))]),
+            Nullability::NonNullable,
+        );
+        let dtype = DType::Struct(
+            StructFields::from_iter([("a", inner)]),
+            Nullability::NonNullable,
+        );
+        let buffer = FlatBuffer::from(dtype.write_flatbuffer_bytes()?);
+        let parsed = DType::from_flatbuffer(buffer, &SESSION)?;
+        let fields = parsed.as_struct_fields_opt().unwrap();
+
+        let field = &fields.0.dtypes[0];
+        let FieldDTypeInner::View(_, cell) = &field.inner else {
+            panic!("flatbuffer-backed field must be a View");
+        };
+        assert!(cell.get().is_none());
+
+        let first = field.value()?;
+        assert!(cell.get().is_some());
+        let second = field.value()?;
+        let (DType::Struct(first, _), DType::Struct(second, _)) = (&first, &second) else {
+            panic!("field must parse to a struct");
+        };
+        assert!(Arc::ptr_eq(&first.0, &second.0));
+        Ok(())
     }
 
     #[test]

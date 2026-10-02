@@ -16,9 +16,11 @@ use num_traits::ToPrimitive;
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::arrays::DecimalArray;
+use vortex_array::dtype::DType;
 use vortex_array::dtype::DecimalType;
 use vortex_buffer::Buffer;
 use vortex_error::VortexResult;
+use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
 
 use crate::null_buffer::to_null_buffer;
@@ -28,6 +30,13 @@ pub(super) fn to_arrow_decimal(
     data_type: &DataType,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrowArrayRef> {
+    vortex_ensure!(
+        matches!(array.dtype(), DType::Decimal(..)),
+        "Cannot convert Vortex array with dtype {} to an Arrow {} array",
+        array.dtype(),
+        data_type
+    );
+
     // Execute the array as a DecimalArray.
     let decimal_array = array.execute::<DecimalArray>(ctx)?;
 
@@ -265,7 +274,11 @@ mod tests {
         #[case] _decimal_type: T,
     ) -> VortexResult<()> {
         let mut ctx = array_session().create_execution_ctx();
-        let mut decimal = DecimalBuilder::new::<T>(DecimalDType::new(2, 1), false.into());
+        let mut decimal = DecimalBuilder::new_in::<T>(
+            DecimalDType::new(2, 1),
+            false.into(),
+            vortex_buffer::BufferAllocatorRef::static_ref(),
+        );
         decimal.append_value(10);
         decimal.append_value(11);
         decimal.append_value(12);
@@ -293,7 +306,11 @@ mod tests {
         use arrow_array::Decimal32Array;
 
         let mut ctx = array_session().create_execution_ctx();
-        let mut decimal = DecimalBuilder::new::<T>(DecimalDType::new(2, 1), false.into());
+        let mut decimal = DecimalBuilder::new_in::<T>(
+            DecimalDType::new(2, 1),
+            false.into(),
+            vortex_buffer::BufferAllocatorRef::static_ref(),
+        );
         decimal.append_value(10);
         decimal.append_value(11);
         decimal.append_value(12);
@@ -321,7 +338,11 @@ mod tests {
         use arrow_array::Decimal64Array;
 
         let mut ctx = array_session().create_execution_ctx();
-        let mut decimal = DecimalBuilder::new::<T>(DecimalDType::new(2, 1), false.into());
+        let mut decimal = DecimalBuilder::new_in::<T>(
+            DecimalDType::new(2, 1),
+            false.into(),
+            vortex_buffer::BufferAllocatorRef::static_ref(),
+        );
         decimal.append_value(10);
         decimal.append_value(11);
         decimal.append_value(12);
@@ -349,7 +370,11 @@ mod tests {
         #[case] _decimal_type: T,
     ) -> VortexResult<()> {
         let mut ctx = array_session().create_execution_ctx();
-        let mut decimal = DecimalBuilder::new::<T>(DecimalDType::new(2, 1), false.into());
+        let mut decimal = DecimalBuilder::new_in::<T>(
+            DecimalDType::new(2, 1),
+            false.into(),
+            vortex_buffer::BufferAllocatorRef::static_ref(),
+        );
         decimal.append_value(10);
         decimal.append_value(11);
         decimal.append_value(12);

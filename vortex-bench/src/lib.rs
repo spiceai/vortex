@@ -70,6 +70,8 @@ pub use datasets::BenchmarkDataset;
 pub use output::BenchmarkOutput;
 pub use output::create_output_writer;
 use vortex::VortexSessionDefault;
+use vortex::editions::ComponentKind;
+use vortex::editions::EditionSessionExt;
 pub use vortex::error::vortex_panic;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
@@ -80,7 +82,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 pub static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     let session = VortexSession::default().with_tokio();
-    vortex_geo::initialize(&session);
+    vortex_spatial::initialize(&session);
     session
 });
 
@@ -139,10 +141,10 @@ impl Display for Target {
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Format {
+    #[clap(name = "arrow-ipc")]
+    ArrowIpc,
     #[clap(name = "csv")]
     Csv,
-    #[clap(name = "arrow")]
-    Arrow,
     #[clap(name = "parquet")]
     Parquet,
     #[clap(name = "vortex")]
@@ -151,9 +153,9 @@ pub enum Format {
     #[clap(name = "vortex-compact")]
     #[serde(rename = "vortex-compact")]
     VortexCompact,
-    #[clap(name = "vortex-geo-native")]
-    #[serde(rename = "vortex-geo-native")]
-    VortexNative,
+    #[clap(name = "vortex-spatial-native")]
+    #[serde(rename = "vortex-spatial-native")]
+    VortexSpatialNative,
     #[clap(name = "duckdb")]
     #[serde(rename = "duckdb")]
     OnDiskDuckDB,
@@ -169,10 +171,15 @@ impl Display for Format {
 }
 
 /// Allowed formats for benchmark CLI arguments.
-pub const ALLOWED_FORMATS: &[Format] = &[Format::Parquet, Format::OnDiskVortex, Format::Lance];
+pub const ALLOWED_FORMATS: &[Format] = &[
+    Format::ArrowIpc,
+    Format::Parquet,
+    Format::OnDiskVortex,
+    Format::Lance,
+];
 
 impl Format {
-    /// Clap value parser that only accepts parquet, vortex, and lance.
+    /// Clap value parser that only accepts formats supported by random-access benchmarks.
     pub fn parse_allowed(s: &str) -> Result<Format, String> {
         let format = Format::from_str(s, true)?;
         if ALLOWED_FORMATS.contains(&format) {
@@ -188,12 +195,12 @@ impl Format {
 
     pub fn name(&self) -> &'static str {
         match self {
+            Format::ArrowIpc => "arrow-ipc",
             Format::Csv => "csv",
-            Format::Arrow => "arrow",
             Format::Parquet => "parquet",
             Format::OnDiskVortex => "vortex-file-compressed",
             Format::VortexCompact => "vortex-compact",
-            Format::VortexNative => "vortex-geo-native",
+            Format::VortexSpatialNative => "vortex-spatial-native",
             Format::OnDiskDuckDB => "duckdb",
             Format::Lance => "lance",
         }
@@ -201,12 +208,12 @@ impl Format {
 
     pub fn ext(&self) -> &'static str {
         match self {
+            Format::ArrowIpc => "arrow",
             Format::Csv => "csv",
-            Format::Arrow => "arrow",
             Format::Parquet => "parquet",
             Format::OnDiskVortex => "vortex",
             Format::VortexCompact => "vortex",
-            Format::VortexNative => "vortex",
+            Format::VortexSpatialNative => "vortex",
             Format::OnDiskDuckDB => "duckdb",
             Format::Lance => "lance",
         }
@@ -218,7 +225,6 @@ impl Format {
 pub enum Engine {
     #[default]
     Vortex,
-    Arrow,
     #[clap(name = "datafusion")]
     #[serde(rename = "datafusion")]
     DataFusion,
@@ -233,7 +239,6 @@ impl Display for Engine {
             Engine::DataFusion => write!(f, "datafusion"),
             Engine::DuckDB => write!(f, "duckdb"),
             Engine::Vortex => write!(f, "vortex"),
-            Engine::Arrow => write!(f, "arrow"),
         }
     }
 }
@@ -250,12 +255,90 @@ impl CompactionStrategy {
         match self {
             CompactionStrategy::Compact => options.with_strategy(
                 WriteStrategyBuilder::default()
-                    .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact())
+                    .with_btrblocks_builder(retain_edition_encodings(
+                        &SESSION,
+                        BtrBlocksCompressorBuilder::default().with_compact(),
+                    ))
                     .build(),
             ),
             CompactionStrategy::Default => options,
         }
     }
+}
+
+/// Restrict `builder` to the encodings permitted by the session's enabled editions.
+///
+/// The default writer applies this filter itself. An explicit strategy bypasses it, so a
+/// benchmark that builds its own compressor applies it here to stay within editions.
+pub fn retain_edition_encodings(
+    session: &VortexSession,
+    builder: BtrBlocksCompressorBuilder,
+) -> BtrBlocksCompressorBuilder {
+    let allowed = session
+        .enabled_component_ids(ComponentKind::Array)
+        .into_iter()
+        .collect();
+    builder.retain_allowed_encodings(&allowed)
+}
+
+/// Verify that local data has already been prepared for the requested benchmark formats.
+///
+/// Engine-specific benchmark binaries call this before running queries. Data generation itself
+/// belongs to the `data-gen` binary.
+pub fn require_prepared_data<B>(benchmark: &B, formats: &[Format]) -> anyhow::Result<()>
+where
+    B: Benchmark + ?Sized,
+{
+    if benchmark.data_url().scheme() != "file" {
+        return Ok(());
+    }
+
+    let base_path = benchmark
+        .data_url()
+        .to_file_path()
+        .map_err(|_| anyhow::anyhow!("Invalid file URL: {}", benchmark.data_url()))?;
+
+    let mut missing = Vec::new();
+    for format in formats.iter().copied().unique() {
+        let required_path = match format {
+            Format::Parquet => base_path.join(Format::Parquet.name()),
+            Format::OnDiskVortex => base_path.join(Format::OnDiskVortex.name()),
+            Format::VortexCompact => base_path.join(Format::VortexCompact.name()),
+            Format::OnDiskDuckDB => base_path
+                .join(Format::OnDiskDuckDB.name())
+                .join("duckdb.db"),
+            format => base_path.join(format.name()),
+        };
+
+        if !required_path.exists() {
+            missing.push((format, required_path));
+        }
+    }
+
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    let missing_data = missing
+        .iter()
+        .map(|(format, path)| format!("{format} ({})", path.display()))
+        .join(", ");
+    let requested_formats = formats
+        .iter()
+        .copied()
+        .unique()
+        .map(|format| format!("\"{format}\""))
+        .join(",");
+
+    anyhow::bail!(
+        "prepared data is missing for {}: {missing_data}. Generate it first with \
+         `vx-bench prepare-data {} --formats-json '[{requested_formats}]'` or \
+         `cargo run --bin data-gen -- {} --formats {}` using the same --opt values.",
+        benchmark.dataset_display(),
+        benchmark.dataset_name(),
+        benchmark.dataset_name(),
+        formats.iter().copied().unique().join(","),
+    );
 }
 
 /// CLI argument for selecting which benchmark to run.

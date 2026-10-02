@@ -8,8 +8,10 @@
 //! and bare file paths are both accepted. Filesystems are cached per base URL so repeated
 //! globs against the same bucket share a single client.
 
+use std::ptr;
 use std::sync::Arc;
 
+use arrow_array::ffi::FFI_ArrowSchema;
 use jni::EnvUnowned;
 use jni::objects::JClass;
 use jni::objects::JLongArray;
@@ -28,10 +30,9 @@ use vortex::io::filesystem::FileSystemRef;
 use vortex::io::runtime::BlockingRuntime;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::scan::DataSourceRef;
-use vortex::utils::aliases::hash_map::HashMap;
+use vortex_arrow::ArrowSessionExt;
 
 use crate::RUNTIME;
-use crate::dtype::export_dtype_to_arrow;
 use crate::errors::try_or_throw;
 use crate::file::extract_properties;
 use crate::io::JavaFileSystem;
@@ -91,23 +92,11 @@ pub extern "system" fn Java_dev_vortex_jni_NativeDataSource_open(
             .map(|g| parse_uri_or_path(g.as_str()))
             .collect::<VortexResult<_>>()?;
 
-        let mut fs_cache: HashMap<Url, FileSystemRef> = HashMap::new();
-        for glob_url in &glob_urls {
-            let base = base_url(glob_url);
-            if !fs_cache.contains_key(&base) {
-                let fs = object_store_fs(glob_url, &properties, session.handle())?;
-                fs_cache.insert(base, fs);
-            }
-        }
-
+        // Glob by the path the resolver reports — only it knows how deep each store is mounted.
         let mut builder = MultiFileDataSource::new(session.clone());
         for glob_url in &glob_urls {
-            let base = base_url(glob_url);
-            let fs = fs_cache
-                .get(&base)
-                .cloned()
-                .unwrap_or_else(|| unreachable!("fs cached for every base url"));
-            builder = builder.with_glob(glob_url.path(), Some(fs));
+            let (fs, glob) = object_store_fs(glob_url, &properties, session.handle())?;
+            builder = builder.with_glob(glob, Some(fs));
         }
 
         let inner = RUNTIME
@@ -188,13 +177,6 @@ pub extern "system" fn Java_dev_vortex_jni_NativeDataSource_openFiles(
     })
 }
 
-/// URL with the path cleared, used as a cache key for filesystem reuse.
-fn base_url(url: &Url) -> Url {
-    let mut base = url.clone();
-    base.set_path("");
-    base
-}
-
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_vortex_jni_NativeDataSource_free(
     _env: EnvUnowned,
@@ -208,11 +190,11 @@ pub extern "system" fn Java_dev_vortex_jni_NativeDataSource_free(
 }
 
 /// Export the data source's schema into the Arrow C Data Interface schema struct at
-/// `schema_addr`.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_vortex_jni_NativeDataSource_arrowSchema(
     mut env: EnvUnowned,
     _class: JClass,
+    session_ptr: jlong,
     pointer: jlong,
     schema_addr: jlong,
 ) {
@@ -220,8 +202,13 @@ pub extern "system" fn Java_dev_vortex_jni_NativeDataSource_arrowSchema(
         if schema_addr == 0 {
             throw_runtime!("null arrow schema address");
         }
+        let session = unsafe { session_ref(session_ptr) };
         let ds = unsafe { NativeDataSource::from_ptr(pointer) };
-        export_dtype_to_arrow(ds.inner.dtype(), schema_addr)?;
+        let arrow_schema = session.arrow().to_arrow_schema(ds.inner.dtype())?;
+        let ffi_schema = FFI_ArrowSchema::try_from(&arrow_schema)?;
+        unsafe {
+            ptr::write(schema_addr as *mut FFI_ArrowSchema, ffi_schema);
+        }
         Ok(())
     });
 }
@@ -266,18 +253,4 @@ pub extern "system" fn Java_dev_vortex_jni_NativeDataSource_byteSize(
         out.set_region(env, 0, &[bytes, precision])?;
         Ok(())
     });
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_base_url_strips_path() {
-        let url = Url::parse("s3://bucket/a/b/c").unwrap();
-        let base = base_url(&url);
-        assert_eq!(base.scheme(), "s3");
-        assert_eq!(base.host_str(), Some("bucket"));
-        assert_eq!(base.path(), "");
-    }
 }

@@ -79,9 +79,7 @@ impl From<Infallible> for VortexError {
     }
 }
 
-const _: () = {
-    assert!(size_of::<VortexError>() < 128);
-};
+const _: () = assert!(size_of::<VortexError>() < 128);
 
 /// The top-level error type for Vortex.
 #[non_exhaustive]
@@ -341,6 +339,7 @@ where
 {
     type Output = T;
 
+    #[allow(clippy::inline_always)]
     #[inline(always)]
     fn vortex_expect(self, msg: &'static str) -> Self::Output {
         self.map_err(|err| err.into())
@@ -351,6 +350,7 @@ where
 impl<T> VortexExpect for Option<T> {
     type Output = T;
 
+    #[allow(clippy::inline_always)]
     #[inline(always)]
     fn vortex_expect(self, msg: &'static str) -> Self::Output {
         self.unwrap_or_else(|| {

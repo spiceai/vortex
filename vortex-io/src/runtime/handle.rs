@@ -13,15 +13,16 @@ use std::task::ready;
 use futures::FutureExt;
 /// The one-shot channel carrying a spawned [`Task`]'s result.
 ///
-/// This is tokio's channel rather than the `oneshot` crate. The `oneshot` crate's receiver
-/// releases its stored waker from inside its own destructor; when that waker belongs to an
-/// executor's task handle, the drop reenters that executor's task teardown, which either
-/// trips its "future still here when dropping" assertion or frees the waker under a sender
-/// that is concurrently waking it -- a use-after-free faulting on the indirect call in
-/// `ReceiverWaker::unpark`. Dropping a [`Task`] that has already been polled is exactly that
-/// window, so ordinary cancellation can corrupt memory. Tokio's receiver drops no waker in
-/// its own destructor: it marks the channel closed, wakes the sender by reference, and defers
-/// waker cleanup until both ends are gone. `single.rs` avoids the hazard the same way.
+/// This is tokio's channel rather than the `oneshot` crate or `futures::channel::oneshot`.
+/// Those receivers release a stored waker from inside their own destructor; when that
+/// waker belongs to an executor's task handle, the drop reenters that executor's task
+/// teardown, which either trips its "future still here when dropping" assertion or frees
+/// the waker under a sender that is concurrently waking it — a use-after-free faulting
+/// on the indirect call in `ReceiverWaker::unpark`. Dropping a [`Task`] that has already
+/// been polled is exactly that window, so ordinary cancellation can corrupt memory.
+/// Tokio's receiver drops no waker in its own destructor: it marks the channel closed,
+/// wakes the sender by reference, and defers waker cleanup until both ends are gone.
+/// `single.rs` avoids the hazard the same way.
 ///
 /// Re-exported so crates building on this runtime use the same channel rather than each
 /// taking a direct tokio dependency.
@@ -31,6 +32,7 @@ use vortex_error::vortex_panic;
 
 use crate::runtime::AbortHandleRef;
 use crate::runtime::Executor;
+use crate::runtime::platform;
 
 /// A handle to an active Vortex runtime.
 ///
@@ -58,7 +60,9 @@ impl Handle {
     /// Returns a handle to the current runtime, if such a reasonable choice exists.
     ///
     /// For example, if called from within a Tokio context this will return a
-    /// `TokioRuntime` handle.
+    /// `TokioRuntime` handle. On browser WebAssembly with the `wasm-bindgen` feature this returns
+    /// the global `WasmRuntime` handle; without it there is no event loop to schedule onto, and
+    /// callers must drive a `SingleThreadRuntime` and install its handle themselves.
     pub fn find() -> Option<Self> {
         #[cfg(feature = "tokio")]
         {
@@ -70,7 +74,7 @@ impl Handle {
             }
         }
 
-        None
+        platform::default_handle()
     }
 
     /// Spawn a new future onto the runtime.

@@ -14,16 +14,19 @@ use vortex_array::arrays::ExtensionArray;
 use vortex_array::arrays::FixedSizeListArray;
 use vortex_array::arrays::Masked;
 use vortex_array::arrays::StructArray;
+use vortex_array::arrays::UnionArray;
 use vortex_array::arrays::Variant;
 use vortex_array::arrays::VariantArray;
 use vortex_array::arrays::extension::ExtensionArrayExt;
 use vortex_array::arrays::fixed_size_list::FixedSizeListArrayExt;
-use vortex_array::arrays::listview::ListViewArrayExt;
+use vortex_array::arrays::fixed_size_list::FixedSizeListArraySlotsExt;
+use vortex_array::arrays::listview::ListViewArraySlotsExt;
 use vortex_array::arrays::listview::list_from_list_view;
 use vortex_array::arrays::masked::MaskedArraySlotsExt;
-use vortex_array::arrays::scalar_fn::AnyScalarFn;
 use vortex_array::arrays::struct_::StructArrayExt;
-use vortex_array::arrays::variant::VariantArrayExt;
+use vortex_array::arrays::union::UnionArrayExt;
+use vortex_array::arrays::union::UnionArraySlotsExt;
+use vortex_array::arrays::variant::VariantArraySlotsExt;
 use vortex_array::scalar::Scalar;
 use vortex_error::VortexResult;
 
@@ -130,6 +133,18 @@ impl CascadingCompressor {
                 )?
                 .into_array())
             }
+            Canonical::Union(union_array) => {
+                let type_ids = self.compress(union_array.type_ids(), exec_ctx)?;
+                let children = union_array
+                    .iter_children()
+                    .map(|child| self.compress(child, exec_ctx))
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                Ok(
+                    UnionArray::try_new(type_ids, union_array.variants().clone(), children)?
+                        .into_array(),
+                )
+            }
             Canonical::List(list_view_array) => {
                 if list_view_array.is_zero_copy_to_list() || list_view_array.elements().is_empty() {
                     let list_array = list_from_list_view(list_view_array, exec_ctx)?;
@@ -138,6 +153,7 @@ impl CascadingCompressor {
                     self.compress_list_view_array(list_view_array, compress_ctx, exec_ctx)
                 }
             }
+            Canonical::Map(map_array) => self.compress_map_array(map_array, compress_ctx, exec_ctx),
             Canonical::FixedSizeList(fsl_array) => {
                 let compressed_elems = self.compress(fsl_array.elements(), exec_ctx)?;
 
@@ -159,10 +175,6 @@ impl CascadingCompressor {
                     compress_ctx,
                     exec_ctx,
                 )?;
-                // TODO(connor): HACK TO SUPPORT L2 DENORMALIZATION!!!
-                if scheme_compressed.is::<AnyScalarFn>() {
-                    return Ok(scheme_compressed);
-                }
 
                 // A constant extension array (that might be masked) is already in its terminal
                 // representation, and compressing the storage separately cannot do better.
@@ -305,8 +317,7 @@ impl CascadingCompressor {
         let after_nbytes = compressed.nbytes();
         let actual_ratio = (after_nbytes != 0).then(|| before_nbytes as f64 / after_nbytes as f64);
 
-        // TODO(connor): HACK TO SUPPORT L2 DENORMALIZATION!!!
-        let accepted = after_nbytes < before_nbytes || compressed.is::<AnyScalarFn>();
+        let accepted = after_nbytes < before_nbytes;
 
         trace::record_winner_compress_result(
             after_nbytes,

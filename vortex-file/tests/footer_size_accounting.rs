@@ -25,6 +25,8 @@
     reason = "std locks park without allocating; parking_lot would perturb the counting allocator"
 )]
 
+mod common;
+
 use std::alloc::GlobalAlloc;
 use std::alloc::Layout as AllocLayout;
 use std::alloc::System;
@@ -36,6 +38,7 @@ use std::sync::RwLockWriteGuard;
 use std::sync::atomic::AtomicIsize;
 use std::sync::atomic::Ordering;
 
+use common::enable_all_registered_array_encodings;
 use rstest::rstest;
 use rstest_reuse::apply;
 use rstest_reuse::template;
@@ -117,6 +120,7 @@ static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
         .with::<LayoutSession>()
         .with::<RuntimeSession>();
     vortex_file::register_default_encodings(&session);
+    enable_all_registered_array_encodings(&session);
     session
 });
 

@@ -21,15 +21,31 @@ use vortex_array::arrays::struct_::StructDataParts;
 use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::FieldNames;
-use vortex_array::dtype::StructFields;
+use vortex_array::matcher::Matcher;
 use vortex_array::scalar_fn::fns::pack::Pack;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 
 use crate::ArrowArrayExecutor;
-use crate::dtype::FromArrowType;
+use crate::executor::infer_nearest_arrow_field;
 use crate::executor::validity::to_arrow_null_buffer;
 use crate::session::ArrowSessionExt;
+
+/// Matches the encodings [`to_arrow_struct`] requires for export.
+struct ArrowStructExportable;
+
+impl Matcher for ArrowStructExportable {
+    type Match<'a> = &'a ArrayRef;
+
+    fn try_match(array: &ArrayRef) -> Option<Self::Match<'_>> {
+        (array.is::<Struct>()
+            || array.is::<Chunked>()
+            || array
+                .as_opt::<ScalarFn>()
+                .is_some_and(|scalar_fn| scalar_fn.scalar_fn().as_opt::<Pack>().is_some()))
+        .then_some(array)
+    }
+}
 
 pub(super) fn to_arrow_struct(
     array: ArrayRef,
@@ -37,6 +53,8 @@ pub(super) fn to_arrow_struct(
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrowArrayRef> {
     let len = array.len();
+
+    let array = array.execute_until::<ArrowStructExportable>(ctx)?;
 
     // If the array is chunked, then we invert the chunk-of-struct to struct-of-chunk.
     let array = match array.try_downcast::<Chunked>() {
@@ -87,7 +105,7 @@ pub(super) fn to_arrow_struct(
 
     // Otherwise, we fall back to executing to a StructArray.
     let array = if let Some(fields) = target_fields {
-        let vx_fields = StructFields::from_arrow(fields);
+        let vx_fields = ctx.session().arrow().from_arrow_fields(fields)?;
         // We apply a cast to ensure we push down casting where possible into the struct fields.
         array.cast(DType::Struct(
             vx_fields,
@@ -158,26 +176,27 @@ fn create_from_fields(
             }))
         }
         Err(names) => {
-            // No target fields specified - use preferred types for each child
+            // No target fields specified - use preferred types for each child. The inferred field
+            // is what carries any `ARROW:extension:name` metadata, which the executed array's bare
+            // `DataType` cannot, so build the child fields from it rather than from the array.
             let mut arrow_arrays = Vec::with_capacity(vortex_fields.len());
-            for vx_field in vortex_fields.iter() {
+            let mut arrow_fields = Vec::with_capacity(vortex_fields.len());
+            for (name, vx_field) in names.iter().zip_eq(vortex_fields.iter()) {
+                let inferred = infer_nearest_arrow_field(vx_field, name.as_ref(), ctx)?;
                 let arrow_array = vx_field.clone().execute_arrow(None, ctx)?;
+                // The executed array is authoritative for the physical type; only the metadata is
+                // taken from the inferred field.
+                arrow_fields.push(Arc::new(
+                    Field::new(
+                        name.as_ref(),
+                        arrow_array.data_type().clone(),
+                        vx_field.dtype().is_nullable(),
+                    )
+                    .with_metadata(inferred.metadata().clone()),
+                ));
                 arrow_arrays.push(arrow_array);
             }
-
-            // Build the Arrow fields from the resulting arrays
-            let arrow_fields: Fields = names
-                .iter()
-                .zip_eq(arrow_arrays.iter())
-                .zip_eq(vortex_fields.iter().map(|f| f.dtype().is_nullable()))
-                .map(|((name, arr), vx_nullable)| {
-                    Arc::new(Field::new(
-                        name.as_ref(),
-                        arr.data_type().clone(),
-                        vx_nullable,
-                    ))
-                })
-                .collect();
+            let arrow_fields = Fields::from(arrow_fields);
 
             Ok(Arc::new(unsafe {
                 ArrowStructArray::new_unchecked_with_length(
@@ -196,6 +215,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrays::varbinview::VarBinViewArray;
+    use arrow_array::Array;
     use arrow_array::ArrayRef;
     use arrow_array::PrimitiveArray as ArrowPrimitiveArray;
     use arrow_array::StringViewArray;
@@ -204,20 +224,21 @@ mod tests {
     use arrow_buffer::NullBuffer;
     use arrow_schema::DataType;
     use arrow_schema::Field;
-    use vortex_array as array;
     use vortex_array::IntoArray;
     use vortex_array::VortexSessionExecute;
     use vortex_array::array_session;
     use vortex_array::arrays;
+    use vortex_array::arrays::BoolArray;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::arrays::StructArray;
     use vortex_array::dtype::FieldNames;
+    use vortex_array::scalar_fn::fns::mask::Mask;
     use vortex_array::validity::Validity;
     use vortex_buffer::buffer;
     use vortex_error::VortexResult;
 
     use crate::ArrowArrayExecutor;
-    use crate::FromArrowArray;
+    use crate::convert::from_arrow_dyn;
     use crate::dtype::to_data_type_naive;
 
     #[test]
@@ -340,6 +361,40 @@ mod tests {
     }
 
     #[test]
+    fn mask_wrapped_struct_exports_via_struct_fast_path() -> VortexResult<()> {
+        let mut ctx = array_session().create_execution_ctx();
+        // A struct behind a lazy `mask` scalar-fn nulling out row 1 — the shape a scan
+        // produces when a row mask is applied to a top-level struct batch.
+        let xs = PrimitiveArray::new(buffer![1i64, 2, 3], Validity::NonNullable);
+        let struct_array = StructArray::try_new(
+            FieldNames::from(["xs"]),
+            vec![xs.into_array()],
+            3,
+            Validity::NonNullable,
+        )?;
+        let mask = BoolArray::from_iter([true, false, true]);
+        let masked = Mask::try_new(struct_array.into_array(), mask.into_array())?.into_array();
+
+        let arrow = masked.execute_arrow(None, &mut ctx)?;
+
+        let arrow_struct = arrow
+            .as_any()
+            .downcast_ref::<ArrowStructArray>()
+            .expect("struct array");
+        assert_eq!(arrow_struct.len(), 3);
+        assert!(!arrow_struct.is_null(0));
+        assert!(arrow_struct.is_null(1));
+        assert!(!arrow_struct.is_null(2));
+        let xs_col = arrow_struct
+            .column(0)
+            .as_any()
+            .downcast_ref::<ArrowPrimitiveArray<arrow_array::types::Int64Type>>()
+            .expect("int64 column");
+        assert_eq!(xs_col.values(), &[1, 2, 3]);
+        Ok(())
+    }
+
+    #[test]
     fn to_arrow_with_non_nullable_fields() -> VortexResult<()> {
         let mut ctx = array_session().create_execution_ctx();
         let array = StructArray::from_fields(
@@ -357,7 +412,7 @@ mod tests {
         )?;
         let orig_dtype = array.dtype().clone();
         let arrow_array = array.into_array().execute_arrow(None, &mut ctx)?;
-        let from_arrow = array::ArrayRef::from_arrow(arrow_array.as_ref(), false)?;
+        let from_arrow = from_arrow_dyn(arrow_array.as_ref(), false)?;
         assert_eq!(&orig_dtype, from_arrow.dtype());
         Ok(())
     }

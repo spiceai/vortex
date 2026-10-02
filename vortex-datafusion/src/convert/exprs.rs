@@ -15,12 +15,12 @@ use datafusion_expr::Operator as DFOperator;
 use datafusion_functions::core::getfield::GetFieldFunc;
 use datafusion_functions::string::octet_length::OctetLengthFunc;
 use datafusion_functions_nested::length::ArrayLength;
+use datafusion_physical_expr::DynamicFilterTracking;
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::ScalarFunctionExpr;
 use datafusion_physical_expr::projection::ProjectionExpr;
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr::utils::collect_columns;
-use datafusion_physical_expr_common::physical_expr::is_dynamic_physical_expr;
 use datafusion_physical_plan::expressions as df_expr;
 use itertools::Itertools;
 use vortex::VortexSessionDefault;
@@ -48,11 +48,13 @@ use vortex::scalar_fn::fns::operators::Operator;
 use vortex::session::VortexSession;
 use vortex_arrow::ArrowSessionExt;
 
-use crate::convert::FromDataFusion;
+use crate::convert::scalar_from_df;
 
 /// Result of splitting a projection into Vortex expressions and leftover DataFusion projections.
 pub struct ProcessedProjection {
+    /// Projection evaluated by the Vortex scan.
     pub scan_projection: Expression,
+    /// Projection evaluated by DataFusion after the Vortex scan.
     pub leftover_projection: ProjectionExprs,
 }
 
@@ -73,6 +75,47 @@ pub(crate) fn make_vortex_predicate(
 }
 
 /// Trait for converting DataFusion expressions to Vortex ones.
+///
+/// # Implementing a custom convertor
+///
+/// ```
+/// use std::sync::Arc;
+///
+/// use arrow_schema::Schema;
+/// use datafusion_common::Result as DFResult;
+/// use datafusion_physical_expr::PhysicalExpr;
+/// use datafusion_physical_expr::projection::ProjectionExprs;
+/// use vortex::expr::Expression;
+/// use vortex_datafusion::convert::DefaultExpressionConvertor;
+/// use vortex_datafusion::convert::ExpressionConvertor;
+/// use vortex_datafusion::convert::ProcessedProjection;
+///
+/// struct CustomExpressionConvertor(DefaultExpressionConvertor);
+///
+/// impl ExpressionConvertor for CustomExpressionConvertor {
+///     fn can_be_pushed_down(&self, expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
+///         self.0.can_be_pushed_down(expr, schema)
+///     }
+///
+///     fn convert(&self, expr: &dyn PhysicalExpr) -> DFResult<Expression> {
+///         self.0.convert(expr)
+///     }
+///
+///     fn split_projection(
+///         &self,
+///         source_projection: ProjectionExprs,
+///         input_schema: &Schema,
+///         output_schema: &Schema,
+///     ) -> DFResult<ProcessedProjection> {
+///         self.0
+///             .split_projection(source_projection, input_schema, output_schema)
+///     }
+/// }
+///
+/// let _convertor: Arc<dyn ExpressionConvertor> = Arc::new(CustomExpressionConvertor(
+///     DefaultExpressionConvertor::default(),
+/// ));
+/// ```
 pub trait ExpressionConvertor: Send + Sync {
     /// Can an expression be pushed down given a specific schema
     fn can_be_pushed_down(&self, expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool;
@@ -302,7 +345,7 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
         }
 
         if let Some(literal) = df.downcast_ref::<df_expr::Literal>() {
-            let value = Scalar::from_df(literal.value());
+            let value = scalar_from_df(literal.value(), &self.session);
             return Ok(lit(value));
         }
 
@@ -333,7 +376,7 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
                 .iter()
                 .map(|e| {
                     if let Some(lit) = e.downcast_ref::<df_expr::Literal>() {
-                        Ok(Scalar::from_df(lit.value()))
+                        Ok(scalar_from_df(lit.value(), &self.session))
                     } else {
                         Err(exec_datafusion_err!("Failed to cast sub-expression"))
                     }
@@ -487,7 +530,7 @@ fn try_operator_from_df(value: &DFOperator) -> DFResult<Operator> {
 fn can_be_pushed_down_impl(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
     // We currently do not support pushdown of dynamic expressions in DF.
     // See issue: https://github.com/vortex-data/vortex/issues/4034
-    if is_dynamic_physical_expr(expr) {
+    if DynamicFilterTracking::classify(expr).contains_dynamic_filter() {
         return false;
     }
 
@@ -496,8 +539,7 @@ fn can_be_pushed_down_impl(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> boo
     } else if let Some(col) = expr.downcast_ref::<df_expr::Column>() {
         schema
             .field_with_name(col.name())
-            .ok()
-            .is_some_and(|field| supported_data_types(field.data_type()))
+            .is_ok_and(|field| supported_data_types(field.data_type()))
     } else if let Some(like) = expr.downcast_ref::<df_expr::LikeExpr>() {
         can_be_pushed_down_impl(like.expr(), schema)
             && can_be_pushed_down_impl(like.pattern(), schema)
@@ -1244,7 +1286,6 @@ mod tests {
         use vortex::array::Canonical;
         use vortex::array::VortexSessionExecute as _;
         use vortex::session::VortexSession;
-        use vortex_arrow::FromArrowArray;
 
         // Create test data
         let values = Arc::new(Int32Array::from(vec![1, 5, 10, 15, 20]));
@@ -1291,10 +1332,13 @@ mod tests {
         let vortex_expr = expr_convertor.try_convert_case_expr(&case_expr).unwrap();
 
         // Convert batch to Vortex array
-        let vortex_array: ArrayRef = ArrayRef::from_arrow(&batch, false).unwrap();
+        let session = VortexSession::default();
+        let vortex_array: ArrayRef = session
+            .arrow()
+            .from_arrow_record_batch(batch.clone(), &batch.schema())
+            .unwrap();
 
         // Apply Vortex expression
-        let session = VortexSession::default();
         let mut ctx = session.create_execution_ctx();
         let vortex_result = vortex_array
             .apply(&vortex_expr)

@@ -22,7 +22,7 @@ console = Console()
 class BenchmarkExecutor:
     """Executes benchmark binaries and captures output."""
 
-    def __init__(self, binary_path: Path, backend: Engine, verbose: bool = False):
+    def __init__(self, binary_path: Path, backend: Engine, verbose: bool = False) -> None:
         self.binary_path = binary_path
         self.backend = backend
         self.verbose = verbose
@@ -31,8 +31,7 @@ class BenchmarkExecutor:
         self,
         benchmark: Benchmark,
         formats: list[Format],
-        queries: list[int] | None = None,
-        exclude_queries: list[int] | None = None,
+        query: int | None = None,
         iterations: int = 5,
         options: dict[str, str] | None = None,
         track_memory: bool = False,
@@ -40,7 +39,7 @@ class BenchmarkExecutor:
         sample_rate: int | None = None,
         tracing: bool = False,
         runner: str | None = None,
-        gh_json_v3: Path | None = None,
+        ingest_output: Path | None = None,
     ) -> list[str]:
         """Build the command used to execute a benchmark binary."""
         cmd = [
@@ -58,18 +57,16 @@ class BenchmarkExecutor:
         if self.backend == Engine.DUCKDB:
             cmd.append("--delete-duckdb-database")
 
-        if queries:
-            cmd.extend(["--queries", ",".join(map(str, queries))])
-        if exclude_queries:
-            cmd.extend(["--exclude-queries", ",".join(map(str, exclude_queries))])
+        if query is not None:
+            cmd.extend(["--queries", str(query)])
         if track_memory:
             cmd.append("--track-memory")
         if tracing:
             cmd.append("--tracing")
         if runner:
             cmd.extend(["--runner", runner])
-        if gh_json_v3 is not None:
-            cmd.extend(["--gh-json-v3", str(gh_json_v3)])
+        if ingest_output is not None:
+            cmd.extend(["--ingest-jsonl", str(ingest_output)])
         if options:
             for key, value in options.items():
                 cmd.extend(["--opt", f"{key}={value}"])
@@ -88,12 +85,35 @@ class BenchmarkExecutor:
 
         return cmd
 
+    def list_queries(
+        self,
+        benchmark: Benchmark,
+        queries: list[int] | None = None,
+        exclude_queries: list[int] | None = None,
+    ) -> list[int]:
+        """Return query indices this benchmark selects"""
+        cmd = [str(self.binary_path), benchmark.value, "--print-queries"]
+        if queries:
+            cmd.extend(["--queries", ",".join(map(str, queries))])
+        if exclude_queries:
+            cmd.extend(["--exclude-queries", ",".join(map(str, exclude_queries))])
+
+        if self.verbose:
+            console.print(f"[dim]$ {' '.join(cmd)}[/dim]")
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Failed to list queries for {self.backend.value} {benchmark.value}: {result.stderr.strip()}"
+            )
+
+        return [int(line) for line in result.stdout.split() if line.strip()]
+
     def run(
         self,
         benchmark: Benchmark,
         formats: list[Format],
-        queries: list[int] | None = None,
-        exclude_queries: list[int] | None = None,
+        query: int | None = None,
         iterations: int = 5,
         options: dict[str, str] | None = None,
         track_memory: bool = False,
@@ -101,7 +121,7 @@ class BenchmarkExecutor:
         sample_rate: int | None = None,
         tracing: bool = False,
         runner: str | None = None,
-        gh_json_v3: Path | None = None,
+        ingest_output: Path | None = None,
         on_result: Callable[[str], None] | None = None,
     ) -> list[str]:
         """
@@ -110,8 +130,7 @@ class BenchmarkExecutor:
         Args:
             benchmark: The benchmark suite to run
             formats: Data formats to benchmark
-            queries: Specific queries to run (None for all)
-            exclude_queries: Queries to skip
+            query: Specific query to run (None for all)
             iterations: Number of runs per query
             options: Additional options (e.g., scale_factor)
             track_memory: Enable memory tracking
@@ -123,8 +142,7 @@ class BenchmarkExecutor:
         cmd = self.build_command(
             benchmark=benchmark,
             formats=formats,
-            queries=queries,
-            exclude_queries=exclude_queries,
+            query=query,
             iterations=iterations,
             options=options,
             track_memory=track_memory,
@@ -132,7 +150,7 @@ class BenchmarkExecutor:
             sample_rate=sample_rate,
             tracing=tracing,
             runner=runner,
-            gh_json_v3=gh_json_v3,
+            ingest_output=ingest_output,
         )
 
         if self.verbose:

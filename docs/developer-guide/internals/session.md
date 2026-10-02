@@ -15,10 +15,11 @@ The session is built on two primitives from the `vortex-session` crate:
 - **`VortexSession`** -- a cloneable, thread-safe map from Rust `TypeId` to a shared
   (`Arc`-wrapped) value. Any type that is `Clone + Send + Sync + Debug + 'static` can be stored
   as a session variable.
-- **`Registry<T>`** -- a concurrent map from string IDs to values of type `T`, used by each
-  component to look up registered plugins at runtime.
+- **`ArcSwapMap<K, V>`** -- a concurrent copy-on-write map, used both as the backing store of
+  `VortexSession` itself and (keyed by interned string `Id`s) as the plugin registries each
+  component uses to look up registered plugins at runtime.
 
-Because `VortexSession` is backed by an `ArcSwap`, cloning is cheap and all clones share the
+Because both primitives are backed by an `ArcSwap`, cloning is cheap and all clones share the
 same state, with lock-free reads and copy-on-write writes. This makes it safe to hand the
 session to multiple threads, tasks, or I/O operations without coordination.
 
@@ -77,8 +78,11 @@ session.write_options()
     .await?;
 
 // Scanning a layout
+let filter = expr
+    .optimize_recursive(layout_reader.dtype())?
+    .bind(layout_reader.dtype())?;
 ScanBuilder::new(session.clone(), layout_reader)
-    .with_filter(expr)
+    .with_filter(filter)
     .into_array_stream()?;
 ```
 

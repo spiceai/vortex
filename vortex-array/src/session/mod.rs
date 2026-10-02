@@ -6,14 +6,18 @@ use std::sync::Arc;
 
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
+use vortex_error::vortex_ensure;
+use vortex_session::ArcSwapMap;
 use vortex_session::SessionExt;
 use vortex_session::SessionGuard;
 use vortex_session::SessionVar;
-use vortex_session::registry::Registry;
+use vortex_session::registry::Id;
 
 use crate::ArrayRef;
+use crate::array::ArrayId;
 use crate::array::ArrayPlugin;
 use crate::array::ArrayPluginRef;
+use crate::array::ArraySerialization;
 use crate::arrays::Bool;
 use crate::arrays::Chunked;
 use crate::arrays::Constant;
@@ -23,26 +27,33 @@ use crate::arrays::Extension;
 use crate::arrays::FixedSizeList;
 use crate::arrays::List;
 use crate::arrays::ListView;
+use crate::arrays::Map;
 use crate::arrays::Masked;
 use crate::arrays::Null;
+use crate::arrays::PiecewiseSequence;
 use crate::arrays::Primitive;
 use crate::arrays::Struct;
+use crate::arrays::Union;
 use crate::arrays::VarBin;
 use crate::arrays::VarBinView;
 use crate::arrays::Variant;
 
-pub type ArrayRegistry = Registry<ArrayPluginRef>;
+/// Registry of array encodings.
+pub type ArrayRegistry = ArcSwapMap<Id, ArrayPluginRef>;
 
 #[derive(Clone, Debug)]
 pub struct ArraySession {
-    /// The set of registered array encodings.
+    /// Deserializers keyed by the array ID found on the wire.
     registry: ArrayRegistry,
+    /// Serializers keyed by the in-memory array encoding ID.
+    serializers: ArrayRegistry,
 }
 
 impl ArraySession {
     pub fn empty() -> ArraySession {
         Self {
             registry: ArrayRegistry::default(),
+            serializers: ArrayRegistry::default(),
         }
     }
 
@@ -50,10 +61,20 @@ impl ArraySession {
         &self.registry
     }
 
-    /// Register a new array encoding, replacing any existing encoding with the same ID.
+    /// Register an in-memory array plugin and all of its recognized serialized IDs.
+    ///
+    /// This replaces any serializer with the same in-memory ID and any deserializer registered
+    /// under one of [`ArrayPlugin::serialized_ids`].
     pub fn register<P: ArrayPlugin>(&self, plugin: P) {
-        self.registry
-            .register(plugin.id(), Arc::new(plugin) as ArrayPluginRef);
+        let plugin = Arc::new(plugin) as ArrayPluginRef;
+        self.serializers.insert(plugin.id(), Arc::clone(&plugin));
+        for serialized_id in plugin.serialized_ids() {
+            self.registry.insert(serialized_id, Arc::clone(&plugin));
+        }
+    }
+
+    fn serializer(&self, id: &ArrayId) -> Option<ArrayPluginRef> {
+        self.serializers.get(id)
     }
 }
 
@@ -61,6 +82,7 @@ impl Default for ArraySession {
     fn default() -> Self {
         let this = ArraySession {
             registry: ArrayRegistry::default(),
+            serializers: ArrayRegistry::default(),
         };
 
         // Register the canonical encodings.
@@ -70,8 +92,10 @@ impl Default for ArraySession {
         this.register(Decimal);
         this.register(VarBinView);
         this.register(ListView);
+        this.register(Map);
         this.register(FixedSizeList);
         this.register(Struct);
+        this.register(Union);
         this.register(Variant);
         this.register(Extension);
 
@@ -81,6 +105,7 @@ impl Default for ArraySession {
         this.register(Dict);
         this.register(List);
         this.register(Masked);
+        this.register(PiecewiseSequence);
         this.register(VarBin);
 
         this
@@ -105,15 +130,26 @@ pub trait ArraySessionExt: SessionExt {
     }
 
     /// Serialize an array using a plugin from the registry.
-    fn array_serialize(&self, array: &ArrayRef) -> VortexResult<Option<Vec<u8>>> {
-        let Some(plugin) = self.arrays().registry.find(&array.encoding_id()) else {
+    fn array_serialize(&self, array: &ArrayRef) -> VortexResult<Option<ArraySerialization>> {
+        let Some(plugin) = self.arrays().serializer(&array.encoding_id()) else {
             vortex_bail!(
-                "Array {} is not registered for serializations",
+                "Array {} is not registered for serialization",
                 array.encoding_id()
             );
         };
 
-        plugin.serialize(array, &self.session())
+        let Some(serialization) = plugin.serialize(array, &self.session())? else {
+            return Ok(None);
+        };
+        vortex_ensure!(
+            plugin
+                .serialized_ids()
+                .contains(&serialization.serialized_id),
+            "array serializer {} produced undeclared serialized ID {}",
+            array.encoding_id(),
+            serialization.serialized_id,
+        );
+        Ok(Some(serialization))
     }
 }
 
@@ -132,13 +168,15 @@ mod tests {
     fn array_session_default_registers_encodings() {
         let session = VortexSession::empty().with::<ArraySession>();
 
-        assert!(session.arrays().registry().find(&Bool.id()).is_some());
+        assert!(session.arrays().registry().contains_key(&Bool.id()));
+        assert!(session.arrays().serializer(&Bool.id()).is_some());
     }
 
     #[test]
     fn empty_array_session_registers_no_encodings() {
         let session = VortexSession::empty().with_some(ArraySession::empty());
 
-        assert!(session.arrays().registry().find(&Bool.id()).is_none());
+        assert!(!session.arrays().registry().contains_key(&Bool.id()));
+        assert!(session.arrays().serializer(&Bool.id()).is_none());
     }
 }

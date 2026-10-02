@@ -3,6 +3,7 @@
 
 use vortex_buffer::BitBuffer;
 use vortex_buffer::BitBufferMut;
+use vortex_buffer::BufferAllocatorRef;
 use vortex_error::VortexExpect;
 use vortex_error::vortex_panic;
 use vortex_mask::Mask;
@@ -18,52 +19,18 @@ pub struct LazyBitBufferBuilder {
     inner: Option<BitBufferMut>,
     len: usize,
     capacity: usize,
+    allocator: BufferAllocatorRef,
 }
 
 impl LazyBitBufferBuilder {
     /// Creates a new empty builder.
     /// `capacity` is the number of bits in the null buffer.
-    pub fn new(capacity: usize) -> Self {
+    pub fn new(capacity: usize, allocator: BufferAllocatorRef) -> Self {
         Self {
             inner: None,
             len: 0,
             capacity,
-        }
-    }
-
-    /// Creates a builder pre-populated from a validity mask, taking ownership of the mask's buffer
-    /// instead of copying it where possible.
-    ///
-    /// This is the counterpart to [`append_validity_mask`](Self::append_validity_mask) for callers
-    /// that want to *replace* the builder's contents with the mask rather than extend them: because
-    /// we own the mask, we can move its buffer in instead of copying it.
-    pub fn from_validity_mask(validity_mask: Mask) -> Self {
-        match validity_mask {
-            // An unmaterialized builder already represents `len` non-null values, so an all-valid
-            // mask stays lazy.
-            Mask::AllTrue(len) => Self {
-                inner: None,
-                len,
-                capacity: len,
-            },
-            Mask::AllFalse(len) => Self::from_buffer(BitBufferMut::new_unset(len)),
-            // Take ownership of the underlying buffer; `into_bit_buffer` and `try_into_mut` only
-            // copy when the buffer is shared, otherwise this is a move.
-            values @ Mask::Values(_) => Self::from_buffer(
-                values
-                    .into_bit_buffer()
-                    .try_into_mut()
-                    .unwrap_or_else(|buffer| BitBufferMut::copy_from(&buffer)),
-            ),
-        }
-    }
-
-    /// Creates a builder backed by an already-materialized buffer.
-    fn from_buffer(inner: BitBufferMut) -> Self {
-        Self {
-            inner: Some(inner),
-            len: 0,
-            capacity: 0,
+            allocator,
         }
     }
 
@@ -184,7 +151,8 @@ impl LazyBitBufferBuilder {
     #[inline(never)]
     fn materialize(&mut self) {
         if self.inner.is_none() {
-            let mut bit_mut = BitBufferMut::with_capacity(self.len.max(self.capacity));
+            let mut bit_mut =
+                BitBufferMut::with_capacity_in(self.len.max(self.capacity), self.allocator.clone());
             bit_mut.append_n(true, self.len);
             self.inner = Some(bit_mut);
         }

@@ -16,7 +16,7 @@ Optional integrations can be installed as extras:
 
 .. code-block:: bash
 
-    pip install vortex-data[polars,pandas,numpy,duckdb,ray]
+    pip install vortex-data[polars,pandas,numpy,duckdb,ray,hf]
 
 
 Compatibility
@@ -27,6 +27,8 @@ The Python bindings require Python 3.11 or newer. Pre-built wheels are available
 * x86_64 Linux
 * ARM64 Linux
 * Apple Silicon macOS
+* x86_64 macOS
+* x86_64 Windows
 
 They support any Linux distribution with a GLIBC version >= 2.17. This includes
 
@@ -66,5 +68,6 @@ API Reference
    io
    store
    dataset
+   datasets
    runtime
    type_aliases

@@ -90,7 +90,7 @@ impl PartialOrd for ListScalar<'_> {
 
 impl Hash for ListScalar<'_> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.dtype.hash(state);
+        self.dtype.hash_ignore_nullability(state);
         self.elements().hash(state);
     }
 }
@@ -160,6 +160,17 @@ impl<'a> ListScalar<'a> {
         })
     }
 
+    /// Returns the element values, borrowed from the scalar itself.
+    ///
+    /// Returns None if the list is null. Unlike [`Self::elements`] this clones
+    /// nothing, so it is the form to reach for when a caller only reads the
+    /// values; the cost of materializing a `Vec<Scalar>` is proportional to the
+    /// length of the list and is paid again on drop.
+    #[inline]
+    pub fn element_values(&self) -> Option<&'a [Option<ScalarValue>]> {
+        self.elements
+    }
+
     /// Returns all elements in the list as a vector of scalars.
     ///
     /// Returns None if the list is null.
@@ -225,6 +236,9 @@ impl<'a> ListScalar<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::Hash;
+    use std::hash::Hasher;
     use std::sync::Arc;
 
     use super::*;
@@ -422,10 +436,6 @@ mod tests {
 
     #[test]
     fn test_list_hash() {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::Hash;
-        use std::hash::Hasher;
-
         let element_dtype = Arc::new(DType::Primitive(PType::I32, Nullability::NonNullable));
         let children = vec![
             Scalar::primitive(1i32, Nullability::NonNullable),
@@ -444,6 +454,30 @@ mod tests {
         let hash2 = hasher2.finish();
 
         assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_list_hash_ignores_nested_nullability() {
+        let nullable = Scalar::list(
+            DType::Primitive(PType::I32, Nullability::Nullable),
+            vec![Scalar::primitive(42_i32, Nullability::Nullable)],
+            Nullability::NonNullable,
+        );
+        let non_nullable = Scalar::list(
+            DType::Primitive(PType::I32, Nullability::NonNullable),
+            vec![Scalar::primitive(42_i32, Nullability::NonNullable)],
+            Nullability::NonNullable,
+        );
+        let nullable = nullable.as_list();
+        let non_nullable = non_nullable.as_list();
+
+        assert_eq!(nullable, non_nullable);
+
+        let mut nullable_hasher = DefaultHasher::new();
+        nullable.hash(&mut nullable_hasher);
+        let mut non_nullable_hasher = DefaultHasher::new();
+        non_nullable.hash(&mut non_nullable_hasher);
+        assert_eq!(nullable_hasher.finish(), non_nullable_hasher.finish());
     }
 
     #[test]

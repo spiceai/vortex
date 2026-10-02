@@ -16,7 +16,7 @@ use vortex_array::dtype::DType;
 use vortex_array::dtype::FieldMask;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
-use vortex_array::expr::Expression;
+use vortex_array::expr::BoundExpression;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
 use vortex_io::runtime::Handle;
@@ -130,7 +130,7 @@ impl LayoutReader for ProbeLayoutReader {
     fn pruning_evaluation(
         &self,
         _row_range: &Range<u64>,
-        _expr: &Expression,
+        _expr: &BoundExpression,
         mask: Mask,
     ) -> VortexResult<MaskFuture> {
         Ok(MaskFuture::ready(mask))
@@ -139,7 +139,7 @@ impl LayoutReader for ProbeLayoutReader {
     fn filter_evaluation(
         &self,
         _row_range: &Range<u64>,
-        _expr: &Expression,
+        _expr: &BoundExpression,
         mask: MaskFuture,
     ) -> VortexResult<MaskFuture> {
         Ok(mask)
@@ -148,7 +148,7 @@ impl LayoutReader for ProbeLayoutReader {
     fn projection_evaluation(
         &self,
         row_range: &Range<u64>,
-        _expr: &Expression,
+        _expr: &BoundExpression,
         _mask: MaskFuture,
     ) -> VortexResult<ArrayFuture> {
         let start = usize::try_from(row_range.start)

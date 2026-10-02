@@ -7,14 +7,18 @@ use std::ops::BitOr;
 
 use arrow_buffer::bit_iterator::BitIndexIterator;
 pub use kernel::*;
+use num_traits::AsPrimitive;
 use num_traits::Zero;
 use vortex_buffer::BitBuffer;
+use vortex_buffer::BitBufferMut;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
+use vortex_mask::Mask;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
+use vortex_utils::aliases::hash_set::HashSet;
 use vortex_utils::iter::ReduceBalancedIterExt;
 
 use crate::ArrayRef;
@@ -23,32 +27,55 @@ use crate::IntoArray;
 use crate::arrays::BoolArray;
 use crate::arrays::Constant;
 use crate::arrays::ConstantArray;
+use crate::arrays::ExtensionArray;
 use crate::arrays::ListViewArray;
 use crate::arrays::PrimitiveArray;
+use crate::arrays::ScalarFnArray;
+use crate::arrays::VarBin;
+use crate::arrays::VarBinViewArray;
 use crate::arrays::bool::BoolArrayExt;
-use crate::arrays::listview::ListViewArrayExt;
+use crate::arrays::extension::ExtensionArrayExt;
+use crate::arrays::listview::ListViewArraySlotsExt;
+use crate::arrays::primitive::NativeValue;
 use crate::arrays::primitive::PrimitiveArrayExt;
-use crate::arrays::scalar_fn::ScalarFnFactoryExt;
+use crate::arrays::varbin::VarBinArrayExt;
+use crate::arrays::varbin::VarBinArraySlotsExt;
+use crate::arrays::varbinview::ViewsSide;
 use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
 use crate::dtype::IntegerPType;
+use crate::dtype::NativePType;
 use crate::dtype::Nullability;
 use crate::match_each_integer_ptype;
+use crate::match_each_native_ptype;
 use crate::match_each_unsigned_integer_ptype;
 use crate::scalar::ListScalar;
 use crate::scalar::Scalar;
+use crate::scalar::ScalarValue;
 use crate::scalar_fn::Arity;
 use crate::scalar_fn::ChildName;
 use crate::scalar_fn::EmptyOptions;
 use crate::scalar_fn::ExecutionArgs;
 use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::ScalarFnVTable;
+use crate::scalar_fn::ScalarFnVTableExt;
 use crate::scalar_fn::fns::binary::Binary;
 use crate::scalar_fn::fns::operators::Operator;
 use crate::validity::Validity;
 
 #[derive(Clone)]
 pub struct ListContains;
+
+impl ListContains {
+    /// Creates a lazy list membership check for `needle` in `list`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the children have different lengths or `list` is not a list array.
+    pub fn try_new(list: ArrayRef, needle: ArrayRef) -> VortexResult<ScalarFnArray> {
+        ScalarFnArray::try_new(ListContains.bind(EmptyOptions), vec![list, needle])
+    }
+}
 
 impl ScalarFnVTable for ListContains {
     type Options = EmptyOptions;
@@ -121,13 +148,13 @@ impl ScalarFnVTable for ListContains {
         compute_list_contains(&list_array, &value_array, ctx)
     }
 
-    // Nullability matters for contains([], x) where x is false.
-    fn is_null_sensitive(&self, _instance: &Self::Options) -> bool {
-        true
+    // An empty list can produce false even when the needle is null.
+    fn is_strict(&self, _options: &Self::Options) -> bool {
+        false
     }
 
-    fn is_fallible(&self, _options: &Self::Options) -> bool {
-        false
+    fn is_infallible(&self, _options: &Self::Options) -> bool {
+        true
     }
 }
 
@@ -177,42 +204,167 @@ fn compute_list_contains(
     if let Some(value_scalar) = value.as_constant() {
         list_contains_scalar(array, &value_scalar, nullability, ctx)
     } else if let Some(list_scalar) = array.as_constant() {
-        constant_list_scalar_contains(&list_scalar.as_list(), value, nullability)
+        constant_list_scalar_contains(&list_scalar.as_list(), value, nullability, ctx)
     } else {
         todo!("unsupported list contains with list and element as arrays")
     }
 }
+
+/// List length past which membership is answered by probing a set instead of by
+/// OR-ing one equality per element.
+const HASH_PROBE_MIN_ELEMENTS: usize = 4;
+
+/// Slots per element to size the probe set with.
+const PROBE_SET_HEADROOM: usize = 4;
 
 /// There is a constant list scalar (haystack) being compared to an array of needles.
 fn constant_list_scalar_contains(
     list_scalar: &ListScalar,
     values: &ArrayRef,
     nullability: Nullability,
+    ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
-    let elements = list_scalar.elements().vortex_expect("non null");
+    let element_values = list_scalar.element_values().vortex_expect("non null");
 
+    if element_values.len() >= HASH_PROBE_MIN_ELEMENTS
+        && element_values.iter().all(Option::is_some)
+        && let Some(probed) = hash_probe_contains(element_values, values, nullability, ctx)?
+    {
+        return Ok(probed);
+    }
+
+    let elements = list_scalar.elements().vortex_expect("non null");
     let len = values.len();
     let false_scalar = Scalar::bool(false, nullability);
 
     let result = elements
         .iter()
         .map(|element| {
-            Binary
-                .try_new_array(
-                    len,
-                    Operator::Eq,
-                    [
-                        ConstantArray::new(element.clone(), len).into_array(),
-                        values.clone(),
-                    ],
-                )?
-                .fill_null(false_scalar.clone())
+            Binary::try_new(
+                ConstantArray::new(element.clone(), len).into_array(),
+                values.clone(),
+                Operator::Eq,
+            )?
+            .into_array()
+            .fill_null(false_scalar.clone())
         })
         .collect::<VortexResult<Vec<_>>>()?
         .into_iter()
         .try_reduce_balanced(|acc, res| acc.binary(res, Operator::Or))?;
 
     Ok(result.unwrap_or_else(|| ConstantArray::new(false_scalar, len).into_array()))
+}
+
+/// Answers membership by building a set from the list once and probing it in a
+/// single pass over the needles.
+fn hash_probe_contains(
+    elements: &[Option<ScalarValue>],
+    values: &ArrayRef,
+    nullability: Nullability,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<Option<ArrayRef>> {
+    let len = values.len();
+    let ptype = match values.dtype() {
+        DType::Primitive(ptype, _) => *ptype,
+        DType::Utf8(_) | DType::Binary(_) => {
+            return bytes_probe_contains(elements, values, nullability, ctx);
+        }
+        DType::Extension(_) => {
+            let storage = values.clone().execute::<ExtensionArray>(ctx)?;
+            return hash_probe_contains(elements, storage.storage_array(), nullability, ctx);
+        }
+        _ => return Ok(None),
+    };
+
+    let needles = values.clone().execute::<PrimitiveArray>(ctx)?;
+    let validity = needles.validity()?.execute_mask(len, ctx)?;
+
+    let bits = match_each_native_ptype!(ptype, |T| {
+        let Some(set) = primitive_key_set::<T>(elements) else {
+            return Ok(None);
+        };
+        let slice = needles.as_slice::<T>();
+        probe_rows(len, &validity, |idx| set.contains(&NativeValue(slice[idx])))
+    });
+
+    Ok(Some(BoolArray::new(bits, nullability.into()).into_array()))
+}
+
+fn primitive_key_set<T: NativePType>(
+    elements: &[Option<ScalarValue>],
+) -> Option<HashSet<NativeValue<T>>>
+where
+    NativeValue<T>: std::hash::Hash + Eq,
+{
+    let mut set = HashSet::with_capacity(elements.len() * PROBE_SET_HEADROOM);
+    for element in elements {
+        let ScalarValue::Primitive(pvalue) = element.as_ref()? else {
+            return None;
+        };
+        if !pvalue.is_instance_of(&T::PTYPE) {
+            return None;
+        }
+        set.insert(NativeValue(pvalue.cast::<T>().ok()?));
+    }
+    Some(set)
+}
+
+fn bytes_probe_contains(
+    elements: &[Option<ScalarValue>],
+    values: &ArrayRef,
+    nullability: Nullability,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<Option<ArrayRef>> {
+    let mut set: HashSet<&[u8]> = HashSet::with_capacity(elements.len() * PROBE_SET_HEADROOM);
+    for element in elements {
+        let bytes = match element {
+            Some(ScalarValue::Utf8(value)) => value.as_bytes(),
+            Some(ScalarValue::Binary(value)) => value.as_slice(),
+            _ => return Ok(None),
+        };
+        set.insert(bytes);
+    }
+
+    let len = values.len();
+
+    let bits = if let Some(varbin) = values.as_opt::<VarBin>() {
+        let validity = varbin.varbin_validity().execute_mask(len, ctx)?;
+        let bytes = varbin.bytes().as_slice();
+        let offsets = varbin.offsets().clone().execute::<PrimitiveArray>(ctx)?;
+        match_each_integer_ptype!(offsets.ptype(), |O| {
+            let offsets = offsets.as_slice::<O>();
+            probe_rows(len, &validity, |idx| {
+                let (start, end): (usize, usize) = (offsets[idx].as_(), offsets[idx + 1].as_());
+                set.contains(&bytes[start..end])
+            })
+        })
+    } else {
+        let needles = values.clone().execute::<VarBinViewArray>(ctx)?;
+        let validity = needles.validity()?.execute_mask(len, ctx)?;
+        let side = ViewsSide::new(&needles);
+        let views = side.views();
+        probe_rows(len, &validity, |idx| {
+            set.contains(side.view_bytes(&views[idx]))
+        })
+    };
+
+    Ok(Some(BoolArray::new(bits, nullability.into()).into_array()))
+}
+
+fn probe_rows(len: usize, validity: &Mask, hit: impl Fn(usize) -> bool) -> BitBuffer {
+    match validity {
+        Mask::AllTrue(_) => (0..len).map(hit).collect(),
+        Mask::AllFalse(_) => BitBuffer::new_unset(len),
+        Mask::Values(valid) => {
+            let mut bits = BitBufferMut::new_unset(len);
+            valid.bit_buffer().for_each_set_index(|idx| {
+                if hit(idx) {
+                    bits.set(idx);
+                }
+            });
+            bits.freeze()
+        }
+    }
 }
 
 /// Returns a [`BoolArray`] where each bit represents if a list contains the scalar.
@@ -237,11 +389,8 @@ fn list_contains_scalar(
     }
 
     let rhs = ConstantArray::new(value.clone(), elems.len());
-    let matching_elements = Binary.try_new_array(
-        elems.len(),
-        Operator::Eq,
-        &[elems.clone(), rhs.clone().into_array()],
-    )?;
+    let matching_elements =
+        Binary::try_new(elems.clone(), rhs.clone().into_array(), Operator::Eq)?.into_array();
 
     // TODO(ngates): we should execute this into a Columnar and check for constant.
     let matches = matching_elements.execute::<BoolArray>(ctx)?;
@@ -599,24 +748,31 @@ mod tests {
             Nullability::NonNullable,
         );
 
+        // The falsifier describes the list as intervals: the scope lies wholly
+        // outside the list's range, or wholly inside a gap between two adjacent
+        // list values. For a list this dense the gaps cover every element, so
+        // it proves exactly what a term per element would.
         assert_eq!(
-            expr.falsify(&scope, &STATS_SESSION)?,
-            Some(and(
-                and(
+            expr.bind(&scope)?.falsify(&STATS_SESSION)?,
+            Some(
+                or(
                     or(
                         lt(stat(col("a"), Stat::Max), lit(1i32)),
-                        gt(stat(col("a"), Stat::Min), lit(1i32)),
+                        gt(stat(col("a"), Stat::Min), lit(3i32)),
                     ),
                     or(
-                        lt(stat(col("a"), Stat::Max), lit(2i32)),
-                        gt(stat(col("a"), Stat::Min), lit(2i32)),
-                    )
-                ),
-                or(
-                    lt(stat(col("a"), Stat::Max), lit(3i32)),
-                    gt(stat(col("a"), Stat::Min), lit(3i32)),
+                        and(
+                            gt(stat(col("a"), Stat::Min), lit(1i32)),
+                            lt(stat(col("a"), Stat::Max), lit(2i32)),
+                        ),
+                        and(
+                            gt(stat(col("a"), Stat::Min), lit(2i32)),
+                            lt(stat(col("a"), Stat::Max), lit(3i32)),
+                        ),
+                    ),
                 )
-            ))
+                .bind(&scope)?
+            )
         );
         Ok(())
     }
