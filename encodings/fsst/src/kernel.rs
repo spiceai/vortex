@@ -16,6 +16,8 @@ use vortex_array::scalar_fn::fns::cast::Cast;
 use vortex_array::scalar_fn::fns::cast::CastExecuteAdaptor;
 use vortex_array::scalar_fn::fns::like::Like;
 use vortex_array::scalar_fn::fns::like::LikeExecuteAdaptor;
+use vortex_array::scalar_fn::fns::list_contains::ListContains;
+use vortex_array::scalar_fn::fns::list_contains::ListContainsElementExecuteAdaptor;
 use vortex_session::VortexSession;
 
 use crate::FSST;
@@ -24,6 +26,11 @@ pub(super) fn initialize(session: &VortexSession) {
     let kernels = session.kernels();
     kernels.register_execute_parent_kernel(Cast.id(), FSST, CastExecuteAdaptor(FSST));
     kernels.register_execute_parent_kernel(Binary.id(), FSST, CompareExecuteAdaptor(FSST));
+    kernels.register_execute_parent_kernel(
+        ListContains.id(),
+        FSST,
+        ListContainsElementExecuteAdaptor(FSST),
+    );
     kernels.register_execute_parent_kernel(Filter.id(), FSST, FilterExecuteAdaptor(FSST));
     kernels.register_execute_parent_kernel(Dict.id(), FSST, TakeExecuteAdaptor(FSST));
     kernels.register_execute_parent_kernel(Like.id(), FSST, LikeExecuteAdaptor(FSST));
@@ -61,7 +68,11 @@ mod tests {
     });
 
     fn build_test_fsst_array() -> ArrayRef {
-        let mut builder = VarBinBuilder::<i32>::with_capacity(10);
+        let mut builder = VarBinBuilder::<i32>::with_capacity_in(
+            DType::Utf8(Nullability::NonNullable),
+            10,
+            vortex_buffer::BufferAllocatorRef::static_ref(),
+        );
         builder.append_value(b"hello world");
         builder.append_value(b"foo bar baz");
         builder.append_value(b"testing fsst compression");
@@ -72,7 +83,7 @@ mod tests {
         builder.append_value(b"qrstuvwxyz");
         builder.append_value(b"0123456789");
         builder.append_value(b"final string");
-        let input = builder.finish(DType::Utf8(Nullability::NonNullable));
+        let input = builder.finish_into_varbin();
 
         let mut ctx = SESSION.create_execution_ctx();
         let arr = input.into_array();
@@ -131,7 +142,11 @@ mod tests {
         // Test case with special characters and nulls
         // Values: ["", "", "", "", "", "", "", "", "", "", "", ",", "A<<<<<<<", "", "", "", "", null, null, null, null, null, null]
         // Mask: only the last element is selected (true at index 22)
-        let mut builder = VarBinBuilder::<i32>::with_capacity(23);
+        let mut builder = VarBinBuilder::<i32>::with_capacity_in(
+            DType::Utf8(Nullability::Nullable),
+            23,
+            vortex_buffer::BufferAllocatorRef::static_ref(),
+        );
         // 11 empty strings
         for _ in 0..11 {
             builder.append_value(b"");
@@ -146,9 +161,9 @@ mod tests {
         }
         // 6 nulls
         for _ in 0..6 {
-            builder.append_null();
+            builder.push_null();
         }
-        let input = builder.finish(DType::Utf8(Nullability::Nullable));
+        let input = builder.finish_into_varbin();
         let array = input.clone().into_array();
 
         let mut ctx = SESSION.create_execution_ctx();
@@ -172,12 +187,16 @@ mod tests {
 
     #[test]
     fn filter_only_null() -> VortexResult<()> {
-        let mut builder = VarBinBuilder::<i32>::with_capacity(3);
-        builder.append_null();
+        let mut builder = VarBinBuilder::<i32>::with_capacity_in(
+            DType::Utf8(Nullability::Nullable),
+            3,
+            vortex_buffer::BufferAllocatorRef::static_ref(),
+        );
+        builder.push_null();
         builder.append_value(b"A");
-        builder.append_null();
+        builder.push_null();
 
-        let input = builder.finish(DType::Utf8(Nullability::Nullable));
+        let input = builder.finish_into_varbin();
         let array = input.clone().into_array();
 
         let mut ctx = SESSION.create_execution_ctx();
@@ -213,15 +232,17 @@ mod tests {
 
     #[test]
     fn test_fsst_byte_length() -> VortexResult<()> {
-        let mut builder = VarBinBuilder::<i32>::with_capacity(3);
+        let mut builder = VarBinBuilder::<i32>::with_capacity_in(
+            DType::Utf8(Nullability::NonNullable),
+            3,
+            vortex_buffer::BufferAllocatorRef::static_ref(),
+        );
         builder.append_value(b"hello");
         builder.append_value(b"world!!");
         builder.append_value("Пуховички"); // 9 characters, 18 bytes
         builder.append_value(b"");
 
-        let varbin = builder
-            .finish(DType::Utf8(Nullability::NonNullable))
-            .into_array();
+        let varbin = builder.finish_into_varbin().into_array();
         let mut ctx = SESSION.create_execution_ctx();
         let compressor = fsst_train_compressor(&varbin, &mut ctx)?;
         let fsst = fsst_compress(&varbin, &compressor, &mut ctx)?.into_array();

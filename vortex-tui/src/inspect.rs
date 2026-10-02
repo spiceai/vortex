@@ -185,22 +185,22 @@ async fn exec_inspect_json(
                     dtype: ps.dtype.map(|s| SegmentInfoJson {
                         offset: s.offset,
                         length: s.length,
-                        alignment: *s.alignment,
+                        alignment: s.alignment.as_usize(),
                     }),
                     layout: SegmentInfoJson {
                         offset: ps.layout.offset,
                         length: ps.layout.length,
-                        alignment: *ps.layout.alignment,
+                        alignment: ps.layout.alignment.as_usize(),
                     },
                     statistics: ps.statistics.map(|s| SegmentInfoJson {
                         offset: s.offset,
                         length: s.length,
-                        alignment: *s.alignment,
+                        alignment: s.alignment.as_usize(),
                     }),
                     footer: SegmentInfoJson {
                         offset: ps.footer.offset,
                         length: ps.footer.length,
-                        alignment: *ps.footer.alignment,
+                        alignment: ps.footer.alignment.as_usize(),
                     },
                 })
         } else {
@@ -239,7 +239,7 @@ async fn exec_inspect_json(
                         offset: segment.offset,
                         end_offset: segment.offset + segment.length as u64,
                         length: segment.length,
-                        alignment: *segment.alignment,
+                        alignment: segment.alignment.as_usize(),
                         path: segment_paths[i]
                             .as_ref()
                             .map(|p| p.iter().map(|s| s.as_ref()).collect::<Vec<_>>().join(".")),
@@ -402,34 +402,28 @@ impl<'a> VortexInspector<'a> {
         let fb_postscript = root::<fb::Postscript>(&postscript_buffer)
             .map_err(|e| vortex_err!("Failed to parse postscript flatbuffer: {}", e))?;
 
-        let dtype = fb_postscript.dtype().map(|s| SegmentInfo {
-            offset: s.offset(),
-            length: s.length(),
-            alignment: Alignment::from_exponent(s.alignment_exponent()),
-        });
+        let segment_info = |s: fb::PostscriptSegment<'_>| -> VortexResult<SegmentInfo> {
+            Ok(SegmentInfo {
+                offset: s.offset(),
+                length: s.length(),
+                alignment: Alignment::try_from_exponent(s.alignment_exponent())?,
+            })
+        };
+
+        let dtype = fb_postscript.dtype().map(segment_info).transpose()?;
 
         let layout = fb_postscript
             .layout()
-            .map(|s| SegmentInfo {
-                offset: s.offset(),
-                length: s.length(),
-                alignment: Alignment::from_exponent(s.alignment_exponent()),
-            })
+            .map(segment_info)
+            .transpose()?
             .ok_or_else(|| vortex_err!("Postscript missing layout segment"))?;
 
-        let statistics = fb_postscript.statistics().map(|s| SegmentInfo {
-            offset: s.offset(),
-            length: s.length(),
-            alignment: Alignment::from_exponent(s.alignment_exponent()),
-        });
+        let statistics = fb_postscript.statistics().map(segment_info).transpose()?;
 
         let footer = fb_postscript
             .footer()
-            .map(|s| SegmentInfo {
-                offset: s.offset(),
-                length: s.length(),
-                alignment: Alignment::from_exponent(s.alignment_exponent()),
-            })
+            .map(segment_info)
+            .transpose()?
             .ok_or_else(|| vortex_err!("Postscript missing footer segment"))?;
 
         Ok(PostscriptInfo {
@@ -617,7 +611,7 @@ impl FooterSegments {
             print!(
                 "{:>length_w$}  {:>align_w$}  ",
                 segment.length,
-                *segment.alignment,
+                segment.alignment.as_usize(),
                 length_w = length_width,
                 align_w = alignment_width,
             );

@@ -4,6 +4,7 @@
 use std::any::Any;
 use std::sync::Arc;
 
+use vortex_session::ArcSwapMap;
 use vortex_session::SessionExt;
 use vortex_session::SessionGuard;
 use vortex_session::SessionVar;
@@ -32,10 +33,11 @@ use crate::aggregate_fn::fns::nan_count::NanCount;
 use crate::aggregate_fn::fns::null_count::NullCount;
 use crate::aggregate_fn::fns::sum::PrimitiveGroupedSumEncodingKernel;
 use crate::aggregate_fn::fns::sum::Sum;
+use crate::aggregate_fn::fns::sum_v2::PrimitiveGroupedSumV2EncodingKernel;
+use crate::aggregate_fn::fns::sum_v2::SumV2;
 use crate::aggregate_fn::fns::uncompressed_size_in_bytes::UncompressedSizeInBytes;
 use crate::aggregate_fn::kernels::DynAggregateKernel;
 use crate::aggregate_fn::kernels::DynGroupedAggregateKernel;
-use crate::arc_swap_map::ArcSwapMap;
 use crate::array::ArrayId;
 use crate::array::VTable;
 use crate::arrays::Chunked;
@@ -54,12 +56,11 @@ use crate::dtype::DType;
 /// [`VortexSession`](vortex_session::VortexSession).
 #[derive(Clone, Debug)]
 pub struct AggregateFnSession {
-    registry: ArcSwapMap<AggregateFnId, AggregateFnPluginRef>,
+    registry: AggregateFnRegistry,
 
-    kernels: ArcSwapMap<AggregateKernelKey, &'static dyn DynAggregateKernel>,
-    grouped_kernels: ArcSwapMap<AggregateFnId, &'static dyn DynGroupedAggregateKernel>,
-    grouped_encoding_kernels:
-        ArcSwapMap<GroupedEncodingKernelKey, &'static dyn DynGroupedAggregateKernel>,
+    kernels: AggregateKernelRegistry,
+    grouped_kernels: GroupedKernelRegistry,
+    grouped_encoding_kernels: GroupedEncodingKernelRegistry,
 }
 
 impl SessionVar for AggregateFnSession {
@@ -75,13 +76,23 @@ impl SessionVar for AggregateFnSession {
 type AggregateKernelKey = (ArrayId, Option<AggregateFnId>);
 type GroupedEncodingKernelKey = (ArrayId, AggregateFnId);
 
+/// Registry of aggregate function plugins, keyed by aggregate function id.
+type AggregateFnRegistry = ArcSwapMap<AggregateFnId, AggregateFnPluginRef>;
+/// Registry of aggregate kernels, keyed by encoding and optional aggregate function.
+type AggregateKernelRegistry = ArcSwapMap<AggregateKernelKey, &'static dyn DynAggregateKernel>;
+/// Registry of encoding-agnostic grouped aggregate kernels, keyed by aggregate function id.
+type GroupedKernelRegistry = ArcSwapMap<AggregateFnId, &'static dyn DynGroupedAggregateKernel>;
+/// Registry of grouped aggregate kernels, keyed by encoding and aggregate function.
+type GroupedEncodingKernelRegistry =
+    ArcSwapMap<GroupedEncodingKernelKey, &'static dyn DynGroupedAggregateKernel>;
+
 impl Default for AggregateFnSession {
     fn default() -> Self {
         let this = Self {
-            registry: ArcSwapMap::default(),
-            kernels: ArcSwapMap::default(),
-            grouped_kernels: ArcSwapMap::default(),
-            grouped_encoding_kernels: ArcSwapMap::default(),
+            registry: AggregateFnRegistry::default(),
+            kernels: AggregateKernelRegistry::default(),
+            grouped_kernels: GroupedKernelRegistry::default(),
+            grouped_encoding_kernels: GroupedEncodingKernelRegistry::default(),
         };
 
         // Register the built-in aggregate functions
@@ -102,6 +113,7 @@ impl Default for AggregateFnSession {
         this.register(NanCount);
         this.register(NullCount);
         this.register(Sum);
+        this.register(SumV2);
         this.register(UncompressedSizeInBytes);
 
         // Register the built-in aggregate kernels.
@@ -116,6 +128,11 @@ impl Default for AggregateFnSession {
             Primitive.id(),
             Sum.id(),
             &PrimitiveGroupedSumEncodingKernel,
+        );
+        this.register_grouped_encoding_kernel(
+            Primitive.id(),
+            SumV2.id(),
+            &PrimitiveGroupedSumV2EncodingKernel,
         );
 
         this

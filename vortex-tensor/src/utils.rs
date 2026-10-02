@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use half::f16;
 use prost::Message;
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
@@ -11,9 +10,8 @@ use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::FixedSizeListArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::ScalarFn;
-use vortex_array::arrays::fixed_size_list::FixedSizeListArrayExt;
+use vortex_array::arrays::fixed_size_list::FixedSizeListArraySlotsExt;
 use vortex_array::arrays::primitive::PrimitiveArrayExt;
-use vortex_array::arrays::scalar_fn::ExactScalarFn;
 use vortex_array::arrays::scalar_fn::ScalarFnArrayExt;
 use vortex_array::arrays::scalar_fn::ScalarFnArrayView;
 use vortex_array::dtype::DType;
@@ -21,7 +19,7 @@ use vortex_array::dtype::NativePType;
 use vortex_array::dtype::PType;
 use vortex_array::dtype::proto::dtype as pb;
 use vortex_array::scalar_fn::ScalarFnVTable;
-use vortex_error::VortexExpect;
+use vortex_buffer::Buffer;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
@@ -29,48 +27,6 @@ use vortex_session::VortexSession;
 
 use crate::matcher::AnyTensor;
 use crate::matcher::TensorMatch;
-use crate::scalar_fns::l2_denorm::L2Denorm;
-
-/// Safety factor for unit-norm tolerance. Applied as a constant multiplier on the probabilistic
-/// `√d · ε` bound so that legitimate round-off noise clears the check with headroom.
-pub(crate) const SAFETY_FACTOR: usize = 10;
-
-/// Returns the acceptable unit-norm drift for the given element precision and dimension count.
-///
-/// Uses the `c · √d · ε` bound where ε is machine epsilon and d is the vector dimension. Under
-/// IEEE 754 round-to-nearest the probabilistic (RMS-case) forward error for computing ‖x‖₂ grows
-/// as `O(√d · ε)` rather than the worst-case `O(d · ε)` from the classical Wilkinson bound,
-/// assuming near-independent rounding errors across the d-term summation.
-///
-/// Reference: Croci, Fasi, Higham, Mary, Mikaitis (2022). "Stochastic rounding: implementation,
-/// error analysis and applications." Royal Society Open Science, 9: 211631, §6.1 "Probabilistic
-/// error analysis." <https://doi.org/10.1098/rsos.211631>
-pub fn unit_norm_tolerance(element_ptype: PType, dimensions: usize) -> f64 {
-    let machine_epsilon: f64 = match element_ptype {
-        PType::F64 => f64::EPSILON,
-        PType::F32 => f32::EPSILON as f64,
-        PType::F16 => f16::EPSILON.to_f64_const(),
-        _ => unreachable!("unit_norm_tolerance requires a float ptype, got {element_ptype:?}"),
-    };
-
-    let dimensions_root = (dimensions as f64).sqrt();
-
-    SAFETY_FACTOR as f64 * machine_epsilon * dimensions_root
-}
-
-/// Extracts the `(normalized, norms)` children from an [`L2Denorm`] scalar function array.
-///
-/// [`L2Denorm`]: crate::scalar_fns::l2_denorm::L2Denorm
-pub fn extract_l2_denorm_children(array: &ArrayRef) -> (ArrayRef, ArrayRef) {
-    let sfn = array
-        .as_opt::<ExactScalarFn<L2Denorm>>()
-        .vortex_expect("expected ScalarFnArray wrapping L2Denorm");
-    (
-        sfn.nth_child(0)
-            .vortex_expect("L2Denorm missing normalized array"),
-        sfn.nth_child(1).vortex_expect("L2Denorm missing norms"),
-    )
-}
 
 /// Validates that `input_dtype` is a float-valued tensor-like extension dtype.
 pub fn validate_tensor_float_input(input_dtype: &DType) -> VortexResult<TensorMatch<'_>> {
@@ -132,13 +88,29 @@ impl FlatElements {
         let slice = self.elems.as_slice::<T>();
         &slice[row_idx * self.list_size..][..self.list_size]
     }
+
+    /// Returns the number of elements in each row.
+    #[must_use]
+    pub fn list_size(&self) -> usize {
+        self.list_size
+    }
+
+    /// Returns the physical distance between rows, or zero when every row uses one stored value.
+    #[must_use]
+    pub fn row_stride(&self) -> usize {
+        if self.is_constant { 0 } else { self.list_size }
+    }
+
+    /// Returns the elements as a typed buffer, performing the ptype check once for the batch.
+    pub fn into_buffer<T: NativePType>(self) -> Buffer<T> {
+        self.elems.into_buffer::<T>()
+    }
 }
 
 /// Extracts the flat primitive elements from a tensor storage array (FixedSizeList).
 ///
 /// When the input is a [`ConstantArray`] (e.g., a literal query vector), only a single row is
-/// materialized to avoid expanding it to the full column length. Callers that have already
-/// confirmed the storage is constant-backed should prefer [`extract_constant_flat_row`].
+/// materialized to avoid expanding it to the full column length.
 pub fn extract_flat_elements(
     storage: &ArrayRef,
     list_size: usize,
@@ -165,57 +137,6 @@ pub fn extract_flat_elements(
         list_size,
         is_constant,
     })
-}
-
-/// The single stored row of a constant-backed tensor storage array.
-///
-/// Contrast with [`FlatElements`], which exposes arbitrary row indices: a `FlatRow` statically
-/// encodes "there is exactly one row available," so call sites that have gated on a constant input
-/// read the row via [`Self::as_slice`] instead of `row(0)`.
-pub struct FlatRow {
-    elems: PrimitiveArray,
-}
-
-impl FlatRow {
-    /// Returns the [`PType`] of the underlying elements.
-    #[must_use]
-    pub fn ptype(&self) -> PType {
-        self.elems.ptype()
-    }
-
-    /// Returns the stored row as a typed slice. Its length equals the storage scalar's
-    /// fixed-size-list size.
-    #[must_use]
-    pub fn as_slice<T: NativePType>(&self) -> &[T] {
-        self.elems.as_slice::<T>()
-    }
-}
-
-/// Extracts the single stored row from a [`Constant`]-backed tensor storage array.
-///
-/// The caller must have confirmed that `storage` is a [`Constant`] encoding whose scalar is a
-/// non-null fixed-size list. This is the fast path for constant query vectors: exactly one row is
-/// materialized regardless of the column length.
-///
-/// # Panics
-///
-/// Panics if `storage` is not a [`Constant`] encoding.
-pub fn extract_constant_flat_row(
-    storage: &ArrayRef,
-    ctx: &mut ExecutionCtx,
-) -> VortexResult<FlatRow> {
-    let constant = storage
-        .as_opt::<Constant>()
-        .vortex_expect("extract_constant_flat_row requires Constant-backed storage");
-    let single = ConstantArray::new(constant.scalar().clone(), 1).into_array();
-    let fsl: FixedSizeListArray = single.execute(ctx)?;
-    let elems: PrimitiveArray = fsl.elements().clone().execute(ctx)?;
-    vortex_ensure!(
-        !elems.nullability().is_nullable(),
-        "tensor storage elements must be non-nullable, got {}",
-        elems.dtype(),
-    );
-    Ok(FlatRow { elems })
 }
 
 /// Metadata for a serialized binary tensor-op array (shared by [`InnerProduct`] and
@@ -280,12 +201,10 @@ impl BinaryTensorOpMetadata {
 #[cfg(test)]
 pub mod test_helpers {
     use vortex_array::ArrayRef;
-    use vortex_array::ExecutionCtx;
     use vortex_array::IntoArray;
     use vortex_array::arrays::ConstantArray;
     use vortex_array::arrays::ExtensionArray;
     use vortex_array::arrays::FixedSizeListArray;
-    use vortex_array::arrays::PrimitiveArray;
     use vortex_array::dtype::DType;
     use vortex_array::dtype::NativePType;
     use vortex_array::dtype::Nullability;
@@ -296,7 +215,6 @@ pub mod test_helpers {
     use vortex_buffer::Buffer;
     use vortex_error::VortexResult;
 
-    use crate::scalar_fns::l2_denorm::L2Denorm;
     use crate::types::fixed_shape_tensor::FixedShapeTensor;
     use crate::types::fixed_shape_tensor::FixedShapeTensorMetadata;
     use crate::types::vector::Vector;
@@ -362,21 +280,6 @@ pub mod test_helpers {
         use vortex_array::EmptyMetadata;
         let ext_scalar = Scalar::extension::<Vector>(EmptyMetadata, fsl_scalar(elements));
         ConstantArray::new(ext_scalar, len).into_array()
-    }
-
-    /// Creates an [`L2Denorm`] scalar function array from pre-normalized tensor elements and
-    /// matching norms. The caller must ensure every row of `normalized_elements` is unit-norm or
-    /// zero.
-    pub fn l2_denorm_array<T: NativePType>(
-        shape: &[usize],
-        normalized_elements: &[T],
-        norms: &[T],
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<ArrayRef> {
-        let normalized = tensor_array(shape, normalized_elements)?;
-        let norms =
-            PrimitiveArray::new(Buffer::copy_from(norms), Validity::NonNullable).into_array();
-        Ok(L2Denorm::try_new_array(normalized, norms, ctx)?.into_array())
     }
 
     /// Asserts that each element in `actual` is within `1e-10` of the corresponding `expected`

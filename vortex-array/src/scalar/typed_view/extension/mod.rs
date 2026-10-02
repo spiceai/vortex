@@ -82,6 +82,11 @@ impl<'a> ExtScalar<'a> {
             .vortex_expect("ExtScalar is invalid")
     }
 
+    /// Returns a reference to the underlying value
+    pub fn value(&self) -> Option<&ScalarValue> {
+        self.value
+    }
+
     /// Casts this scalar to the given `dtype`.
     pub(crate) fn cast(&self, target_dtype: &DType) -> VortexResult<Scalar> {
         if self.value.is_none() && !target_dtype.is_nullable() {
@@ -188,7 +193,7 @@ impl PartialOrd for ExtScalar<'_> {
 
 impl Hash for ExtScalar<'_> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.ext_dtype.hash(state);
+        self.ext_dtype.hash_ignore_nullability(state);
         self.to_storage_scalar().hash(state);
     }
 }

@@ -58,13 +58,18 @@ struct Args {
     #[arg(short, long, value_delimiter = ',')]
     exclude_queries: Option<Vec<usize>>,
 
+    /// Print the selected query indices, one per line, and exit
+    /// Knowledge of query ids lies only in this binary so we need
+    /// orchestrator to know whan queries to run one by one.
+    #[arg(long, default_value_t = false)]
+    print_queries: bool,
+
     #[arg(short)]
     output_path: Option<PathBuf>,
 
-    /// Additionally write v3 JSONL records to this path. See
-    /// `benchmarks-website/planning/02-contracts.md`.
-    #[arg(long)]
-    gh_json_v3: Option<PathBuf>,
+    /// Additionally write benchmark ingest JSONL records to this path.
+    #[arg(long = "ingest-jsonl")]
+    ingest_output: Option<PathBuf>,
 
     #[arg(long, default_value_t = false)]
     hide_progress_bar: bool,
@@ -93,6 +98,13 @@ async fn main() -> anyhow::Result<()> {
         args.queries.as_ref(),
         args.exclude_queries.as_ref(),
     );
+
+    if args.print_queries {
+        for (query_idx, _) in &filtered_queries {
+            println!("{query_idx}");
+        }
+        return Ok(());
+    }
 
     // Generate base Parquet data first
     benchmark.generate_base_data().await?;
@@ -131,7 +143,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .await?;
 
-    if let Some(path) = args.gh_json_v3.as_ref() {
+    if let Some(path) = args.ingest_output.as_ref() {
         v3::write_jsonl_to_path(path, &runner.v3_records())?;
     }
 
@@ -219,23 +231,15 @@ async fn generate_lance_data<B: Benchmark + ?Sized>(benchmark: &B) -> anyhow::Re
 
     // Convert each table to Lance format
     for table in benchmark.table_specs().iter() {
-        // Determine file prefix pattern for this table
-        // TPC-H/TPC-DS use {table}_ prefix, others may use the table name directly
-        let file_prefix = benchmark
+        let file_pattern = benchmark
             .pattern(table.name, Format::Parquet)
-            .and_then(|p| {
-                // Extract prefix from pattern like "customer_*.parquet" -> "customer_"
-                let pattern_str = p.as_str();
-                pattern_str
-                    .strip_suffix(&format!("*.{}", Format::Parquet.ext()))
-                    .map(|s| s.to_string())
-            });
+            .map(|p| p.to_string());
 
         convert_parquet_to_lance(
             &parquet_dir,
             &lance_dir,
             table.name,
-            file_prefix.as_deref(),
+            file_pattern.as_deref(),
             true, // Convert Utf8View to Utf8 for Lance compatibility
         )
         .await?;

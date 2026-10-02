@@ -38,7 +38,7 @@ use vortex::array::arrays::extension::ExtensionArrayExt;
 use vortex::array::arrays::fixed_size_list::FixedSizeListArrayExt;
 use vortex::array::arrays::fixed_size_list::FixedSizeListDataParts;
 use vortex::array::arrays::list::ListDataParts;
-use vortex::array::arrays::listview::ListViewArrayExt;
+use vortex::array::arrays::listview::ListViewArraySlotsExt;
 use vortex::array::arrays::listview::list_from_list_view;
 use vortex::array::arrays::primitive::PrimitiveDataParts;
 use vortex::array::arrays::struct_::StructDataParts;
@@ -55,12 +55,12 @@ use vortex::dtype::Nullability;
 use vortex::dtype::PType;
 use vortex::dtype::i256;
 use vortex::encodings::fsst::FSST;
-use vortex::encodings::fsst::FSSTArray;
 use vortex::error::VortexResult;
 use vortex::error::vortex_bail;
 use vortex::error::vortex_ensure;
 use vortex::error::vortex_err;
 use vortex::extension::datetime::AnyTemporal;
+use vortex_onpair::OnPair;
 
 use crate::CudaBufferExt;
 use crate::CudaDeviceBuffer;
@@ -81,8 +81,9 @@ use crate::cub::exclusive_sum_i32;
 use crate::device_buffer::CUDF_VALIDITY_BUFFER_PADDING;
 use crate::executor::CudaArrayExt;
 use crate::executor::execute_validity_cuda;
-use crate::kernel::FSSTVarBin;
+use crate::kernel::DecodedVarBin;
 use crate::kernel::decode_fsst_varbin;
+use crate::kernel::decode_onpair_varbin;
 
 /// An implementation of `ExportDeviceArray` that exports Vortex arrays to `ArrowDeviceArray` by
 /// first decoding the array on the GPU and then converting the canonical type to the nearest
@@ -229,9 +230,21 @@ fn export_array(
         // `CudaDispatchMode` only governs `execute_cuda`'s fused-vs-standalone planning.
         let array = match array.try_downcast::<FSST>() {
             Ok(fsst) if ctx.cuda_session().varbin_export_layout() == VarBinExportLayout::VarBin => {
-                return export_fsst_varbin(fsst, ctx).await;
+                let decoded = decode_fsst_varbin(fsst, ctx).await?;
+                return export_decoded_varbin(decoded, ctx).await;
             }
             Ok(fsst) => fsst.into_array(),
+            Err(array) => array,
+        };
+        // OnPair takes the same offset-based export shortcut as FSST.
+        let array = match array.try_downcast::<OnPair>() {
+            Ok(onpair)
+                if ctx.cuda_session().varbin_export_layout() == VarBinExportLayout::VarBin =>
+            {
+                let decoded = decode_onpair_varbin(onpair, ctx).await?;
+                return export_decoded_varbin(decoded, ctx).await;
+            }
+            Ok(onpair) => onpair.into_array(),
             Err(array) => array,
         };
 
@@ -487,11 +500,9 @@ where
             .await;
     }
 
-    let output_buffer = ctx.device_alloc::<D>(len)?;
-    let output_device = CudaDeviceBuffer::new(output_buffer);
+    let mut output_buffer = ctx.device_alloc::<D>(len)?;
 
     let values_view = values.cuda_view::<S>()?;
-    let output_view = output_device.as_view::<D>();
     let len_u64 = len as u64;
     let cuda_function = ctx.load_function_with_suffixes(
         "decimal_cast",
@@ -499,10 +510,12 @@ where
     )?;
 
     ctx.launch_kernel(&cuda_function, len, |args| {
-        args.arg(&values_view).arg(&output_view).arg(&len_u64);
+        args.arg(&values_view).arg(&mut output_buffer).arg(&len_u64);
     })?;
 
-    Ok(BufferHandle::new_device(Arc::new(output_device)))
+    Ok(BufferHandle::new_device(Arc::new(CudaDeviceBuffer::new(
+        output_buffer,
+    ))))
 }
 
 /// Export Vortex binary views as an Arrow Device array with `Utf8View`/`BinaryView` layout.
@@ -581,20 +594,22 @@ async fn export_varbin(
     export_varbin_buffers(len, validity_buffer, null_count, offsets, values, ctx)
 }
 
-async fn export_fsst_varbin(
-    fsst: FSSTArray,
+/// Export an offset-based decompression result (FSST or OnPair) with the
+/// standard Arrow `Utf8`/`Binary` layout.
+async fn export_decoded_varbin(
+    decoded: DecodedVarBin,
     ctx: &mut CudaExecutionCtx,
 ) -> VortexResult<(ArrowArray, SyncEvent)> {
-    let FSSTVarBin {
+    let DecodedVarBin {
         dtype,
         len,
         offsets,
         values,
         validity,
-    } = decode_fsst_varbin(fsst, ctx).await?;
+    } = decoded;
     vortex_ensure!(
         matches!(dtype, DType::Utf8(_) | DType::Binary(_)),
-        "FSST produced invalid variable-length dtype {dtype}"
+        "offset-based decode produced invalid variable-length dtype {dtype}"
     );
     let (validity_buffer, null_count) = export_arrow_validity_buffer(validity, len, 0, ctx).await?;
     export_varbin_buffers(len, validity_buffer, null_count, offsets, values, ctx)
@@ -655,21 +670,25 @@ async fn export_binary_buffers(
     }
     let data_buffer_ptrs = device_buffer_from(ptr_values, ctx).await?;
     let data_buffer_lens = device_buffer_from(len_values, ctx).await?;
-    let status = device_buffer_from(vec![0u32], ctx).await?;
+    let mut status = ctx.device_alloc::<u32>(1)?;
+    ctx.stream()
+        .memset_zeros(&mut status)
+        .map_err(|err| vortex_err!("Failed to zero Arrow Binary status buffer: {err}"))?;
 
     let scan_input = init_binary_scan(
         views,
         validity,
         &data_buffer_lens,
         device_data_buffers.len(),
-        &status,
+        &mut status,
         len,
         ctx,
     )?;
     let output_offsets = BufferHandle::new_device(Arc::new(CudaDeviceBuffer::new(
         exclusive_sum_i32(&scan_input, len + 1, ctx)?,
     )));
-    validate_binary_offsets(&output_offsets, len, &status, ctx)?;
+    validate_binary_offsets(&output_offsets, len, &mut status, ctx)?;
+    let status = BufferHandle::new_device(Arc::new(CudaDeviceBuffer::new(status)));
 
     // One status read covers init_scan and offset validation. Both must pass before gather may
     // dereference view payloads through the scanned offsets. Enqueue both copies up front so the
@@ -726,7 +745,7 @@ fn init_binary_scan(
     validity: Option<&BufferHandle>,
     data_buffer_lens: &BufferHandle,
     data_buffer_count: usize,
-    status: &BufferHandle,
+    status: &mut CudaSlice<u32>,
     len: usize,
     ctx: &mut CudaExecutionCtx,
 ) -> VortexResult<CudaSlice<i32>> {
@@ -738,18 +757,17 @@ fn init_binary_scan(
         .transpose()?
         .unwrap_or(0);
     let lens_view = data_buffer_lens.cuda_view::<u64>()?;
-    let status_view = status.cuda_view::<u32>()?;
     let data_buffer_count_u64 = data_buffer_count as u64;
     let len_u64 = len as u64;
-    let scan_input = ctx.device_alloc::<i32>(scan_len)?;
+    let mut scan_input = ctx.device_alloc::<i32>(scan_len)?;
     let kernel = ctx.load_function_with_suffixes("arrow_binary", &["init_scan"])?;
 
     ctx.launch_kernel(&kernel, scan_len, |args| {
         args.arg(&views_view)
             .arg(&validity_ptr)
             .arg(&lens_view)
-            .arg(&scan_input)
-            .arg(&status_view)
+            .arg(&mut scan_input)
+            .arg(&mut *status)
             .arg(&data_buffer_count_u64)
             .arg(&len_u64);
     })?;
@@ -763,17 +781,16 @@ fn init_binary_scan(
 fn validate_binary_offsets(
     offsets: &BufferHandle,
     len: usize,
-    status: &BufferHandle,
+    status: &mut CudaSlice<u32>,
     ctx: &mut CudaExecutionCtx,
 ) -> VortexResult<()> {
     let scan_len = len + 1;
     let offsets_view = offsets.cuda_view::<i32>()?;
-    let status_view = status.cuda_view::<u32>()?;
     let scan_len_u64 = scan_len as u64;
     let kernel = ctx.load_function_with_suffixes("arrow_binary", &["validate_offsets"])?;
 
     ctx.launch_kernel(&kernel, scan_len, |args| {
-        args.arg(&offsets_view).arg(&status_view).arg(&scan_len_u64);
+        args.arg(&offsets_view).arg(&mut *status).arg(&scan_len_u64);
     })
 }
 
@@ -785,7 +802,7 @@ fn gather_binary_values(
     len: usize,
     ctx: &mut CudaExecutionCtx,
 ) -> VortexResult<BufferHandle> {
-    let output_values = ctx.device_alloc::<u8>(total_bytes.max(1))?;
+    let mut output_values = ctx.device_alloc::<u8>(total_bytes.max(1))?;
 
     if total_bytes != 0 {
         let views_view = views.cuda_view::<u8>()?;
@@ -799,7 +816,7 @@ fn gather_binary_values(
             args.arg(&views_view)
                 .arg(&ptrs_view)
                 .arg(&offsets_view)
-                .arg(&output_values)
+                .arg(&mut output_values)
                 .arg(&len_u64)
                 .arg(&total_bytes_u64);
         })?;
@@ -979,10 +996,8 @@ pub fn count_arrow_validity_nulls(
     ctx.stream()
         .memset_zeros(&mut count)
         .map_err(|err| vortex_err!("Failed to zero Arrow validity count buffer: {err}"))?;
-    let count = CudaDeviceBuffer::new(count);
 
     let input_view = bitmap.cuda_view::<u8>()?;
-    let output_view = count.as_view::<u64>();
     let len = u64::try_from(len)?;
     let arrow_offset = u64::try_from(arrow_offset)?;
 
@@ -998,14 +1013,14 @@ pub fn count_arrow_validity_nulls(
     };
     ctx.launch_kernel_config(&kernel, config, expected_bytes, |args| {
         args.arg(&input_view)
-            .arg(&output_view)
+            .arg(&mut count)
             .arg(&len)
             .arg(&arrow_offset);
     })?;
 
     let valid_count = ctx
         .stream()
-        .clone_dtoh(&output_view)
+        .clone_dtoh(&count)
         .map_err(|err| vortex_err!("Failed to copy Arrow validity count to host: {err}"))?
         .into_iter()
         .next()
@@ -1055,12 +1070,9 @@ pub fn repack_arrow_validity_buffer(
     ctx.stream()
         .memset_zeros(&mut output)
         .map_err(|err| vortex_err!("Failed to zero Arrow validity buffer padding: {err}"))?;
-    // The memset above zeroed all allocation bytes after the logical output.
-    let output_device = CudaDeviceBuffer::new_with_zeroed_tail(output, output_bytes)?;
 
     if output_words > 0 {
         let input_view = input_buffer.cuda_view::<u8>()?;
-        let output_view = output_device.as_view::<u64>();
         let len = u64::try_from(len)?;
         let input_offset = u64::try_from(input_offset)?;
         let arrow_offset = u64::try_from(arrow_offset)?;
@@ -1076,7 +1088,7 @@ pub fn repack_arrow_validity_buffer(
         };
         ctx.launch_kernel_config(&kernel, config, output_words, |args| {
             args.arg(&input_view)
-                .arg(&output_view)
+                .arg(&mut output)
                 .arg(&len)
                 .arg(&input_offset)
                 .arg(&arrow_offset)
@@ -1084,6 +1096,8 @@ pub fn repack_arrow_validity_buffer(
         })?;
     }
 
+    // The memset above zeroed all allocation bytes after the logical output.
+    let output_device = CudaDeviceBuffer::new_with_zeroed_tail(output, output_bytes)?;
     Ok(BufferHandle::new_device(Arc::new(output_device)).slice(0..output_bytes))
 }
 
@@ -1255,13 +1269,13 @@ fn fixed_size_list_offsets(
     let output_len = len
         .checked_add(1)
         .ok_or_else(|| vortex_err!("FixedSizeList Arrow List offsets length overflows usize"))?;
-    let offsets = ctx.device_alloc::<i32>(output_len)?;
+    let mut offsets = ctx.device_alloc::<i32>(output_len)?;
     let base = 0i32;
     let output_len_u64 = output_len as u64;
     let kernel = ctx.load_function_with_suffixes("sequence", &["i32"])?;
 
     ctx.launch_kernel(&kernel, output_len, |args| {
-        args.arg(&offsets)
+        args.arg(&mut offsets)
             .arg(&base)
             .arg(&list_size)
             .arg(&output_len_u64);
@@ -1440,6 +1454,8 @@ mod tests {
     use rstest::rstest;
     use vortex::array::ArrayRef;
     use vortex::array::IntoArray;
+    use vortex::array::VortexSessionExecute;
+    use vortex::array::array_session;
     use vortex::array::arrays::BoolArray;
     use vortex::array::arrays::ChunkedArray;
     use vortex::array::arrays::DecimalArray;
@@ -1502,7 +1518,7 @@ mod tests {
     }
 
     fn cuda_ctx_with_varbin_layout(layout: VarBinExportLayout) -> VortexResult<CudaExecutionCtx> {
-        let session = vortex::array::array_session()
+        let session = array_session()
             .with_some(CudaSession::try_default()?.with_varbin_export_layout(layout));
         CudaSession::create_execution_ctx(&session)
     }
@@ -1670,6 +1686,7 @@ mod tests {
             Arc::from([first, second]),
             dtype,
             Validity::NonNullable,
+            &mut array_session().create_execution_ctx(),
         )
         .vortex_expect("valid multi-buffer VarBinViewArray")
         .into_array();
@@ -2520,10 +2537,9 @@ mod tests {
         let fsst = fsst_compress(&varbin, &compressor, ctx.execution_ctx())?;
 
         // Same codes, but uncompressed lengths whose sum exceeds i32::MAX.
-        let oversized = FSST::try_new(
+        let oversized = FSST::try_new_with_symbol_table(
             DType::Utf8(Nullability::NonNullable),
-            fsst.symbols().clone(),
-            fsst.symbol_lengths().clone(),
+            fsst.symbol_table(),
             fsst.codes(),
             PrimitiveArray::from_iter([i32::MAX, i32::MAX]).into_array(),
             ctx.execution_ctx(),
@@ -2543,7 +2559,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("FSST decoded size exceeds Arrow i32 offset range")
+                .contains("length sum exceeds Arrow i32 offset range")
         );
         Ok(())
     }
@@ -2805,9 +2821,8 @@ mod tests {
         Ok(())
     }
 
-    // Regression test: with an average list size >= 128 the host list-view rebuild picks its
-    // list-by-list strategy, which may canonicalize Dict elements. The schema must describe the
-    // rebuilt child layout.
+    // Regression test: the host list-view rebuild uses a take for large lists, which preserves
+    // dictionary elements. The schema must describe the rebuilt child layout.
     #[crate::test]
     async fn test_export_host_large_lists_dictionary_list_view_schema_matches_rebuilt_child()
     -> VortexResult<()> {
@@ -2836,7 +2851,17 @@ mod tests {
             field,
             Field::new_list(
                 "",
-                Field::new(Field::LIST_FIELD_DEFAULT_NAME, DataType::Int32, true),
+                Field::new(
+                    Field::LIST_FIELD_DEFAULT_NAME,
+                    DataType::Dictionary(
+                        Box::new(DataType::Int64),
+                        Box::new(DataType::Dictionary(
+                            Box::new(DataType::Int16),
+                            Box::new(DataType::Int32),
+                        )),
+                    ),
+                    true,
+                ),
                 false,
             )
         );
@@ -2846,9 +2871,11 @@ mod tests {
         );
         let list_children = unsafe { std::slice::from_raw_parts(exported.array.array.children, 1) };
         let child = unsafe { &*list_children[0] };
-        assert!(child.dictionary.is_null());
+        assert!(!child.dictionary.is_null());
         assert_eq!(child.length, 256);
         assert_eq!(child.n_buffers, 2);
+        let nested_dict = unsafe { &*child.dictionary };
+        assert!(!nested_dict.dictionary.is_null());
 
         unsafe { release_exported_array(&raw mut exported.array.array) };
         Ok(())

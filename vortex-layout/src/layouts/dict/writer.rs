@@ -13,12 +13,12 @@ use futures::FutureExt;
 use futures::Stream;
 use futures::StreamExt;
 use futures::TryStreamExt;
+use futures::channel::oneshot;
 use futures::future::BoxFuture;
 use futures::pin_mut;
 use futures::stream::BoxStream;
 use futures::stream::once;
 use futures::try_join;
-use vortex_array::ArrayContext;
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
@@ -26,7 +26,7 @@ use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::Dict;
 use vortex_array::builders::dict::DictConstraints;
 use vortex_array::builders::dict::DictEncoder;
-use vortex_array::builders::dict::dict_encoder;
+use vortex_array::builders::dict::dict_encoder_in;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
@@ -38,9 +38,9 @@ use vortex_io::kanal_ext::KanalExt;
 use vortex_io::session::RuntimeSessionExt;
 use vortex_session::VortexSession;
 
-use crate::IntoLayout;
 use crate::LayoutRef;
 use crate::LayoutStrategy;
+use crate::LayoutWriterContext;
 use crate::OwnedLayoutChildren;
 use crate::layouts::chunked::ChunkedLayout;
 use crate::layouts::compressed::CompressorPlugin;
@@ -133,7 +133,7 @@ impl DictStrategy {
 impl LayoutStrategy for DictStrategy {
     async fn write_stream(
         &self,
-        ctx: ArrayContext,
+        ctx: LayoutWriterContext,
         segment_sink: SegmentSinkRef,
         stream: SendableSequentialStream,
         mut eof: SequencePointer,
@@ -196,8 +196,7 @@ impl LayoutStrategy for DictStrategy {
                 let ctx2 = ctx.clone();
                 let segment_sink2 = Arc::clone(&segment_sink);
                 let session2 = session.clone();
-                let codes_fut = handle.spawn_nested(move |h| async move {
-                    let session2 = session2.with_handle(h);
+                let codes_fut = handle.spawn_nested(move |_| async move {
                     codes.write_stream(
                         ctx2,
                         segment_sink2,
@@ -213,8 +212,7 @@ impl LayoutStrategy for DictStrategy {
                 let segment_sink2 = Arc::clone(&segment_sink);
                 let dtype2 = dtype2.clone();
                 let session2 = session.clone();
-                let values_layout = handle.spawn_nested(move |h| async move {
-                    let session2 = session2.with_handle(h);
+                let values_layout = handle.spawn_nested(move |_| async move {
                     values.write_stream(
                         ctx2,
                         segment_sink2,
@@ -251,10 +249,6 @@ impl LayoutStrategy for DictStrategy {
             OwnedLayoutChildren::layout_children(child_layouts),
         )
         .into_layout())
-    }
-
-    fn buffered_bytes(&self) -> u64 {
-        self.codes.buffered_bytes() + self.values.buffered_bytes() + self.fallback.buffered_bytes()
     }
 }
 
@@ -566,7 +560,7 @@ fn start_encoding(
     chunk: &ArrayRef,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<EncodingState> {
-    let encoder = dict_encoder(chunk, constraints);
+    let encoder = dict_encoder_in(chunk, constraints, ctx.allocator().clone());
     encode_chunk(encoder, chunk, ctx)
 }
 

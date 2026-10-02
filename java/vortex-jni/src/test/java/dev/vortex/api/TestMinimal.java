@@ -6,6 +6,7 @@ package dev.vortex.api;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import dev.vortex.arrow.ArrowAllocation;
 import dev.vortex.jni.NativeLoader;
@@ -14,7 +15,6 @@ import java.math.BigDecimal;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Objects;
 import org.apache.arrow.c.ArrowArray;
@@ -86,7 +86,8 @@ public final class TestMinimal {
                 Field.notNullable("Salary", ArrowType.Decimal.createDecimal(9, 2, 128)),
                 Field.nullable("State", ArrowType.Utf8View.INSTANCE)));
         Session session = Session.create();
-        try (VortexWriter writer = VortexWriter.create(session, writePath, schema, new HashMap<>(), allocator);
+        try (VortexWriter writer = VortexWriter.builder(session, writePath, schema, allocator)
+                        .build();
                 VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
             ViewVarCharVector nameVec = (ViewVarCharVector) root.getVector("Name");
             DecimalVector salaryVec = (DecimalVector) root.getVector("Salary");
@@ -226,10 +227,14 @@ public final class TestMinimal {
     }
 
     @Test
-    public void testSelectionIndicesMustBeSortedAndUnique() {
-        IllegalArgumentException exception =
-                assertThrows(IllegalArgumentException.class, () -> ScanOptions.includeRows(2, 1));
-        assertEquals("selection indices must be sorted ascending and unique", exception.getMessage());
+    public void testSelectionIndicesMustBeSortedAndUnique() throws Exception {
+        Session session = Session.create();
+        DataSource ds = DataSource.open(session, writePath);
+
+        RuntimeException exception = assertThrows(RuntimeException.class, () -> ds.scan(ScanOptions.includeRows(2, 1)));
+        assertTrue(
+                exception.getMessage().contains("must be strictly increasing"),
+                "unexpected message: " + exception.getMessage());
     }
 
     @Test
