@@ -311,4 +311,89 @@ mod tests {
         assert_arrays_eq!(compressed, array, &mut ctx);
         Ok(())
     }
+
+    /// Strings shaped like JSON documents, with a seed so two calls draw different data.
+    fn json_strings(rows: usize, seed: u64) -> VarBinViewArray {
+        let mut state = seed;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        VarBinViewArray::from_iter_str((0..rows).map(|row| {
+            let mut s = format!("{{\"id\":{row},\"items\":[");
+            for _ in 0..(next() % 8 + 1) {
+                let v = next();
+                s.push_str(&format!(
+                    "{{\"sku\":\"SKU-{:08x}\",\"qty\":{}}},",
+                    v >> 32,
+                    (v >> 40) % 50
+                ));
+            }
+            s.push_str("]}");
+            s
+        }))
+    }
+
+    #[test]
+    fn replaying_a_plan_reproduces_the_search_on_the_same_array() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let input = json_strings(4096, 7).into_array();
+        let compressor = BtrBlocksCompressor::default();
+
+        let searched = compressor.compress(&input, &mut ctx)?;
+        let (recorded, plan) = compressor.compress_recording(&input, &mut ctx)?;
+        let replayed = compressor.compress_with_plan(&input, &plan, &mut ctx)?;
+
+        assert!(!plan.is_empty(), "recording decided nothing");
+        let tree = searched.display_tree_encodings_only().to_string();
+        assert_eq!(recorded.display_tree_encodings_only().to_string(), tree);
+        assert_eq!(replayed.display_tree_encodings_only().to_string(), tree);
+        assert_eq!(replayed.nbytes(), searched.nbytes());
+        assert_arrays_eq!(replayed, input, &mut ctx);
+        Ok(())
+    }
+
+    #[test]
+    fn a_replayed_plan_roundtrips_other_data_of_the_same_dtype() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let compressor = BtrBlocksCompressor::default();
+        let (recorded, plan) =
+            compressor.compress_recording(&json_strings(1024, 7).into_array(), &mut ctx)?;
+
+        // Different rows, and short repeated strings the recorded data never had.
+        let other = json_strings(1024, 11).into_array();
+        let replayed = compressor.compress_with_plan(&other, &plan, &mut ctx)?;
+        assert_arrays_eq!(replayed, other, &mut ctx);
+
+        let repeated = VarBinViewArray::from_iter_str((0..1024).map(|i| ["a", "bb", "ccc"][i % 3]))
+            .into_array();
+        let replayed = compressor.compress_with_plan(&repeated, &plan, &mut ctx)?;
+        assert_arrays_eq!(replayed, repeated, &mut ctx);
+        // The replay used the recorded scheme rather than searching again: a search on these
+        // strings picks a different one.
+        let searched = compressor.compress(&repeated, &mut ctx)?;
+        assert_ne!(searched.encoding_id(), recorded.encoding_id());
+        assert_eq!(replayed.encoding_id(), recorded.encoding_id());
+        Ok(())
+    }
+
+    #[test]
+    fn an_empty_plan_falls_back_to_the_search() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let input = json_strings(2048, 3).into_array();
+        let compressor = BtrBlocksCompressor::default();
+
+        let searched = compressor.compress(&input, &mut ctx)?;
+        let replayed =
+            compressor.compress_with_plan(&input, &crate::CompressionPlan::default(), &mut ctx)?;
+
+        assert_eq!(
+            replayed.display_tree_encodings_only().to_string(),
+            searched.display_tree_encodings_only().to_string()
+        );
+        assert_eq!(replayed.nbytes(), searched.nbytes());
+        Ok(())
+    }
 }

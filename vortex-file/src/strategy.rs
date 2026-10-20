@@ -68,6 +68,7 @@ pub struct WriteStrategyBuilder {
     compressor: CompressorConfig,
     row_block_size: usize,
     data_block_target_bytes: Option<u64>,
+    data_block_max_bytes: Option<u64>,
     field_writers: HashMap<FieldPath, Arc<dyn LayoutStrategy>>,
     flat_strategy: Option<Arc<dyn LayoutStrategy>>,
     probe_compressor: Option<Arc<dyn CompressorPlugin>>,
@@ -108,6 +109,7 @@ impl Default for WriteStrategyBuilder {
             compressor: CompressorConfig::BtrBlocks(BtrBlocksCompressorBuilder::default()),
             row_block_size: 8192,
             data_block_target_bytes: Some(ONE_MEG),
+            data_block_max_bytes: None,
             field_writers: HashMap::new(),
             flat_strategy: None,
             probe_compressor: None,
@@ -132,6 +134,22 @@ impl WriteStrategyBuilder {
     /// [`Self::with_row_block_size`].
     pub fn with_data_block_target_bytes(mut self, target_bytes: Option<u64>) -> Self {
         self.data_block_target_bytes = target_bytes;
+        self
+    }
+
+    /// Cap the uncompressed bytes a data block of a string or binary column references.
+    ///
+    /// A data block holds a multiple of [`Self::with_row_block_size`] rows. For a fixed-width
+    /// type the row count shrinks to stay near [`Self::with_data_block_target_bytes`]; a string
+    /// or binary column has no fixed width, so its blocks hold the full row count whatever its
+    /// rows weigh, and a reader that needs one row reads the whole block. With a maximum, a
+    /// block over it is split into blocks of a power-of-two number of rows, each at or under
+    /// about the maximum. Zone statistics keep [`Self::with_row_block_size`] rows. Encodings
+    /// are chosen once per [`Self::with_row_block_size`] rows and reused for the split blocks.
+    ///
+    /// `None`, the default, leaves blocks at the row block size.
+    pub fn with_data_block_max_bytes(mut self, max_bytes: Option<u64>) -> Self {
+        self.data_block_max_bytes = max_bytes;
         self
     }
 
@@ -221,7 +239,10 @@ impl WriteStrategyBuilder {
             ),
             CompressorConfig::Opaque(compressor) => Arc::clone(compressor),
         };
-        let compressing = CompressingStrategy::new(buffered, data_compressor);
+        // Choose encodings once per row block, even when a block is split into smaller data
+        // blocks (see `with_data_block_max_bytes`).
+        let compressing = CompressingStrategy::new(buffered, data_compressor)
+            .with_group_rows(self.row_block_size);
 
         // 4. prior to compression, coalesce up to a minimum size
         let coalescing = RepartitionStrategy::new(
@@ -238,7 +259,8 @@ impl WriteStrategyBuilder {
                 block_size_target: self.data_block_target_bytes,
                 canonicalize: true,
             },
-        );
+        )
+        .with_block_size_maximum(self.data_block_max_bytes);
 
         // 2.1. | 3.1. compress stats tables and dict values.
         let stats_compressor: Arc<dyn CompressorPlugin> = match compressor {

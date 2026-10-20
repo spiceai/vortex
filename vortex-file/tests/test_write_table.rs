@@ -18,6 +18,7 @@ use vortex_array::arrays::StructArray;
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::dtype::FieldNames;
 use vortex_array::field_path;
+use vortex_array::stream::ArrayStreamExt;
 use vortex_array::validity::Validity;
 use vortex_btrblocks::BtrBlocksCompressor;
 use vortex_buffer::ByteBuffer;
@@ -214,4 +215,62 @@ async fn test_write_empty_nullable_struct_column() {
         rows += next.expect("read back should succeed").len();
     }
     assert_eq!(rows, 0);
+}
+
+/// Writes `data` with the default strategy and an optional data block maximum, and returns the
+/// file read back with its segment count.
+async fn roundtrip_with_block_max(
+    data: vortex_array::ArrayRef,
+    max_bytes: Option<u64>,
+) -> vortex_error::VortexResult<(vortex_array::ArrayRef, usize)> {
+    let strategy = vortex_file::WriteStrategyBuilder::default()
+        .with_data_block_max_bytes(max_bytes)
+        .build();
+    let mut bytes = Vec::new();
+    SESSION
+        .write_options()
+        .with_strategy(strategy)
+        .write(&mut bytes, data.to_array_stream())
+        .await?;
+    let vxf = SESSION
+        .open_options()
+        .open_buffer(ByteBuffer::from(bytes))?;
+    let segments = vxf.footer().segment_map().len();
+    let read = vxf.scan()?.into_array_stream()?.read_all().await?;
+    Ok((read, segments))
+}
+
+/// A data block maximum splits the blocks of a wide string column and changes no value: every
+/// row, including nulls and rows of other columns, reads back as written.
+#[tokio::test]
+async fn test_data_block_max_bytes_roundtrip() -> vortex_error::VortexResult<()> {
+    let mut ctx = SESSION.create_execution_ctx();
+    let rows = 20_000;
+    let wide = vortex_array::arrays::VarBinViewArray::from_iter_nullable_str(
+        (0..rows)
+            .map(|i| (i % 97 != 0).then(|| format!("{i:08}-{}", "payload ".repeat(70 + i % 13)))),
+    )
+    .into_array();
+    let ids = PrimitiveArray::from_iter(0..rows as i64).into_array();
+    let data = StructArray::new(
+        FieldNames::from(["id", "wide"]),
+        vec![ids, wide],
+        rows,
+        Validity::NonNullable,
+    )
+    .into_array();
+
+    let (default_read, default_segments) = roundtrip_with_block_max(data.clone(), None).await?;
+    let (split_read, split_segments) =
+        roundtrip_with_block_max(data.clone(), Some(256 * 1024)).await?;
+
+    vortex_array::assert_arrays_eq!(default_read, data, &mut ctx);
+    vortex_array::assert_arrays_eq!(split_read, data, &mut ctx);
+    // ~600-byte rows: a 256 KiB maximum splits each 8,192-row block of `wide` into 256-row
+    // blocks, so the file holds many more segments than without it.
+    assert!(
+        split_segments > default_segments * 4,
+        "expected the maximum to split `wide`: {split_segments} segments vs {default_segments}"
+    );
+    Ok(())
 }

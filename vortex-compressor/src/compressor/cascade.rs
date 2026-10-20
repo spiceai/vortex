@@ -32,6 +32,9 @@ use vortex_error::VortexResult;
 
 use super::CascadingCompressor;
 use super::constant;
+use super::plan::CompressionPlan;
+use super::plan::Decision;
+use super::plan::PlanState;
 use crate::scheme::CompressorContext;
 use crate::scheme::Scheme;
 use crate::scheme::SchemeExt;
@@ -64,6 +67,47 @@ impl CascadingCompressor {
         trace::record_compress_outcome(&span, before_nbytes, compressed.nbytes());
 
         Ok(compressed)
+    }
+
+    /// Compresses `array` like [`Self::compress`], and returns the schemes it chose as a plan
+    /// that [`Self::compress_with_plan`] can replay on other arrays of the same dtype.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if canonicalizing `array` or any scheme's compression fails.
+    pub fn compress_recording(
+        &self,
+        array: &ArrayRef,
+        exec_ctx: &mut ExecutionCtx,
+    ) -> VortexResult<(ArrayRef, CompressionPlan)> {
+        let state = PlanState::recording();
+        let canonical = array.clone().execute::<CanonicalValidity>(exec_ctx)?.0;
+        let compact = canonical.compact(exec_ctx)?;
+        let ctx = CompressorContext::new().with_plan(std::sync::Arc::clone(&state));
+        let compressed = self.compress_canonical(compact, ctx, exec_ctx)?;
+        Ok((compressed, state.into_plan()))
+    }
+
+    /// Compresses `array` with the schemes `plan` recorded, without estimating any scheme.
+    ///
+    /// Where the plan decided nothing, which happens when `array`'s data takes a path through
+    /// the cascade the recorded array did not, the full search runs as in [`Self::compress`].
+    /// A replayed scheme is still only kept when its output is smaller than its input.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if canonicalizing `array` or any scheme's compression fails.
+    pub fn compress_with_plan(
+        &self,
+        array: &ArrayRef,
+        plan: &CompressionPlan,
+        exec_ctx: &mut ExecutionCtx,
+    ) -> VortexResult<ArrayRef> {
+        let state = PlanState::replaying(plan.clone());
+        let canonical = array.clone().execute::<CanonicalValidity>(exec_ctx)?.0;
+        let compact = canonical.compact(exec_ctx)?;
+        let ctx = CompressorContext::new().with_plan(state);
+        self.compress_canonical(compact, ctx, exec_ctx)
     }
 
     /// Compresses a child array produced by a cascading scheme.
@@ -295,9 +339,33 @@ impl CascadingCompressor {
             return Ok(data.into_array());
         }
 
-        let Some((winner, winner_estimate)) =
-            self.choose_best_scheme(&eligible_schemes, &data, compress_ctx.clone(), exec_ctx)?
-        else {
+        let replayed = compress_ctx
+            .plan()
+            .and_then(|plan| plan.replayed(compress_ctx.cascade_history()));
+        let chosen = match replayed {
+            Some(Decision::Canonical) => return Ok(data.into_array()),
+            Some(Decision::Scheme(id)) => eligible_schemes
+                .iter()
+                .copied()
+                .find(|scheme| scheme.id() == id)
+                .map(|scheme| (scheme, super::select::WinnerEstimate::AlwaysUse)),
+            None => None,
+        };
+        let chosen = match chosen {
+            Some(chosen) => Some(chosen),
+            None => {
+                self.choose_best_scheme(&eligible_schemes, &data, compress_ctx.clone(), exec_ctx)?
+            }
+        };
+        if let Some(plan) = compress_ctx.plan() {
+            plan.record(
+                compress_ctx.cascade_history(),
+                chosen.map_or(Decision::Canonical, |(scheme, _)| {
+                    Decision::Scheme(scheme.id())
+                }),
+            );
+        }
+        let Some((winner, winner_estimate)) = chosen else {
             return Ok(data.into_array());
         };
 
