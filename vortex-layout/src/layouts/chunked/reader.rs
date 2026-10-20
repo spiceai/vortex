@@ -351,9 +351,15 @@ impl LayoutReader for ChunkedReader {
         let mut chunk_evals = vec![];
 
         for (chunk_idx, _, chunk_range, mask_range) in self.ranges(row_range) {
+            let chunk_mask = mask.slice(mask_range);
+            // A chunk the mask already excludes passes nothing, so it need not be read.
+            if chunk_mask.known().is_some_and(Mask::all_false) {
+                chunk_evals.push(MaskFuture::ready(Mask::new_false(chunk_mask.len())));
+                continue;
+            }
             let chunk_reader = self.chunk_reader(chunk_idx)?;
             let chunk_eval = chunk_reader
-                .filter_evaluation(&chunk_range, expr, mask.slice(mask_range))
+                .filter_evaluation(&chunk_range, expr, chunk_mask)
                 .map_err(|err| {
                     err.with_context(format!("While evaluating filter on chunk {chunk_idx}"))
                 })?;
@@ -390,13 +396,23 @@ impl LayoutReader for ChunkedReader {
         let mut chunk_evals = vec![];
 
         for (chunk_idx, _, chunk_range, mask_range) in self.ranges(row_range) {
+            let chunk_mask = mask.slice(mask_range);
+            // A chunk the mask already excludes contributes no rows, so its data is never
+            // requested: a point read that selects one row of a range reads one chunk.
+            if chunk_mask.known().is_some_and(Mask::all_false) {
+                continue;
+            }
             let chunk_reader = self.chunk_reader(chunk_idx)?;
             let chunk_eval = chunk_reader
-                .projection_evaluation(&chunk_range, expr, mask.slice(mask_range))
+                .projection_evaluation(&chunk_range, expr, chunk_mask)
                 .map_err(|err| {
                     err.with_context(format!("While evaluating projection on chunk {chunk_idx}"))
                 })?;
             chunk_evals.push(chunk_eval);
+        }
+
+        if chunk_evals.is_empty() {
+            return Ok(future::ready(Ok(Canonical::empty(expr.dtype()).into_array())).boxed());
         }
 
         Ok(async move {
@@ -425,6 +441,8 @@ impl LayoutReader for ChunkedReader {
 #[cfg(test)]
 mod test {
     use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
 
     use futures::stream;
     use rstest::fixture;
@@ -433,6 +451,7 @@ mod test {
     use vortex_array::IntoArray;
     use vortex_array::MaskFuture;
     use vortex_array::VortexSessionExecute;
+    use vortex_array::arrays::PrimitiveArray;
     use vortex_array::assert_arrays_eq;
     use vortex_array::dtype::DType;
     use vortex_array::dtype::FieldMask;
@@ -442,6 +461,7 @@ mod test {
     use vortex_buffer::buffer;
     use vortex_io::runtime::single::block_on;
     use vortex_io::session::RuntimeSessionExt;
+    use vortex_mask::Mask;
     use vortex_session::registry::ReadContext;
 
     use crate::LayoutRef;
@@ -452,6 +472,7 @@ mod test {
     use crate::layouts::flat::FlatLayout;
     use crate::layouts::flat::writer::FlatLayoutStrategy;
     use crate::scan::split_by::SplitBy;
+    use crate::segments::SegmentFuture;
     use crate::segments::SegmentId;
     use crate::segments::SegmentSource;
     use crate::segments::TestSegments;
@@ -568,6 +589,90 @@ mod test {
 
             let expected = buffer![1i32, 2, 3, 4, 5, 6, 7, 8, 9].into_array();
             assert_arrays_eq!(result, expected, &mut ctx);
+        })
+    }
+
+    /// Counts the segments a reader requests.
+    struct CountingSegmentSource {
+        inner: Arc<dyn SegmentSource>,
+        requests: Arc<AtomicUsize>,
+    }
+
+    impl SegmentSource for CountingSegmentSource {
+        fn request(&self, id: SegmentId) -> SegmentFuture {
+            self.requests.fetch_add(1, Ordering::Relaxed);
+            self.inner.request(id)
+        }
+    }
+
+    #[rstest]
+    #[case::one_row_of_the_middle_chunk(vec![4], vec![5], 1)]
+    #[case::rows_of_the_first_and_last_chunks(vec![0, 8], vec![1, 9], 2)]
+    #[case::no_rows(vec![], vec![], 0)]
+    fn a_known_mask_reads_only_the_chunks_it_selects(
+        #[from(chunked_layout)] (segments, layout): (Arc<dyn SegmentSource>, LayoutRef),
+        #[case] selected: Vec<usize>,
+        #[case] expected: Vec<i32>,
+        #[case] expected_requests: usize,
+    ) {
+        block_on(|_h| async {
+            let mut ctx = SESSION.create_execution_ctx();
+            let requests = Arc::new(AtomicUsize::new(0));
+            let source = Arc::new(CountingSegmentSource {
+                inner: segments,
+                requests: Arc::clone(&requests),
+            });
+            let reader = layout
+                .new_reader("".into(), source, &SESSION, &Default::default())
+                .unwrap();
+            let expr = root().bind(reader.dtype()).unwrap();
+            let rows = usize::try_from(layout.row_count()).unwrap();
+            let mask = Mask::from_indices(rows, selected);
+
+            let result = reader
+                .projection_evaluation(&(0..layout.row_count()), &expr, MaskFuture::ready(mask))
+                .unwrap()
+                .await
+                .unwrap();
+
+            let expected = PrimitiveArray::from_iter(expected).into_array();
+            assert_arrays_eq!(result, expected, &mut ctx);
+            assert_eq!(
+                requests.load(Ordering::Relaxed),
+                expected_requests,
+                "segments requested"
+            );
+        })
+    }
+
+    /// Without a known mask every chunk in range is read, as before.
+    #[rstest]
+    fn an_unresolved_mask_reads_every_chunk(
+        #[from(chunked_layout)] (segments, layout): (Arc<dyn SegmentSource>, LayoutRef),
+    ) {
+        block_on(|_h| async {
+            let mut ctx = SESSION.create_execution_ctx();
+            let requests = Arc::new(AtomicUsize::new(0));
+            let source = Arc::new(CountingSegmentSource {
+                inner: segments,
+                requests: Arc::clone(&requests),
+            });
+            let reader = layout
+                .new_reader("".into(), source, &SESSION, &Default::default())
+                .unwrap();
+            let expr = root().bind(reader.dtype()).unwrap();
+            let rows = usize::try_from(layout.row_count()).unwrap();
+            let mask = Mask::from_indices(rows, vec![4]);
+            let pending = MaskFuture::new(rows, async move { Ok(mask) });
+            assert!(pending.known().is_none());
+
+            let result = reader
+                .projection_evaluation(&(0..layout.row_count()), &expr, pending)
+                .unwrap()
+                .await
+                .unwrap();
+            assert_arrays_eq!(result, buffer![5i32].into_array(), &mut ctx);
+            assert_eq!(requests.load(Ordering::Relaxed), 3);
         })
     }
 }

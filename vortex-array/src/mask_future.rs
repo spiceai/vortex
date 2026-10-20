@@ -20,6 +20,8 @@ use vortex_mask::Mask;
 pub struct MaskFuture {
     inner: Shared<BoxFuture<'static, SharedVortexResult<Mask>>>,
     len: usize,
+    /// The mask, when it was known before the future was created; see [`Self::known`].
+    known: Option<Mask>,
 }
 
 impl MaskFuture {
@@ -40,7 +42,16 @@ impl MaskFuture {
                 .boxed()
                 .shared(),
             len,
+            known: None,
         }
+    }
+
+    /// The mask, if it is known without awaiting: this future was created with [`Self::ready`]
+    /// or [`Self::new_true`], or sliced from one that was.
+    ///
+    /// A reader can use it to skip work for rows the mask excludes before requesting any data.
+    pub fn known(&self) -> Option<&Mask> {
+        self.known.as_ref()
     }
 
     /// Returns the length of the mask.
@@ -55,7 +66,10 @@ impl MaskFuture {
 
     /// Create a MaskFuture from a ready mask.
     pub fn ready(mask: Mask) -> Self {
-        Self::new(mask.len(), async move { Ok(mask) })
+        let known = mask.clone();
+        let mut future = Self::new(mask.len(), async move { Ok(mask) });
+        future.known = Some(known);
+        future
     }
 
     /// Create a MaskFuture that resolves to a mask with all values set to true.
@@ -71,6 +85,10 @@ impl MaskFuture {
             return self.clone();
         }
 
+        if let Some(known) = &self.known {
+            return Self::ready(known.slice(range));
+        }
+
         let inner = self.inner.clone();
         Self::new(range.len(), async move { Ok(inner.await?.slice(range)) })
     }
@@ -84,6 +102,7 @@ impl MaskFuture {
         Self {
             inner: self.inner.inspect(f).boxed().shared(),
             len,
+            known: self.known,
         }
     }
 }
@@ -122,5 +141,30 @@ mod tests {
             assert_eq!(partial.await?, mask.slice(0..mask.len() - 1));
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod known_tests {
+    use vortex_mask::Mask;
+
+    use super::MaskFuture;
+
+    #[test]
+    fn a_ready_mask_and_its_slices_are_known() {
+        let ready = MaskFuture::ready(Mask::from_indices(10, vec![2, 7]));
+        assert_eq!(ready.known(), Some(&Mask::from_indices(10, vec![2, 7])));
+        assert_eq!(
+            ready.slice(5..10).known(),
+            Some(&Mask::from_indices(5, vec![2]))
+        );
+        assert_eq!(MaskFuture::new_true(4).known(), Some(&Mask::new_true(4)));
+    }
+
+    #[test]
+    fn a_pending_mask_is_not_known_until_awaited() {
+        let pending = MaskFuture::new(4, async { Ok(Mask::new_true(4)) });
+        assert!(pending.known().is_none());
+        assert!(pending.slice(1..3).known().is_none());
     }
 }
