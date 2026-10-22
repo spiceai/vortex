@@ -88,6 +88,29 @@ impl CascadingCompressor {
         Ok((compressed, state.into_plan()))
     }
 
+    /// Chooses the schemes for `array` without compressing all of it, returning them as a plan
+    /// for [`Self::compress_with_plan`] to apply to `array`'s parts.
+    ///
+    /// The schemes are chosen on the same stratified sample [`Self::compress`] would estimate
+    /// them on for the whole of `array`, so applying the plan to slices of `array` encodes them
+    /// as `array` itself would have been, even when its data differs from one part to another.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if canonicalizing the sample or any scheme's compression fails.
+    pub fn plan_for(
+        &self,
+        array: &ArrayRef,
+        exec_ctx: &mut ExecutionCtx,
+    ) -> VortexResult<CompressionPlan> {
+        let sample = super::sample::sample(
+            array,
+            super::sample::SAMPLE_SIZE,
+            super::sample::sample_count_approx_one_percent(array.len()),
+        );
+        Ok(self.compress_recording(&sample, exec_ctx)?.1)
+    }
+
     /// Compresses `array` with the schemes `plan` recorded, without estimating any scheme.
     ///
     /// Where the plan decided nothing, which happens when `array`'s data takes a path through

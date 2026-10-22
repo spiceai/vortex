@@ -9,7 +9,9 @@ use futures::StreamExt as _;
 use futures::stream;
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
+use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
+use vortex_array::arrays::ChunkedArray;
 use vortex_array::expr::stats::Stat;
 use vortex_btrblocks::BtrBlocksCompressor;
 use vortex_error::VortexResult;
@@ -81,29 +83,31 @@ impl CompressorPlugin for BtrBlocksCompressor {
         self.compress(chunk, ctx)
     }
 
-    /// Searches for encodings on the first chunk and replays them on the rest.
+    /// Searches for encodings once for the whole group and applies them to every chunk.
     ///
     /// Choosing an encoding compresses a sample once per candidate, and a chunk of at most
     /// 1,024 rows is its own sample, so searching every small chunk costs several full
-    /// compressions each. Replaying keeps one search per group.
+    /// compressions each. The search runs on the sample the compressor would draw from the
+    /// group as one array, so each chunk is encoded as the unsplit group would have been. A
+    /// search on the first chunk alone fits only that chunk: when it differs from the rest
+    /// (incompressible rows ahead of JSON, say), the rest are encoded to suit it.
     fn compress_chunks(
         &self,
         chunks: &[ArrayRef],
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Vec<ArrayRef>> {
-        let Some((first, rest)) = chunks.split_first() else {
+        let [first, ..] = chunks else {
             return Ok(Vec::new());
         };
-        if rest.is_empty() {
+        if chunks.len() == 1 {
             return Ok(vec![self.compress(first, ctx)?]);
         }
-        let (compressed, plan) = self.compress_recording(first, ctx)?;
-        let mut out = Vec::with_capacity(chunks.len());
-        out.push(compressed);
-        for chunk in rest {
-            out.push(self.compress_with_plan(chunk, &plan, ctx)?);
-        }
-        Ok(out)
+        let group = ChunkedArray::try_new(chunks.to_vec(), first.dtype().clone())?.into_array();
+        let plan = self.plan_for(&group, ctx)?;
+        chunks
+            .iter()
+            .map(|chunk| self.compress_with_plan(chunk, &plan, ctx))
+            .collect()
     }
 }
 
@@ -368,5 +372,81 @@ mod tests {
             "{groups:?}"
         );
         assert_eq!(groups[2], Ok(1));
+    }
+
+    fn next(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    /// ~1.5 KB rows of hex digits of random words: no dictionary or symbol table built on
+    /// them fits other data.
+    fn hex_rows(rows: usize, seed: u64) -> ArrayRef {
+        let mut state = seed;
+        vortex_array::arrays::VarBinViewArray::from_iter_str((0..rows).map(|_| {
+            (0..96)
+                .map(|_| format!("{:016x}", next(&mut state)))
+                .collect::<String>()
+        }))
+        .into_array()
+    }
+
+    /// ~1.5 KB JSON documents of repeated keys and words with varying numbers.
+    fn documents(rows: usize, seed: u64) -> ArrayRef {
+        const WORDS: [&str; 8] = [
+            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+        ];
+        let mut state = seed;
+        vortex_array::arrays::VarBinViewArray::from_iter_str((0..rows).map(|i| {
+            let mut s = format!("{{\"id\":{i},\"items\":[");
+            while s.len() < 1_500 {
+                let v = next(&mut state);
+                s.push_str(&format!(
+                    "{{\"k\":\"{}-{}\",\"n\":{},\"t\":\"{} {}\"}},",
+                    WORDS[(v % 8) as usize],
+                    (v >> 8) % 10_000,
+                    (v >> 24) % 1_000_000,
+                    WORDS[((v >> 44) % 8) as usize],
+                    (v >> 50) % 97
+                ));
+            }
+            s.push_str("]}");
+            s
+        }))
+        .into_array()
+    }
+
+    /// A group whose first chunk is unlike the rest is encoded as the unsplit group would be:
+    /// the schemes are chosen on a sample of the whole group, not on its first chunk. Here the
+    /// first chunk alone picks FSST, and replaying that on the documents instead of the
+    /// group's own choice leaves them larger and slower to filter.
+    #[test]
+    fn a_group_is_encoded_as_its_unsplit_data_would_be() -> VortexResult<()> {
+        let mut ctx = crate::test::SESSION.create_execution_ctx();
+        let mut chunks = vec![hex_rows(1024, 7)];
+        chunks.extend((1..8).map(|i| documents(1024, i)));
+        let compressor = BtrBlocksCompressor::default();
+
+        let unsplit =
+            ChunkedArray::try_new(chunks.clone(), chunks[0].dtype().clone())?.into_array();
+        let expected = compressor.compress(&unsplit, &mut ctx)?.encoding_id();
+        // The premise: the first chunk on its own chooses differently.
+        let (first, plan) = compressor.compress_recording(&chunks[0], &mut ctx)?;
+        assert_ne!(first.encoding_id(), expected);
+        assert_eq!(
+            compressor
+                .compress_with_plan(&chunks[1], &plan, &mut ctx)?
+                .encoding_id(),
+            first.encoding_id()
+        );
+
+        let grouped = compressor.compress_chunks(&chunks, &mut ctx)?;
+        for (compressed, chunk) in grouped.iter().zip(&chunks) {
+            assert_eq!(compressed.encoding_id(), expected);
+            vortex_array::assert_arrays_eq!(compressed.clone(), chunk.clone(), &mut ctx);
+        }
+        Ok(())
     }
 }
