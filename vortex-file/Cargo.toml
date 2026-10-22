@@ -61,6 +61,7 @@ vortex-zigzag = { workspace = true }
 vortex-zstd = { workspace = true, optional = true }
 
 [dev-dependencies]
+libc = "0.2"
 allocator-api2 = { workspace = true }
 divan = { workspace = true }
 rstest = { workspace = true }
@@ -89,3 +90,13 @@ tokio = [
 wasm-bindgen = ["vortex-layout/wasm-bindgen"]
 zstd = ["dep:vortex-zstd", "vortex-btrblocks/zstd", "vortex-btrblocks/pco"]
 tensor = ["dep:vortex-tensor"]
+
+[[bench]]
+name = "scan_mask_paths"
+harness = false
+test = false
+
+[[bench]]
+name = "wide_string_cases"
+harness = false
+test = false

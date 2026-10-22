@@ -11056,6 +11056,7 @@ dependencies = [
  "futures",
  "itertools 0.14.0",
  "kanal",
+ "libc",
  "moka",
  "object_store",
  "parking_lot",
