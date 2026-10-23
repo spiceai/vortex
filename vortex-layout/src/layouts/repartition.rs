@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::collections::VecDeque;
+use std::ops::Range;
 use std::sync::Arc;
 
 use async_stream::try_stream;
@@ -109,32 +110,54 @@ impl RepartitionStrategy {
     }
 }
 
-/// The number of rows per block that keeps each block of `chunk` at or under `maximum` bytes,
-/// as a power of two no larger than `max_rows`, or `None` when `chunk` needs no split.
+/// The row ranges that split `chunk` into blocks each referencing at most `maximum` bytes, or
+/// `None` when `chunk` needs no split.
+///
+/// `chunk` is cut into blocks of `max_rows`, and a block over `maximum` is halved, repeatedly,
+/// until each piece fits or holds one row. A block's average row width does not bound its parts:
+/// wide rows clustered at one end of it would leave that part over `maximum`. Each piece starts
+/// at a multiple of its power-of-two length within its block, so pieces line up with the blocks
+/// of other columns wherever their splits agree.
 ///
 /// Only a canonical [`VarBinView`] chunk is measured, by the bytes its rows reference (each
 /// view plus the bytes it points at), not by its buffers: rows sliced from a larger array share
 /// that array's buffers.
-fn split_rows(chunk: &ArrayRef, maximum: u64, max_rows: usize) -> Option<usize> {
+fn split_ranges(chunk: &ArrayRef, maximum: u64, max_rows: usize) -> Option<Vec<Range<usize>>> {
     let views = chunk.as_opt::<VarBinView>()?;
     let len = chunk.len();
     if len <= 1 {
         return None;
     }
-    let referenced: u64 = views
-        .views()
-        .iter()
-        .map(|view| u64::from(view.len()))
-        .sum::<u64>()
-        + (len * size_of::<BinaryView>()) as u64;
-    if referenced <= maximum {
+    let view_bytes = size_of::<BinaryView>() as u64;
+    // `prefix[i]` is the bytes rows `0..i` reference.
+    let mut prefix = Vec::with_capacity(len + 1);
+    prefix.push(0_u64);
+    let mut total = 0_u64;
+    for view in views.views().iter() {
+        total += u64::from(view.len()) + view_bytes;
+        prefix.push(total);
+    }
+    if total <= maximum {
         return None;
     }
-    let fit = usize::try_from(u128::from(maximum) * len as u128 / u128::from(referenced))
-        .unwrap_or(usize::MAX)
-        .clamp(1, max_rows.max(1));
-    let rows = 1_usize << (usize::BITS - 1 - fit.leading_zeros());
-    (rows < len).then_some(rows)
+
+    let mut ranges = Vec::new();
+    let mut pending = Vec::new();
+    let block = max_rows.max(1);
+    for start in (0..len).step_by(block) {
+        pending.push(start..(start + block).min(len));
+        while let Some(range) = pending.pop() {
+            if range.len() <= 1 || prefix[range.end] - prefix[range.start] <= maximum {
+                ranges.push(range);
+                continue;
+            }
+            // The first half is a power of two, so the second starts at a multiple of it.
+            let mid = range.start + range.len().next_power_of_two() / 2;
+            pending.push(mid..range.end);
+            pending.push(range.start..mid);
+        }
+    }
+    (ranges.len() > 1).then_some(ranges)
 }
 
 #[async_trait]
@@ -186,8 +209,8 @@ impl LayoutStrategy for RepartitionStrategy {
             while let Some(chunk) = canonical_stream.as_mut().next().await {
                 let (sequence_id, chunk) = chunk?;
                 let mut sequence_pointer = sequence_id.descend();
-                if let Some(rows) = block_size_maximum
-                    .and_then(|maximum| split_rows(&chunk, maximum, block_len))
+                if let Some(ranges) = block_size_maximum
+                    .and_then(|maximum| split_ranges(&chunk, maximum, block_len))
                 {
                     // Blocks buffered from earlier chunks come first, as they are.
                     let pending = chunks.take_all();
@@ -198,11 +221,8 @@ impl LayoutStrategy for RepartitionStrategy {
                             pending.into_array().execute::<Canonical>(&mut ctx)?.into_array(),
                         );
                     }
-                    let mut offset = 0;
-                    while offset < chunk.len() {
-                        let end = (offset + rows).min(chunk.len());
-                        yield (sequence_pointer.advance(), chunk.slice(offset..end)?);
-                        offset = end;
+                    for range in ranges {
+                        yield (sequence_pointer.advance(), chunk.slice(range)?);
                     }
                     continue;
                 }
@@ -668,21 +688,57 @@ mod tests {
         Ok(())
     }
 
+    fn lengths(ranges: Option<Vec<Range<usize>>>) -> Option<Vec<usize>> {
+        ranges.map(|ranges| ranges.iter().map(ExactSizeIterator::len).collect())
+    }
+
     #[test]
-    fn split_rows_measures_referenced_bytes_not_buffers() {
+    fn split_ranges_measures_referenced_bytes_not_buffers() {
         // Rows sliced from a larger array share its buffers; only the bytes they point at count.
         let wide = strings(8192, 1000);
         let slice = wide.slice(0..64).vortex_expect("slice");
         assert_eq!(
-            split_rows(&slice, ONE_MEG, 8192),
+            split_ranges(&slice, ONE_MEG, 8192),
             None,
             "64 rows reference ~64 KiB"
         );
-        assert_eq!(split_rows(&wide, ONE_MEG, 8192), Some(1024));
+        assert_eq!(
+            lengths(split_ranges(&wide, ONE_MEG, 8192)),
+            Some(vec![1024; 8])
+        );
         // A maximum smaller than one row still yields blocks of one row.
-        assert_eq!(split_rows(&wide, 100, 8192), Some(1));
+        assert_eq!(lengths(split_ranges(&wide, 100, 8192)), Some(vec![1; 8192]));
         // Non-string chunks are never split.
         let ints = PrimitiveArray::from_iter(0..8192_i64).into_array();
-        assert_eq!(split_rows(&ints, 1, 8192), None);
+        assert_eq!(split_ranges(&ints, 1, 8192), None);
+    }
+
+    #[test]
+    fn clustered_wide_rows_are_split_until_every_block_fits() -> VortexResult<()> {
+        // 256 rows of 100,000 bytes, then 7,936 rows of 100: the block's average row fits a
+        // 1,024-row block under 4 MiB, but its first 1,024 rows reference ~25 MiB.
+        let widths: Vec<usize> = (0..8192)
+            .map(|i| if i < 256 { 100_000 } else { 100 })
+            .collect();
+        let array = VarBinViewArray::from_iter_str(widths.iter().map(|&width| "x".repeat(width)))
+            .into_array();
+        let maximum = 4 * ONE_MEG;
+        let rows = block_rows_with_maximum(array, Some(maximum))?;
+
+        assert_eq!(rows.iter().sum::<u64>(), 8192);
+        let mut start = 0;
+        for &n in &rows {
+            let n = usize::try_from(n).vortex_expect("rows fit usize");
+            let referenced: usize = widths[start..start + n]
+                .iter()
+                .map(|w| w + size_of::<BinaryView>())
+                .sum();
+            assert!(
+                n == 1 || referenced as u64 <= maximum,
+                "block of {n} rows at {start} references {referenced} bytes: {rows:?}"
+            );
+            start += n;
+        }
+        Ok(())
     }
 }
