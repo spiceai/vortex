@@ -374,6 +374,7 @@ impl CascadingCompressor {
                 .map(|scheme| (scheme, super::select::WinnerEstimate::AlwaysUse)),
             None => None,
         };
+        let from_plan = chosen.is_some();
         let chosen = match chosen {
             Some(chosen) => Some(chosen),
             None => {
@@ -396,14 +397,47 @@ impl CascadingCompressor {
         // scheme name and cascade history before propagating.
         let error_ctx = trace::enabled_error_context(&compress_ctx);
         let _winner_span = trace::winner_compress_span(winner.id(), before_nbytes).entered();
-        let compressed = winner
-            .compress(self, &data, compress_ctx, exec_ctx)
-            .inspect_err(|err| {
-                // NB: this is the only way we can tell which scheme panicked / bailed on their
-                // data, especially for third-party schemes where the error site may not carry any
-                // compressor context.
-                trace::scheme_compress_failed(winner.id(), before_nbytes, error_ctx.as_ref(), err);
-            })?;
+        let (winner_estimate, compressed) =
+            match winner.compress(self, &data, compress_ctx.clone(), exec_ctx) {
+                Ok(compressed) => (winner_estimate, compressed),
+                // A replayed scheme was chosen on other data, and some schemes accept a dtype yet
+                // reject data they cannot encode (a sequence needs evenly spaced values). Choose
+                // as if there were no plan; an error from that choice is a real failure.
+                Err(_) if from_plan => {
+                    let Some((winner, winner_estimate)) = self.choose_best_scheme(
+                        &eligible_schemes,
+                        &data,
+                        compress_ctx.clone(),
+                        exec_ctx,
+                    )?
+                    else {
+                        return Ok(data.into_array());
+                    };
+                    let compressed = winner
+                        .compress(self, &data, compress_ctx, exec_ctx)
+                        .inspect_err(|err| {
+                            trace::scheme_compress_failed(
+                                winner.id(),
+                                before_nbytes,
+                                error_ctx.as_ref(),
+                                err,
+                            );
+                        })?;
+                    (winner_estimate, compressed)
+                }
+                Err(err) => {
+                    // NB: this is the only way we can tell which scheme panicked / bailed on their
+                    // data, especially for third-party schemes where the error site may not carry
+                    // any compressor context.
+                    trace::scheme_compress_failed(
+                        winner.id(),
+                        before_nbytes,
+                        error_ctx.as_ref(),
+                        &err,
+                    );
+                    return Err(err);
+                }
+            };
 
         let after_nbytes = compressed.nbytes();
         let actual_ratio = (after_nbytes != 0).then(|| before_nbytes as f64 / after_nbytes as f64);

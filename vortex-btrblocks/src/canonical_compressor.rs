@@ -396,4 +396,32 @@ mod tests {
         assert_eq!(replayed.nbytes(), searched.nbytes());
         Ok(())
     }
+
+    /// A plan is replayed on other data of the same dtype; a scheme that cannot encode that data
+    /// must not fail the write.
+    #[test]
+    fn a_replayed_plan_survives_data_its_schemes_cannot_encode() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let compressor = BtrBlocksCompressor::default();
+        let sequential = vortex_array::arrays::PrimitiveArray::from_iter(0..4096_i64).into_array();
+        let (recorded, plan) = compressor.compress_recording(&sequential, &mut ctx)?;
+        // The premise: the plan holds a scheme that random integers cannot use.
+        assert_eq!(recorded.encoding_id().to_string(), "vortex.sequence");
+
+        let mut state = 0x9e37_79b9_u64;
+        let random = vortex_array::arrays::PrimitiveArray::from_iter((0..4096).map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % 1_000_000) as i64
+        }))
+        .into_array();
+        let replayed = compressor.compress_with_plan(&random, &plan, &mut ctx)?;
+        assert_eq!(
+            replayed.encoding_id(),
+            compressor.compress(&random, &mut ctx)?.encoding_id()
+        );
+        assert_arrays_eq!(replayed, random, &mut ctx);
+        Ok(())
+    }
 }
