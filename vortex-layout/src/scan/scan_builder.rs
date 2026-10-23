@@ -102,6 +102,9 @@ pub struct ScanBuilder<A> {
     natural_splits: Option<Arc<[u64]>>,
     /// How many splits to make progress on concurrently.
     concurrency: SplitConcurrency,
+    /// Splits allowed in flight beyond the decoding concurrency, see
+    /// [`Self::with_split_io_overlap`].
+    max_splits_in_flight: Option<usize>,
     /// Function to apply to each [`ArrayRef`] within the spawned split tasks.
     map_fn: Arc<dyn Fn(ArrayRef) -> VortexResult<A> + Send + Sync>,
     metrics_registry: Option<Arc<dyn MetricsRegistry>>,
@@ -131,6 +134,7 @@ impl ScanBuilder<ArrayRef> {
             // We default to four tasks per worker thread, which allows for some I/O lookahead
             // without too much impact on work-stealing.
             concurrency: SplitConcurrency::PerWorker(4),
+            max_splits_in_flight: None,
             map_fn: Arc::new(Ok),
             metrics_registry: None,
             file_stats: None,
@@ -296,6 +300,24 @@ impl<A: 'static + Send> ScanBuilder<A> {
         self
     }
 
+    /// Lets the scan keep up to `max_splits_in_flight` splits in flight while it still decodes
+    /// only as many at once as [`Self::concurrency`].
+    ///
+    /// A split holds one of `concurrency` decode permits while it runs and gives it back while it
+    /// waits for a segment from a source wrapped in
+    /// [`WaitMarkedSegmentSource`](crate::segments::WaitMarkedSegmentSource), so a scan over a
+    /// high-latency source can have many reads outstanding without decoding many splits at once.
+    /// A split's permit is held until its output leaves the stream, so the decoded batches a scan
+    /// holds stay bounded by `concurrency`.
+    ///
+    /// Has no effect unless it exceeds the concurrency, and none on an ordered scan: an ordered
+    /// stream releases a split's output only in file order, so a split that finished early could
+    /// hold the permit the earlier split needs to finish.
+    pub fn with_split_io_overlap(mut self, max_splits_in_flight: usize) -> Self {
+        self.max_splits_in_flight = Some(max_splits_in_flight);
+        self
+    }
+
     /// Add or clear the metrics registry used by scan execution.
     pub fn with_some_metrics_registry(mut self, metrics: Option<Arc<dyn MetricsRegistry>>) -> Self {
         self.metrics_registry = metrics;
@@ -347,6 +369,7 @@ impl<A: 'static + Send> ScanBuilder<A> {
             split_by: self.split_by,
             natural_splits: self.natural_splits,
             concurrency: self.concurrency,
+            max_splits_in_flight: self.max_splits_in_flight,
             metrics_registry: self.metrics_registry,
             file_stats: self.file_stats,
             limit: self.limit,
@@ -415,6 +438,7 @@ impl<A: 'static + Send> ScanBuilder<A> {
             self.selection,
             splits,
             self.concurrency,
+            self.max_splits_in_flight,
             self.map_fn,
             self.limit,
             dtype,
