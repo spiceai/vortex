@@ -239,10 +239,15 @@ impl WriteStrategyBuilder {
             ),
             CompressorConfig::Opaque(compressor) => Arc::clone(compressor),
         };
-        // Choose encodings once per row block, even when a block is split into smaller data
-        // blocks (see `with_data_block_max_bytes`).
-        let compressing = CompressingStrategy::new(buffered, data_compressor)
-            .with_group_rows(self.row_block_size);
+        // Choose encodings once per row block when a block is split into smaller data blocks
+        // (see `with_data_block_max_bytes`); without a maximum no block is split.
+        let compressing = CompressingStrategy::new(buffered, data_compressor).with_group_rows(
+            if self.data_block_max_bytes.is_some() {
+                self.row_block_size
+            } else {
+                0
+            },
+        );
 
         // 4. prior to compression, coalesce up to a minimum size
         let coalescing = RepartitionStrategy::new(

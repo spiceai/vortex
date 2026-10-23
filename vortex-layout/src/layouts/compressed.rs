@@ -12,6 +12,7 @@ use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::ChunkedArray;
+use vortex_array::dtype::DType;
 use vortex_array::expr::stats::Stat;
 use vortex_btrblocks::BtrBlocksCompressor;
 use vortex_error::VortexResult;
@@ -140,6 +141,11 @@ impl CompressingStrategy {
     ///
     /// A chunk that holds `rows` or more on its own is compressed alone, as without grouping.
     /// The default, 0, compresses every chunk alone.
+    ///
+    /// Only string and binary columns are grouped: those are the chunks a byte maximum splits
+    /// (see `RepartitionStrategy::with_block_size_maximum`). Other chunks smaller than `rows`,
+    /// such as the blocks of a wide fixed-size list, stay separate tasks that compress in
+    /// parallel.
     pub fn with_group_rows(mut self, rows: usize) -> Self {
         self.group_rows = rows;
         self
@@ -175,7 +181,12 @@ impl LayoutStrategy for CompressingStrategy {
         let compute_session = session.clone();
 
         let handle = session.handle();
-        let stream = group_chunks(stream, self.group_rows)
+        let group_rows = if matches!(dtype, DType::Utf8(_) | DType::Binary(_)) {
+            self.group_rows
+        } else {
+            0
+        };
+        let stream = group_chunks(stream, group_rows)
             .map(move |group| {
                 let compressor = Arc::clone(&compressor);
                 let stats = Arc::clone(&stats);
@@ -283,6 +294,7 @@ fn group_chunks(
 
 #[cfg(test)]
 mod tests {
+    use vortex_array::ArrayContext;
     use vortex_array::IntoArray;
     use vortex_array::arrays::ChunkedArray;
     use vortex_array::arrays::PrimitiveArray;
@@ -292,9 +304,15 @@ mod tests {
     use vortex_error::VortexExpect;
     use vortex_error::vortex_err;
     use vortex_io::runtime::single::block_on;
+    use vortex_io::session::RuntimeSessionExt;
 
     use super::*;
+    use crate::layouts::chunked::writer::ChunkedLayoutStrategy;
+    use crate::layouts::flat::writer::FlatLayoutStrategy;
+    use crate::segments::TestSegments;
+    use crate::sequence::SequenceId;
     use crate::sequence::SequentialArrayStreamExt;
+    use crate::test::new_session;
 
     fn group_lengths(lengths: &[usize], rows: usize) -> Vec<Vec<usize>> {
         let chunks = lengths
@@ -447,6 +465,78 @@ mod tests {
             assert_eq!(compressed.encoding_id(), expected);
             vortex_array::assert_arrays_eq!(compressed.clone(), chunk.clone(), &mut ctx);
         }
+        Ok(())
+    }
+
+    /// Passes chunks through uncompressed, recording how many it is handed at a time.
+    #[derive(Clone, Default)]
+    struct GroupSizes(Arc<parking_lot::Mutex<Vec<usize>>>);
+
+    impl CompressorPlugin for GroupSizes {
+        fn compress_chunk(&self, chunk: &ArrayRef, _: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
+            Ok(chunk.clone())
+        }
+
+        fn compress_chunks(
+            &self,
+            chunks: &[ArrayRef],
+            ctx: &mut ExecutionCtx,
+        ) -> VortexResult<Vec<ArrayRef>> {
+            self.0.lock().push(chunks.len());
+            chunks.iter().map(|c| self.compress_chunk(c, ctx)).collect()
+        }
+    }
+
+    /// Writes `chunks` through a grouping compressor and returns the size of each group.
+    fn group_sizes(chunks: Vec<ArrayRef>) -> VortexResult<Vec<usize>> {
+        let sizes = GroupSizes::default();
+        let strategy = CompressingStrategy::new(
+            ChunkedLayoutStrategy::new(FlatLayoutStrategy::default()),
+            sizes.clone(),
+        )
+        .with_group_rows(8192);
+        let dtype = chunks[0].dtype().clone();
+        let (ptr, eof) = SequenceId::root().split();
+        let stream = ChunkedArray::try_new(chunks, dtype)?
+            .into_array()
+            .to_array_stream()
+            .sequenced(ptr);
+        let segments = Arc::new(TestSegments::default());
+        block_on(|handle| async move {
+            let session = new_session().with_handle(handle);
+            strategy
+                .write_stream(
+                    ArrayContext::empty().into(),
+                    segments,
+                    stream,
+                    eof,
+                    &session,
+                )
+                .await
+        })?;
+        let sizes = sizes.0.lock().clone();
+        Ok(sizes)
+    }
+
+    /// Small string chunks, the pieces a byte maximum splits a block into, are compressed as
+    /// one group; small chunks of other types, such as the blocks of a wide fixed-size list,
+    /// stay separate tasks so they compress in parallel.
+    #[test]
+    fn only_string_and_binary_chunks_are_grouped() -> VortexResult<()> {
+        let strings = (0..8)
+            .map(|i| {
+                vortex_array::arrays::VarBinViewArray::from_iter_str(
+                    (0..1024).map(|row| format!("{i}-{row}")),
+                )
+                .into_array()
+            })
+            .collect();
+        assert_eq!(group_sizes(strings)?, vec![8]);
+
+        let ints = (0..8)
+            .map(|i| PrimitiveArray::from_iter((0..1024).map(|row| i * 1024 + row)).into_array())
+            .collect();
+        assert_eq!(group_sizes(ints)?, vec![1; 8]);
         Ok(())
     }
 }
