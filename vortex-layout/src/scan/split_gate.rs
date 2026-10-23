@@ -317,10 +317,14 @@ mod tests {
         });
         let done: Vec<_> = stream::iter(tasks)
             .buffer_unordered(in_flight)
+            .map(|result| {
+                let (output, permit) = result.expect("split task joins");
+                drop(permit);
+                output
+            })
             .collect()
             .await;
-        for result in done {
-            let (output, _permit) = result.expect("split task joins");
+        for output in done {
             output.expect("split succeeds");
         }
         probe
@@ -358,7 +362,15 @@ mod tests {
             };
             tokio::spawn(GatedSplit::new(unmarked, Arc::clone(&gate)))
         });
-        let done: Vec<_> = stream::iter(tasks).buffer_unordered(16).collect().await;
+        let done: Vec<_> = stream::iter(tasks)
+            .buffer_unordered(16)
+            .map(|result| {
+                let (output, permit) = result.expect("split task joins");
+                drop(permit);
+                output
+            })
+            .collect()
+            .await;
         assert_eq!(done.len(), 32);
         assert_eq!(probe.max_reading.load(Ordering::SeqCst), 2);
     }
