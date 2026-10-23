@@ -47,7 +47,8 @@ impl MaskFuture {
     }
 
     /// The mask, if it is known without awaiting: this future was created with [`Self::ready`]
-    /// or [`Self::new_true`], or sliced from one that was.
+    /// or [`Self::new_true`], or sliced from one that was (and not given an [`Self::inspect`]
+    /// callback, which must run).
     ///
     /// A reader can use it to skip work for rows the mask excludes before requesting any data.
     pub fn known(&self) -> Option<&Mask> {
@@ -99,10 +100,12 @@ impl MaskFuture {
     ) -> Self {
         let len = self.len;
 
+        // Not `known`: a slice of a known mask resolves without awaiting this future, and so
+        // without running `f`.
         Self {
             inner: self.inner.inspect(f).boxed().shared(),
             len,
-            known: self.known,
+            known: None,
         }
     }
 }
@@ -146,6 +149,11 @@ mod tests {
 
 #[cfg(test)]
 mod known_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+
+    use vortex_error::VortexResult;
     use vortex_mask::Mask;
 
     use super::MaskFuture;
@@ -166,5 +174,19 @@ mod known_tests {
         let pending = MaskFuture::new(4, async { Ok(Mask::new_true(4)) });
         assert!(pending.known().is_none());
         assert!(pending.slice(1..3).known().is_none());
+    }
+
+    /// A slice of an inspected future still awaits it, so the callback runs.
+    #[test]
+    fn a_slice_of_an_inspected_future_runs_the_callback() -> VortexResult<()> {
+        futures::executor::block_on(async {
+            let ran = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&ran);
+            let fut = MaskFuture::ready(Mask::new_true(4))
+                .inspect(move |_| flag.store(true, Ordering::SeqCst));
+            assert_eq!(fut.slice(1..3).await?, Mask::new_true(2));
+            assert!(ran.load(Ordering::SeqCst));
+            Ok(())
+        })
     }
 }
