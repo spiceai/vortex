@@ -27,7 +27,8 @@ pub use source::*;
 #[cfg(any(test, feature = "_test-harness"))]
 pub use test::*;
 use vortex_error::VortexError;
-pub use wait_marked::*;
+pub use wait_marked::WaitMarkedSegmentSource;
+pub(crate) use wait_marked::mark_pending_wait;
 
 /// Identifier for a single physical segment referenced by a layout.
 ///

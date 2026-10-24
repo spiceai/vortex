@@ -9,8 +9,6 @@ use std::task::Poll;
 
 use futures::FutureExt;
 use pin_project_lite::pin_project;
-use vortex_array::buffer::BufferHandle;
-use vortex_error::VortexResult;
 
 use crate::scan::split_gate::WaitScope;
 use crate::scan::split_gate::current_scope;
@@ -39,23 +37,26 @@ impl<S: SegmentSource> WaitMarkedSegmentSource<S> {
 
 impl<S: SegmentSource> SegmentSource for WaitMarkedSegmentSource<S> {
     fn request(&self, id: SegmentId) -> SegmentFuture {
-        WaitMarked {
-            inner: self.inner.request(id),
-            scope: None,
-        }
-        .boxed()
+        mark_pending_wait(self.inner.request(id)).boxed()
     }
 }
 
+/// Mark each consumer's pending wait, including consumers of a shared layout future.
+/// The underlying segment future may be polled by just one consumer, so marking only that
+/// future would leave the other consumers holding decode permits while they wait for it.
+pub(crate) fn mark_pending_wait<F: Future>(inner: F) -> impl Future<Output = F::Output> {
+    WaitMarked { inner, scope: None }
+}
+
 pin_project! {
-    struct WaitMarked {
+    struct WaitMarked<F> {
         #[pin]
-        inner: SegmentFuture,
+        inner: F,
         // The split this request is making wait, while it is pending.
         scope: Option<Arc<WaitScope>>,
     }
 
-    impl PinnedDrop for WaitMarked {
+    impl<F> PinnedDrop for WaitMarked<F> {
         fn drop(this: Pin<&mut Self>) {
             if let Some(scope) = this.project().scope.take() {
                 scope.end();
@@ -64,8 +65,8 @@ pin_project! {
     }
 }
 
-impl Future for WaitMarked {
-    type Output = VortexResult<BufferHandle>;
+impl<F: Future> Future for WaitMarked<F> {
+    type Output = F::Output;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();

@@ -104,6 +104,15 @@ impl SplitGate {
             if let Some(id) = waiter.take() {
                 state.waiters.retain(|(queued, _)| *queued != id);
             }
+            // Several releases can wake the same front waiter before it runs. Pass the wake-up
+            // on if another permit is still free after this waiter acquires one.
+            let next = (state.available > 0)
+                .then(|| state.waiters.front().map(|(_, waker)| waker.clone()))
+                .flatten();
+            drop(state);
+            if let Some(waker) = next {
+                waker.wake();
+            }
             return Poll::Ready(DecodePermit {
                 gate: Arc::clone(self),
             });
@@ -238,6 +247,8 @@ impl<F: Future> Future for GatedSplit<F> {
 mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
+    use std::task::Wake;
+    use std::task::Waker;
     use std::time::Duration;
 
     use futures::FutureExt;
@@ -253,6 +264,7 @@ mod tests {
     use crate::segments::SegmentId;
     use crate::segments::SegmentSource;
     use crate::segments::WaitMarkedSegmentSource;
+    use crate::segments::mark_pending_wait;
 
     /// Resolves each request after a pause, standing in for a remote read.
     struct SlowSource;
@@ -390,5 +402,81 @@ mod tests {
         drop(permit);
         let (value, _permit) = second.await;
         assert_eq!(value, 2);
+    }
+
+    #[tokio::test]
+    async fn consumers_of_one_pending_array_each_release_their_permit() {
+        let gate = SplitGate::new(1);
+        // One marked source future is shared by two splits, like a FlatReader array future.
+        let shared = mark_pending_wait(futures::future::pending::<usize>())
+            .boxed()
+            .shared();
+        let mut first = Box::pin(GatedSplit::new(
+            mark_pending_wait(shared.clone()),
+            Arc::clone(&gate),
+        ));
+        let mut second = Box::pin(GatedSplit::new(
+            mark_pending_wait(shared),
+            Arc::clone(&gate),
+        ));
+        assert!(futures::poll!(first.as_mut()).is_pending());
+        assert!(futures::poll!(second.as_mut()).is_pending());
+
+        // The second consumer did not poll the shared source. It must still hand off its
+        // permit so another split can start a read while the shared array is pending.
+        let mut third = Box::pin(GatedSplit::new(async { 3 }, gate));
+        assert!(futures::poll!(third.as_mut()).is_ready());
+    }
+
+    #[test]
+    fn two_releases_wake_two_queued_splits() {
+        struct CountWakes(AtomicUsize);
+        impl Wake for CountWakes {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let gate = SplitGate::new(2);
+        let first_waker: Waker = Arc::new(CountWakes(AtomicUsize::new(0))).into();
+        let second_wakes = Arc::new(CountWakes(AtomicUsize::new(0)));
+        let second_waker: Waker = Arc::clone(&second_wakes).into();
+        let first_context = Context::from_waker(&first_waker);
+        let second_context = Context::from_waker(&second_waker);
+
+        let mut first_id = None;
+        let mut second_id = None;
+        let first = match gate.poll_acquire(&mut first_id, &first_context) {
+            Poll::Ready(permit) => permit,
+            Poll::Pending => panic!("first permit must be available"),
+        };
+        let second = match gate.poll_acquire(&mut second_id, &second_context) {
+            Poll::Ready(permit) => permit,
+            Poll::Pending => panic!("second permit must be available"),
+        };
+
+        assert!(
+            gate.poll_acquire(&mut first_id, &first_context)
+                .is_pending()
+        );
+        assert!(
+            gate.poll_acquire(&mut second_id, &second_context)
+                .is_pending()
+        );
+        drop(first);
+        drop(second);
+
+        let _first_reacquired = match gate.poll_acquire(&mut first_id, &first_context) {
+            Poll::Ready(permit) => permit,
+            Poll::Pending => panic!("released permit must be available"),
+        };
+        assert!(
+            second_wakes.0.load(Ordering::SeqCst) > 0,
+            "the second queued split must be woken for the remaining permit"
+        );
     }
 }
