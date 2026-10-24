@@ -274,3 +274,61 @@ async fn test_data_block_max_bytes_roundtrip() -> vortex_error::VortexResult<()>
     );
     Ok(())
 }
+
+/// Splitting a block must not copy its whole data buffer into every piece: when no scheme
+/// shrinks the bytes (random binary), each piece's segment holds only the rows it covers.
+#[tokio::test]
+async fn split_blocks_of_incompressible_binary_store_only_their_rows()
+-> vortex_error::VortexResult<()> {
+    let rows = 8192;
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let values: Vec<Vec<u8>> = (0..rows)
+        .map(|_| {
+            (0..1000)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state >> 56) as u8
+                })
+                .collect()
+        })
+        .collect();
+    let data =
+        vortex_array::arrays::VarBinViewArray::from_iter_bin(values.iter().map(Vec::as_slice))
+            .into_array();
+
+    let mut sizes = Vec::new();
+    for max in [None, Some(4 << 20)] {
+        let strategy = vortex_file::WriteStrategyBuilder::default()
+            .with_data_block_max_bytes(max)
+            .build();
+        let mut bytes = Vec::new();
+        SESSION
+            .write_options()
+            .with_strategy(strategy)
+            .write(&mut bytes, data.to_array_stream())
+            .await?;
+        let file_len = bytes.len();
+        let vxf = SESSION
+            .open_options()
+            .open_buffer(ByteBuffer::from(bytes))?;
+        let largest = vxf
+            .footer()
+            .segment_map()
+            .iter()
+            .map(|s| s.length)
+            .max()
+            .unwrap_or(0);
+        let read = vxf.scan()?.into_array_stream()?.read_all().await?;
+        vortex_array::assert_arrays_eq!(read, data, &mut SESSION.create_execution_ctx());
+        sizes.push((file_len, largest));
+    }
+    let ((plain, plain_largest), (split, split_largest)) = (sizes[0], sizes[1]);
+    assert!(split <= plain + plain / 50, "split file {split} vs {plain}");
+    assert!(
+        split_largest <= 4 << 20,
+        "largest split segment {split_largest} (unsplit {plain_largest})"
+    );
+    Ok(())
+}
