@@ -160,6 +160,19 @@ fn split_ranges(chunk: &ArrayRef, maximum: u64, max_rows: usize) -> Option<Vec<R
     (ranges.len() > 1).then_some(ranges)
 }
 
+/// `block` as it is, or its pieces from [`split_ranges`] when it is over `maximum`. Coalescing
+/// merges blocks that are each under the maximum into one that need not be.
+fn under_maximum(
+    block: ArrayRef,
+    maximum: Option<u64>,
+    max_rows: usize,
+) -> VortexResult<Vec<ArrayRef>> {
+    match maximum.and_then(|maximum| split_ranges(&block, maximum, max_rows)) {
+        Some(ranges) => ranges.into_iter().map(|range| block.slice(range)).collect(),
+        None => Ok(vec![block]),
+    }
+}
+
 #[async_trait]
 impl LayoutStrategy for RepartitionStrategy {
     async fn write_stream(
@@ -216,10 +229,10 @@ impl LayoutStrategy for RepartitionStrategy {
                     let pending = chunks.take_all();
                     if !pending.is_empty() {
                         let pending = ChunkedArray::try_new(pending, dtype_clone.clone())?;
-                        yield (
-                            sequence_pointer.advance(),
-                            pending.into_array().execute::<Canonical>(&mut ctx)?.into_array(),
-                        );
+                        let pending = pending.into_array().execute::<Canonical>(&mut ctx)?.into_array();
+                        for block in under_maximum(pending, block_size_maximum, block_len)? {
+                            yield (sequence_pointer.advance(), block);
+                        }
                     }
                     for range in ranges {
                         yield (sequence_pointer.advance(), chunk.slice(range)?);
@@ -240,10 +253,9 @@ impl LayoutStrategy for RepartitionStrategy {
                             ChunkedArray::try_new(output_chunks, dtype_clone.clone())?;
                         if !chunked.is_empty() {
                             let canonical = chunked.into_array().execute::<Canonical>(&mut ctx)?.into_array();
-                            yield (
-                                sequence_pointer.advance(),
-                                canonical,
-                            )
+                            for block in under_maximum(canonical, block_size_maximum, block_len)? {
+                                yield (sequence_pointer.advance(), block);
+                            }
                         }
                     }
                 }
@@ -254,10 +266,9 @@ impl LayoutStrategy for RepartitionStrategy {
                     )?;
                     if !to_flush.is_empty() {
                         let canonical = to_flush.into_array().execute::<Canonical>(&mut ctx)?.into_array();
-                        yield (
-                            sequence_pointer.advance(),
-                            canonical,
-                        )
+                        for block in under_maximum(canonical, block_size_maximum, block_len)? {
+                            yield (sequence_pointer.advance(), block);
+                        }
                     }
                 }
             }
@@ -645,6 +656,10 @@ mod tests {
                 .write_stream(ctx.into(), segments, stream, eof, &session)
                 .await
         })?;
+        if layout.nchildren() == 0 {
+            // A single block is written as that block's own layout.
+            return Ok(vec![layout.row_count()]);
+        }
         (0..layout.nchildren())
             .map(|i| {
                 Ok(layout
@@ -726,6 +741,41 @@ mod tests {
         let rows = block_rows_with_maximum(array, Some(maximum))?;
 
         assert_eq!(rows.iter().sum::<u64>(), 8192);
+        let mut start = 0;
+        for &n in &rows {
+            let n = usize::try_from(n).vortex_expect("rows fit usize");
+            let referenced: usize = widths[start..start + n]
+                .iter()
+                .map(|w| w + size_of::<BinaryView>())
+                .sum();
+            assert!(
+                n == 1 || referenced as u64 <= maximum,
+                "block of {n} rows at {start} references {referenced} bytes: {rows:?}"
+            );
+            start += n;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn coalesced_blocks_stay_under_the_maximum() -> VortexResult<()> {
+        // Two separately allocated 8,192-row chunks, each under 4 MiB: 100-byte rows (~0.9 MiB,
+        // under the 1 MiB coalescing minimum) and 480-byte rows (~3.9 MiB). Coalescing the first
+        // with the second would make a ~4.8 MiB block.
+        let widths: Vec<usize> = (0..16_384)
+            .map(|i| if i < 8192 { 100 } else { 480 })
+            .collect();
+        let chunk = |range: Range<usize>| {
+            VarBinViewArray::from_iter_str(widths[range].iter().map(|&w| "x".repeat(w)))
+                .into_array()
+        };
+        let dtype = chunk(0..1).dtype().clone();
+        let array =
+            ChunkedArray::try_new(vec![chunk(0..8192), chunk(8192..16_384)], dtype)?.into_array();
+        let maximum = 4 * ONE_MEG;
+        let rows = block_rows_with_maximum(array, Some(maximum))?;
+
+        assert_eq!(rows.iter().sum::<u64>(), 16_384);
         let mut start = 0;
         for &n in &rows {
             let n = usize::try_from(n).vortex_expect("rows fit usize");
