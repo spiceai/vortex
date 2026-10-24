@@ -22,6 +22,7 @@ use vortex_layout::segments::SegmentCacheSourceAdapter;
 use vortex_layout::segments::SegmentId;
 use vortex_layout::segments::SegmentSource;
 use vortex_layout::segments::SharedSegmentSource;
+use vortex_layout::segments::WaitMarkedSegmentSource;
 use vortex_layout::session::LayoutSessionExt;
 use vortex_metrics::DefaultMetricsRegistry;
 use vortex_metrics::Label;
@@ -326,9 +327,10 @@ impl VortexOpenOptions {
         )));
 
         // Wrap up the segment source to first resolve segments from the initial read cache.
-        let segment_source: Arc<dyn SegmentSource> = Arc::new(SegmentCacheSourceAdapter::new(
-            segment_cache,
-            segment_source,
+        // The outermost source, so each request pending on a cache fill or a shared read counts
+        // as a wait for the scan split that made it.
+        let segment_source: Arc<dyn SegmentSource> = Arc::new(WaitMarkedSegmentSource::new(
+            SegmentCacheSourceAdapter::new(segment_cache, segment_source),
         ));
 
         let metadata = if self.include_metadata {
