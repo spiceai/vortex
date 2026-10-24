@@ -11,6 +11,7 @@ use futures::StreamExt as _;
 use futures::pin_mut;
 use vortex_array::ArrayRef;
 use vortex_array::Canonical;
+use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::ChunkedArray;
@@ -166,10 +167,34 @@ fn under_maximum(
     block: ArrayRef,
     maximum: Option<u64>,
     max_rows: usize,
+    ctx: &mut ExecutionCtx,
 ) -> VortexResult<Vec<ArrayRef>> {
     match maximum.and_then(|maximum| split_ranges(&block, maximum, max_rows)) {
-        Some(ranges) => ranges.into_iter().map(|range| block.slice(range)).collect(),
+        Some(ranges) => ranges
+            .into_iter()
+            .map(|range| split_piece(&block, range, ctx))
+            .collect(),
         None => Ok(vec![block]),
+    }
+}
+
+/// Rows `range` of the [`VarBinView`] `block`, holding only the bytes those rows reference.
+///
+/// A slice shares its parent's data buffers, and a buffer is written whole, so a piece passed
+/// on as a slice would store every other piece's bytes too unless the compressor compacts it.
+/// Compaction slices a buffer the piece uses contiguously, so this rarely copies.
+fn split_piece(
+    block: &ArrayRef,
+    range: Range<usize>,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<ArrayRef> {
+    let piece = block.slice(range)?;
+    match piece.as_opt::<VarBinView>() {
+        Some(views) => Ok(views
+            .into_owned()
+            .compact_with_threshold(1.0, ctx)?
+            .into_array()),
+        None => Ok(piece),
     }
 }
 
@@ -230,12 +255,12 @@ impl LayoutStrategy for RepartitionStrategy {
                     if !pending.is_empty() {
                         let pending = ChunkedArray::try_new(pending, dtype_clone.clone())?;
                         let pending = pending.into_array().execute::<Canonical>(&mut ctx)?.into_array();
-                        for block in under_maximum(pending, block_size_maximum, block_len)? {
+                        for block in under_maximum(pending, block_size_maximum, block_len, &mut ctx)? {
                             yield (sequence_pointer.advance(), block);
                         }
                     }
                     for range in ranges {
-                        yield (sequence_pointer.advance(), chunk.slice(range)?);
+                        yield (sequence_pointer.advance(), split_piece(&chunk, range, &mut ctx)?);
                     }
                     continue;
                 }
@@ -253,7 +278,7 @@ impl LayoutStrategy for RepartitionStrategy {
                             ChunkedArray::try_new(output_chunks, dtype_clone.clone())?;
                         if !chunked.is_empty() {
                             let canonical = chunked.into_array().execute::<Canonical>(&mut ctx)?.into_array();
-                            for block in under_maximum(canonical, block_size_maximum, block_len)? {
+                            for block in under_maximum(canonical, block_size_maximum, block_len, &mut ctx)? {
                                 yield (sequence_pointer.advance(), block);
                             }
                         }
@@ -266,7 +291,7 @@ impl LayoutStrategy for RepartitionStrategy {
                     )?;
                     if !to_flush.is_empty() {
                         let canonical = to_flush.into_array().execute::<Canonical>(&mut ctx)?.into_array();
-                        for block in under_maximum(canonical, block_size_maximum, block_len)? {
+                        for block in under_maximum(canonical, block_size_maximum, block_len, &mut ctx)? {
                             yield (sequence_pointer.advance(), block);
                         }
                     }

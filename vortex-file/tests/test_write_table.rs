@@ -275,16 +275,12 @@ async fn test_data_block_max_bytes_roundtrip() -> vortex_error::VortexResult<()>
     Ok(())
 }
 
-/// Splitting a block must not copy its whole data buffer into every piece: when no scheme
-/// shrinks the bytes (random binary), each piece's segment holds only the rows it covers.
-#[tokio::test]
-async fn split_blocks_of_incompressible_binary_store_only_their_rows()
--> vortex_error::VortexResult<()> {
-    let rows = 8192;
-    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+/// Random bytes, `width` per row: no compression scheme shrinks them.
+fn random_binary(rows: usize, width: usize, seed: u64) -> vortex_array::ArrayRef {
+    let mut state = seed;
     let values: Vec<Vec<u8>> = (0..rows)
         .map(|_| {
-            (0..1000)
+            (0..width)
                 .map(|_| {
                     state ^= state << 13;
                     state ^= state >> 7;
@@ -294,41 +290,74 @@ async fn split_blocks_of_incompressible_binary_store_only_their_rows()
                 .collect()
         })
         .collect();
-    let data =
-        vortex_array::arrays::VarBinViewArray::from_iter_bin(values.iter().map(Vec::as_slice))
-            .into_array();
+    vortex_array::arrays::VarBinViewArray::from_iter_bin(values.iter().map(Vec::as_slice))
+        .into_array()
+}
 
-    let mut sizes = Vec::new();
-    for max in [None, Some(4 << 20)] {
-        let strategy = vortex_file::WriteStrategyBuilder::default()
-            .with_data_block_max_bytes(max)
-            .build();
-        let mut bytes = Vec::new();
-        SESSION
-            .write_options()
-            .with_strategy(strategy)
-            .write(&mut bytes, data.to_array_stream())
-            .await?;
-        let file_len = bytes.len();
-        let vxf = SESSION
-            .open_options()
-            .open_buffer(ByteBuffer::from(bytes))?;
-        let largest = vxf
-            .footer()
-            .segment_map()
-            .iter()
-            .map(|s| s.length)
-            .max()
-            .unwrap_or(0);
-        let read = vxf.scan()?.into_array_stream()?.read_all().await?;
-        vortex_array::assert_arrays_eq!(read, data, &mut SESSION.create_execution_ctx());
-        sizes.push((file_len, largest));
+/// Writes `data` with `max`, through BtrBlocks or a compressor that stores chunks as they are,
+/// and returns the file size and its largest segment, checking the values read back.
+async fn file_and_largest_segment(
+    data: &vortex_array::ArrayRef,
+    max: Option<u64>,
+    pass_through: bool,
+) -> vortex_error::VortexResult<(usize, u32)> {
+    let mut builder = vortex_file::WriteStrategyBuilder::default().with_data_block_max_bytes(max);
+    if pass_through {
+        builder = builder.with_compressor(
+            |chunk: &vortex_array::ArrayRef, _: &mut vortex_array::ExecutionCtx| Ok(chunk.clone()),
+        );
     }
-    let ((plain, plain_largest), (split, split_largest)) = (sizes[0], sizes[1]);
-    assert!(split <= plain + plain / 50, "split file {split} vs {plain}");
-    assert!(
-        split_largest <= 4 << 20,
-        "largest split segment {split_largest} (unsplit {plain_largest})"
-    );
+    let mut bytes = Vec::new();
+    SESSION
+        .write_options()
+        .with_strategy(builder.build())
+        .write(&mut bytes, data.to_array_stream())
+        .await?;
+    let file_len = bytes.len();
+    let vxf = SESSION
+        .open_options()
+        .open_buffer(ByteBuffer::from(bytes))?;
+    let largest = vxf
+        .footer()
+        .segment_map()
+        .iter()
+        .map(|s| s.length)
+        .max()
+        .unwrap_or(0);
+    let read = vxf.scan()?.into_array_stream()?.read_all().await?;
+    vortex_array::assert_arrays_eq!(read, data.clone(), &mut SESSION.create_execution_ctx());
+    Ok((file_len, largest))
+}
+
+/// Splitting a block must not store its whole data buffer in every piece: when nothing shrinks
+/// the bytes (random binary, or a compressor that stores chunks as they are), each piece's
+/// segment holds only its own rows. Covers a block split as it arrives and one rebuilt by
+/// coalescing two separately allocated chunks.
+#[tokio::test]
+async fn split_blocks_of_incompressible_binary_store_only_their_rows()
+-> vortex_error::VortexResult<()> {
+    let one_block = random_binary(8192, 1000, 7);
+    // 100-byte rows (~0.9 MiB, under the coalescing minimum), then 480-byte rows (~3.9 MiB).
+    let coalesced = vortex_array::arrays::ChunkedArray::try_new(
+        vec![random_binary(8192, 100, 11), random_binary(8192, 480, 13)],
+        one_block.dtype().clone(),
+    )?
+    .into_array();
+    let maximum: u64 = 4 << 20;
+    for (name, data) in [("one block", &one_block), ("coalesced", &coalesced)] {
+        for pass_through in [false, true] {
+            let (plain, _) = file_and_largest_segment(data, None, pass_through).await?;
+            let (split, largest) =
+                file_and_largest_segment(data, Some(maximum), pass_through).await?;
+            assert!(
+                split <= plain + plain / 50,
+                "{name}, pass-through {pass_through}: split file {split} bytes vs {plain}"
+            );
+            assert!(
+                u64::from(largest) <= maximum,
+                "{name}, pass-through {pass_through}: largest split segment {largest} bytes"
+            );
+        }
+    }
     Ok(())
 }
