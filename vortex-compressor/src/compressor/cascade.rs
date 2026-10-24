@@ -32,6 +32,9 @@ use vortex_error::VortexResult;
 
 use super::CascadingCompressor;
 use super::constant;
+use super::plan::CompressionPlan;
+use super::plan::Decision;
+use super::plan::PlanState;
 use crate::scheme::CompressorContext;
 use crate::scheme::Scheme;
 use crate::scheme::SchemeExt;
@@ -64,6 +67,70 @@ impl CascadingCompressor {
         trace::record_compress_outcome(&span, before_nbytes, compressed.nbytes());
 
         Ok(compressed)
+    }
+
+    /// Compresses `array` like [`Self::compress`], and returns the schemes it chose as a plan
+    /// that [`Self::compress_with_plan`] can replay on other arrays of the same dtype.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if canonicalizing `array` or any scheme's compression fails.
+    pub fn compress_recording(
+        &self,
+        array: &ArrayRef,
+        exec_ctx: &mut ExecutionCtx,
+    ) -> VortexResult<(ArrayRef, CompressionPlan)> {
+        let state = PlanState::recording();
+        let canonical = array.clone().execute::<CanonicalValidity>(exec_ctx)?.0;
+        let compact = canonical.compact(exec_ctx)?;
+        let ctx = CompressorContext::new().with_plan(std::sync::Arc::clone(&state));
+        let compressed = self.compress_canonical(compact, ctx, exec_ctx)?;
+        Ok((compressed, state.into_plan()))
+    }
+
+    /// Chooses the schemes for `array` without compressing all of it, returning them as a plan
+    /// for [`Self::compress_with_plan`] to apply to `array`'s parts.
+    ///
+    /// The schemes are chosen on the same stratified sample [`Self::compress`] would estimate
+    /// them on for the whole of `array`, so applying the plan to slices of `array` encodes them
+    /// as `array` itself would have been, even when its data differs from one part to another.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if canonicalizing the sample or any scheme's compression fails.
+    pub fn plan_for(
+        &self,
+        array: &ArrayRef,
+        exec_ctx: &mut ExecutionCtx,
+    ) -> VortexResult<CompressionPlan> {
+        let sample = super::sample::sample(
+            array,
+            super::sample::SAMPLE_SIZE,
+            super::sample::sample_count_approx_one_percent(array.len()),
+        );
+        Ok(self.compress_recording(&sample, exec_ctx)?.1)
+    }
+
+    /// Compresses `array` with the schemes `plan` recorded, without estimating any scheme.
+    ///
+    /// Where the plan decided nothing, which happens when `array`'s data takes a path through
+    /// the cascade the recorded array did not, the full search runs as in [`Self::compress`].
+    /// A replayed scheme is still only kept when its output is smaller than its input.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if canonicalizing `array` or any scheme's compression fails.
+    pub fn compress_with_plan(
+        &self,
+        array: &ArrayRef,
+        plan: &CompressionPlan,
+        exec_ctx: &mut ExecutionCtx,
+    ) -> VortexResult<ArrayRef> {
+        let state = PlanState::replaying(plan.clone());
+        let canonical = array.clone().execute::<CanonicalValidity>(exec_ctx)?.0;
+        let compact = canonical.compact(exec_ctx)?;
+        let ctx = CompressorContext::new().with_plan(state);
+        self.compress_canonical(compact, ctx, exec_ctx)
     }
 
     /// Compresses a child array produced by a cascading scheme.
@@ -295,9 +362,34 @@ impl CascadingCompressor {
             return Ok(data.into_array());
         }
 
-        let Some((winner, winner_estimate)) =
-            self.choose_best_scheme(&eligible_schemes, &data, compress_ctx.clone(), exec_ctx)?
-        else {
+        let replayed = compress_ctx
+            .plan()
+            .and_then(|plan| plan.replayed(compress_ctx.cascade_history()));
+        let chosen = match replayed {
+            Some(Decision::Canonical) => return Ok(data.into_array()),
+            Some(Decision::Scheme(id)) => eligible_schemes
+                .iter()
+                .copied()
+                .find(|scheme| scheme.id() == id)
+                .map(|scheme| (scheme, super::select::WinnerEstimate::AlwaysUse)),
+            None => None,
+        };
+        let from_plan = chosen.is_some();
+        let chosen = match chosen {
+            Some(chosen) => Some(chosen),
+            None => {
+                self.choose_best_scheme(&eligible_schemes, &data, compress_ctx.clone(), exec_ctx)?
+            }
+        };
+        if let Some(plan) = compress_ctx.plan() {
+            plan.record(
+                compress_ctx.cascade_history(),
+                chosen.map_or(Decision::Canonical, |(scheme, _)| {
+                    Decision::Scheme(scheme.id())
+                }),
+            );
+        }
+        let Some((winner, winner_estimate)) = chosen else {
             return Ok(data.into_array());
         };
 
@@ -305,14 +397,47 @@ impl CascadingCompressor {
         // scheme name and cascade history before propagating.
         let error_ctx = trace::enabled_error_context(&compress_ctx);
         let _winner_span = trace::winner_compress_span(winner.id(), before_nbytes).entered();
-        let compressed = winner
-            .compress(self, &data, compress_ctx, exec_ctx)
-            .inspect_err(|err| {
-                // NB: this is the only way we can tell which scheme panicked / bailed on their
-                // data, especially for third-party schemes where the error site may not carry any
-                // compressor context.
-                trace::scheme_compress_failed(winner.id(), before_nbytes, error_ctx.as_ref(), err);
-            })?;
+        let (winner_estimate, compressed) =
+            match winner.compress(self, &data, compress_ctx.clone(), exec_ctx) {
+                Ok(compressed) => (winner_estimate, compressed),
+                // A replayed scheme was chosen on other data, and some schemes accept a dtype yet
+                // reject data they cannot encode (a sequence needs evenly spaced values). Choose
+                // as if there were no plan; an error from that choice is a real failure.
+                Err(_) if from_plan => {
+                    let Some((winner, winner_estimate)) = self.choose_best_scheme(
+                        &eligible_schemes,
+                        &data,
+                        compress_ctx.clone(),
+                        exec_ctx,
+                    )?
+                    else {
+                        return Ok(data.into_array());
+                    };
+                    let compressed = winner
+                        .compress(self, &data, compress_ctx, exec_ctx)
+                        .inspect_err(|err| {
+                            trace::scheme_compress_failed(
+                                winner.id(),
+                                before_nbytes,
+                                error_ctx.as_ref(),
+                                err,
+                            );
+                        })?;
+                    (winner_estimate, compressed)
+                }
+                Err(err) => {
+                    // NB: this is the only way we can tell which scheme panicked / bailed on their
+                    // data, especially for third-party schemes where the error site may not carry
+                    // any compressor context.
+                    trace::scheme_compress_failed(
+                        winner.id(),
+                        before_nbytes,
+                        error_ctx.as_ref(),
+                        &err,
+                    );
+                    return Err(err);
+                }
+            };
 
         let after_nbytes = compressed.nbytes();
         let actual_ratio = (after_nbytes != 0).then(|| before_nbytes as f64 / after_nbytes as f64);

@@ -5,6 +5,7 @@
 
 mod cascade;
 mod constant;
+pub(crate) mod plan;
 mod sample;
 mod select;
 mod structural;

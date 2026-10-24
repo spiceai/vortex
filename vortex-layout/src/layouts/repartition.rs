@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::collections::VecDeque;
+use std::ops::Range;
 use std::sync::Arc;
 
 use async_stream::try_stream;
@@ -10,9 +11,12 @@ use futures::StreamExt as _;
 use futures::pin_mut;
 use vortex_array::ArrayRef;
 use vortex_array::Canonical;
+use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::ChunkedArray;
+use vortex_array::arrays::VarBinView;
+use vortex_array::arrays::varbinview::BinaryView;
 use vortex_array::dtype::DType;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
@@ -80,6 +84,7 @@ impl RepartitionWriterOptions {
 pub struct RepartitionStrategy {
     child: Arc<dyn LayoutStrategy>,
     options: RepartitionWriterOptions,
+    block_size_maximum: Option<u64>,
 }
 
 impl RepartitionStrategy {
@@ -87,7 +92,109 @@ impl RepartitionStrategy {
         Self {
             child: Arc::new(child),
             options,
+            block_size_maximum: None,
         }
+    }
+
+    /// Split a canonical string or binary chunk whose rows reference more than `maximum`
+    /// bytes into blocks of at most about `maximum` bytes.
+    ///
+    /// [`RepartitionWriterOptions::block_size_target`] sizes blocks of fixed-width types by
+    /// their element size; a variable-width type has none, so a block of a wide string column
+    /// holds `block_len_multiple` rows whatever their width, and a reader that wants one row
+    /// reads all of them. A split block holds a power-of-two number of rows, which divides
+    /// any power-of-two `block_len_multiple`, so its boundaries line up with the blocks of
+    /// every other column. Chunks at or under `maximum` are repartitioned as without it.
+    pub fn with_block_size_maximum(mut self, maximum: Option<u64>) -> Self {
+        self.block_size_maximum = maximum;
+        self
+    }
+}
+
+/// The row ranges that split `chunk` into blocks each referencing at most `maximum` bytes, or
+/// `None` when `chunk` needs no split.
+///
+/// `chunk` is cut into blocks of `max_rows`, and a block over `maximum` is halved, repeatedly,
+/// until each piece fits or holds one row. A block's average row width does not bound its parts:
+/// wide rows clustered at one end of it would leave that part over `maximum`. Each piece starts
+/// at a multiple of its power-of-two length within its block, so pieces line up with the blocks
+/// of other columns wherever their splits agree.
+///
+/// Only a canonical [`VarBinView`] chunk is measured, by the bytes its rows reference (each
+/// view plus the bytes it points at), not by its buffers: rows sliced from a larger array share
+/// that array's buffers.
+fn split_ranges(chunk: &ArrayRef, maximum: u64, max_rows: usize) -> Option<Vec<Range<usize>>> {
+    let views = chunk.as_opt::<VarBinView>()?;
+    let len = chunk.len();
+    if len <= 1 {
+        return None;
+    }
+    let view_bytes = size_of::<BinaryView>() as u64;
+    // `prefix[i]` is the bytes rows `0..i` reference.
+    let mut prefix = Vec::with_capacity(len + 1);
+    prefix.push(0_u64);
+    let mut total = 0_u64;
+    for view in views.views().iter() {
+        total += u64::from(view.len()) + view_bytes;
+        prefix.push(total);
+    }
+    if total <= maximum {
+        return None;
+    }
+
+    let mut ranges = Vec::new();
+    let mut pending = Vec::new();
+    let block = max_rows.max(1);
+    for start in (0..len).step_by(block) {
+        pending.push(start..(start + block).min(len));
+        while let Some(range) = pending.pop() {
+            if range.len() <= 1 || prefix[range.end] - prefix[range.start] <= maximum {
+                ranges.push(range);
+                continue;
+            }
+            // The first half is a power of two, so the second starts at a multiple of it.
+            let mid = range.start + range.len().next_power_of_two() / 2;
+            pending.push(mid..range.end);
+            pending.push(range.start..mid);
+        }
+    }
+    (ranges.len() > 1).then_some(ranges)
+}
+
+/// `block` as it is, or its pieces from [`split_ranges`] when it is over `maximum`. Coalescing
+/// merges blocks that are each under the maximum into one that need not be.
+fn under_maximum(
+    block: ArrayRef,
+    maximum: Option<u64>,
+    max_rows: usize,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<Vec<ArrayRef>> {
+    match maximum.and_then(|maximum| split_ranges(&block, maximum, max_rows)) {
+        Some(ranges) => ranges
+            .into_iter()
+            .map(|range| split_piece(&block, range, ctx))
+            .collect(),
+        None => Ok(vec![block]),
+    }
+}
+
+/// Rows `range` of the [`VarBinView`] `block`, holding only the bytes those rows reference.
+///
+/// A slice shares its parent's data buffers, and a buffer is written whole, so a piece passed
+/// on as a slice would store every other piece's bytes too unless the compressor compacts it.
+/// Compaction slices a buffer the piece uses contiguously, so this rarely copies.
+fn split_piece(
+    block: &ArrayRef,
+    range: Range<usize>,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<ArrayRef> {
+    let piece = block.slice(range)?;
+    match piece.as_opt::<VarBinView>() {
+        Some(views) => Ok(views
+            .into_owned()
+            .compact_with_threshold(1.0, ctx)?
+            .into_array()),
+        None => Ok(piece),
     }
 }
 
@@ -128,6 +235,7 @@ impl LayoutStrategy for RepartitionStrategy {
         // segments.
         let block_len = options.effective_block_len(&dtype);
         let block_size_minimum = options.block_size_minimum;
+        let block_size_maximum = self.block_size_maximum;
         let repartition_session = session.clone();
 
         let repartitioned_stream = try_stream! {
@@ -139,6 +247,23 @@ impl LayoutStrategy for RepartitionStrategy {
             while let Some(chunk) = canonical_stream.as_mut().next().await {
                 let (sequence_id, chunk) = chunk?;
                 let mut sequence_pointer = sequence_id.descend();
+                if let Some(ranges) = block_size_maximum
+                    .and_then(|maximum| split_ranges(&chunk, maximum, block_len))
+                {
+                    // Blocks buffered from earlier chunks come first, as they are.
+                    let pending = chunks.take_all();
+                    if !pending.is_empty() {
+                        let pending = ChunkedArray::try_new(pending, dtype_clone.clone())?;
+                        let pending = pending.into_array().execute::<Canonical>(&mut ctx)?.into_array();
+                        for block in under_maximum(pending, block_size_maximum, block_len, &mut ctx)? {
+                            yield (sequence_pointer.advance(), block);
+                        }
+                    }
+                    for range in ranges {
+                        yield (sequence_pointer.advance(), split_piece(&chunk, range, &mut ctx)?);
+                    }
+                    continue;
+                }
                 let mut offset = 0;
                 while offset < chunk.len() {
                     let end = (offset + block_len).min(chunk.len());
@@ -153,10 +278,9 @@ impl LayoutStrategy for RepartitionStrategy {
                             ChunkedArray::try_new(output_chunks, dtype_clone.clone())?;
                         if !chunked.is_empty() {
                             let canonical = chunked.into_array().execute::<Canonical>(&mut ctx)?.into_array();
-                            yield (
-                                sequence_pointer.advance(),
-                                canonical,
-                            )
+                            for block in under_maximum(canonical, block_size_maximum, block_len, &mut ctx)? {
+                                yield (sequence_pointer.advance(), block);
+                            }
                         }
                     }
                 }
@@ -167,10 +291,9 @@ impl LayoutStrategy for RepartitionStrategy {
                     )?;
                     if !to_flush.is_empty() {
                         let canonical = to_flush.into_array().execute::<Canonical>(&mut ctx)?.into_array();
-                        yield (
-                            sequence_pointer.advance(),
-                            canonical,
-                        )
+                        for block in under_maximum(canonical, block_size_maximum, block_len, &mut ctx)? {
+                            yield (sequence_pointer.advance(), block);
+                        }
                     }
                 }
             }
@@ -252,6 +375,13 @@ impl ChunksBuffer {
         self.data.push_front((chunk, nb));
     }
 
+    /// Removes every buffered chunk, in order.
+    fn take_all(&mut self) -> Vec<ArrayRef> {
+        self.row_count = 0;
+        self.nbytes = 0;
+        self.data.drain(..).map(|(chunk, _)| chunk).collect()
+    }
+
     fn pop_front(&mut self) -> Option<(ArrayRef, u64)> {
         let res = self.data.pop_front();
         if let Some((chunk, nb)) = res.as_ref() {
@@ -274,6 +404,7 @@ mod tests {
     use vortex_array::arrays::FixedSizeListArray;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::arrays::SharedArray;
+    use vortex_array::arrays::VarBinViewArray;
     use vortex_array::dtype::DType;
     use vortex_array::dtype::Nullability::NonNullable;
     use vortex_array::dtype::PType;
@@ -524,6 +655,165 @@ mod tests {
         assert_eq!(buf.nbytes, 0);
         assert_eq!(buf.row_count, 0);
 
+        Ok(())
+    }
+
+    /// Writes `array` through a coalescing repartition with a block size maximum and returns
+    /// the row count of each block written.
+    fn block_rows_with_maximum(array: ArrayRef, maximum: Option<u64>) -> VortexResult<Vec<u64>> {
+        let ctx = ArrayContext::empty();
+        let segments = Arc::new(TestSegments::default());
+        let (ptr, eof) = SequenceId::root().split();
+        let strategy = RepartitionStrategy::new(
+            ChunkedLayoutStrategy::new(FlatLayoutStrategy::default()),
+            RepartitionWriterOptions {
+                block_size_minimum: ONE_MEG,
+                block_len_multiple: 8192,
+                block_size_target: Some(ONE_MEG),
+                canonicalize: true,
+            },
+        )
+        .with_block_size_maximum(maximum);
+        let stream = array.to_array_stream().sequenced(ptr);
+        let layout = block_on(|handle| async move {
+            let session = new_session().with_handle(handle);
+            strategy
+                .write_stream(ctx.into(), segments, stream, eof, &session)
+                .await
+        })?;
+        if layout.nchildren() == 0 {
+            // A single block is written as that block's own layout.
+            return Ok(vec![layout.row_count()]);
+        }
+        (0..layout.nchildren())
+            .map(|i| {
+                Ok(layout
+                    .slot(i)?
+                    .vortex_expect("chunk slot present")
+                    .row_count())
+            })
+            .collect()
+    }
+
+    fn strings(rows: usize, width: usize) -> ArrayRef {
+        VarBinViewArray::from_iter_str((0..rows).map(|row| format!("{row:0width$}"))).into_array()
+    }
+
+    #[test]
+    fn a_block_size_maximum_splits_wide_strings_into_power_of_two_blocks() -> VortexResult<()> {
+        // 16,384 rows of 1,000 bytes reference 1,016 bytes each (with their views): an 8,192-row
+        // block is ~8 MiB, so a 1 MiB maximum fits 1,032 rows, rounded down to 1,024.
+        let rows = block_rows_with_maximum(strings(16_384, 1000), Some(ONE_MEG))?;
+        assert_eq!(rows, vec![1024; 16]);
+        Ok(())
+    }
+
+    #[test]
+    fn without_a_maximum_wide_strings_keep_the_row_multiple() -> VortexResult<()> {
+        let rows = block_rows_with_maximum(strings(16_384, 1000), None)?;
+        assert_eq!(rows, vec![8192, 8192]);
+        Ok(())
+    }
+
+    #[test]
+    fn narrow_strings_under_the_maximum_coalesce_as_without_it() -> VortexResult<()> {
+        // 20-byte strings reference 8192 * 36 bytes, about 288 KiB, per 8,192-row block, far
+        // under the maximum, so the blocks are whatever coalescing makes of them without it.
+        // (Coalescing weighs a block by `nbytes()`, which counts the buffer it shares with the
+        // other slices of the input, so here no two blocks merge.)
+        let without = block_rows_with_maximum(strings(65_536, 20), None)?;
+        let with = block_rows_with_maximum(strings(65_536, 20), Some(4 * ONE_MEG))?;
+        assert_eq!(with, without);
+        assert_eq!(with.iter().sum::<u64>(), 65_536);
+        Ok(())
+    }
+
+    fn lengths(ranges: Option<Vec<Range<usize>>>) -> Option<Vec<usize>> {
+        ranges.map(|ranges| ranges.iter().map(ExactSizeIterator::len).collect())
+    }
+
+    #[test]
+    fn split_ranges_measures_referenced_bytes_not_buffers() {
+        // Rows sliced from a larger array share its buffers; only the bytes they point at count.
+        let wide = strings(8192, 1000);
+        let slice = wide.slice(0..64).vortex_expect("slice");
+        assert_eq!(
+            split_ranges(&slice, ONE_MEG, 8192),
+            None,
+            "64 rows reference ~64 KiB"
+        );
+        assert_eq!(
+            lengths(split_ranges(&wide, ONE_MEG, 8192)),
+            Some(vec![1024; 8])
+        );
+        // A maximum smaller than one row still yields blocks of one row.
+        assert_eq!(lengths(split_ranges(&wide, 100, 8192)), Some(vec![1; 8192]));
+        // Non-string chunks are never split.
+        let ints = PrimitiveArray::from_iter(0..8192_i64).into_array();
+        assert_eq!(split_ranges(&ints, 1, 8192), None);
+    }
+
+    #[test]
+    fn clustered_wide_rows_are_split_until_every_block_fits() -> VortexResult<()> {
+        // 256 rows of 100,000 bytes, then 7,936 rows of 100: the block's average row fits a
+        // 1,024-row block under 4 MiB, but its first 1,024 rows reference ~25 MiB.
+        let widths: Vec<usize> = (0..8192)
+            .map(|i| if i < 256 { 100_000 } else { 100 })
+            .collect();
+        let array = VarBinViewArray::from_iter_str(widths.iter().map(|&width| "x".repeat(width)))
+            .into_array();
+        let maximum = 4 * ONE_MEG;
+        let rows = block_rows_with_maximum(array, Some(maximum))?;
+
+        assert_eq!(rows.iter().sum::<u64>(), 8192);
+        let mut start = 0;
+        for &n in &rows {
+            let n = usize::try_from(n).vortex_expect("rows fit usize");
+            let referenced: usize = widths[start..start + n]
+                .iter()
+                .map(|w| w + size_of::<BinaryView>())
+                .sum();
+            assert!(
+                n == 1 || referenced as u64 <= maximum,
+                "block of {n} rows at {start} references {referenced} bytes: {rows:?}"
+            );
+            start += n;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn coalesced_blocks_stay_under_the_maximum() -> VortexResult<()> {
+        // Two separately allocated 8,192-row chunks, each under 4 MiB: 100-byte rows (~0.9 MiB,
+        // under the 1 MiB coalescing minimum) and 480-byte rows (~3.9 MiB). Coalescing the first
+        // with the second would make a ~4.8 MiB block.
+        let widths: Vec<usize> = (0..16_384)
+            .map(|i| if i < 8192 { 100 } else { 480 })
+            .collect();
+        let chunk = |range: Range<usize>| {
+            VarBinViewArray::from_iter_str(widths[range].iter().map(|&w| "x".repeat(w)))
+                .into_array()
+        };
+        let dtype = chunk(0..1).dtype().clone();
+        let array =
+            ChunkedArray::try_new(vec![chunk(0..8192), chunk(8192..16_384)], dtype)?.into_array();
+        let maximum = 4 * ONE_MEG;
+        let rows = block_rows_with_maximum(array, Some(maximum))?;
+
+        assert_eq!(rows.iter().sum::<u64>(), 16_384);
+        let mut start = 0;
+        for &n in &rows {
+            let n = usize::try_from(n).vortex_expect("rows fit usize");
+            let referenced: usize = widths[start..start + n]
+                .iter()
+                .map(|w| w + size_of::<BinaryView>())
+                .sum();
+            assert!(
+                n == 1 || referenced as u64 <= maximum,
+                "block of {n} rows at {start} references {referenced} bytes: {rows:?}"
+            );
+            start += n;
+        }
         Ok(())
     }
 }
