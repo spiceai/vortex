@@ -179,20 +179,11 @@ mod unix {
         let mut bytes = 0;
         for block in (0..rows).step_by(8192) {
             let block_end = (block + 8192).min(rows);
+            // The writer's planning: schemes chosen on the sample `compress` would draw from
+            // the whole block.
             let mut plan = from_sample.then(|| {
-                // A 1,024-row stratified sample (16 x 64 rows) of the block.
-                let stride = (block_end - block) / 16;
-                let slices: Vec<ArrayRef> = (0..16)
-                    .map(|slice| {
-                        let start = block + slice * stride;
-                        array.slice(start..(start + 64).min(block_end)).unwrap()
-                    })
-                    .collect();
-                let sample =
-                    vortex_array::arrays::ChunkedArray::try_new(slices, array.dtype().clone())
-                        .unwrap()
-                        .into_array();
-                compressor.compress_recording(&sample, &mut ctx).unwrap().1
+                let whole = array.slice(block..block_end).unwrap();
+                compressor.plan_for(&whole, &mut ctx).unwrap()
             });
             for start in (block..block_end).step_by(chunk_rows) {
                 let end = (start + chunk_rows).min(block_end);
@@ -255,7 +246,7 @@ mod unix {
                 Box::new(move || compress_planned(full, array, rows, chunk_rows, false)),
             ));
             arms.push((
-                format!("plan P2 8k sample, {chunk_rows} rows"),
+                format!("plan_for on the whole block, {chunk_rows} rows"),
                 Box::new(move || compress_planned(full, array, rows, chunk_rows, true)),
             ));
         }
