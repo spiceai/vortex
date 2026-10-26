@@ -40,6 +40,10 @@ vortex-zstd = { workspace = true, optional = true }
 
 [dev-dependencies]
 arrow-array = { workspace = true }
+libc = "0.2"
+onpair = { workspace = true }
+tracing = { workspace = true, features = ["std"] }
+tracing-subscriber = { workspace = true, features = ["registry"] }
 divan = { workspace = true }
 insta = { workspace = true }
 rstest = { workspace = true }
@@ -61,6 +65,11 @@ workspace = true
 
 [[bench]]
 name = "compress"
+harness = false
+test = false
+
+[[bench]]
+name = "small_chunk_compress"
 harness = false
 test = false
 
