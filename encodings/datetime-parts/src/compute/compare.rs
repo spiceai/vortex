@@ -49,7 +49,11 @@ impl CompareKernel for DateTimeParts {
         let Some(options) = ext_dtype.metadata_opt::<Timestamp>() else {
             return Ok(None);
         };
-        let ts_parts = timestamp::split(timestamp, options.unit)?;
+        // A literal whose day count leaves `i32` has no parts to compare against; fall back
+        // to comparing the decoded timestamps.
+        let Ok(ts_parts) = timestamp::split(timestamp, options.unit) else {
+            return Ok(None);
+        };
 
         match operator {
             CompareOperator::Eq => compare_eq(lhs, &ts_parts, nullability, ctx),
@@ -380,8 +384,13 @@ mod test {
         )
         .unwrap();
 
-        // Timestamp with a value larger than i32::MAX.
-        let rhs = dtp_array_from_timestamp(i64::MAX, rhs_validity);
+        // A timestamp whose day count is larger than i32::MAX cannot be split into parts, so
+        // it stays a plain timestamp array.
+        let rhs = TemporalArray::new_timestamp(
+            PrimitiveArray::new(buffer![i64::MAX], rhs_validity).into_array(),
+            TimeUnit::Seconds,
+            Some("UTC".into()),
+        );
 
         let comparison = lhs
             .clone()
