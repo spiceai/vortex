@@ -429,9 +429,9 @@ mod tests {
     #[case(TimeUnit::Seconds, -62_135_596_800)]
     #[case(TimeUnit::Microseconds, -62_135_596_800_000_000)]
     // -9999-01-01T00:00:00Z
-    #[case(TimeUnit::Seconds, -377_705_203_200)]
-    #[case(TimeUnit::Milliseconds, -377_705_203_200_000)]
-    #[case(TimeUnit::Microseconds, -377_705_203_200_000_000)]
+    #[case(TimeUnit::Seconds, -377_705_116_800)]
+    #[case(TimeUnit::Milliseconds, -377_705_116_800_000)]
+    #[case(TimeUnit::Microseconds, -377_705_116_800_000_000)]
     #[case(TimeUnit::Seconds, i64::MAX)]
     #[case(TimeUnit::Seconds, i64::MIN)]
     #[case(TimeUnit::Milliseconds, i64::MAX)]
