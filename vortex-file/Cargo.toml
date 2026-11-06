@@ -61,9 +61,9 @@ vortex-zigzag = { workspace = true }
 vortex-zstd = { workspace = true, optional = true }
 
 [dev-dependencies]
-libc = "0.2"
 allocator-api2 = { workspace = true }
 divan = { workspace = true }
+libc = "0.2"
 rstest = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 vortex-array = { workspace = true, features = ["_test-harness"] }
