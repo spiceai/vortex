@@ -83,21 +83,25 @@ mod tests {
     use vortex_array::arrays::List;
     use vortex_array::arrays::ListView;
     use vortex_array::arrays::ListViewArray;
+    use vortex_array::arrays::PrimitiveArray;
+    use vortex_array::arrays::TemporalArray;
     use vortex_array::arrays::VarBinViewArray;
     use vortex_array::assert_arrays_eq;
     use vortex_array::dtype::DType;
     use vortex_array::dtype::Nullability;
+    use vortex_array::extension::datetime::TimeUnit;
     use vortex_array::validity::Validity;
     use vortex_buffer::BitBuffer;
     use vortex_buffer::buffer;
+    use vortex_datetime_parts::DateTimeParts;
     use vortex_error::VortexResult;
     use vortex_session::VortexSession;
     #[cfg(feature = "zstd")]
     use vortex_utils::aliases::hash_set::HashSet;
 
     use crate::BtrBlocksCompressor;
-    #[cfg(feature = "zstd")]
     use crate::BtrBlocksCompressorBuilder;
+    use crate::schemes::temporal::TemporalScheme;
 
     static SESSION: LazyLock<VortexSession> = LazyLock::new(vortex_array::array_session);
 
@@ -136,6 +140,44 @@ mod tests {
             assert!(result.as_opt::<ListView>().is_some());
         }
         assert_arrays_eq!(result, input, &mut ctx);
+        Ok(())
+    }
+
+    /// Seconds or milliseconds past `i32` days must not go through datetime parts, which would
+    /// truncate the days and move the instant; the 9999-12-31 sentinel still does.
+    #[rstest]
+    #[case::seconds_2_pow_32_days(TimeUnit::Seconds, 371_085_174_374_400, false)]
+    #[case::seconds_max(TimeUnit::Seconds, i64::MAX, false)]
+    #[case::millis_min(TimeUnit::Milliseconds, i64::MIN, false)]
+    #[case::sentinel_seconds(TimeUnit::Seconds, 253_402_214_400, true)]
+    fn timestamps_past_i32_days_compress_losslessly(
+        #[case] unit: TimeUnit,
+        #[case] extreme: i64,
+        #[case] expect_parts: bool,
+    ) -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        // Midnights, which datetime parts always wins on when its own scheme is the only one.
+        let ticks_per_day = match unit {
+            TimeUnit::Seconds => 86_400,
+            TimeUnit::Milliseconds => 86_400_000,
+            _ => 86_400_000_000, // unused: only s and ms cases
+        };
+        let values: Vec<i64> = (0..2048i64)
+            .map(|i| (i * 7_919 % 20_000) * ticks_per_day)
+            .chain([extreme])
+            .collect();
+        let input = TemporalArray::new_timestamp(
+            PrimitiveArray::from_iter(values).into_array(),
+            unit,
+            None,
+        )
+        .into_array();
+        let compressed = BtrBlocksCompressorBuilder::empty()
+            .with_new_scheme(&TemporalScheme)
+            .build()
+            .compress(&input, &mut ctx)?;
+        assert_eq!(compressed.is::<DateTimeParts>(), expect_parts);
+        assert_arrays_eq!(compressed, input, &mut ctx);
         Ok(())
     }
 
@@ -403,13 +445,13 @@ mod tests {
     fn a_replayed_plan_survives_data_its_schemes_cannot_encode() -> VortexResult<()> {
         let mut ctx = SESSION.create_execution_ctx();
         let compressor = BtrBlocksCompressor::default();
-        let sequential = vortex_array::arrays::PrimitiveArray::from_iter(0..4096_i64).into_array();
+        let sequential = PrimitiveArray::from_iter(0..4096_i64).into_array();
         let (recorded, plan) = compressor.compress_recording(&sequential, &mut ctx)?;
         // The premise: the plan holds a scheme that random integers cannot use.
         assert_eq!(recorded.encoding_id().to_string(), "vortex.sequence");
 
         let mut state = 0x9e37_79b9_u64;
-        let random = vortex_array::arrays::PrimitiveArray::from_iter((0..4096).map(|_| {
+        let random = PrimitiveArray::from_iter((0..4096).map(|_| {
             state ^= state << 13;
             state ^= state >> 7;
             state ^= state << 17;

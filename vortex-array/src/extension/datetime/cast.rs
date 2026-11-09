@@ -150,34 +150,33 @@ mod tests {
         Ok(())
     }
 
-    /// A date past the last instant a timestamp can hold has to be refused.
-    ///
-    /// The `i64` range does not catch these: `i32::MAX` days is a valid `Date32` value and
-    /// scales into `i64` seconds with room to spare, but no timestamp scalar can be built from
-    /// the result. Converting it anyway is what puts the array and the scalar out of step —
-    /// the array holds it, and the scalar a file's statistics go through does not.
+    /// The `9999-12-31` sentinel, and the day after it, convert in every unit that can hold
+    /// them; only `i64` overflow is refused.
     #[rstest]
     #[case(TimeUnit::Seconds)]
     #[case(TimeUnit::Milliseconds)]
     #[case(TimeUnit::Microseconds)]
-    fn a_date_beyond_the_last_representable_instant_is_refused(
-        #[case] target_unit: TimeUnit,
-    ) -> VortexResult<()> {
+    fn a_date_converts_unless_it_overflows_i64(#[case] target_unit: TimeUnit) -> VortexResult<()> {
         let conversion = DateToTimestamp::new(TimeUnit::Days, target_unit)?;
 
+        // 2_932_896 days is 9999-12-31, past Jiff's last instant; 2_932_897 is 10000-01-01.
+        assert!(conversion.convert(2_932_896).is_ok(), "9999-12-31 converts");
         assert!(
-            conversion.convert(i64::from(i32::MAX)).is_err(),
-            "the largest Date32 value is far past the last instant"
+            conversion.convert(2_932_897).is_ok(),
+            "10000-01-01 converts"
         );
-        // Jiff stops at the end of year 9999; 2_932_896 days is 10000-01-01.
-        assert!(
-            conversion.convert(2_932_896).is_err(),
-            "the first day past the end of the range is refused"
-        );
-        assert!(
-            conversion.convert(2_932_895).is_ok(),
-            "the last day inside the range still converts"
-        );
+        // -719_162 days is 0001-01-01.
+        assert!(conversion.convert(-719_162).is_ok(), "0001-01-01 converts");
+
+        let largest = conversion.convert(i64::from(i32::MAX));
+        if target_unit == TimeUnit::Microseconds {
+            assert!(
+                largest.is_err(),
+                "the largest Date32 overflows i64 microseconds"
+            );
+        } else {
+            assert!(largest.is_ok(), "the largest Date32 fits in {target_unit}");
+        }
         Ok(())
     }
 
@@ -185,7 +184,7 @@ mod tests {
     #[test]
     fn the_representable_range_narrows_with_the_target_unit() -> VortexResult<()> {
         // 9999-12-31 fits in seconds through microseconds; nanoseconds run out in 2262.
-        let last_day = 2_932_895;
+        let last_day = 2_932_896;
         assert!(
             DateToTimestamp::new(TimeUnit::Days, TimeUnit::Seconds)?
                 .convert(last_day)

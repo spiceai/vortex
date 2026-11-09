@@ -18,19 +18,55 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 
 use crate::timestamp;
-/// All parts are stored as i32. seconds and subseconds always fit in i32.
-/// For days we have a upper day limitation due to "jiff" validation so days
-/// also fit in i32.
+/// All parts are stored as i32. seconds and subseconds always fit in i32. Days fit for every
+/// microsecond and nanosecond timestamp, but not for seconds or milliseconds past about ±5.8
+/// million years, so [`split_temporal`] refuses those (see `timestamp::days_fit_i32`).
 pub struct TemporalParts {
     pub days: ArrayRef,
     pub seconds: ArrayRef,
     pub subseconds: ArrayRef,
 }
 
+/// Returns whether every value of `array` can be split, i.e. its day count fits in `i32`.
+///
+/// # Errors
+///
+/// Returns an error if the array holds day-level data or cannot be decoded.
+pub fn can_split_temporal(array: &TemporalArray, ctx: &mut ExecutionCtx) -> VortexResult<bool> {
+    let time_unit = array.temporal_metadata().time_unit();
+    if matches!(time_unit, TimeUnit::Days) {
+        return Ok(false);
+    }
+    // Micro- and nanosecond day counts always fit.
+    if matches!(time_unit, TimeUnit::Microseconds | TimeUnit::Nanoseconds) {
+        return Ok(true);
+    }
+    let values = array
+        .temporal_values()
+        .clone()
+        .execute::<PrimitiveArray>(ctx)?;
+    let values = values
+        .clone()
+        .into_array()
+        .cast(DType::Primitive(PType::I64, values.dtype().nullability()))?
+        .execute::<PrimitiveArray>(ctx)?;
+    for &ts in values.as_slice::<i64>() {
+        if !timestamp::days_fit_i32(ts, time_unit)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Compress a `TemporalArray` into day, second, and subseconds components.
 ///
 /// Splitting the components by granularity creates more small values, which enables better
 /// cascading compression.
+///
+/// # Errors
+///
+/// Returns an error for day-level data, or if a value's day count does not fit in `i32` (check
+/// with [`can_split_temporal`] first).
 pub fn split_temporal(array: TemporalArray, ctx: &mut ExecutionCtx) -> VortexResult<TemporalParts> {
     let time_unit = array.temporal_metadata().time_unit();
     if matches!(time_unit, TimeUnit::Days) {
@@ -57,6 +93,15 @@ pub fn split_temporal(array: TemporalArray, ctx: &mut ExecutionCtx) -> VortexRes
     // If we don't [..length], compiler can't infer all 3 or 4 slices are the
     // same length, and zip() in split_slice_* checks iterator boundaries.
     let timestamps = &timestamps.as_slice::<i64>()[..length];
+
+    // A day count past `i32` would be truncated and the instant silently moved.
+    for &ts in timestamps {
+        if !timestamp::days_fit_i32(ts, time_unit)? {
+            vortex_bail!(
+                "Timestamp {ts} {time_unit} has a day count that does not fit in i32 and cannot be split"
+            );
+        }
+    }
 
     let mut days: BufferMut<i32> = BufferMut::with_capacity(timestamps.len());
     let mut seconds: BufferMut<i32> = BufferMut::with_capacity(timestamps.len());
