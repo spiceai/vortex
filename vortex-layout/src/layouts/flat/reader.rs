@@ -27,6 +27,7 @@ use crate::reader::LayoutReader;
 use crate::reader::RowSplits;
 use crate::reader::SplitRange;
 use crate::segments::SegmentSource;
+use crate::segments::mark_pending_wait;
 
 /// The threshold of mask density below which we will evaluate the expression only over the
 /// selected rows, and above which we evaluate the expression over all rows and then select
@@ -144,7 +145,7 @@ impl LayoutReader for FlatReader {
             // TODO(ngates): if the mask density is low enough, or if the mask is dense within a range
             //  (as often happens with zone map pruning), then we could slice/filter the array prior
             //  to evaluating the expression.
-            let mut array = array.clone().await?;
+            let mut array = mark_pending_wait(array).await?;
             let mask = mask.await?;
 
             // Slice the array based on the row mask.
@@ -201,7 +202,7 @@ impl LayoutReader for FlatReader {
         Ok(async move {
             trace!("Flat array evaluation {} - {}", name, expr);
 
-            let mut array = array.clone().await?;
+            let mut array = mark_pending_wait(array).await?;
             let mask = mask.await?;
 
             // Slice the array based on the row mask.

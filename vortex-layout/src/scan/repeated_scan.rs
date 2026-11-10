@@ -6,7 +6,9 @@ use std::iter;
 use std::ops::Range;
 use std::sync::Arc;
 
+use futures::FutureExt;
 use futures::Stream;
+use futures::StreamExt;
 use futures::future::BoxFuture;
 use futures::future::Either as EitherFuture;
 use itertools::Either;
@@ -28,6 +30,9 @@ use vortex_session::VortexSession;
 use crate::LayoutReaderRef;
 use crate::scan::filter::FilterExpr;
 use crate::scan::scan_builder::SplitConcurrency;
+use crate::scan::split_gate::DecodePermit;
+use crate::scan::split_gate::GatedSplit;
+use crate::scan::split_gate::SplitGate;
 use crate::scan::splits::Splits;
 use crate::scan::tasks::TaskContext;
 use crate::scan::tasks::TaskFuture;
@@ -51,6 +56,9 @@ pub struct RepeatedScan<A: 'static + Send> {
     splits: Splits,
     /// How many splits to make progress on concurrently.
     concurrency: SplitConcurrency,
+    /// Splits allowed in flight beyond `concurrency`, see
+    /// [`ScanBuilder::with_split_io_overlap`](crate::scan::scan_builder::ScanBuilder::with_split_io_overlap).
+    max_splits_in_flight: Option<usize>,
     /// Function to apply to each [`ArrayRef`] within the spawned split tasks.
     map_fn: Arc<dyn Fn(ArrayRef) -> VortexResult<A> + Send + Sync>,
     /// Maximal number of rows to read (after filtering)
@@ -101,6 +109,7 @@ impl<A: 'static + Send> RepeatedScan<A> {
         selection: Selection,
         splits: Splits,
         concurrency: SplitConcurrency,
+        max_splits_in_flight: Option<usize>,
         map_fn: Arc<dyn Fn(ArrayRef) -> VortexResult<A> + Send + Sync>,
         limit: Option<u64>,
         dtype: DType,
@@ -115,6 +124,7 @@ impl<A: 'static + Send> RepeatedScan<A> {
             selection,
             splits,
             concurrency,
+            max_splits_in_flight,
             map_fn,
             limit,
             dtype,
@@ -235,7 +245,8 @@ impl<A: 'static + Send> RepeatedScan<A> {
         })
     }
 
-    /// Streams the scan, holding at most [`SplitConcurrency::effective`] splits in flight.
+    /// Streams the scan, holding at most [`SplitConcurrency::effective`] splits in flight, or up
+    /// to the overlap set with `ScanBuilder::with_split_io_overlap` when the scan is unordered.
     ///
     /// Splits are constructed lazily under that bound, so a split's reads are not registered
     /// until it is admitted.
@@ -243,21 +254,46 @@ impl<A: 'static + Send> RepeatedScan<A> {
         &self,
         row_range: Option<Range<u64>>,
     ) -> VortexResult<impl Stream<Item = VortexResult<A>> + Send + 'static + use<A>> {
-        use futures::StreamExt;
         let concurrency = self.concurrency.effective();
         let handle = self.session.handle();
 
+        // Only an unordered scan can overlap I/O: see `ScanBuilder::with_split_io_overlap`.
+        let gate = match self.max_splits_in_flight {
+            Some(max) if !self.ordered && max > concurrency => Some(SplitGate::new(concurrency)),
+            _ => None,
+        };
+        let in_flight = match (&gate, self.max_splits_in_flight) {
+            (Some(_), Some(max)) => max,
+            _ => concurrency,
+        };
+
+        // The permit of a finished split travels with its output and is dropped when the output
+        // leaves the stream below.
         let stream =
             futures::stream::iter(self.split_tasks(row_range)).map(move |task| match task {
-                Ok(task) => EitherFuture::Left(handle.spawn(task)),
-                Err(err) => EitherFuture::Right(futures::future::ready(Err(err))),
+                Ok(task) => match &gate {
+                    Some(gate) => EitherFuture::Left(EitherFuture::Left(
+                        handle.spawn(GatedSplit::new(task, Arc::clone(gate))),
+                    )),
+                    None => EitherFuture::Left(EitherFuture::Right(
+                        handle.spawn(task.map(|output| (output, None::<DecodePermit>))),
+                    )),
+                },
+                Err(err) => {
+                    EitherFuture::Right(futures::future::ready((Err(err), None::<DecodePermit>)))
+                }
             });
 
         let stream = if self.ordered {
-            stream.buffered(concurrency).boxed()
+            stream.buffered(in_flight).boxed()
         } else {
-            stream.buffer_unordered(concurrency).boxed()
+            stream.buffer_unordered(in_flight).boxed()
         };
+
+        let stream = stream.map(|(output, permit)| {
+            drop(permit);
+            output
+        });
 
         Ok(stream.filter_map(|chunk| async move { chunk.transpose() }))
     }

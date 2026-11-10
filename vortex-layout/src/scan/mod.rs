@@ -8,6 +8,7 @@ pub mod multi;
 pub mod repeated_scan;
 pub mod scan_builder;
 pub mod split_by;
+pub(crate) mod split_gate;
 mod splits;
 mod tasks;
 #[cfg(test)]

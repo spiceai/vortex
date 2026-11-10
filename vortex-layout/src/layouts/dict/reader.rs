@@ -42,6 +42,7 @@ use crate::RowSplits;
 use crate::SplitRange;
 use crate::layouts::SharedArrayFuture;
 use crate::segments::SegmentSource;
+use crate::segments::mark_pending_wait;
 
 pub struct DictReader {
     layout: DictLayout,
@@ -273,7 +274,10 @@ impl LayoutReader for DictReader {
 
         Ok(MaskFuture::new(mask.len(), async move {
             // Join on the I/O futures first, before the mask.
-            let (codes, values) = try_join!(codes_eval, values_eval.map_err(VortexError::from))?;
+            let (codes, values) = try_join!(
+                codes_eval,
+                mark_pending_wait(values_eval).map_err(VortexError::from)
+            )?;
             let mask = mask.await?;
 
             let mut ctx = session.create_execution_ctx();
@@ -325,7 +329,10 @@ impl LayoutReader for DictReader {
         };
         let all_values_referenced = self.layout.has_all_values_referenced();
         Ok(async move {
-            let (values, codes) = try_join!(values_eval.map_err(VortexError::from), codes_eval)?;
+            let (values, codes) = try_join!(
+                mark_pending_wait(values_eval).map_err(VortexError::from),
+                codes_eval
+            )?;
 
             // SAFETY: Layout was validated at write time.
             //  * The codes dtype is guaranteed to be an integer type from the layout

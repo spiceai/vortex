@@ -12,6 +12,7 @@ mod cache;
 mod shared;
 mod sink;
 mod source;
+mod wait_marked;
 
 #[cfg(any(test, feature = "_test-harness"))]
 mod test;
@@ -26,6 +27,8 @@ pub use source::*;
 #[cfg(any(test, feature = "_test-harness"))]
 pub use test::*;
 use vortex_error::VortexError;
+pub use wait_marked::WaitMarkedSegmentSource;
+pub(crate) use wait_marked::mark_pending_wait;
 
 /// Identifier for a single physical segment referenced by a layout.
 ///

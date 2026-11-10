@@ -4,22 +4,25 @@
 use std::io;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use futures::FutureExt;
 use futures::SinkExt;
 use futures::StreamExt;
 use futures::channel::mpsc;
 use futures::future::BoxFuture;
 use futures::stream;
+use futures::stream::BoxStream;
 use object_store::GetOptions;
 use object_store::GetRange;
+use object_store::GetResult;
 use object_store::GetResultPayload;
+use object_store::ObjectMeta;
 use object_store::ObjectStore;
 use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjectPath;
 use vortex_array::buffer::BufferHandle;
 use vortex_array::memory::BufferAllocatorRef;
 use vortex_buffer::Alignment;
-use vortex_error::VortexError;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 
@@ -34,6 +37,32 @@ use crate::std_file::read_exact_at;
 /// Default number of concurrent requests to allow.
 pub const DEFAULT_CONCURRENCY: usize = 192;
 
+/// Marks waits on a remote object store without coupling Vortex to a query engine.
+///
+/// The callback receives the network request and its response byte stream separately. It must
+/// preserve their outputs. In particular, it should not mark work that decodes a Vortex array or
+/// copies bytes after a stream item is ready. Applications can leave the callback unset for local
+/// and in-memory stores.
+pub trait ObjectStoreIoWait: Send + Sync + 'static {
+    /// Wrap a remote object metadata request.
+    fn head(
+        &self,
+        future: BoxFuture<'static, object_store::Result<ObjectMeta>>,
+    ) -> BoxFuture<'static, object_store::Result<ObjectMeta>>;
+
+    /// Wrap a remote object range request.
+    fn get(
+        &self,
+        future: BoxFuture<'static, object_store::Result<GetResult>>,
+    ) -> BoxFuture<'static, object_store::Result<GetResult>>;
+
+    /// Wrap each pending wait for the next bytes from a remote response.
+    fn stream(
+        &self,
+        stream: BoxStream<'static, object_store::Result<Bytes>>,
+    ) -> BoxStream<'static, object_store::Result<Bytes>>;
+}
+
 /// An object store backed I/O source.
 pub struct ObjectStoreReadAt {
     store: Arc<dyn ObjectStore>,
@@ -43,6 +72,7 @@ pub struct ObjectStoreReadAt {
     allocator: BufferAllocatorRef,
     concurrency: usize,
     coalesce_config: Option<CoalesceConfig>,
+    io_wait: Option<Arc<dyn ObjectStoreIoWait>>,
 }
 
 impl ObjectStoreReadAt {
@@ -72,7 +102,15 @@ impl ObjectStoreReadAt {
             allocator,
             concurrency: DEFAULT_CONCURRENCY,
             coalesce_config: Some(CoalesceConfig::object_storage()),
+            io_wait: None,
         }
+    }
+
+    /// Mark remote object-store waits using the application's I/O-wait contract.
+    /// Leave this unset for local and in-memory object stores.
+    pub fn with_io_wait(mut self, io_wait: Arc<dyn ObjectStoreIoWait>) -> Self {
+        self.io_wait = Some(io_wait);
+        self
     }
 
     /// Set the concurrency for this source.
@@ -94,6 +132,7 @@ async fn read_object_store_range(
     io_handle: Handle,
     allocator: BufferAllocatorRef,
     request: ReadAtRequest,
+    io_wait: Option<Arc<dyn ObjectStoreIoWait>>,
 ) -> VortexResult<BufferHandle> {
     let ReadAtRequest {
         offset,
@@ -105,15 +144,22 @@ async fn read_object_store_range(
     // SAFETY: each return path checks that every byte was initialized.
     unsafe { buffer.set_len(length) };
 
-    let response = store
-        .get_opts(
-            &path,
-            GetOptions {
-                range: Some(GetRange::Bounded(range.clone())),
-                ..Default::default()
-            },
-        )
-        .await?;
+    let get_range = range.clone();
+    let get = async move {
+        store
+            .get_opts(
+                &path,
+                GetOptions {
+                    range: Some(GetRange::Bounded(get_range)),
+                    ..Default::default()
+                },
+            )
+            .await
+    };
+    let response = match &io_wait {
+        Some(marker) => marker.get(get.boxed()).await?,
+        None => get.await?,
+    };
 
     let buffer = match response.payload {
         #[cfg(not(target_arch = "wasm32"))]
@@ -128,7 +174,11 @@ async fn read_object_store_range(
         GetResultPayload::File(..) => {
             unreachable!("File payload not supported on wasm32")
         }
-        GetResultPayload::Stream(mut byte_stream) => {
+        GetResultPayload::Stream(byte_stream) => {
+            let mut byte_stream = match &io_wait {
+                Some(marker) => marker.stream(byte_stream),
+                None => byte_stream,
+            };
             let mut written = 0usize;
             while let Some(bytes) = byte_stream.next().await {
                 let bytes = bytes?;
@@ -175,12 +225,14 @@ impl VortexReadAt for ObjectStoreReadAt {
     fn size(&self) -> BoxFuture<'static, VortexResult<u64>> {
         let store = Arc::clone(&self.store);
         let path = self.path.clone();
+        let io_wait = self.io_wait.clone();
         async move {
-            store
-                .head(&path)
-                .await
-                .map(|h| h.size)
-                .map_err(VortexError::from)
+            let head = async move { store.head(&path).await };
+            let meta = match io_wait {
+                Some(marker) => marker.head(head.boxed()).await?,
+                None => head.await?,
+            };
+            Ok(meta.size)
         }
         .boxed()
     }
@@ -196,6 +248,7 @@ impl VortexReadAt for ObjectStoreReadAt {
         let handle = self.handle.clone();
         let allocator = self.allocator.clone();
         let io_handle = handle.clone();
+        let io_wait = self.io_wait.clone();
         handle
             .spawn_io(read_object_store_range(
                 store,
@@ -203,6 +256,7 @@ impl VortexReadAt for ObjectStoreReadAt {
                 io_handle,
                 allocator,
                 ReadAtRequest::new(offset, length, alignment),
+                io_wait,
             ))
             .boxed()
     }
@@ -216,6 +270,7 @@ impl VortexReadAt for ObjectStoreReadAt {
         let path = self.path.clone();
         let handle = self.handle.clone();
         let allocator = self.allocator.clone();
+        let io_wait = self.io_wait.clone();
         let concurrency = self.concurrency.max(1);
         let (mut send, recv) = mpsc::channel(concurrency);
         let io_handle = handle.clone();
@@ -229,9 +284,12 @@ impl VortexReadAt for ObjectStoreReadAt {
                 let path = path.clone();
                 let io_handle = io_handle.clone();
                 let allocator = allocator.clone();
+                let io_wait = io_wait.clone();
                 async move {
-                    let result =
-                        read_object_store_range(store, path, io_handle, allocator, request).await;
+                    let result = read_object_store_range(
+                        store, path, io_handle, allocator, request, io_wait,
+                    )
+                    .await;
                     (request, result)
                 }
             });
@@ -275,6 +333,39 @@ mod tests {
     struct CountingExecutor {
         spawn_count: AtomicUsize,
         spawn_io_count: AtomicUsize,
+    }
+
+    #[derive(Default)]
+    struct CountingIoWait {
+        heads: AtomicUsize,
+        gets: AtomicUsize,
+        streams: AtomicUsize,
+    }
+
+    impl ObjectStoreIoWait for CountingIoWait {
+        fn head(
+            &self,
+            future: BoxFuture<'static, object_store::Result<ObjectMeta>>,
+        ) -> BoxFuture<'static, object_store::Result<ObjectMeta>> {
+            self.heads.fetch_add(1, Ordering::SeqCst);
+            future
+        }
+
+        fn get(
+            &self,
+            future: BoxFuture<'static, object_store::Result<GetResult>>,
+        ) -> BoxFuture<'static, object_store::Result<GetResult>> {
+            self.gets.fetch_add(1, Ordering::SeqCst);
+            future
+        }
+
+        fn stream(
+            &self,
+            stream: BoxStream<'static, object_store::Result<Bytes>>,
+        ) -> BoxStream<'static, object_store::Result<Bytes>> {
+            self.streams.fetch_add(1, Ordering::SeqCst);
+            stream
+        }
     }
 
     impl Executor for CountingExecutor {
@@ -362,6 +453,36 @@ mod tests {
         assert_eq!(executor.spawn_io_count.load(Ordering::SeqCst), 1);
         assert_eq!(executor.spawn_count.load(Ordering::SeqCst), 0);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn io_wait_marker_covers_head_and_both_range_read_paths() -> anyhow::Result<()> {
+        let executor = Arc::new(CountingExecutor::default());
+        let runtime = Arc::clone(&executor) as Arc<dyn Executor>;
+        let handle = Handle::new(Arc::downgrade(&runtime));
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let path = ObjectPath::from("test.bin");
+        store.put(&path, PutPayload::from_static(TEST_DATA)).await?;
+
+        let marker = Arc::new(CountingIoWait::default());
+        let reader = ObjectStoreReadAt::new(store, path, handle)
+            .with_io_wait(Arc::clone(&marker) as Arc<dyn ObjectStoreIoWait>);
+        assert_eq!(reader.size().await?, TEST_DATA.len() as u64);
+        assert_eq!(reader.read_at(7, 5, Alignment::new(1)).await?.len(), 5);
+        let requests: Arc<[ReadAtRequest]> = Arc::from([
+            ReadAtRequest::new(0, 6, Alignment::new(1)),
+            ReadAtRequest::new(7, 5, Alignment::new(1)),
+        ]);
+        let results = reader.read_ranges(requests).collect::<Vec<_>>().await;
+        assert_eq!(results.len(), 2);
+        for (_, result) in results {
+            result?;
+        }
+
+        assert_eq!(marker.heads.load(Ordering::SeqCst), 1);
+        assert_eq!(marker.gets.load(Ordering::SeqCst), 3);
+        assert_eq!(marker.streams.load(Ordering::SeqCst), 3);
         Ok(())
     }
 }
