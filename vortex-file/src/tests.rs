@@ -3477,3 +3477,94 @@ async fn repro_8166_binary_gt_all_ff_max() -> VortexResult<()> {
     assert_arrays_eq!(result, mk_struct(vec![big])?, &mut ctx);
     Ok(())
 }
+
+/// Writes `chunks` of an `n: i64` column next to an `s: utf8` column, and returns the
+/// file-level `Sum` of `n` and whether `s` kept its bounded max, as a reader of the file
+/// sees them.
+async fn sum_and_string_max_written(
+    chunks: Vec<Vec<i64>>,
+    additional: Vec<AggregateFnRef>,
+) -> VortexResult<(Precision<ScalarValue>, bool)> {
+    let struct_chunks = chunks
+        .into_iter()
+        .map(|values| {
+            let len = values.len();
+            let strings = VarBinViewArray::from_iter_str((0..len).map(|i| format!("value-{i}")));
+            StructArray::try_new(
+                ["n", "s"].into(),
+                vec![
+                    PrimitiveArray::from_iter(values).into_array(),
+                    strings.into_array(),
+                ],
+                len,
+                Validity::NonNullable,
+            )
+            .map(IntoArray::into_array)
+        })
+        .collect::<VortexResult<Vec<_>>>()?;
+    let dtype = struct_chunks[0].dtype().clone();
+    let array = ChunkedArray::try_new(struct_chunks, dtype)?.into_array();
+
+    let mut buf = ByteBufferMut::empty();
+    SESSION
+        .write_options()
+        .with_additional_file_statistics(additional)
+        .write(&mut buf, array.to_array_stream())
+        .await?;
+
+    let file = SESSION.open_options().open_buffer(ByteBuffer::from(buf))?;
+    let stats = file
+        .file_stats()
+        .expect("file statistics should be present");
+    let (n, _) = stats.get_by_path(&field_path!(n)).expect("n entry");
+    let (s, _) = stats.get_by_path(&field_path!(s)).expect("s entry");
+    Ok((
+        stat_value(n, Stat::Sum),
+        !stat_value(s, Stat::Max).is_absent(),
+    ))
+}
+
+/// The defaults leave `Sum` out; asking for it on top of them records it, and keeps each
+/// column's own defaults, such as the bounded max of a string column, which has no sum.
+#[tokio::test]
+async fn additional_file_statistics_add_to_each_columns_defaults() -> VortexResult<()> {
+    let sum = Stat::Sum
+        .aggregate_fn()
+        .vortex_expect("Sum has an aggregate fn");
+    // Two chunks of 8,192 rows each, so the file sum is a merge of chunk sums.
+    let chunks = || vec![vec![2i64; 8192], vec![3i64; 8192]];
+
+    let (default_sum, default_string_max) = sum_and_string_max_written(chunks(), vec![]).await?;
+    assert!(default_sum.is_absent(), "the defaults record no sum");
+    assert!(default_string_max, "a string column records a bounded max");
+
+    let (with_sum, string_max) = sum_and_string_max_written(chunks(), vec![sum]).await?;
+    assert_eq!(
+        with_sum,
+        Precision::exact(ScalarValue::from(5 * 8192i64)),
+        "the sum of both chunks"
+    );
+    assert!(
+        string_max,
+        "adding a sum keeps the string column's defaults"
+    );
+    Ok(())
+}
+
+/// A chunk whose sum overflows leaves the file sum absent rather than the sum of the other
+/// chunks, which a reader would take as exact.
+#[tokio::test]
+async fn an_additional_sum_is_absent_when_a_chunk_overflows() -> VortexResult<()> {
+    let sum = Stat::Sum
+        .aggregate_fn()
+        .vortex_expect("Sum has an aggregate fn");
+    let mut overflowing = vec![0i64; 8192];
+    overflowing[0] = i64::MAX;
+    overflowing[1] = 1;
+    let mut other = vec![0i64; 8192];
+    other[0] = -10;
+
+    let (file_sum, _) = sum_and_string_max_written(vec![overflowing, other], vec![sum]).await?;
+    assert!(file_sum.is_absent(), "got {file_sum:?}");
+    Ok(())
+}

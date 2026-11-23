@@ -51,7 +51,7 @@ use vortex_layout::BufferedBytesTracker;
 use vortex_layout::LayoutContext;
 use vortex_layout::LayoutStrategy;
 use vortex_layout::LayoutWriterContext;
-use vortex_layout::layouts::file_stats::accumulate_stats;
+use vortex_layout::layouts::file_stats::accumulate_stats_with_additional;
 use vortex_layout::sequence::SequenceId;
 use vortex_layout::sequence::SequentialStreamAdapter;
 use vortex_layout::sequence::SequentialStreamExt;
@@ -90,6 +90,9 @@ pub struct VortexWriteOptions {
     ///
     /// If unset, the writer chooses pruning aggregates from the file dtype.
     file_statistics: Option<Vec<AggregateFnRef>>,
+    /// Aggregates recorded on top of each column's defaults; see
+    /// [`Self::with_additional_file_statistics`].
+    additional_file_statistics: Vec<AggregateFnRef>,
     write_nested_statistics: bool,
     write_legacy_statistics: bool,
     metadata: HashMap<String, ByteBuffer>,
@@ -114,6 +117,7 @@ impl VortexWriteOptions {
             session,
             exclude_dtype: false,
             file_statistics: None,
+            additional_file_statistics: Vec::new(),
             write_nested_statistics: false,
             write_legacy_statistics: true,
             metadata: HashMap::default(),
@@ -171,6 +175,19 @@ impl VortexWriteOptions {
     /// write fails if this asks for one they don't, while the defaults leave such aggregates out.
     pub fn with_file_statistics(mut self, file_statistics: Vec<AggregateFnRef>) -> Self {
         self.file_statistics = Some(file_statistics);
+        self
+    }
+
+    /// Record `additional` file-level aggregates on top of the defaults each column's dtype
+    /// chooses.
+    ///
+    /// Unlike [`Self::with_file_statistics`], which replaces the defaults with one list for every
+    /// column, this keeps each column's own defaults, such as a byte-bounded min/max for a string
+    /// column, and adds to them. An aggregate a column's dtype does not support, or that the
+    /// enabled editions do not permit, is left out for that column rather than failing the write.
+    /// Ignored when [`Self::with_file_statistics`] is set.
+    pub fn with_additional_file_statistics(mut self, additional: Vec<AggregateFnRef>) -> Self {
+        self.additional_file_statistics = additional;
         self
     }
 
@@ -329,9 +346,10 @@ impl VortexWriteOptions {
         let write_nested_statistics =
             self.write_nested_statistics && ctx.allows_aggregate(&Min.id());
 
-        let (file_stats, stream) = accumulate_stats(
+        let (file_stats, stream) = accumulate_stats_with_additional(
             stream,
             file_statistics,
+            Arc::from(self.additional_file_statistics.as_slice()),
             &self.session,
             write_nested_statistics,
             self.write_legacy_statistics,
