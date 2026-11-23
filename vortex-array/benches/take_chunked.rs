@@ -8,23 +8,38 @@
 
 use std::fmt::Display;
 use std::fmt::Formatter;
+use std::sync::LazyLock;
 
 use divan::Bencher;
 use divan::counter::ItemsCount;
+use mimalloc::MiMalloc;
 use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
 use vortex_array::RecursiveCanonical;
 use vortex_array::VortexSessionExecute;
-use vortex_array::array_session;
 use vortex_array::arrays::ChunkedArray;
 use vortex_array::arrays::FixedSizeListArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::StructArray;
 use vortex_array::dtype::FieldNames;
+use vortex_array::memory::MemorySession;
+use vortex_array::optimizer::kernels::KernelSession;
+use vortex_array::test_harness::mark_optimized;
 use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
+use vortex_session::VortexSession;
+
+static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
+    VortexSession::empty()
+        .with::<KernelSession>()
+        .with::<MemorySession>()
+});
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 fn main() {
+    LazyLock::force(&SESSION);
     divan::main();
 }
 
@@ -35,7 +50,6 @@ const NESTED_WIDTH: usize = 8;
 enum Pattern {
     Sorted,
     Shuffled,
-    Repeated,
     Duplicate90,
     Duplicate99,
     SameChunk,
@@ -48,7 +62,6 @@ impl Display for Pattern {
         f.write_str(match self {
             Self::Sorted => "sorted",
             Self::Shuffled => "shuffled",
-            Self::Repeated => "repeated",
             Self::Duplicate90 => "duplicate90",
             Self::Duplicate99 => "duplicate99",
             Self::SameChunk => "same_chunk",
@@ -135,7 +148,7 @@ impl Display for Case {
     }
 }
 
-// Chunk and index counts are sized to keep CodSpeed simulation under 1ms per case.
+// Chunk and index counts cover routing costs while keeping each iteration below 1 ms.
 fn cases() -> Vec<Case> {
     let mut cases = Vec::new();
 
@@ -148,16 +161,15 @@ fn cases() -> Vec<Case> {
     }
 
     for chunks in [256, 2_048] {
-        for indices in [1, 16, 64] {
+        for indices in [16, 64] {
             cases.push(Case::new("small_m", Pattern::Shuffled, chunks, indices));
         }
     }
 
-    for pattern in [
-        Pattern::Repeated,
-        Pattern::Duplicate90,
-        Pattern::Duplicate99,
-    ] {
+    // Duplicate90 and Duplicate99 cover heavy duplication. An all-identical index vector used
+    // to sit here too, but it reported either 24 µs or 104 µs on pull requests that changed no
+    // Vortex code, so the degenerate case measured nothing useful.
+    for pattern in [Pattern::Duplicate90, Pattern::Duplicate99] {
         cases.push(Case::new("duplicates", pattern, 16, 1_000));
     }
 
@@ -232,15 +244,12 @@ fn chunk_values(value_kind: ValueKind, start: usize, end: usize) -> ArrayRef {
 
 fn chunked_values(case: Case) -> ArrayRef {
     let chunk_len = SOURCE_LEN / case.chunks;
-    let chunks = (0..case.chunks)
-        .map(|chunk_idx| {
-            let start = chunk_idx * chunk_len;
-            let end = start + chunk_len;
-            chunk_values(case.value_kind, start, end)
-        })
-        .collect::<Vec<_>>();
-    let dtype = chunks[0].dtype().clone();
-    ChunkedArray::try_new(chunks, dtype).unwrap().into_array()
+    let chunks = (0..case.chunks).map(|chunk_idx| {
+        let start = chunk_idx * chunk_len;
+        let end = start + chunk_len;
+        chunk_values(case.value_kind, start, end)
+    });
+    ChunkedArray::from_iter(chunks).into_array()
 }
 
 fn advance_random(state: &mut u64) -> u64 {
@@ -255,8 +264,7 @@ fn index_values(case: Case) -> Vec<u64> {
     let mut indices = match case.pattern {
         Pattern::Sorted | Pattern::Shuffled => (0..case.indices)
             .map(|_| advance_random(&mut state) % u64::try_from(SOURCE_LEN).unwrap())
-            .collect(),
-        Pattern::Repeated => vec![u64::try_from(SOURCE_LEN / 2).unwrap(); case.indices],
+            .collect::<Vec<_>>(),
         Pattern::Duplicate90 | Pattern::Duplicate99 => {
             let divisor = match case.pattern {
                 Pattern::Duplicate90 => 10,
@@ -337,15 +345,19 @@ fn take_indices(case: Case) -> ArrayRef {
     }
 }
 
-#[divan::bench(args = cases())]
+// Materialization can grow mimalloc's page map through system calls. Measure its full cost.
+// The x86 variants still vary between processes with larger samples. Keep those runs local.
+#[vortex_bench_support::cpu_features(exclude = ["avx2", "avx512"])]
+#[divan::bench(args = cases(), sample_size = 16)]
 fn take(bencher: Bencher, case: Case) {
     let values = chunked_values(case);
     let indices = take_indices(case);
-    let session = array_session();
+    mark_optimized(&values, &SESSION).unwrap();
+    mark_optimized(&indices, &SESSION).unwrap();
 
     bencher
         .counter(ItemsCount::new(case.indices))
-        .with_inputs(|| (indices.clone(), session.create_execution_ctx()))
+        .with_inputs(|| (indices.clone(), SESSION.create_execution_ctx()))
         .bench_refs(|(indices, ctx)| {
             values
                 .take(indices.clone())

@@ -16,15 +16,16 @@ use vortex::array::Canonical;
 use vortex::array::IntoArray;
 use vortex::array::VortexSessionExecute;
 use vortex::array::arrays::Bool;
+use vortex::array::arrays::BoolArray;
 use vortex::array::arrays::NullArray;
 use vortex::array::arrays::Primitive;
 use vortex::array::arrays::PrimitiveArray;
-use vortex::array::arrays::StructArray;
+use vortex::array::arrays::Struct;
 use vortex::array::arrays::VarBinView;
 use vortex::array::arrays::bool::BoolArrayExt;
 use vortex::array::arrays::struct_::StructArrayExt;
-use vortex::array::legacy_session;
 use vortex::array::validity::Validity;
+use vortex::buffer::BitBuffer;
 use vortex::buffer::Buffer;
 use vortex::dtype::DType;
 use vortex::dtype::half::f16;
@@ -32,6 +33,7 @@ use vortex::error::VortexExpect;
 use vortex::error::VortexResult;
 use vortex::error::vortex_bail;
 use vortex::error::vortex_ensure;
+use vortex::error::vortex_ensure_eq;
 use vortex::error::vortex_err;
 use vortex::error::vortex_panic;
 use vortex_arrow::ArrowSessionExt;
@@ -67,6 +69,46 @@ box_wrapper!(
     ArrayRef,
     vx_array
 );
+
+/// Readonly view over bitpacked booleans.
+///
+/// "elements" is the number of bits/elements. Use vx_bool_view_words(view) to
+/// get the number of uint8_t words.
+/// Bits are laid out LSB-first.
+///
+/// "bit_offset" is in [0; 8) and lets a view start at a non-byte-aligned bit.
+/// Use vx_bool_view_nth(view, index) macro to read a single element.
+///
+/// Example:
+/// "view" holds 6 boolean elements, bit_offset=2, first 5 elements are "true",
+/// last is "false".
+///
+/// uint8_t word = 0b01111100;
+/// vx_bool_view view = {&word, 6, 2};
+#[repr(C)]
+pub struct vx_bool_view {
+    /// Element 0 is bit "bit_offset" of "ptr".
+    pub ptr: *const u8,
+    /// Number of elements represented by "ptr".
+    pub elements: usize,
+    /// Bit offset of element 0 within the first byte of "ptr".
+    pub bit_offset: usize,
+}
+
+impl vx_bool_view {
+    /// {NULL, 0, 0}
+    const fn null() -> vx_bool_view {
+        vx_bool_view {
+            ptr: ptr::null(),
+            elements: 0,
+            bit_offset: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        (self.elements + self.bit_offset).div_ceil(8)
+    }
+}
 
 /// Borrow the [`ArrayRef`] behind a [`vx_array`] handle, erroring on a null pointer.
 ///
@@ -221,10 +263,9 @@ pub unsafe extern "C-unwind" fn vx_array_dtype(array: *const vx_array) -> *const
 }
 
 // Return a field for array at index.
-// Returns NULL and sets error_out if index is out of bounds or array doesn't
-// have dtype DTYPE_STRUCT.
+// Returns NULL and sets error_out if index is out of bounds or array is not a
+// canonical Struct array.
 #[unsafe(no_mangle)]
-#[allow(clippy::disallowed_methods)]
 pub unsafe extern "C-unwind" fn vx_array_get_field(
     array: *const vx_array,
     index: usize,
@@ -232,9 +273,13 @@ pub unsafe extern "C-unwind" fn vx_array_get_field(
 ) -> *const vx_array {
     try_or_default(error_out, || {
         let array = vx_array::as_ref(array);
+        let struct_array = array.as_opt::<Struct>().ok_or_else(|| {
+            vortex_err!(
+                "vx_array_get_field requires a canonical Struct array, got {}",
+                array.encoding_id()
+            )
+        })?;
 
-        let mut ctx = legacy_session().create_execution_ctx();
-        let struct_array = array.clone().execute::<StructArray>(&mut ctx)?;
         let field_array = struct_array
             .unmasked_field_opt(index)
             .ok_or_else(|| vortex_err!("Field index out of bounds"))?
@@ -262,7 +307,6 @@ pub unsafe extern "C-unwind" fn vx_array_slice(
 /// validity array. Sets error if index is out of bounds or underlying validity
 /// array is corrupted.
 #[unsafe(no_mangle)]
-#[allow(clippy::disallowed_methods)]
 pub unsafe extern "C-unwind" fn vx_array_element_is_invalid(
     session: *const vx_session,
     array: *const vx_array,
@@ -277,15 +321,16 @@ pub unsafe extern "C-unwind" fn vx_array_element_is_invalid(
 
 /// Check how many items in the array are invalid (null).
 #[unsafe(no_mangle)]
-#[allow(clippy::disallowed_methods)]
 pub unsafe extern "C-unwind" fn vx_array_invalid_count(
+    session: *const vx_session,
     array: *const vx_array,
     error_out: *mut *mut vx_error,
 ) -> usize {
     try_or_default(error_out, || {
+        let session = unsafe { vx_session_ref(session) }?;
         vortex_ensure!(!array.is_null());
         let array = vx_array::as_ref(array);
-        array.invalid_count(&mut legacy_session().create_execution_ctx())
+        array.invalid_count(&mut session.create_execution_ctx())
     })
 }
 
@@ -381,6 +426,48 @@ pub extern "C-unwind" fn vx_array_new_primitive(
             primitive_from_raw(ptr as *const f64, len, validity, error)
         },
     }
+}
+
+/// Create a new Bool array from vx_bool_view.
+///
+/// Example:
+///
+/// a Bool array with 9 elements, first 8 are "true", last is "false".
+///
+/// const vx_error* error = NULL;
+/// vx_validity validity = {};
+/// validity.type = VX_VALIDITY_NON_NULLABLE;
+///
+/// uint8_t words\[2\] = {0xff, 0}; // 11111111 00000000
+/// vx_bool_view view = {words, 9, 0};
+///
+/// const vx_array* array = vx_array_new_bool(&view, &validity, &error);
+/// vx_array_free(array);
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn vx_array_new_bool(
+    view: *const vx_bool_view,
+    validity: *const vx_validity,
+    error: *mut *mut vx_error,
+) -> *const vx_array {
+    try_or_default(error, || {
+        vortex_ensure!(!view.is_null());
+        vortex_ensure!(!validity.is_null());
+        let bits = unsafe { &*view };
+        let validity = unsafe { &*validity };
+        vortex_ensure!(bits.bit_offset < 8, "bit_offset must be in [0; 8)");
+        let byte_len = bits.len();
+
+        let slice = if bits.ptr.is_null() {
+            vortex_ensure_eq!(byte_len, 0, "nonzero length but null pointer for view");
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(bits.ptr, byte_len) }
+        };
+        let buffer = Buffer::copy_from(slice);
+        let bits = BitBuffer::new_with_offset(buffer, bits.elements, bits.bit_offset);
+        let array = BoolArray::try_new(bits, validity.into())?;
+        Ok(vx_array::new(array.into_array()))
+    })
 }
 
 /// Create a Vortex array by importing an Arrow array via the Arrow C Data Interface.
@@ -573,31 +660,43 @@ pub unsafe extern "C-unwind" fn vx_array_data_ptr_primitive(
     })
 }
 
-/// Return a pointer to the bitpacked buffer of a canonical Bool array.
-/// Pointer is valid as long as "array" is valid.
-///
-/// Writes bit offset of the first element into "bit_offset_out".
-/// "bit_offset_out" must not be NULL.
+/// Return vx_bool_view for a canonical Bool array.
+/// View is valid as long as "array" is valid.
 ///
 /// Errors if array is not a canonical Bool.
+///
+/// Example:
+///
+/// vx_validity validity = {};
+/// validity.type = VX_VALIDITY_NON_NULLABLE;
+///
+/// uint8_t words\[2\] = {0xff, 0}; // 11111111 00000000
+/// vx_bool_view view = {words, 9, 0};
+///
+/// const vx_array* array = vx_array_new_bool(&view, &validity, &error);
+/// vx_bool_view other = vx_array_data_ptr_bool(array, &error);
+///
+/// vx_array_free(array);
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn vx_array_data_ptr_bool(
     array: *const vx_array,
-    bit_offset_out: *mut usize,
     error_out: *mut *mut vx_error,
-) -> *const c_void {
-    try_or(error_out, ptr::null(), || {
-        let array = vx_array::as_ref(array);
-        vortex_ensure!(!bit_offset_out.is_null(), "null bit_offset_out");
-        let bool_array = array.as_opt::<Bool>().ok_or_else(|| {
-            vortex_err!(
-                "vx_array_data_ptr_bool requires a canonical Bool array, got {}",
-                array.encoding_id()
-            )
+) -> vx_bool_view {
+    try_or(error_out, vx_bool_view::null(), || {
+        let array = unsafe { vx_array_ref(array) }?;
+        let array = array.as_opt::<Bool>().ok_or_else(|| {
+            let id = array.encoding_id();
+            vortex_err!("vx_array_data_ptr_bool requires a canonical Bool array, got {id}")
         })?;
-        let bits = bool_array.to_bit_buffer();
-        unsafe { bit_offset_out.write(bits.offset()) };
-        Ok(bits.inner().as_ptr().cast())
+        let bits = array.to_bit_buffer();
+        let ptr = bits.inner().as_ptr().cast();
+        let elements = bits.len();
+        let bit_offset = bits.offset();
+        Ok(vx_bool_view {
+            ptr,
+            elements,
+            bit_offset,
+        })
     })
 }
 
@@ -624,20 +723,21 @@ mod tests {
     use std::ptr;
     use std::slice::from_raw_parts;
     use std::sync::Arc;
+    use std::sync::LazyLock;
 
     use vortex::array::IntoArray;
     use vortex::array::VortexSessionExecute;
-    use vortex::array::array_session;
     use vortex::array::arrays::BoolArray;
     use vortex::array::arrays::PrimitiveArray;
     use vortex::array::arrays::StructArray;
     use vortex::array::arrays::VarBinViewArray;
-    use vortex::array::arrays::bool::BoolArrayExt;
+    use vortex::array::assert_arrays_eq;
     use vortex::array::validity::Validity;
     use vortex::buffer::buffer;
     use vortex::expr::eq;
     use vortex::expr::lit;
     use vortex::expr::root;
+    use vortex::session::VortexSession;
 
     use crate::array::*;
     use crate::dtype::vx_dtype_free;
@@ -651,6 +751,8 @@ mod tests {
     use crate::session::vx_session_new_with;
     use crate::tests::assert_error;
     use crate::tests::assert_no_error;
+
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
 
     unsafe fn get_i32(session: *const vx_session, array: *const vx_array, index: usize) -> i32 {
         let mut error = ptr::null_mut();
@@ -738,6 +840,7 @@ mod tests {
             assert_no_error(error);
             assert_eq!(vx_array_len(sliced), 3);
             assert_eq!(get_i32(session, sliced, 0), 2);
+            assert_eq!(get_i32(session, sliced, 1), 3);
             assert_eq!(get_i32(session, sliced, 2), 4);
 
             vx_array_free(sliced);
@@ -781,7 +884,7 @@ mod tests {
             ));
             assert_no_error(error);
 
-            let null_count = vx_array_invalid_count(ffi_array, &raw mut error);
+            let null_count = vx_array_invalid_count(session, ffi_array, &raw mut error);
             assert_no_error(error);
             assert_eq!(null_count, 1);
 
@@ -811,6 +914,11 @@ mod tests {
             let field0 = vx_array_get_field(ffi_array, 0, &raw mut error);
             assert_no_error(error);
             assert_eq!(vx_array_len(field0), 3);
+            for (index, expected) in ["Alice", "Bob", "Charlie"].into_iter().enumerate() {
+                let actual = vx_array_utf8_at(field0, index, &raw mut error);
+                assert_no_error(error);
+                assert_eq!(actual.as_str().unwrap(), expected);
+            }
 
             let field1 = vx_array_get_field(ffi_array, 1, &raw mut error);
             assert_no_error(error);
@@ -823,6 +931,13 @@ mod tests {
             let field_oob = vx_array_get_field(ffi_array, 2, &raw mut error);
             assert!(!error.is_null());
             assert!(field_oob.is_null());
+            vx_error_free(error);
+
+            // A non-Struct array is not executed into a Struct
+            let mut error = ptr::null_mut();
+            let not_struct = vx_array_get_field(field1, 0, &raw mut error);
+            assert!(!error.is_null());
+            assert!(not_struct.is_null());
             vx_error_free(error);
 
             vx_array_free(field0);
@@ -913,11 +1028,9 @@ mod tests {
             assert!(!res.is_null());
             {
                 let res = vx_array::as_ref(res);
-                let mut ctx = array_session().create_execution_ctx();
-                let bool_array = res.clone().execute::<BoolArray>(&mut ctx).unwrap();
-                let buffer = bool_array.to_bit_buffer();
-                let expected = BoolArray::from_iter(vec![false, false, true, true]);
-                assert_eq!(buffer, expected.to_bit_buffer());
+                let mut ctx = SESSION.create_execution_ctx();
+                let expected = BoolArray::from_iter([Some(false), None, Some(true), Some(true)]);
+                assert_arrays_eq!(res, expected, &mut ctx);
             }
             vx_array_free(res);
 
@@ -950,6 +1063,10 @@ mod tests {
 
         unsafe { vx_array_free(vx_arr) };
         unsafe {
+            assert_eq!(
+                vx_dtype_get_variant(dtype_ptr),
+                vx_dtype_variant::DTYPE_STRUCT
+            );
             vx_dtype_free(dtype_ptr);
         }
     }
@@ -995,6 +1112,17 @@ mod tests {
         };
         assert_no_error(error);
         assert!(!vx.is_null());
+        assert!(ffi_array.is_released());
+        let mut ctx = SESSION.create_execution_ctx();
+        let expected = StructArray::try_from_iter([
+            ("a", buffer![1i32, 2, 3].into_array()),
+            (
+                "b",
+                VarBinViewArray::from_iter_nullable_str([Some("x"), None, Some("z")]).into_array(),
+            ),
+        ])
+        .unwrap();
+        assert_arrays_eq!(vx_array::as_ref(vx), expected, &mut ctx);
 
         unsafe {
             assert!(vx_array_has_dtype(vx, vx_dtype_variant::DTYPE_STRUCT));
@@ -1031,7 +1159,6 @@ mod tests {
         unsafe {
             let session = vx_session_new();
             let mut error = ptr::null_mut();
-            let mut bit_offset = usize::MAX;
 
             let array = vx_array::new(primitive.into_array());
             let canonical = vx_array_canonicalize(session, array, &raw mut error);
@@ -1039,7 +1166,9 @@ mod tests {
             let data = vx_array_data_ptr_primitive(canonical, &raw mut error);
             assert_no_error(error);
 
-            assert_eq!(from_raw_parts(data.cast::<i32>(), 3), [10, 20, 30]);
+            let values = from_raw_parts(data.cast::<i32>(), 3);
+            assert_eq!(values[0], 10);
+            assert_eq!(values[2], 30);
             let mut validity = vx_validity {
                 r#type: vx_validity_type::VX_VALIDITY_NON_NULLABLE,
                 array: ptr::null(),
@@ -1053,12 +1182,10 @@ mod tests {
             ));
             let validity_bools = vx_array_canonicalize(session, validity.array, &raw mut error);
             assert_no_error(error);
-            let bits = vx_array_data_ptr_bool(validity_bools, &raw mut bit_offset, &raw mut error);
+            let view = vx_array_data_ptr_bool(validity_bools, &raw mut error);
             assert_no_error(error);
-            assert_eq!(
-                *bits.cast::<u8>().add(bit_offset / 8) >> (bit_offset % 8) & 0b111,
-                0b101
-            );
+            let byte = *view.ptr.add(view.bit_offset / 8);
+            assert_eq!((byte >> (view.bit_offset % 8)) & 0b111, 0b101);
 
             vx_array_free(validity_bools);
             vx_array_free(validity.array);
@@ -1070,7 +1197,7 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn test_canonicalize() {
+    fn test_nonnullable_validity() {
         let primitive = PrimitiveArray::new(buffer![1u8, 2u8], Validity::NonNullable);
 
         unsafe {
@@ -1097,6 +1224,126 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore)]
+    fn test_bool() {
+        unsafe {
+            let words: [u8; 2] = [u8::MAX, 0];
+            let validity = vx_validity {
+                r#type: vx_validity_type::VX_VALIDITY_NON_NULLABLE,
+                array: ptr::null(),
+            };
+
+            let view = vx_bool_view {
+                ptr: words.as_ptr(),
+                elements: 9,
+                bit_offset: 0,
+            };
+
+            let mut error = ptr::null_mut();
+            let array = vx_array_new_bool(&raw const view, &raw const validity, &raw mut error);
+            assert_no_error(error);
+            assert!(!array.is_null());
+            assert!(vx_array_has_dtype(array, vx_dtype_variant::DTYPE_BOOL));
+            assert_eq!(vx_array_len(array), 9);
+
+            for i in 0..8 {
+                assert!(vx_array_get_bool(array, i));
+            }
+            assert!(!vx_array_get_bool(array, 8));
+
+            let other_view = vx_array_data_ptr_bool(array, &raw mut error);
+            assert_no_error(error);
+            assert_eq!(other_view.elements, 9);
+            assert_eq!(other_view.bit_offset, 0);
+            assert_eq!(*other_view.ptr, words[0]);
+
+            vx_array_free(array);
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_bool_offset() {
+        // 6 elements starting at bit 2, first 5 true, last false.
+        let word: u8 = 0b01111100;
+
+        unsafe {
+            let validity = vx_validity {
+                r#type: vx_validity_type::VX_VALIDITY_NON_NULLABLE,
+                array: ptr::null(),
+            };
+            let view = vx_bool_view {
+                ptr: &raw const word,
+                elements: 6,
+                bit_offset: 2,
+            };
+
+            let mut error = ptr::null_mut();
+            let array = vx_array_new_bool(&raw const view, &raw const validity, &raw mut error);
+            assert_no_error(error);
+            assert_eq!(vx_array_len(array), 6);
+
+            for i in 0..5 {
+                assert!(vx_array_get_bool(array, i), "index {i}");
+            }
+            assert!(!vx_array_get_bool(array, 5));
+
+            vx_array_free(array);
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_bool_roundtrip() {
+        let expected = [
+            true, true, false, true, false, true, true, false, true, true,
+        ];
+
+        unsafe {
+            let session = vx_session_new();
+            let mut error = ptr::null_mut();
+            let validity = vx_validity {
+                r#type: vx_validity_type::VX_VALIDITY_NON_NULLABLE,
+                array: ptr::null(),
+            };
+
+            let mut words = vec![0u8; expected.len().div_ceil(8)];
+            for (i, value) in expected.iter().enumerate() {
+                if *value {
+                    words[i / 8] |= 1 << (i % 8);
+                }
+            }
+
+            let view = vx_bool_view {
+                ptr: words.as_ptr(),
+                elements: expected.len(),
+                bit_offset: 0,
+            };
+            let array = vx_array_new_bool(&raw const view, &raw const validity, &raw mut error);
+            assert_no_error(error);
+
+            let canonical = vx_array_canonicalize(session, array, &raw mut error);
+            assert_no_error(error);
+
+            for (i, value) in expected.iter().enumerate() {
+                assert_eq!(vx_array_get_bool(canonical, i), *value, "index {i}");
+            }
+
+            let bits = vx_array_data_ptr_bool(canonical, &raw mut error);
+            assert_no_error(error);
+            for (i, value) in expected.iter().enumerate() {
+                let bit = bits.bit_offset + i;
+                let actual = (*bits.ptr.add(bit / 8) >> (bit % 8)) & 1 == 1;
+                assert_eq!(actual, *value, "index {i}");
+            }
+
+            vx_array_free(canonical);
+            vx_array_free(array);
+            vx_session_free(session);
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_data_ptr_bool() {
         let bools = BoolArray::from_iter([
             true, true, false, true, false, true, true, false, true, true,
@@ -1105,7 +1352,6 @@ mod tests {
         unsafe {
             let session = vx_session_new();
             let mut error = ptr::null_mut();
-            let mut bit_offset = usize::MAX;
 
             let array = vx_array::new(bools.into_array());
             let sliced = vx_array_slice(array, 3, 10, &raw mut error);
@@ -1114,15 +1360,16 @@ mod tests {
             let canonical = vx_array_canonicalize(session, sliced, &raw mut error);
             assert_no_error(error);
 
-            let bits = vx_array_data_ptr_bool(canonical, &raw mut bit_offset, &raw mut error);
+            let bits = vx_array_data_ptr_bool(canonical, &raw mut error);
             assert_no_error(error);
-            assert!(bit_offset < 8);
+            assert!(bits.bit_offset < 8);
+            assert_eq!(bits.elements, 7);
             for (i, expected) in [true, false, true, true, false, true, true]
                 .into_iter()
                 .enumerate()
             {
-                let bit = bit_offset + i;
-                let actual = (*bits.cast::<u8>().add(bit / 8) >> (bit % 8)) & 1 == 1;
+                let bit = bits.bit_offset + i;
+                let actual = (*bits.ptr.add(bit / 8) >> (bit % 8)) & 1 == 1;
                 assert_eq!(actual, expected, "bit {i}");
             }
             vx_array_free(canonical);
@@ -1146,9 +1393,8 @@ mod tests {
             assert!(data.is_null());
             assert_error(error);
 
-            let mut bit_offset = usize::MAX;
-            let bits = vx_array_data_ptr_bool(array, &raw mut bit_offset, &raw mut error);
-            assert!(bits.is_null());
+            let bits = vx_array_data_ptr_bool(array, &raw mut error);
+            assert!(bits.ptr.is_null());
             assert_error(error);
 
             vx_array_free(array);

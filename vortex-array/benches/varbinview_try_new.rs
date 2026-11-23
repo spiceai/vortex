@@ -7,11 +7,11 @@ use std::sync::LazyLock;
 use divan::Bencher;
 use mimalloc::MiMalloc;
 use vortex_array::VortexSessionExecute;
-use vortex_array::array_session;
 use vortex_array::arrays::VarBinViewArray;
 use vortex_array::arrays::varbinview::BinaryView;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
+use vortex_array::optimizer::kernels::KernelSession;
 use vortex_array::validity::Validity;
 use vortex_buffer::BitBuffer;
 use vortex_buffer::Buffer;
@@ -23,12 +23,14 @@ use vortex_session::VortexSession;
 static GLOBAL: MiMalloc = MiMalloc;
 
 fn main() {
+    LazyLock::force(&SESSION);
     divan::main();
 }
 
 const SIZES: &[usize] = &[1 << 12, 1 << 16];
 
-static SESSION: LazyLock<VortexSession> = LazyLock::new(array_session);
+static SESSION: LazyLock<VortexSession> =
+    LazyLock::new(|| VortexSession::empty().with::<KernelSession>());
 
 fn garbage_view() -> BinaryView {
     BinaryView::new_ref(13, *b"AAAA", 0xDEAD_BEEF, 0xF000_0000)
@@ -88,6 +90,35 @@ fn all_valid_exclusive(bencher: Bencher, len: usize) {
                 Arc::clone(&buffers),
                 dtype.clone(),
                 Validity::NonNullable,
+                SESSION.create_execution_ctx(),
+            )
+        })
+        .bench_values(|(views, buffers, dtype, validity, mut ctx)| {
+            VarBinViewArray::try_new(views, buffers, dtype, validity, &mut ctx)
+                .vortex_expect("try_new must succeed")
+        });
+}
+
+/// Outlined ASCII strings in one buffer, with every other slot null.
+#[divan::bench(args = SIZES)]
+fn outlined_nullable_exclusive(bencher: Bencher, len: usize) {
+    let data = b"a string that is outlined";
+    let buffer = ByteBuffer::from(data.repeat(len));
+    let views: Vec<BinaryView> = (0..len)
+        .map(|i| {
+            let offset = u32::try_from(i * data.len()).vortex_expect("offset fits in u32");
+            BinaryView::make_view(data, 0, offset)
+        })
+        .collect();
+    let buffers: Arc<[ByteBuffer]> = Arc::new([buffer]);
+    let dtype = DType::Utf8(Nullability::Nullable);
+    bencher
+        .with_inputs(|| {
+            (
+                Buffer::copy_from(&views),
+                Arc::clone(&buffers),
+                dtype.clone(),
+                nullable_validity(len),
                 SESSION.create_execution_ctx(),
             )
         })

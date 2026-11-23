@@ -23,9 +23,12 @@ pub struct DeltaSlots {
     /// The base values for each block of deltas.
     #[slot(0)]
     pub bases: ArrayRef,
-    /// The delta-encoded values relative to the base values.
+    /// Nonnullable delta-encoded values relative to the base values.
     #[slot(1)]
     pub deltas: ArrayRef,
+    /// Logical validity, without transposition or chunk padding.
+    #[slot(2)]
+    pub validity_child: Option<ArrayRef>,
 }
 
 /// A FastLanes-style delta-encoded array of primitive values.
@@ -43,7 +46,7 @@ pub struct DeltaSlots {
 /// use vortex_session::VortexSession;
 /// use vortex_fastlanes::Delta;
 ///
-/// let session = vortex_array::array_session();
+/// let session = VortexSession::empty();
 /// let primitive = PrimitiveArray::from_iter([1_u32, 2, 3, 5, 10, 11]);
 /// let array = Delta::try_from_primitive_array(&primitive, &mut session.create_execution_ctx()).unwrap();
 /// ```
@@ -58,7 +61,7 @@ pub struct DeltaSlots {
 /// use vortex_session::VortexSession;
 /// use vortex_fastlanes::Delta;
 ///
-/// let session = vortex_array::array_session();
+/// let session = VortexSession::empty();
 /// let primitive = PrimitiveArray::from_iter([-3_i32, -2, -1, 0, 1, 2]);
 /// let array = Delta::try_from_primitive_array(&primitive, &mut session.create_execution_ctx()).unwrap();
 /// ```
@@ -81,7 +84,10 @@ pub struct DeltaSlots {
 /// [FastLanes](https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf) order which splits the 1,024
 /// values into one contiguous sub-sequence per-lane, thus permitting delta encoding.
 ///
-/// Note the validity is stored in the deltas array.
+/// Validity is stored at the top level; bases and deltas are nonnullable. Before encoding,
+/// null source values repeat the preceding valid value, also across chunk boundaries, or zero
+/// before the first valid value. Their deltas are retained, including in child min/max
+/// statistics, because later values depend on them. Logical statistics exclude nulls.
 #[derive(Clone, Debug)]
 pub struct DeltaData {
     pub(super) offset: usize,

@@ -19,17 +19,15 @@ use vortex_utils::debug_with::DebugWith;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::dtype::DType;
-use crate::expr::Expression;
+use crate::expr::BoundExpression;
 use crate::expr::display::ExprDisplay;
 use crate::scalar_fn::ArrayReduceNode;
-use crate::scalar_fn::EmptyOptions;
 use crate::scalar_fn::ExecutionArgs;
 use crate::scalar_fn::ExpressionReduceNode;
+use crate::scalar_fn::ReduceNodeValidity;
+use crate::scalar_fn::ScalarFnExecutionResult;
 use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::ScalarFnVTable;
-use crate::scalar_fn::ScalarFnVTableExt;
-use crate::scalar_fn::SimplifyCtx;
-use crate::scalar_fn::fns::is_not_null::IsNotNull;
 use crate::scalar_fn::options::ScalarFnOptions;
 use crate::scalar_fn::signature::ScalarFnSignature;
 use crate::scalar_fn::typed::DynScalarFn;
@@ -38,7 +36,7 @@ use crate::scalar_fn::typed::TypedScalarFnInstance;
 /// A type-erased scalar function, pairing a vtable with bound options behind a trait object.
 ///
 /// This stores a [`ScalarFnVTable`] and its options behind an `Arc<dyn DynScalarFn>`, allowing
-/// heterogeneous storage inside [`Expression`] and [`crate::arrays::ScalarFnArray`].
+/// heterogeneous storage inside [`crate::arrays::ScalarFnArray`].
 ///
 /// Use [`super::TypedScalarFnInstance::new()`] to construct, and [`super::TypedScalarFnInstance::erased()`] to
 /// obtain a [`ScalarFnRef`].
@@ -125,12 +123,26 @@ impl ScalarFnRef {
         self.0.return_dtype(arg_types)
     }
 
-    /// Transforms the expression into one representing the validity of this expression.
-    pub fn validity(&self, expr: &Expression) -> VortexResult<Expression> {
-        Ok(self.0.validity(expr)?.unwrap_or_else(|| {
-            // TODO(ngates): make validity a mandatory method on VTable to avoid this fallback.
-            IsNotNull.new_expr(EmptyOptions, [expr.clone()])
-        }))
+    /// Bind whatever in the options depends on the argument types, or keep this function if
+    /// nothing does. See [`ScalarFnVTable::bind_options`].
+    pub(crate) fn bind_options(self, arg_types: &[DType]) -> VortexResult<ScalarFnRef> {
+        Ok(self.0.bind_options(arg_types)?.unwrap_or(self))
+    }
+
+    /// Symbolic validity of this node in an expression tree
+    pub(crate) fn validity_expression<'a>(
+        &self,
+        node: &ExpressionReduceNode<'a>,
+    ) -> VortexResult<ReduceNodeValidity<ExpressionReduceNode<'a>>> {
+        self.0.validity_expression(node)
+    }
+
+    /// Symbolic validity of this in an array tree
+    pub(crate) fn validity_array<'a>(
+        &self,
+        node: &ArrayReduceNode<'a>,
+    ) -> VortexResult<ReduceNodeValidity<ArrayReduceNode<'a>>> {
+        self.0.validity_array(node)
     }
 
     /// Execute the expression given the input arguments.
@@ -140,6 +152,17 @@ impl ScalarFnRef {
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
         self.0.execute(args, ctx)
+    }
+
+    /// Perform a single step of execution given the input arguments.
+    ///
+    /// See [`ScalarFnVTable::execute_step`].
+    pub fn execute_step(
+        &self,
+        args: &dyn ExecutionArgs,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<ScalarFnExecutionResult> {
+        self.0.execute_step(args, ctx)
     }
 
     /// Perform abstract reduction on this scalar function node in an expression tree.
@@ -171,18 +194,9 @@ impl ScalarFnRef {
         self.0.fmt_sql(expr, f)
     }
 
-    /// Simplify the expression using type information.
-    pub(crate) fn simplify(
-        &self,
-        expr: &Expression,
-        ctx: &dyn SimplifyCtx,
-    ) -> VortexResult<Option<Expression>> {
-        self.0.simplify(expr, ctx)
-    }
-
-    /// Simplify the expression without type information.
-    pub(crate) fn simplify_untyped(&self, expr: &Expression) -> VortexResult<Option<Expression>> {
-        self.0.simplify_untyped(expr)
+    /// Simplify a bound expression using the dtypes carried by its nodes.
+    pub(crate) fn simplify(&self, expr: &BoundExpression) -> VortexResult<Option<BoundExpression>> {
+        self.0.simplify(expr)
     }
 }
 

@@ -5,6 +5,7 @@
 
 import json
 import os
+import shlex
 import subprocess
 import tomllib
 import unittest
@@ -29,7 +30,7 @@ class ConfigureTests(CMakeTest):
                 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/defaults.txt"
                     "${CMAKE_BUILD_TYPE}\n${VORTEX_WARNINGS_AS_ERRORS}\n")
                 if(PROJECT_NAME STREQUAL "VortexCXX")
-                    get_target_property(options vortex_cxx COMPILE_OPTIONS)
+                    get_target_property(options vortex_cxx_static COMPILE_OPTIONS)
                     file(APPEND "${CMAKE_CURRENT_BINARY_DIR}/defaults.txt" "${options}\n")
                 endif()
             endfunction()
@@ -68,6 +69,7 @@ class ConfigureTests(CMakeTest):
                     self.assertEqual(settings[:2], ["Debug", "ON"])
                     if len(settings) == 3:
                         self.assertIn("-Werror", settings[2].split(";"))
+                        self.assertIn("$<$<COMPILE_LANGUAGE:C,CXX>:-g2>", settings[2].split(";"))
 
         build = self.work / "ffi"
         self.cmake_build(build)
@@ -76,7 +78,13 @@ class ConfigureTests(CMakeTest):
         self.assertEqual(recorded["args"][recorded["args"].index("--profile") + 1], "dev")
         config = tomllib.loads((self.repo / ".cargo/config.toml").read_text())
         expected = config["target"]['cfg(target_family="unix")']["rustflags"] + ["-C", "relocation-model=pic"]
+        expected += ["-C", "debuginfo=2"]
         self.assertEqual(recorded["env"]["CARGO_ENCODED_RUSTFLAGS"].split("\x1f"), expected)
+
+        self.configure("ffi", "-DVORTEX_DEBUG_INFO=0")
+        self.cmake_build(build)
+        recorded = self.cargo_recording(build / "cargo-target")
+        self.assertEqual(recorded["env"]["CARGO_ENCODED_RUSTFLAGS"].split("\x1f"), expected[:-1] + ["debuginfo=0"])
 
     def test_embedded_root_preserves_parent_variables(self) -> None:
         source = self.write(
@@ -193,6 +201,59 @@ class ConfigureTests(CMakeTest):
         os.utime(build / "build.ninja", (1, 1))
         self.cmake_build(build)
         assert_selection(None)
+
+    def test_linker_type_reaches_cargo_and_default_keeps_ambient(self) -> None:
+        compiler = self.executable(
+            "compiler tools' directory/recording compiler",
+            "import json, sys\nprint(json.dumps(sys.argv[1:]))\n",
+        )
+        hook = self.write(
+            "linker.cmake",
+            f"""\
+            # Probe Threads before the fixture linker exists.
+            set(THREADS_PREFER_PTHREAD_FLAG TRUE)
+            find_package(Threads REQUIRED)
+            set(CMAKE_C_COMPILER "{compiler}")
+            set(CMAKE_CXX_COMPILER "{compiler}")
+            set(CMAKE_LINKER_TYPE VortexFixture)
+            set(CMAKE_C_USING_LINKER_VortexFixture "-fuse-ld=fixture ld;-Wl,--fixture-selection")
+            """,
+        )
+        self.configure("linker", f"-DCMAKE_PROJECT_VortexFFI_INCLUDE={hook}")
+        build = self.work / "linker"
+        self.cmake_build(build, "--target", "vortex_ffi_cargo_build")
+        recorded = self.cargo_recording(build / "cargo-target")
+        target = recorded["args"][recorded["args"].index("--target") + 1]
+        key = f"CARGO_TARGET_{target.upper().replace('-', '_')}_LINKER"
+        linker = Path(recorded["env"][key])
+        arguments = ["-o", "output directory's/program", "--coverage"]
+        result = self.command(linker, *arguments, env=recorded["env"])
+        self.assertEqual(
+            json.loads(result.stdout),
+            [*arguments[:-1], "-fuse-ld=fixture ld", "-Wl,--fixture-selection"],
+        )
+        for language in ("CC", "CXX"):
+            launcher = shlex.split(recorded["env"][f"{language}_{target}"])
+            result = self.command(*launcher, *arguments, env=recorded["env"])
+            self.assertEqual(json.loads(result.stdout), arguments)
+
+        self.env[key] = "/ambient/linker"
+        for options in ((), ("-DCMAKE_LINKER_TYPE=DEFAULT",)):
+            with self.subTest(options=options):
+                self.configure("default", *options)
+                self.cmake_build(self.work / "default", "--target", "vortex_ffi_cargo_build")
+                env = self.cargo_recording(self.work / "default/cargo-target")["env"]
+                self.assertEqual(env[key], "/ambient/linker")
+
+    def test_invalid_linker_selections(self) -> None:
+        for setting, diagnostic in (
+            ('set(CMAKE_C_USING_LINKER_VortexFixture "LINKER:-ld_classic")', "LINKER:-ld_classic"),
+            ('set(CMAKE_C_USING_LINKER_VortexFixture "SHELL:-fuse-ld=lld")', "SHELL:-fuse-ld=lld"),
+        ):
+            with self.subTest(setting=setting):
+                hook = self.write("invalid.cmake", f"set(CMAKE_LINKER_TYPE VortexFixture)\n{setting}\n")
+                result = self.configure("invalid", f"-DCMAKE_PROJECT_VortexFFI_INCLUDE={hook}", success=False)
+                self.assertIn(diagnostic, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

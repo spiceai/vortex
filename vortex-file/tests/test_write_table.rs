@@ -11,11 +11,13 @@ use futures::pin_mut;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::BoolArray;
+use vortex_array::arrays::ChunkedArray;
 use vortex_array::arrays::DictArray;
 use vortex_array::arrays::ListViewArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::StructArray;
 use vortex_array::arrays::struct_::StructArrayExt;
+use vortex_array::assert_arrays_eq;
 use vortex_array::dtype::FieldNames;
 use vortex_array::field_path;
 use vortex_array::stream::ArrayStreamExt;
@@ -36,7 +38,7 @@ mod common;
 use common::enable_all_registered_array_encodings;
 
 static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
-    let session = vortex_array::array_session()
+    let session = VortexSession::empty()
         .with::<LayoutSession>()
         .with::<RuntimeSession>();
 
@@ -74,7 +76,7 @@ async fn test_file_roundtrip() {
     // the b and the a.raw columns uncompressed.
     let default_strategy = Arc::new(CompressingStrategy::new(
         FlatLayoutStrategy::default(),
-        BtrBlocksCompressor::default(),
+        BtrBlocksCompressor::from_session(&SESSION),
     ));
 
     let writer = Arc::new(
@@ -103,8 +105,10 @@ async fn test_file_roundtrip() {
 
     pin_mut!(stream);
 
+    let mut chunks = Vec::new();
     while let Some(next) = stream.next().await {
         let next = next.expect("next");
+        chunks.push(next.clone());
         let next = next.execute::<StructArray>(&mut ctx).unwrap();
         let a = next
             .unmasked_field_by_name("a")
@@ -123,6 +127,8 @@ async fn test_file_roundtrip() {
         assert!(b.is_canonical());
         assert!(raw.nbytes() > compressed.nbytes());
     }
+    let result = ChunkedArray::try_new(chunks, data.dtype().clone()).unwrap();
+    assert_arrays_eq!(result, data, &mut ctx);
 }
 
 /// Regression test: writing a Dict<ListView> where the list has
@@ -130,11 +136,13 @@ async fn test_file_roundtrip() {
 /// with "Array vortex.fill_null does not support serialization".
 #[tokio::test]
 async fn test_dict_listview_validity_roundtrip() {
+    let mut ctx = SESSION.create_execution_ctx();
     let elements = PrimitiveArray::from_iter(vec![1i32, 2, 3, 4, 5]).into_array();
     let offsets = PrimitiveArray::from_iter(vec![0u32, 2, 4]).into_array();
     let sizes = PrimitiveArray::from_iter(vec![2u32, 2, 1]).into_array();
     let list_validity = Validity::Array(BoolArray::from_iter([true, false, true]).into_array());
-    let listview = ListViewArray::new(elements, offsets, sizes, list_validity).into_array();
+    let listview =
+        ListViewArray::new(elements, offsets, sizes, list_validity, &mut ctx).into_array();
 
     let codes = PrimitiveArray::new(
         vortex_buffer::buffer![0u32, 0, 1, 0, 2],
@@ -223,7 +231,7 @@ async fn roundtrip_with_block_max(
     data: vortex_array::ArrayRef,
     max_bytes: Option<u64>,
 ) -> vortex_error::VortexResult<(vortex_array::ArrayRef, usize)> {
-    let strategy = vortex_file::WriteStrategyBuilder::default()
+    let strategy = vortex_file::WriteStrategyBuilder::from_session(&SESSION)
         .with_data_block_max_bytes(max_bytes)
         .build();
     let mut bytes = Vec::new();
@@ -301,7 +309,8 @@ async fn file_and_largest_segment(
     max: Option<u64>,
     pass_through: bool,
 ) -> vortex_error::VortexResult<(usize, u32)> {
-    let mut builder = vortex_file::WriteStrategyBuilder::default().with_data_block_max_bytes(max);
+    let mut builder =
+        vortex_file::WriteStrategyBuilder::from_session(&SESSION).with_data_block_max_bytes(max);
     if pass_through {
         builder = builder.with_compressor(
             |chunk: &vortex_array::ArrayRef, _: &mut vortex_array::ExecutionCtx| Ok(chunk.clone()),
@@ -338,7 +347,7 @@ async fn split_blocks_of_incompressible_binary_store_only_their_rows()
 -> vortex_error::VortexResult<()> {
     let one_block = random_binary(8192, 1000, 7);
     // 100-byte rows (~0.9 MiB, under the coalescing minimum), then 480-byte rows (~3.9 MiB).
-    let coalesced = vortex_array::arrays::ChunkedArray::try_new(
+    let coalesced = ChunkedArray::try_new(
         vec![random_binary(8192, 100, 11), random_binary(8192, 480, 13)],
         one_block.dtype().clone(),
     )?

@@ -3,7 +3,7 @@
 
 mod bool;
 mod decimal;
-mod extension;
+mod fixed_size_list;
 mod primitive;
 mod varbin;
 
@@ -13,11 +13,13 @@ use std::fmt::Formatter;
 
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
+use vortex_error::vortex_bail;
+use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
 use self::bool::check_bool_sorted;
 use self::decimal::check_decimal_sorted;
-use self::extension::check_extension_sorted;
+use self::fixed_size_list::check_fixed_size_bytes_sorted;
 use self::primitive::check_primitive_sorted;
 use self::varbin::check_varbinview_sorted;
 use crate::ArrayRef;
@@ -26,9 +28,11 @@ use crate::Columnar;
 use crate::ExecutionCtx;
 use crate::IntoArray;
 use crate::aggregate_fn::Accumulator;
+use crate::aggregate_fn::AggregateArgs;
 use crate::aggregate_fn::AggregateFnId;
 use crate::aggregate_fn::AggregateFnVTable;
 use crate::aggregate_fn::DynAccumulator;
+use crate::aggregate_fn::fns::fixed_size_bytes::is_fixed_size_bytes;
 use crate::arrays::Constant;
 use crate::arrays::Null;
 use crate::builtins::ArrayBuiltins;
@@ -57,7 +61,8 @@ impl Display for IsSortedOptions {
 /// Compute whether an array is sorted in non-decreasing order.
 ///
 /// Returns `true` for empty arrays and arrays of length 1.
-/// Returns `false` for struct, list, and fixed-size list arrays.
+/// Returns `false` for struct, list, and fixed-size list arrays, except fixed-size lists of
+/// non-nullable `u8`, which are ordered by byte.
 pub fn is_sorted(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<bool> {
     is_sorted_impl(array, false, ctx)
 }
@@ -65,7 +70,8 @@ pub fn is_sorted(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<bool>
 /// Compute whether an array is strictly sorted in increasing order (no duplicates).
 ///
 /// Returns `true` for empty arrays and arrays of length 1.
-/// Returns `false` for struct, list, and fixed-size list arrays.
+/// Returns `false` for struct, list, and fixed-size list arrays, except fixed-size lists of
+/// non-nullable `u8`, which are ordered by byte.
 pub fn is_strict_sorted(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<bool> {
     is_sorted_impl(array, true, ctx)
 }
@@ -77,14 +83,15 @@ fn is_sorted_impl(array: &ArrayRef, strict: bool, ctx: &mut ExecutionCtx) -> Vor
         Stat::IsSorted
     };
 
+    // Arrays with 0 or 1 elements are (strict) sorted. Check this before the cached
+    // statistics so that a stale hint cannot contradict it.
+    if array.len() <= 1 {
+        return Ok(true);
+    }
+
     // Short-circuit using cached array statistics.
     if let Precision::Exact(value) = array.statistics().get_as::<bool>(stat) {
         return Ok(value);
-    }
-
-    // Arrays with 0 or 1 elements are (strict) sorted.
-    if array.len() <= 1 {
-        return Ok(true);
     }
 
     // Constant and null arrays are always sorted, but not strict sorted.
@@ -202,11 +209,20 @@ impl IsSorted {
 /// Partial accumulator state for is_sorted.
 pub struct IsSortedPartial {
     is_sorted: bool,
-    strict: bool,
     /// None = empty (no values seen).
     first_value: Option<Scalar>,
     last_value: Option<Scalar>,
-    element_dtype: DType,
+}
+
+impl IsSortedPartial {
+    /// The state of a group with no accumulated values.
+    fn empty() -> Self {
+        Self {
+            is_sorted: true,
+            first_value: None,
+            last_value: None,
+        }
+    }
 }
 
 static NAMES: std::sync::LazyLock<FieldNames> = std::sync::LazyLock::new(|| {
@@ -237,12 +253,27 @@ impl AggregateFnVTable for IsSorted {
         *ID
     }
 
-    fn serialize(&self, _options: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
-        unimplemented!("IsSorted is not yet serializable");
+    fn serialize(&self, options: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
+        Ok(Some(vec![u8::from(options.strict)]))
+    }
+
+    fn deserialize(
+        &self,
+        metadata: &[u8],
+        _session: &VortexSession,
+    ) -> VortexResult<Self::Options> {
+        match metadata {
+            [0] => Ok(IsSortedOptions { strict: false }),
+            [1] => Ok(IsSortedOptions { strict: true }),
+            _ => vortex_bail!("Invalid IsSorted options: expected a single boolean byte"),
+        }
     }
 
     fn return_dtype(&self, _options: &Self::Options, input_dtype: &DType) -> Option<DType> {
         match input_dtype {
+            DType::FixedSizeList(..) if is_fixed_size_bytes(input_dtype) => {
+                Some(DType::Bool(Nullability::NonNullable))
+            }
             DType::Null
             | DType::List(..)
             | DType::FixedSizeList(..)
@@ -261,6 +292,9 @@ impl AggregateFnVTable for IsSorted {
 
     fn partial_dtype(&self, _options: &Self::Options, input_dtype: &DType) -> Option<DType> {
         match input_dtype {
+            DType::FixedSizeList(..) if is_fixed_size_bytes(input_dtype) => {
+                Some(make_is_sorted_partial_dtype(input_dtype))
+            }
             DType::Null
             | DType::List(..)
             | DType::FixedSizeList(..)
@@ -279,130 +313,134 @@ impl AggregateFnVTable for IsSorted {
 
     fn empty_partial(
         &self,
-        options: &Self::Options,
-        input_dtype: &DType,
+        _args: AggregateArgs<'_, Self::Options>,
     ) -> VortexResult<Self::Partial> {
-        Ok(IsSortedPartial {
-            is_sorted: true,
-            strict: options.strict,
-            first_value: None,
-            last_value: None,
-            element_dtype: input_dtype.clone(),
-        })
+        Ok(IsSortedPartial::empty())
     }
 
-    fn combine_partials(&self, partial: &mut Self::Partial, other: Scalar) -> VortexResult<()> {
-        if !partial.is_sorted {
-            return Ok(());
+    fn partial_from_scalar(
+        &self,
+        _args: AggregateArgs<'_, Self::Options>,
+        scalar: &Scalar,
+    ) -> VortexResult<Self::Partial> {
+        // A null struct means the producing accumulator was empty.
+        if scalar.is_null() {
+            return Ok(IsSortedPartial::empty());
         }
 
-        // Null struct means the other accumulator was empty, skip it.
-        if other.is_null() {
-            return Ok(());
-        }
-
-        let other_is_sorted = other
+        let is_sorted = scalar
             .as_struct()
             .field_by_idx(0)
             .map(|s| s.as_bool().value().unwrap_or(false))
             .unwrap_or(false);
 
-        let other_first = other.as_struct().field_by_idx(2);
-        let other_last = other.as_struct().field_by_idx(3);
-
-        if !other_is_sorted {
-            partial.is_sorted = false;
-            // Still update last_value for correctness if needed, but we're done.
-            if let Some(last) = other_last {
-                partial.last_value = Some(last);
-            }
-            return Ok(());
-        }
-
-        // Check boundary: self.last_value vs other.first_value
-        if let Some(self_last) = &partial.last_value
-            && let Some(other_first_val) = &other_first
-        {
-            if !self_last.is_null() && !other_first_val.is_null() {
-                let boundary_ok = if partial.strict {
-                    *self_last < *other_first_val
-                } else {
-                    *self_last <= *other_first_val
-                };
-                if !boundary_ok {
-                    partial.is_sorted = false;
-                }
-            } else if !self_last.is_null() && other_first_val.is_null() {
-                // non-null before null violates sort order
-                partial.is_sorted = false;
-            } else if self_last.is_null() && other_first_val.is_null() && partial.strict {
-                // both null with strict: violates strict sort
-                partial.is_sorted = false;
-            }
-        }
-
-        // Update first_value if this is the first non-empty chunk.
-        if partial.first_value.is_none() {
-            partial.first_value = other_first;
-        }
-        if let Some(last) = other_last {
-            partial.last_value = Some(last);
-        }
-
-        Ok(())
-    }
-
-    fn to_scalar(&self, partial: &Self::Partial) -> VortexResult<Scalar> {
-        let dtype = make_is_sorted_partial_dtype(&partial.element_dtype);
-        Ok(match (&partial.first_value, &partial.last_value) {
-            (None, _) => {
-                // Empty accumulator — return null struct.
-                Scalar::null(dtype)
-            }
-            (Some(first_value), Some(last_value)) => {
-                // SAFETY: We constructed partial_dtype and the children match its field dtypes.
-                unsafe {
-                    Scalar::struct_unchecked(
-                        dtype,
-                        [
-                            Scalar::bool(partial.is_sorted, Nullability::NonNullable),
-                            Scalar::bool(partial.strict, Nullability::NonNullable),
-                            first_value.clone(),
-                            last_value.clone(),
-                        ],
-                    )
-                }
-            }
-            (Some(first_value), None) => {
-                // SAFETY: We constructed partial_dtype and the children match its field dtypes.
-                unsafe {
-                    Scalar::struct_unchecked(
-                        dtype,
-                        [
-                            Scalar::bool(partial.is_sorted, Nullability::NonNullable),
-                            Scalar::bool(partial.strict, Nullability::NonNullable),
-                            first_value.clone(),
-                            first_value.clone(),
-                        ],
-                    )
-                }
-            }
+        // The scalar's own strict flag is ignored: strictness comes from the options.
+        Ok(IsSortedPartial {
+            is_sorted,
+            first_value: scalar.as_struct().field_by_idx(2),
+            last_value: scalar.as_struct().field_by_idx(3),
         })
     }
 
-    fn reset(&self, partial: &mut Self::Partial) {
-        partial.is_sorted = true;
-        partial.first_value = None;
-        partial.last_value = None;
+    fn merge_partials(
+        &self,
+        args: AggregateArgs<'_, Self::Options>,
+        mut acc: Self::Partial,
+        partial: Self::Partial,
+    ) -> VortexResult<Self::Partial> {
+        if !acc.is_sorted {
+            return Ok(acc);
+        }
+
+        if !partial.is_sorted {
+            // An unsorted partial settles the verdict whether or not it observed boundaries.
+            acc.is_sorted = false;
+            if let Some(last) = partial.last_value.or_else(|| partial.first_value.clone()) {
+                acc.last_value = Some(last);
+            }
+            if acc.first_value.is_none() {
+                acc.first_value = partial.first_value;
+            }
+            return Ok(acc);
+        }
+
+        // A sorted partial without a first value is empty and contributes nothing.
+        let Some(first) = partial.first_value else {
+            return Ok(acc);
+        };
+        // A partial that saw a single value carries it as both boundaries.
+        let last = partial.last_value.unwrap_or_else(|| first.clone());
+
+        if let Some(acc_last) = &acc.last_value {
+            if !acc_last.is_null() && !first.is_null() {
+                let boundary_ok = if args.options.strict {
+                    *acc_last < first
+                } else {
+                    *acc_last <= first
+                };
+                if !boundary_ok {
+                    acc.is_sorted = false;
+                }
+            } else if !acc_last.is_null() && first.is_null() {
+                // non-null before null violates sort order
+                acc.is_sorted = false;
+            } else if acc_last.is_null() && first.is_null() && args.options.strict {
+                // both null with strict: violates strict sort
+                acc.is_sorted = false;
+            }
+        }
+
+        if acc.first_value.is_none() {
+            acc.first_value = Some(first);
+        }
+        acc.last_value = Some(last);
+
+        Ok(acc)
+    }
+
+    fn to_scalar(
+        &self,
+        args: AggregateArgs<'_, Self::Options>,
+        partial: &Self::Partial,
+    ) -> VortexResult<Scalar> {
+        let dtype = args.partial_dtype.clone();
+        // Only a sorted partial that saw no values is the empty (null) state: an unsorted verdict
+        // stands regardless of which boundaries were observed.
+        if partial.is_sorted && partial.first_value.is_none() {
+            return Ok(Scalar::null(dtype));
+        }
+        let first_value = partial
+            .first_value
+            .clone()
+            .unwrap_or_else(|| Scalar::null(args.dtype.as_nullable()));
+        // A partial that saw a single value carries it as both boundaries.
+        let last_value = partial
+            .last_value
+            .clone()
+            .unwrap_or_else(|| first_value.clone());
+        Ok(Scalar::struct_(
+            dtype,
+            vec![
+                Scalar::bool(partial.is_sorted, Nullability::NonNullable),
+                Scalar::bool(args.options.strict, Nullability::NonNullable),
+                first_value,
+                last_value,
+            ],
+        ))
     }
 
     #[inline]
-    fn is_saturated(&self, partial: &Self::Partial) -> bool {
+    fn is_saturated(
+        &self,
+        _args: AggregateArgs<'_, Self::Options>,
+        partial: &Self::Partial,
+    ) -> bool {
         !partial.is_sorted
     }
 
     fn accumulate(
         &self,
+        args: AggregateArgs<'_, Self::Options>,
         partial: &mut Self::Partial,
         batch: &Columnar,
         ctx: &mut ExecutionCtx,
@@ -413,16 +451,20 @@ impl AggregateFnVTable for IsSorted {
 
         match batch {
             Columnar::Constant(c) => {
+                if c.is_empty() {
+                    return Ok(());
+                }
+
                 // Constant arrays are sorted but not strict sorted (if len > 1).
                 let value = c.scalar().clone().into_nullable();
-                if partial.strict && c.len() > 1 {
+                if args.options.strict && c.len() > 1 {
                     partial.is_sorted = false;
                 }
 
                 // Check boundary with previous chunk.
                 if let Some(self_last) = &partial.last_value {
                     if !self_last.is_null() && !value.is_null() {
-                        let boundary_ok = if partial.strict {
+                        let boundary_ok = if args.options.strict {
                             *self_last < value
                         } else {
                             *self_last <= value
@@ -431,7 +473,7 @@ impl AggregateFnVTable for IsSorted {
                             partial.is_sorted = false;
                         }
                     } else if (!self_last.is_null() && value.is_null())
-                        || (self_last.is_null() && value.is_null() && partial.strict)
+                        || (self_last.is_null() && value.is_null() && args.options.strict)
                     {
                         partial.is_sorted = false;
                     }
@@ -454,7 +496,7 @@ impl AggregateFnVTable for IsSorted {
                 let first_value = array_ref.execute_scalar(0, ctx)?.into_nullable();
                 if let Some(self_last) = &partial.last_value {
                     if !self_last.is_null() && !first_value.is_null() {
-                        let boundary_ok = if partial.strict {
+                        let boundary_ok = if args.options.strict {
                             *self_last < first_value
                         } else {
                             *self_last <= first_value
@@ -472,7 +514,7 @@ impl AggregateFnVTable for IsSorted {
                             return Ok(());
                         }
                     } else if (!self_last.is_null() && first_value.is_null())
-                        || (self_last.is_null() && first_value.is_null() && partial.strict)
+                        || (self_last.is_null() && first_value.is_null() && args.options.strict)
                     {
                         partial.is_sorted = false;
                         partial.last_value = Some(
@@ -489,13 +531,19 @@ impl AggregateFnVTable for IsSorted {
 
                 // Check within-batch sortedness.
                 let batch_is_sorted = match c {
-                    Canonical::Primitive(p) => check_primitive_sorted(p, partial.strict, ctx)?,
-                    Canonical::Bool(b) => check_bool_sorted(b, partial.strict, ctx)?,
-                    Canonical::VarBinView(v) => check_varbinview_sorted(v, partial.strict, ctx)?,
-                    Canonical::Decimal(d) => check_decimal_sorted(d, partial.strict, ctx)?,
-                    Canonical::Extension(e) => check_extension_sorted(e, partial.strict, ctx)?,
-                    Canonical::Null(_) => !partial.strict,
-                    // Struct, List, FixedSizeList should have been filtered out by return_dtype
+                    _ if c.len() == 1 => true,
+                    Canonical::Primitive(p) => check_primitive_sorted(p, args.options.strict, ctx)?,
+                    Canonical::Bool(b) => check_bool_sorted(b, args.options.strict, ctx)?,
+                    Canonical::VarBinView(v) => {
+                        check_varbinview_sorted(v, args.options.strict, ctx)?
+                    }
+                    Canonical::Decimal(d) => check_decimal_sorted(d, args.options.strict, ctx)?,
+                    Canonical::FixedSizeList(f) => {
+                        check_fixed_size_bytes_sorted(f, args.options.strict, ctx)?
+                    }
+                    Canonical::Null(_) => !args.options.strict,
+                    // Struct, List, other FixedSizeLists and Extension should have been filtered
+                    // out by return_dtype
                     _ => unreachable!(),
                 };
 
@@ -516,15 +564,23 @@ impl AggregateFnVTable for IsSorted {
         }
     }
 
-    fn finalize(&self, partials: ArrayRef) -> VortexResult<ArrayRef> {
-        partials.get_item(NAMES.get(0).vortex_expect("out of bounds").clone())
+    fn finalize(
+        &self,
+        _args: AggregateArgs<'_, Self::Options>,
+        partials: ArrayRef,
+    ) -> VortexResult<ArrayRef> {
+        // A null partial is the empty state of an empty or null group, which is vacuously sorted.
+        partials
+            .get_item(NAMES.get(0).vortex_expect("out of bounds").clone())?
+            .fill_null(true)
     }
 
-    fn finalize_scalar(&self, partial: &Self::Partial) -> VortexResult<Scalar> {
-        if partial.first_value.is_none() {
-            // Empty accumulator → vacuously sorted.
-            return Ok(Scalar::bool(true, Nullability::NonNullable));
-        }
+    fn finalize_scalar(
+        &self,
+        _args: AggregateArgs<'_, Self::Options>,
+        partial: &Self::Partial,
+    ) -> VortexResult<Scalar> {
+        // The empty state is vacuously sorted, so the verdict stands on its own.
         Ok(Scalar::bool(partial.is_sorted, Nullability::NonNullable))
     }
 }
@@ -556,24 +612,70 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use rstest::rstest;
+    use vortex_buffer::Buffer;
     use vortex_buffer::buffer;
     use vortex_error::VortexExpect;
     use vortex_error::VortexResult;
+    use vortex_session::VortexSession;
 
+    use crate::ArrayRef;
     use crate::IntoArray;
     use crate::VortexSessionExecute;
+    use crate::aggregate_fn::Accumulator;
+    use crate::aggregate_fn::AggregateDTypes;
+    use crate::aggregate_fn::AggregateFnVTable;
+    use crate::aggregate_fn::DynAccumulator;
+    use crate::aggregate_fn::DynGroupedAccumulator;
+    use crate::aggregate_fn::GroupedAccumulator;
+    use crate::aggregate_fn::fns::is_sorted::IsSorted;
+    use crate::aggregate_fn::fns::is_sorted::IsSortedOptions;
+    use crate::aggregate_fn::fns::is_sorted::IsSortedPartial;
     use crate::aggregate_fn::fns::is_sorted::is_sorted;
     use crate::aggregate_fn::fns::is_sorted::is_strict_sorted;
-    use crate::array_session;
     use crate::arrays::BoolArray;
+    use crate::arrays::ChunkedArray;
+    use crate::arrays::ConstantArray;
+    use crate::arrays::DecimalArray;
+    use crate::arrays::DictArray;
+    use crate::arrays::ListViewArray;
     use crate::arrays::PrimitiveArray;
+    use crate::arrays::VarBinViewArray;
+    use crate::arrays::runend::RunEnd;
+    use crate::assert_arrays_eq;
+    use crate::dtype::DType;
+    use crate::dtype::DecimalDType;
+    use crate::dtype::Nullability;
+    use crate::dtype::PType;
+    use crate::expr::stats::Precision;
+    use crate::expr::stats::Stat;
+    use crate::scalar::Scalar;
     use crate::validity::Validity;
+
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
+
+    #[test]
+    fn singleton_ignores_stale_sortedness_stats() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let array = buffer![7i32].into_array();
+        array
+            .statistics()
+            .set(Stat::IsSorted, Precision::Exact(false.into()));
+        array
+            .statistics()
+            .set(Stat::IsStrictSorted, Precision::Exact(false.into()));
+
+        assert!(is_sorted(&array, &mut ctx)?);
+        assert!(is_strict_sorted(&array, &mut ctx)?);
+        Ok(())
+    }
 
     // Tests migrated from compute/is_sorted.rs
     #[test]
     fn test_is_sorted() -> VortexResult<()> {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
 
         let arr = PrimitiveArray::new(buffer!(0, 1, 2, 3), Validity::AllValid).into_array();
         assert!(is_sorted(&arr, &mut ctx)?);
@@ -607,7 +709,7 @@ mod tests {
 
     #[test]
     fn test_is_strict_sorted() -> VortexResult<()> {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
 
         let arr = PrimitiveArray::new(buffer!(0, 1, 2, 3), Validity::AllValid).into_array();
         assert!(is_strict_sorted(&arr, &mut ctx)?);
@@ -644,7 +746,7 @@ mod tests {
     #[case(PrimitiveArray::from_option_iter([None, None, Some(1i32), Some(1)]), true)]
     #[case(PrimitiveArray::from_option_iter([None, Some(5_u8), None]), false)]
     fn test_primitive_is_sorted(#[case] array: PrimitiveArray, #[case] expected: bool) {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         assert_eq!(
             is_sorted(&array.into_array(), &mut ctx)
                 .vortex_expect("operation should succeed in test"),
@@ -659,7 +761,7 @@ mod tests {
     #[case(PrimitiveArray::from_option_iter([None, None, Some(1i32), Some(1), None]), false)]
     #[case(PrimitiveArray::from_option_iter([None, Some(5_u8), None]), false)]
     fn test_primitive_is_strict_sorted(#[case] array: PrimitiveArray, #[case] expected: bool) {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         assert_eq!(
             is_strict_sorted(&array.into_array(), &mut ctx)
                 .vortex_expect("operation should succeed in test"),
@@ -670,10 +772,7 @@ mod tests {
     // Tests migrated from arrays/decimal/compute/is_sorted.rs
     #[test]
     fn test_decimal_is_sorted() -> VortexResult<()> {
-        use crate::arrays::DecimalArray;
-        use crate::dtype::DecimalDType;
-
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let dtype = DecimalDType::new(19, 2);
         // "100.00" and "200.00" at scale 2.
         let i100 = 10_000i128;
@@ -693,10 +792,7 @@ mod tests {
 
     #[test]
     fn test_decimal_is_strict_sorted() -> VortexResult<()> {
-        use crate::arrays::DecimalArray;
-        use crate::dtype::DecimalDType;
-
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         // "100.00", "200.00" and "300.00" at scale 2.
         let i100 = 10_000i128;
         let i200 = 20_000i128;
@@ -716,6 +812,169 @@ mod tests {
         )?);
         assert!(!is_strict_sorted(&sorted_array.into_array(), &mut ctx)?);
 
+        Ok(())
+    }
+
+    #[test]
+    fn empty_constant_leaves_partial_empty() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let array = ConstantArray::new(Scalar::from(99i32), 0).into_array();
+        let options = IsSortedOptions { strict: false };
+        let mut acc = Accumulator::try_new(IsSorted, options, array.dtype().clone())?;
+
+        acc.accumulate(&array, &mut ctx)?;
+
+        assert!(acc.partial_scalar()?.is_null());
+        Ok(())
+    }
+
+    /// Merging an unsorted partial into a materialized empty one must keep the false verdict in
+    /// both the finalized result and the partial scalar.
+    #[test]
+    fn unsorted_merged_into_empty_keeps_verdict() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+        let options = IsSortedOptions { strict: false };
+        let mut empty = Accumulator::try_new(IsSorted, options.clone(), dtype.clone())?;
+        let mut unsorted = Accumulator::try_new(IsSorted, options, dtype)?;
+
+        // An empty batch materializes the empty partial in place.
+        empty.accumulate(
+            &PrimitiveArray::new(Buffer::<i32>::empty(), Validity::NonNullable).into_array(),
+            &mut ctx,
+        )?;
+        unsorted.accumulate(&buffer![3i32, 1].into_array(), &mut ctx)?;
+        empty.merge_from(&mut unsorted)?;
+
+        assert!(!empty.partial_scalar()?.is_null());
+        assert_eq!(
+            empty.finish()?,
+            Scalar::bool(false, Nullability::NonNullable)
+        );
+        Ok(())
+    }
+
+    /// An unsorted verdict without observed boundaries is not the empty state.
+    #[test]
+    fn unsorted_partial_without_boundaries_is_not_empty() -> VortexResult<()> {
+        let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+        let options = IsSortedOptions { strict: false };
+        let owned = AggregateDTypes::try_new(&IsSorted, &options, dtype)?;
+        let args = owned.args(&options);
+        let partial = IsSortedPartial {
+            is_sorted: false,
+            first_value: None,
+            last_value: None,
+        };
+
+        let scalar = IsSorted.to_scalar(args, &partial)?;
+        assert!(!scalar.is_null());
+        let parsed = IsSorted.partial_from_scalar(args, &scalar)?;
+        assert_eq!(
+            IsSorted.finalize_scalar(args, &parsed)?,
+            Scalar::bool(false, Nullability::NonNullable)
+        );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::primitive(PrimitiveArray::from_option_iter([None::<i32>]).into_array())]
+    #[case::bool(BoolArray::from_iter([None::<bool>]).into_array())]
+    #[case::decimal(
+        DecimalArray::new(buffer![0i128], DecimalDType::new(19, 2), Validity::AllInvalid).into_array()
+    )]
+    #[case::string(VarBinViewArray::from_iter_nullable_str([None::<&str>]).into_array())]
+    #[case::constant(ConstantArray::new(Scalar::null_native::<i32>(), 1).into_array())]
+    fn singleton_null_is_strict_sorted(#[case] array: ArrayRef) -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let dict = DictArray::try_new(buffer![0u32].into_array(), array.clone())?.into_array();
+        let runend =
+            RunEnd::try_new(buffer![1u32].into_array(), array.clone(), &mut ctx)?.into_array();
+
+        for array in [array, dict, runend] {
+            let mut acc = Accumulator::try_new(
+                IsSorted,
+                IsSortedOptions { strict: true },
+                array.dtype().clone(),
+            )?;
+            acc.accumulate(&array, &mut ctx)?;
+
+            assert_eq!(acc.finish()?, Scalar::bool(true, Nullability::NonNullable));
+            assert!(is_strict_sorted(&array, &mut ctx)?);
+        }
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::empty(vec![], true)]
+    #[case::null_then_valid(vec![None, Some(1)], true)]
+    #[case::valid_then_null(vec![Some(1), None], false)]
+    #[case::duplicate_nulls(vec![None, None], false)]
+    #[case::duplicate_values(vec![Some(1), Some(1)], false)]
+    #[case::increasing_values(vec![Some(1), Some(2)], true)]
+    fn strict_sorted_batch_boundaries(
+        #[case] values: Vec<Option<i32>>,
+        #[case] expected: bool,
+    ) -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let flat = PrimitiveArray::from_option_iter(values.iter().copied()).into_array();
+        let chunks = values
+            .into_iter()
+            .map(|value| PrimitiveArray::from_option_iter([value]).into_array())
+            .collect::<Vec<_>>();
+        let mut split = Accumulator::try_new(
+            IsSorted,
+            IsSortedOptions { strict: true },
+            flat.dtype().clone(),
+        )?;
+        for chunk in &chunks {
+            split.accumulate(chunk, &mut ctx)?;
+        }
+
+        let expected_scalar = Scalar::bool(expected, Nullability::NonNullable);
+        assert_eq!(split.finish()?, expected_scalar);
+
+        let chunked = ChunkedArray::try_new(chunks, flat.dtype().clone())?.into_array();
+        for array in [flat, chunked] {
+            let mut acc = Accumulator::try_new(
+                IsSorted,
+                IsSortedOptions { strict: true },
+                array.dtype().clone(),
+            )?;
+            acc.accumulate(&array, &mut ctx)?;
+
+            assert_eq!(acc.finish()?, expected_scalar);
+            assert_eq!(is_strict_sorted(&array, &mut ctx)?, expected);
+        }
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::non_strict(false, [true, false, true, true,  true])]
+    #[case::strict(    true,  [true, false, true, false, true])]
+    fn grouped_is_sorted(#[case] strict: bool, #[case] expected: [bool; 5]) -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let elements =
+            PrimitiveArray::from_option_iter([Some(1i32), Some(2), Some(3), Some(1), None, None])
+                .into_array();
+        let dtype = elements.dtype().clone();
+
+        // The groups are `[1, 2, 3]`, `[3, 1]`, `[]`, `[null, null]`, and a null group.
+        let groups = ListViewArray::try_new(
+            elements,
+            buffer![0i32, 2, 0, 4, 0].into_array(),
+            buffer![3i32, 2, 0, 2, 0].into_array(),
+            Validity::from_iter([true, true, true, true, false]),
+            &mut ctx,
+        )?
+        .into_array();
+
+        let mut acc = GroupedAccumulator::try_new(IsSorted, IsSortedOptions { strict }, dtype)?;
+        acc.accumulate_list(&groups, &mut ctx)?;
+
+        assert_arrays_eq!(acc.finish()?, BoolArray::from_iter(expected), &mut ctx);
         Ok(())
     }
 }

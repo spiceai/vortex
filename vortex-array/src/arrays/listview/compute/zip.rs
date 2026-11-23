@@ -6,6 +6,7 @@ use std::ops::BitAnd;
 use std::ops::BitOr;
 use std::ops::Not;
 
+use itertools::Either;
 use vortex_buffer::Buffer;
 use vortex_buffer::BufferMut;
 use vortex_error::VortexExpect;
@@ -50,7 +51,7 @@ impl ZipKernel for ListView {
         };
 
         // Null mask entries select `if_false`, matching `Zip`'s SQL ELSE semantics.
-        let mask = mask.clone().null_as_false().execute(ctx)?;
+        let mask = mask.clone().fill_null(false)?.execute::<Mask>(ctx)?;
         match &mask {
             // Defer the trivial masks to the generic zip, which just casts one side.
             Mask::AllTrue(_) | Mask::AllFalse(_) => return Ok(None),
@@ -75,9 +76,7 @@ impl ZipKernel for ListView {
         // Concatenate the two `elements` arrays without copying. If either side is already a
         // `ChunkedArray` (e.g. the result of a previous list-view zip), splice its chunks in
         // directly rather than nesting chunked arrays.
-        let mut chunks = Vec::with_capacity(2);
-        push_element_chunks(true_elements, &mut chunks);
-        push_element_chunks(false_elements, &mut chunks);
+        let chunks = element_chunks(&true_elements).chain(element_chunks(&false_elements));
         let elements = ChunkedArray::try_new(chunks, result_elements_dtype)?.into_array();
 
         let true_offsets = to_u64(if_true.offsets(), ctx)?;
@@ -159,6 +158,7 @@ impl ZipKernel for ListView {
                 offsets.freeze().into_array(),
                 sizes.freeze().into_array(),
                 validity,
+                ctx,
             )?
             .into_array(),
         ))
@@ -189,12 +189,14 @@ fn select_column(
     }
 }
 
-/// Appends `array`'s element chunks to `chunks`, flattening a top-level [`ChunkedArray`] so the
+/// Iterates over `array`'s element chunks, flattening a top-level [`ChunkedArray`] so the
 /// concatenated elements never nest chunked arrays.
-fn push_element_chunks(array: ArrayRef, chunks: &mut Vec<ArrayRef>) {
+fn element_chunks(array: &ArrayRef) -> impl Iterator<Item = ArrayRef> + '_ {
     match array.as_opt::<Chunked>() {
-        Some(chunked) => chunks.extend(chunked.iter_chunks().cloned()),
-        None => chunks.push(array),
+        Some(chunked) => {
+            Either::Left((0..chunked.nchunks()).map(move |i| chunked.chunk(i).clone()))
+        }
+        None => Either::Right(std::iter::once(array.clone())),
     }
 }
 
@@ -236,15 +238,17 @@ mod tests {
         reason = "test fixtures use small indices that fit the target widths"
     )]
 
+    use std::sync::LazyLock;
+
     use vortex_buffer::Buffer;
     use vortex_buffer::buffer;
     use vortex_error::VortexResult;
     use vortex_mask::Mask;
+    use vortex_session::VortexSession;
 
     use crate::ArrayRef;
     use crate::IntoArray;
     use crate::VortexSessionExecute;
-    use crate::array_session;
     use crate::arrays::BoolArray;
     use crate::arrays::Chunked;
     use crate::arrays::ChunkedArray;
@@ -259,13 +263,16 @@ mod tests {
     use crate::dtype::PType;
     use crate::validity::Validity;
 
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
+
     fn list_view(
         elements: ArrayRef,
         offsets: ArrayRef,
         sizes: ArrayRef,
         validity: Validity,
     ) -> ArrayRef {
-        ListViewArray::try_new(elements, offsets, sizes, validity)
+        let mut ctx = SESSION.create_execution_ctx();
+        ListViewArray::try_new(elements, offsets, sizes, validity, &mut ctx)
             .unwrap()
             .into_array()
     }
@@ -273,7 +280,7 @@ mod tests {
     /// `zip` of two list views selects whole lists per the mask and keeps the list encoding.
     #[test]
     fn zip_selects_lists() -> VortexResult<()> {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         // [[1, 2], [3], [4, 5, 6]]
         let if_true = list_view(
             buffer![1i32, 2, 3, 4, 5, 6].into_array(),
@@ -312,7 +319,7 @@ mod tests {
     /// `zip` selects list-level validity from the chosen side and widens nullability.
     #[test]
     fn zip_selects_validity() -> VortexResult<()> {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         // [[1], null, [2]] (list-level nulls)
         let if_true = list_view(
             buffer![1i32, 2].into_array(),
@@ -330,10 +337,7 @@ mod tests {
         // true -> if_true, false -> if_false
         let mask = Mask::from_iter([false, true, true]);
 
-        let result = mask
-            .into_array()
-            .zip(if_true, if_false)?
-            .execute::<ArrayRef>(&mut ctx)?;
+        let result = mask.into_array().zip(if_true, if_false)?;
 
         // Row 0 -> if_false[0] = [10]; row 1 -> if_true[1] = null; row 2 -> if_true[2] = [2]
         let expected = list_view(
@@ -350,7 +354,7 @@ mod tests {
     /// is nullable.
     #[test]
     fn zip_out_of_order_offsets_and_widening() -> VortexResult<()> {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         // [[5, 6], [7], [8, 9]] expressed with out-of-order offsets.
         let if_true = list_view(
             buffer![7i32, 8, 9, 5, 6].into_array(),
@@ -388,7 +392,7 @@ mod tests {
     /// loop and the trailing remainder, including the `false_shift` applied to `if_false` views.
     #[test]
     fn zip_spans_multiple_mask_chunks() -> VortexResult<()> {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         // 130 single-element lists per side: `if_true[i] = [i]`, `if_false[i] = [1000 + i]`.
         let len = 130usize;
         let true_elements: Vec<i32> = (0..len as i32).collect();
@@ -468,7 +472,7 @@ mod tests {
     /// aligned chunk body and the suffix.
     #[test]
     fn zip_handles_offset_mask() -> VortexResult<()> {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         // 200 single-element lists per side: `if_true[i] = [i]`, `if_false[i] = [1000 + i]`. With a
         // 3-bit lead offset the mask spans more than 16 bytes, so `unaligned_chunks` exposes a
         // non-empty aligned `chunks` body between the prefix and suffix words.
@@ -530,7 +534,7 @@ mod tests {
     /// than nesting a chunked array inside the concatenated elements.
     #[test]
     fn zip_flattens_chunked_elements() -> VortexResult<()> {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         // elements [1, 2, 3] stored as two chunks; lists [[1, 2], [3]].
         let chunked_elements = ChunkedArray::try_new(
             vec![buffer![1i32, 2].into_array(), buffer![3i32].into_array()],

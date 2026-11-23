@@ -6,6 +6,7 @@
 use std::sync::LazyLock;
 
 use divan::Bencher;
+use mimalloc::MiMalloc;
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::distr::Uniform;
@@ -13,19 +14,28 @@ use rand::rngs::StdRng;
 use vortex_array::IntoArray;
 use vortex_array::RecursiveCanonical;
 use vortex_array::VortexSessionExecute;
-use vortex_array::array_session;
 use vortex_array::arrays::StructArray;
 use vortex_array::dtype::FieldNames;
+use vortex_array::memory::MemorySession;
+use vortex_array::optimizer::kernels::KernelSession;
+use vortex_array::test_harness::mark_optimized;
 use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
 use vortex_session::VortexSession;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 fn main() {
     LazyLock::force(&SESSION);
     divan::main();
 }
 
-static SESSION: LazyLock<VortexSession> = LazyLock::new(array_session);
+static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
+    VortexSession::empty()
+        .with::<KernelSession>()
+        .with::<MemorySession>()
+});
 
 const ARRAY_SIZE: usize = 100_000;
 const TAKE_SIZE: usize = 1000;
@@ -54,6 +64,8 @@ fn take_struct_simple(bencher: Bencher) {
         .map(|_| rng.random_range(0..ARRAY_SIZE) as u64)
         .collect();
     let indices_array = indices.into_array();
+    mark_optimized(&struct_array, &SESSION).unwrap();
+    mark_optimized(&indices_array, &SESSION).unwrap();
 
     bencher
         .with_inputs(|| {
@@ -97,6 +109,8 @@ fn take_struct_wide(bencher: Bencher, width: usize) {
         .map(|_| rng.random_range(0..ARRAY_SIZE) as u64)
         .collect();
     let indices_array = indices.into_array();
+    mark_optimized(&struct_array, &SESSION).unwrap();
+    mark_optimized(&indices_array, &SESSION).unwrap();
 
     bencher
         .with_inputs(|| {
@@ -137,6 +151,8 @@ fn take_struct_sequential_indices(bencher: Bencher) {
     // Sequential indices for better cache performance
     let indices: Buffer<u64> = (0..TAKE_SIZE as u64).collect();
     let indices_array = indices.into_array();
+    mark_optimized(&struct_array, &SESSION).unwrap();
+    mark_optimized(&indices_array, &SESSION).unwrap();
 
     bencher
         .with_inputs(|| {

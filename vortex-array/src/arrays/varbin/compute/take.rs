@@ -2,7 +2,6 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::iter;
-use std::ptr;
 use std::sync::Arc;
 
 use itertools::Itertools as _;
@@ -14,6 +13,7 @@ use vortex_buffer::ByteBufferMut;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
+use vortex_error::vortex_ensure_eq;
 use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
 use vortex_mask::AllOr;
@@ -589,9 +589,10 @@ where
         .len()
         .checked_mul(length)
         .ok_or_else(|| vortex_err!("PiecewiseSequenceArray output length overflows usize"))?;
-    vortex_ensure!(
-        computed_len == output_len,
-        "PiecewiseSequenceArray expanded length {computed_len} does not match declared length {output_len}"
+    vortex_ensure_eq!(
+        computed_len,
+        output_len,
+        "PiecewiseSequenceArray expanded length does not match declared length",
     );
 
     let mut new_offsets = Offsets::with_capacity(out_offset_ptype, output_len + 1);
@@ -642,22 +643,15 @@ where
         let byte_start = offset_range[0].as_();
         let byte_end = offset_range[length].as_();
         let src = &data[byte_start..byte_end];
-        // SAFETY: `src` and the checked `spare` range have equal lengths and cannot overlap.
-        unsafe {
-            ptr::copy_nonoverlapping(
-                src.as_ptr(),
-                spare[cursor..][..src.len()].as_mut_ptr().cast::<u8>(),
-                src.len(),
-            );
-        }
+        spare[cursor..][..src.len()].write_copy_of_slice(src);
         cursor += src.len();
     }
     // SAFETY: the loop initialized the prefix `0..cursor` of the spare capacity.
     unsafe { new_data.set_len(cursor) };
-    vortex_ensure!(
-        new_data.len() == output_bytes,
-        "PiecewiseSequenceArray gathered byte length {} does not match declared byte length {output_bytes}",
-        new_data.len()
+    vortex_ensure_eq!(
+        new_data.len(),
+        output_bytes,
+        "PiecewiseSequenceArray gathered byte length does not match declared byte length",
     );
 
     let offsets = new_offsets.into_array();
@@ -715,10 +709,10 @@ where
             .checked_add(byte_end - byte_start)
             .ok_or_else(|| vortex_err!("PiecewiseSequence VarBin output byte length overflow"))?;
     }
-    vortex_ensure!(
-        new_offsets.len() == output_len + 1,
-        "PiecewiseSequenceArray expanded length {} does not match declared length {output_len}",
-        new_offsets.len() - 1
+    vortex_ensure_eq!(
+        new_offsets.len(),
+        output_len + 1,
+        "PiecewiseSequenceArray expanded offsets length does not match declared length plus one",
     );
 
     let mut new_data = ByteBufferMut::with_capacity(output_bytes);
@@ -735,22 +729,15 @@ where
         let byte_start = offset_range[0].as_();
         let byte_end = offset_range[length].as_();
         let src = &data[byte_start..byte_end];
-        // SAFETY: `src` and the checked `spare` range have equal lengths and cannot overlap.
-        unsafe {
-            ptr::copy_nonoverlapping(
-                src.as_ptr(),
-                spare[cursor..][..src.len()].as_mut_ptr().cast::<u8>(),
-                src.len(),
-            );
-        }
+        spare[cursor..][..src.len()].write_copy_of_slice(src);
         cursor += src.len();
     }
     // SAFETY: the loop initialized the prefix `0..cursor` of the spare capacity.
     unsafe { new_data.set_len(cursor) };
-    vortex_ensure!(
-        new_data.len() == output_bytes,
-        "PiecewiseSequenceArray gathered byte length {} does not match declared byte length {output_bytes}",
-        new_data.len()
+    vortex_ensure_eq!(
+        new_data.len(),
+        output_bytes,
+        "PiecewiseSequenceArray gathered byte length does not match declared byte length",
     );
 
     let offsets = new_offsets.into_array();
@@ -827,15 +814,16 @@ fn take_nullable<Index: IntegerPType, Offset: IntegerPType>(
 #[cfg(test)]
 mod tests {
     use std::iter;
+    use std::sync::LazyLock;
 
     use rstest::rstest;
     use vortex_buffer::ByteBuffer;
     use vortex_buffer::buffer;
     use vortex_error::VortexResult;
+    use vortex_session::VortexSession;
 
     use crate::IntoArray;
     use crate::VortexSessionExecute;
-    use crate::array_session;
     use crate::arrays::VarBinArray;
     use crate::arrays::VarBinViewArray;
     use crate::arrays::varbin::compute::take::PrimitiveArray;
@@ -846,22 +834,27 @@ mod tests {
     use crate::dtype::PType;
     use crate::validity::Validity;
 
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
+
     #[test]
     fn test_null_take() {
         let arr = VarBinArray::from_iter([Some("h")], DType::Utf8(Nullability::NonNullable));
 
         let idx1: PrimitiveArray = (0..1).collect();
 
-        assert_eq!(
-            arr.take(idx1.into_array()).unwrap().dtype(),
-            &DType::Utf8(Nullability::NonNullable)
+        let mut ctx = SESSION.create_execution_ctx();
+        assert_arrays_eq!(
+            arr.take(idx1.into_array()).unwrap(),
+            VarBinViewArray::from_iter_str(["h"]),
+            &mut ctx
         );
 
         let idx2: PrimitiveArray = PrimitiveArray::from_option_iter(vec![Some(0)]);
 
-        assert_eq!(
-            arr.take(idx2.into_array()).unwrap().dtype(),
-            &DType::Utf8(Nullability::Nullable)
+        assert_arrays_eq!(
+            arr.take(idx2.into_array()).unwrap(),
+            VarBinViewArray::from_iter_nullable_str([Some("h")]),
+            &mut ctx
         );
     }
 
@@ -880,15 +873,12 @@ mod tests {
     ))]
     #[case(VarBinArray::from_iter(["single"].map(Some), DType::Utf8(Nullability::NonNullable)))]
     fn test_take_varbin_conformance(#[case] array: VarBinArray) {
-        test_take_conformance(
-            &array.into_array(),
-            &mut array_session().create_execution_ctx(),
-        );
+        test_take_conformance(&array.into_array(), &mut SESSION.create_execution_ctx());
     }
 
     #[test]
     fn test_take_overflow() {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let scream = iter::once("a").cycle().take(128).collect::<String>();
         let bytes = ByteBuffer::copy_from(scream.as_bytes());
         let offsets = buffer![0u8, 128u8].into_array();
@@ -898,6 +888,7 @@ mod tests {
             bytes,
             DType::Utf8(Nullability::NonNullable),
             Validity::NonNullable,
+            &mut ctx,
         );
 
         let indices = buffer![0u32; 3].into_array();
@@ -907,7 +898,7 @@ mod tests {
             [Some(scream.clone()), Some(scream.clone()), Some(scream)],
             DType::Utf8(Nullability::NonNullable),
         );
-        assert_arrays_eq!(expected, taken, &mut ctx);
+        assert_arrays_eq!(taken, expected, &mut ctx);
     }
 
     #[rstest]
@@ -925,15 +916,28 @@ mod tests {
         let mut sink = super::Offsets::with_capacity(out_offset_ptype, 2);
         sink.push(0);
         sink.push(max_offset);
+        let array = sink.into_array();
         assert_eq!(
-            PType::try_from(sink.into_array().dtype()).unwrap(),
-            expected
+            array.dtype(),
+            &DType::Primitive(expected, Nullability::NonNullable)
         );
+        assert_eq!(array.len(), 2);
+        let mut ctx = SESSION.create_execution_ctx();
+        for (index, value) in [0, max_offset as u64].into_iter().enumerate() {
+            assert_eq!(
+                array
+                    .execute_scalar(index, &mut ctx)
+                    .unwrap()
+                    .as_primitive()
+                    .as_::<u64>(),
+                Some(value)
+            );
+        }
     }
 
     #[test]
     fn test_offset_widen_values() -> VortexResult<()> {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let big = u32::MAX as usize + 5;
         let mut sink = super::Offsets::with_capacity(PType::U32, 3);
         sink.push(0);
@@ -947,12 +951,13 @@ mod tests {
 
     #[test]
     fn test_take_signed() {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let array = VarBinArray::new(
             buffer![0i32, 5, 10].into_array(),
             ByteBuffer::copy_from(b"helloworld"),
             DType::Utf8(Nullability::NonNullable),
             Validity::NonNullable,
+            &mut ctx,
         );
 
         let taken = array.take(buffer![1u32, 0].into_array()).unwrap();
@@ -961,6 +966,6 @@ mod tests {
             [Some("world"), Some("hello")],
             DType::Utf8(Nullability::NonNullable),
         );
-        assert_arrays_eq!(expected, taken, &mut ctx);
+        assert_arrays_eq!(taken, expected, &mut ctx);
     }
 }

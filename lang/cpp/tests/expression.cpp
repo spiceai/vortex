@@ -19,8 +19,15 @@ TEST_CASE("Expression copy", "[expr]") {
         clone = orig;
     }
     Expression another = clone;
-    (void)another;
-    SUCCEED();
+    clone = expr::root();
+    Session session;
+    const std::vector<uint8_t> ages = {10, 20, 30};
+    Array input = make_struct({{"age", Array::primitive<uint8_t>(ages)}});
+    auto values = input.apply(another).values<uint8_t>(session);
+    REQUIRE(values.size() == ages.size());
+    for (size_t i = 0; i < ages.size(); ++i) {
+        REQUIRE(values.values()[i] == ages[i]);
+    }
 }
 
 TEST_CASE("Apply root()", "[expr]") {
@@ -33,6 +40,7 @@ TEST_CASE("Apply root()", "[expr]") {
     REQUIRE(applied.size() == data.size());
     REQUIRE(applied.is_primitive(I32));
     auto values = applied.values<int32_t>(session);
+    REQUIRE(values.size() == data.size());
     for (size_t i = 0; i < data.size(); ++i) {
         REQUIRE(values.values()[i] == data[i]);
     }
@@ -67,6 +75,7 @@ TEST_CASE("Apply arithmetic", "[expr]") {
 
     REQUIRE(applied.is_primitive(I32));
     auto values = applied.values<int32_t>(session);
+    REQUIRE(values.size() == data.size());
     for (size_t i = 0; i < data.size(); ++i) {
         REQUIRE(values.values()[i] == data[i] + 10);
     }
@@ -79,13 +88,13 @@ TEST_CASE("Operator overloading", "[expr]") {
     Array array = Array::primitive<uint32_t>(data);
 
     Array applied = array.apply(expr::root() == expr::lit<uint32_t>(2));
-    auto bits = applied.bools(session);
-    REQUIRE(bits.size() == data.size());
-    REQUIRE_FALSE(bits.value(0));
-    REQUIRE(bits.value(1));
-    REQUIRE(bits.value(2));
-    REQUIRE_FALSE(bits.value(3));
-    REQUIRE_THROWS_AS(bits.value(data.size()), VortexException);
+    PrimitiveView<bool> view = applied.bools(session);
+    REQUIRE(view.size() == data.size());
+    BoolView values = view.values();
+    REQUIRE_FALSE(values[0]);
+    REQUIRE(values[1]);
+    REQUIRE(values[2]);
+    REQUIRE_FALSE(values[3]);
 }
 
 TEST_CASE("Apply error", "[expr]") {

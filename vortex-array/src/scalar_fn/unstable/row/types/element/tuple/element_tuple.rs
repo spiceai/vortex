@@ -11,6 +11,7 @@ use vortex_error::vortex_ensure_eq;
 
 use crate::ArrayRef;
 use crate::ExecutionCtx;
+use crate::array::VTable;
 use crate::arrays::Constant;
 use crate::arrays::Extension;
 use crate::arrays::Masked;
@@ -133,6 +134,34 @@ pub fn batch_const(array: &ArrayRef) -> Option<ArrayRef> {
     None
 }
 
+/// Whether [`batch_const`] would return a batch-constant array, without cloning it.
+///
+/// The encoding ID is a field of the array, so comparing it rejects the common non-constant input
+/// without the dynamic downcasts that [`batch_const`] performs.
+#[expect(clippy::inline_always)]
+#[inline(always)]
+pub(in crate::scalar_fn::unstable::row) fn is_batch_const(array: &ArrayRef) -> bool {
+    let id = array.encoding_id();
+
+    if id == VTable::id(&Constant) {
+        return array.is::<Constant>();
+    }
+
+    if id == VTable::id(&Masked) {
+        return array
+            .as_opt::<Masked>()
+            .is_some_and(|masked| masked.child().is::<Constant>());
+    }
+
+    if id == VTable::id(&Extension) {
+        return array
+            .as_opt::<Extension>()
+            .is_some_and(|extension| extension.storage_array().is::<Constant>());
+    }
+
+    false
+}
+
 /// Typed argument tuples for arities zero through twelve.
 ///
 /// This trait is sealed. Add a new row representation by implementing [`InputElement`] and placing
@@ -247,12 +276,7 @@ impl ElementTuple for () {
     const DECODE_INFALLIBLE: bool = true;
 
     fn validate(dtypes: &[DType]) -> VortexResult<()> {
-        vortex_ensure_eq!(
-            dtypes.len(),
-            0,
-            "expected 0 argument dtypes, got {}",
-            dtypes.len(),
-        );
+        vortex_ensure_eq!(dtypes.len(), 0);
         Ok(())
     }
 
@@ -311,13 +335,7 @@ macro_rules! element_tuple {
             const DECODE_INFALLIBLE: bool = $($t::DECODE_INFALLIBLE &&)+ true;
 
             fn validate(dtypes: &[DType]) -> VortexResult<()> {
-                vortex_ensure_eq!(
-                    dtypes.len(),
-                    $arity,
-                    "expected {} argument dtypes, got {}",
-                    $arity,
-                    dtypes.len(),
-                );
+                vortex_ensure_eq!(dtypes.len(), $arity);
 
                 $($t::validate(&dtypes[$idx])?;)+
                 Ok(())

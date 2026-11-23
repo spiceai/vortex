@@ -106,20 +106,14 @@ impl VTable for Extension {
         vortex_ensure_eq!(
             storage.len(),
             len,
-            "ExtensionArray length {} does not match outer length {len}",
-            storage.len(),
+            "ExtensionArray length does not match outer length",
         );
 
         let ext_dtype = dtype
             .as_extension_opt()
             .ok_or_else(|| vortex_err!("not an extension dtype"))?;
 
-        let actual_dtype = DType::Extension(ext_dtype.clone());
-        vortex_ensure_eq!(
-            &actual_dtype,
-            dtype,
-            "ExtensionArray dtype {actual_dtype} does not match outer dtype {dtype}",
-        );
+        vortex_ensure_eq!(storage.dtype(), ext_dtype.storage_dtype());
 
         Ok(())
     }
@@ -174,10 +168,13 @@ impl VTable for Extension {
             vortex_bail!("Expected 1 child, got {}", children.len());
         }
         let storage = children.get(0, ext_dtype.storage_dtype(), len)?;
-        Ok(
-            ArrayParts::new(self.clone(), dtype.clone(), len, EmptyArrayData)
-                .with_slots(ExtensionSlots { storage }.into_slots()),
-        )
+        Ok(ArrayParts::new(
+            self.clone(),
+            dtype.clone(),
+            len,
+            EmptyArrayData,
+            ExtensionSlots { storage }.into_slots(),
+        ))
     }
 
     fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {

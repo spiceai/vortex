@@ -33,8 +33,12 @@
 //! [`TableProvider`]: datafusion_catalog::TableProvider
 //! [`DataSource`]: datafusion_datasource::source::DataSource
 
+pub(crate) mod dynamic_filters;
 mod source;
 mod table;
+
+#[cfg(test)]
+mod tests;
 
 pub use source::VortexDataSource;
 pub use table::VortexTable;

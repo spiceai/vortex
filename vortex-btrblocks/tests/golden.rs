@@ -39,6 +39,7 @@ use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::StructArray;
 use vortex_array::arrays::TemporalArray;
 use vortex_array::arrays::VarBinViewArray;
+use vortex_array::assert_arrays_eq;
 use vortex_array::display::EncodingSummaryExtractor;
 use vortex_array::display::MetadataExtractor;
 use vortex_array::display::TreeContext;
@@ -47,11 +48,12 @@ use vortex_array::dtype::DType;
 use vortex_array::dtype::DecimalDType;
 use vortex_array::dtype::Nullability;
 use vortex_array::extension::datetime::TimeUnit;
+#[cfg(feature = "pco")]
+use vortex_array::session::ArraySessionExt;
 use vortex_array::validity::Validity;
 use vortex_btrblocks::BtrBlocksCompressor;
 use vortex_btrblocks::BtrBlocksCompressorBuilder;
 use vortex_buffer::Buffer;
-use vortex_edition::ComponentKind;
 use vortex_edition::EDITION_DECLARATIONS;
 use vortex_edition::EDITION_FAMILIES;
 use vortex_edition::EditionId;
@@ -61,7 +63,7 @@ use vortex_edition::declarations::core::CORE_2026_08_3;
 use vortex_error::VortexResult;
 use vortex_session::VortexSession;
 
-static SESSION: LazyLock<VortexSession> = LazyLock::new(vortex_array::array_session);
+static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
 
 /// Number of values in each numeric corpus entry: comfortably above the 1024-value sampling
 /// threshold so scheme selection runs on sampled estimates, as it does for real file chunks.
@@ -113,13 +115,15 @@ fn golden_snapshots(
     entries: Vec<(&'static str, ArrayRef)>,
 ) -> VortexResult<()> {
     for (name, array) in entries {
-        let rendered = {
+        let (rendered, compressed) = {
             let mut exec_ctx = SESSION.create_execution_ctx();
-            render(&array, &compressor.compress(&array, &mut exec_ctx)?)
+            let compressed = compressor.compress(&array, &mut exec_ctx)?;
+            (render(&array, &compressed), compressed)
         };
-        let rendered_again = {
+        let (rendered_again, compressed_again) = {
             let mut exec_ctx = SESSION.create_execution_ctx();
-            render(&array, &compressor.compress(&array, &mut exec_ctx)?)
+            let compressed = compressor.compress(&array, &mut exec_ctx)?;
+            (render(&array, &compressed), compressed)
         };
         assert_eq!(
             rendered, rendered_again,
@@ -127,6 +131,9 @@ fn golden_snapshots(
         );
 
         insta::assert_snapshot!(format!("{variant}__{name}"), rendered);
+        let mut exec_ctx = SESSION.create_execution_ctx();
+        assert_arrays_eq!(&compressed, &array, &mut exec_ctx);
+        assert_arrays_eq!(&compressed_again, &array, &mut exec_ctx);
     }
     Ok(())
 }
@@ -135,6 +142,10 @@ fn golden_snapshots(
 fn corpus() -> VortexResult<Vec<(&'static str, ArrayRef)>> {
     Ok(vec![
         ("int_monotone_jitter", int_monotone_jitter()),
+        (
+            "int_monotone_jitter_nullable",
+            int_monotone_jitter_nullable(),
+        ),
         ("int_arithmetic_sequence", int_arithmetic_sequence()),
         ("int_low_cardinality", int_low_cardinality()),
         ("int_runs", int_runs()),
@@ -168,6 +179,27 @@ fn int_monotone_jitter() -> ArrayRef {
         })
         .collect();
     PrimitiveArray::new(values, Validity::NonNullable).into_array()
+}
+
+/// [`int_monotone_jitter`] with a tenth of the slots null: covers the nullable Delta tree, whose
+/// validity is a top-level child rather than part of the deltas, once Delta rejoins
+/// [`ALL_SCHEMES`](vortex_btrblocks::ALL_SCHEMES).
+fn int_monotone_jitter_nullable() -> ArrayRef {
+    let mut rng = StdRng::seed_from_u64(101);
+    let mut value = 1_700_000_000_000u64;
+    let mut validity: Vec<bool> = Vec::with_capacity(N);
+    let values: Buffer<u64> = (0..N)
+        .map(|_| {
+            value += 900 + rng.random_range(0..200);
+            validity.push(rng.random_range(0..10) != 0);
+            value
+        })
+        .collect();
+    PrimitiveArray::new(
+        values,
+        Validity::Array(BoolArray::from_iter(validity).into_array()),
+    )
+    .into_array()
 }
 
 /// Exact arithmetic sequence: Sequence habitat (distinct == len, no nulls).
@@ -377,6 +409,7 @@ fn struct_mixed() -> VortexResult<ArrayRef> {
 
 /// Variable-length lists of run-heavy ints: pins the list offsets/elements path.
 fn list_of_int_runs() -> VortexResult<ArrayRef> {
+    let mut ctx = SESSION.create_execution_ctx();
     let mut rng = StdRng::seed_from_u64(118);
     let elements = int_runs();
     let mut offsets: Vec<i32> = Vec::with_capacity(N / 4 + 1);
@@ -387,7 +420,13 @@ fn list_of_int_runs() -> VortexResult<ArrayRef> {
         offsets.push(offset);
     }
     let offsets = PrimitiveArray::new(Buffer::copy_from(&offsets), Validity::NonNullable);
-    Ok(ListArray::try_new(elements, offsets.into_array(), Validity::NonNullable)?.into_array())
+    Ok(ListArray::try_new(
+        elements,
+        offsets.into_array(),
+        Validity::NonNullable,
+        &mut ctx,
+    )?
+    .into_array())
 }
 
 /// Excludes OnPair from the `regular` and `compact` variants: it beats FSST on
@@ -397,11 +436,23 @@ fn without_onpair(builder: BtrBlocksCompressorBuilder) -> BtrBlocksCompressorBui
     use vortex_btrblocks::SchemeExt;
     use vortex_btrblocks::schemes::string::OnPairScheme;
 
-    builder.exclude_schemes([OnPairScheme.id()])
+    builder.exclude_schemes([OnPairScheme::default().id()])
 }
 
 fn edition_session(editions: &[EditionId]) -> VortexResult<VortexSession> {
-    let session = vortex_array::array_session().with::<EditionSession>();
+    let session = VortexSession::empty().with::<EditionSession>();
+    // The compressor only produces encodings registered on the session.
+    vortex_alp::initialize(&session);
+    vortex_datetime_parts::initialize(&session);
+    vortex_decimal_byte_parts::initialize(&session);
+    vortex_fastlanes::initialize(&session);
+    vortex_fsst::initialize(&session);
+    vortex_onpair::initialize(&session);
+    vortex_sequence::initialize(&session);
+    vortex_sparse::initialize(&session);
+    vortex_zigzag::initialize(&session);
+    #[cfg(feature = "pco")]
+    session.arrays().register(vortex_pco::Pco);
     for family in EDITION_FAMILIES {
         session.editions().declare_family(family)?;
     }
@@ -414,35 +465,10 @@ fn edition_session(editions: &[EditionId]) -> VortexResult<VortexSession> {
     Ok(session)
 }
 
-fn compressor_for_session(
-    session: &VortexSession,
-    builder: BtrBlocksCompressorBuilder,
-) -> BtrBlocksCompressor {
-    let allowed = session
-        .enabled_component_ids(ComponentKind::Array)
-        .into_iter()
-        .collect();
-    without_onpair(builder)
-        .retain_allowed_encodings(&allowed)
-        .build()
-}
-
-/// Like [`compressor_for_session`] but keeps OnPair in the scheme pool.
-fn compressor_with_onpair(
-    session: &VortexSession,
-    builder: BtrBlocksCompressorBuilder,
-) -> BtrBlocksCompressor {
-    let allowed = session
-        .enabled_component_ids(ComponentKind::Array)
-        .into_iter()
-        .collect();
-    builder.retain_allowed_encodings(&allowed).build()
-}
-
 #[test]
 fn golden_regular() -> VortexResult<()> {
     let session = edition_session(&[CORE_2026_08_3])?;
-    let compressor = compressor_for_session(&session, BtrBlocksCompressorBuilder::default());
+    let compressor = without_onpair(BtrBlocksCompressorBuilder::from_session(&session)).build();
     golden_corpus_snapshots("regular", &compressor)
 }
 
@@ -450,7 +476,7 @@ fn golden_regular() -> VortexResult<()> {
 #[test]
 fn golden_onpair() -> VortexResult<()> {
     let session = edition_session(&[CORE_2026_08_3])?;
-    let compressor = compressor_with_onpair(&session, BtrBlocksCompressorBuilder::default());
+    let compressor = BtrBlocksCompressorBuilder::from_session(&session).build();
     golden_snapshots(
         "onpair",
         &compressor,
@@ -464,9 +490,7 @@ fn golden_compact() -> VortexResult<()> {
     let session = edition_session(&[CORE_2026_08_3])?;
     vortex_zstd::initialize(&session);
     session.enable_edition(vortex_zstd::editions::ZSTD_2026_02)?;
-    let compressor = compressor_for_session(
-        &session,
-        BtrBlocksCompressorBuilder::default().with_compact(),
-    );
+    let compressor =
+        without_onpair(BtrBlocksCompressorBuilder::from_session(&session).with_compact()).build();
     golden_corpus_snapshots("compact", &compressor)
 }

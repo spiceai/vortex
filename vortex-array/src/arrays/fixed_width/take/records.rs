@@ -2,29 +2,31 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use vortex_buffer::Buffer;
+use vortex_buffer::BufferAllocatorRef;
 use vortex_buffer::BufferMut;
 use vortex_buffer::ByteBuffer;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
 
 use super::take_values;
-use crate::arrays::fixed_width::match_each_record_width;
 use crate::dtype::UnsignedPType;
+use crate::match_each_power_of_two_width;
 
 pub(super) fn take_byte_records<I: UnsignedPType>(
     values: &ByteBuffer,
     byte_width: usize,
     record_count: usize,
     indices: &[I],
+    allocator: &BufferAllocatorRef,
 ) -> VortexResult<ByteBuffer> {
     let alignment = values.alignment();
 
-    match_each_record_width!(
+    match_each_power_of_two_width!(
         byte_width,
         |W| {
             let records = Buffer::<[u8; W]>::from_byte_buffer(values.clone());
             debug_assert_eq!(records.len(), record_count);
-            Ok(take_values(records.as_slice(), indices)
+            Ok(take_values(records.as_slice(), indices, allocator)
                 .into_byte_buffer()
                 .aligned(alignment))
         },
@@ -33,7 +35,7 @@ pub(super) fn take_byte_records<I: UnsignedPType>(
                 .len()
                 .checked_mul(byte_width)
                 .ok_or_else(|| vortex_err!("Fixed-width take output length overflows usize"))?;
-            let mut result = BufferMut::<u8>::with_capacity(output_len);
+            let mut result = BufferMut::<u8>::with_capacity_in(output_len, allocator.clone());
             for index in indices {
                 let index = index.as_();
                 assert!(

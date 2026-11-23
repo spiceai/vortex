@@ -3,12 +3,10 @@ name = "vortex-scan"
 authors.workspace = true
 description = "Scanning operations for Vortex"
 edition = { workspace = true }
-homepage = { workspace = true }
 categories = { workspace = true }
 include = { workspace = true }
 keywords = { workspace = true }
 license = { workspace = true }
-readme = "README.md"
 repository = { workspace = true }
 rust-version = { workspace = true }
 version = { workspace = true }
@@ -20,13 +18,20 @@ all-features = true
 vortex-array = { workspace = true }
 vortex-buffer = { workspace = true }
 vortex-error = { workspace = true }
+vortex-io = { workspace = true }
 vortex-mask = { workspace = true }
 vortex-session = { workspace = true }
+vortex-utils = { workspace = true }
 
 async-trait = { workspace = true }
 futures = { workspace = true }
 roaring = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+parking_lot = { workspace = true }
+rstest = { workspace = true }
+vortex-array = { workspace = true, features = ["_test-harness"] }
 
 [lints]
 workspace = true

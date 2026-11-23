@@ -13,28 +13,36 @@ use crate::scalar_fn::fns::mask::MaskReduce;
 use crate::validity::Validity;
 
 impl MaskReduce for VarBin {
+    const VALIDITY_IS_METADATA_ONLY: bool = true;
+
     fn mask(array: ArrayView<'_, VarBin>, mask: &ArrayRef) -> VortexResult<Option<ArrayRef>> {
-        Ok(Some(
-            VarBinArray::try_new(
+        // SAFETY: offsets and bytes are unchanged, and masking only removes valid rows.
+        Ok(Some(unsafe {
+            VarBinArray::new_unchecked_from_handle(
                 array.offsets().clone(),
-                array.bytes().clone(),
+                array.bytes_handle().clone(),
                 array.dtype().as_nullable(),
                 array.validity()?.and(Validity::Array(mask.clone()))?,
-            )?
-            .into_array(),
-        ))
+            )
+            .into_array()
+        }))
     }
 }
 
 #[cfg(test)]
 mod test {
+    use std::sync::LazyLock;
+
+    use vortex_session::VortexSession;
+
     use crate::IntoArray;
     use crate::VortexSessionExecute;
-    use crate::array_session;
     use crate::arrays::VarBinArray;
     use crate::compute::conformance::mask::test_mask_conformance;
     use crate::dtype::DType;
     use crate::dtype::Nullability;
+
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
 
     #[test]
     fn test_mask_var_bin_array() {
@@ -42,18 +50,12 @@ mod test {
             vec!["hello", "world", "filter", "good", "bye"],
             DType::Utf8(Nullability::NonNullable),
         );
-        test_mask_conformance(
-            &array.into_array(),
-            &mut array_session().create_execution_ctx(),
-        );
+        test_mask_conformance(&array.into_array(), &mut SESSION.create_execution_ctx());
 
         let array = VarBinArray::from_iter(
             vec![Some("hello"), None, Some("filter"), Some("good"), None],
             DType::Utf8(Nullability::Nullable),
         );
-        test_mask_conformance(
-            &array.into_array(),
-            &mut array_session().create_execution_ctx(),
-        );
+        test_mask_conformance(&array.into_array(), &mut SESSION.create_execution_ctx());
     }
 }

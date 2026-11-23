@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use vortex_error::VortexResult;
-use vortex_error::vortex_ensure;
+use vortex_error::vortex_ensure_eq;
 use vortex_session::VortexSession;
 
 use crate::ArrayDeserialization;
@@ -62,6 +62,14 @@ impl<V: ScalarFnVTable + ScalarFnArrayVTable> ArrayPlugin for ScalarFnArrayPlugi
         self.0.id()
     }
 
+    fn read_ids(&self) -> Vec<ArrayId> {
+        vec![self.id()]
+    }
+
+    fn write_ids(&self) -> Vec<ArrayId> {
+        vec![self.id()]
+    }
+
     fn serialize(
         &self,
         array: &ArrayRef,
@@ -80,11 +88,10 @@ impl<V: ScalarFnVTable + ScalarFnArrayVTable> ArrayPlugin for ScalarFnArrayPlugi
         parts: ArrayDeserialization<'_>,
         session: &VortexSession,
     ) -> VortexResult<ArrayRef> {
-        vortex_ensure!(
-            parts.serialized_id == self.id(),
-            "scalar function array plugin {} does not recognize serialized ID {}",
-            self.id(),
+        vortex_ensure_eq!(
             parts.serialized_id,
+            self.id(),
+            "scalar function array plugin does not recognize serialized ID",
         );
         let len = parts.len;
         let scalar_parts = <V as ScalarFnArrayVTable>::deserialize(

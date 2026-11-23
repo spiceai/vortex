@@ -7,8 +7,7 @@ use vortex::array::arrays::ExtensionArray;
 use vortex::array::arrays::extension::ExtensionArrayExt;
 use vortex::buffer::Buffer;
 use vortex::error::VortexResult;
-use vortex::error::vortex_ensure;
-use vortex::mask::Mask;
+use vortex::error::vortex_ensure_eq;
 
 use crate::duckdb::VectorRef;
 use crate::exporter::ColumnExporter;
@@ -37,24 +36,19 @@ pub(crate) fn new_exporter(
     if parts.validity.definitely_all_null() {
         return Ok(all_invalid::new_exporter());
     }
-    let mask = parts.validity.to_array(len).execute::<Mask>(ctx)?;
-
     let bytes = parts
         .elements
         .execute::<Canonical>(ctx)?
         .into_primitive()
         .to_buffer::<u8>();
-    vortex_ensure!(
-        bytes.len() == len * UUID_BYTE_LEN,
-        "UUID storage has {} bytes, expected {}",
+    vortex_ensure_eq!(
         bytes.len(),
-        len * UUID_BYTE_LEN
+        len * UUID_BYTE_LEN,
+        "UUID storage byte length mismatch"
     );
 
-    Ok(validity::new_exporter(
-        mask,
-        Box::new(UuidExporter { bytes }),
-    ))
+    let exporter = Box::new(UuidExporter { bytes });
+    validity::new_exporter(parts.validity, len, exporter, ctx)
 }
 
 impl ColumnExporter for UuidExporter {
@@ -89,8 +83,8 @@ mod tests {
     use vortex::array::arrays::PrimitiveArray;
     use vortex::array::validity::Validity;
     use vortex::dtype::extension::ExtDType;
-    use vortex::extension::uuid::Uuid;
-    use vortex::extension::uuid::UuidMetadata;
+    use vortex::encodings::uuid::Uuid;
+    use vortex::encodings::uuid::UuidMetadata;
 
     use super::*;
     use crate::SESSION;

@@ -14,6 +14,8 @@ use crate::scalar_fn::fns::mask::MaskReduce;
 use crate::validity::Validity;
 
 impl MaskReduce for VarBinView {
+    const VALIDITY_IS_METADATA_ONLY: bool = true;
+
     fn mask(array: ArrayView<'_, VarBinView>, mask: &ArrayRef) -> VortexResult<Option<ArrayRef>> {
         // SAFETY: masking the validity does not affect the invariants
         unsafe {
@@ -32,17 +34,22 @@ impl MaskReduce for VarBinView {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
+    use vortex_session::VortexSession;
+
     use crate::IntoArray;
     use crate::VortexSessionExecute;
-    use crate::array_session;
     use crate::arrays::VarBinViewArray;
     use crate::compute::conformance::mask::test_mask_conformance;
+
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
 
     #[test]
     fn take_mask_var_bin_view_array() {
         test_mask_conformance(
             &VarBinViewArray::from_iter_str(["one", "two", "three", "four", "five"]).into_array(),
-            &mut array_session().create_execution_ctx(),
+            &mut SESSION.create_execution_ctx(),
         );
 
         test_mask_conformance(
@@ -54,7 +61,7 @@ mod tests {
                 Some("five"),
             ])
             .into_array(),
-            &mut array_session().create_execution_ctx(),
+            &mut SESSION.create_execution_ctx(),
         );
     }
 }

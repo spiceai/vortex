@@ -21,14 +21,26 @@ mod unix {
     use vortex_array::ArrayRef;
     use vortex_array::IntoArray;
     use vortex_array::VortexSessionExecute;
+    use vortex_array::aggregate_fn::session::AggregateFnSession;
     use vortex_array::arrays::VarBinViewArray;
+    use vortex_array::memory::MemorySession;
+    use vortex_array::optimizer::kernels::KernelSession;
+    use vortex_array::session::ArraySession;
     use vortex_btrblocks::BtrBlocksCompressor;
     use vortex_btrblocks::BtrBlocksCompressorBuilder;
+    use vortex_btrblocks::CompressionSession;
     use vortex_btrblocks::SchemeExt;
     use vortex_btrblocks::schemes::string;
     use vortex_session::VortexSession;
 
-    static SESSION: LazyLock<VortexSession> = LazyLock::new(vortex_array::array_session);
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
+        VortexSession::empty()
+            .with::<ArraySession>()
+            .with::<KernelSession>()
+            .with::<AggregateFnSession>()
+            .with::<MemorySession>()
+            .with::<CompressionSession>()
+    });
 
     /// Deterministic xorshift so every run compresses identical data.
     struct Rng(u64);
@@ -222,8 +234,11 @@ mod unix {
         let array =
             &VarBinViewArray::from_iter_str(strings.iter().map(String::as_str)).into_array();
 
-        let full = &BtrBlocksCompressor::default();
-        let onpair_only = &BtrBlocksCompressorBuilder::default()
+        let full = &BtrBlocksCompressorBuilder::from_session(&SESSION)
+            .unrestricted()
+            .build();
+        let onpair_only = &BtrBlocksCompressorBuilder::from_session(&SESSION)
+            .unrestricted()
             .exclude_schemes([string::FSSTScheme.id(), string::StringDictScheme.id()])
             .build();
 

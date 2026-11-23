@@ -20,6 +20,7 @@
 use std::mem::size_of;
 
 use vortex_buffer::Buffer;
+use vortex_buffer::BufferAllocatorRef;
 use vortex_mask::MaskValues;
 
 use crate::arrays::filter::execute::byte_compress;
@@ -33,7 +34,11 @@ const MIN_SLICES_AVERAGE_RUN_LENGTH: usize = 8;
 /// Filter a [`Buffer<T>`] by [`MaskValues`], returning a new buffer.
 ///
 /// Dense uniquely owned buffers are compacted in place; other buffers allocate a new output.
-pub(crate) fn filter_buffer<T: Copy>(buffer: Buffer<T>, mask: &MaskValues) -> Buffer<T> {
+pub(crate) fn filter_buffer<T: Copy>(
+    buffer: Buffer<T>,
+    mask: &MaskValues,
+    allocator: &BufferAllocatorRef,
+) -> Buffer<T> {
     assert_eq!(buffer.len(), mask.len());
 
     let buffer = if mask.density() >= IN_PLACE_MIN_DENSITY {
@@ -49,28 +54,30 @@ pub(crate) fn filter_buffer<T: Copy>(buffer: Buffer<T>, mask: &MaskValues) -> Bu
         buffer
     };
 
-    filter_slice(buffer.as_slice(), mask)
+    filter_slice(buffer.as_slice(), mask, allocator)
 }
 
-fn filter_slice<T: Copy>(values: &[T], mask: &MaskValues) -> Buffer<T> {
+fn filter_slice<T: Copy>(
+    values: &[T],
+    mask: &MaskValues,
+    allocator: &BufferAllocatorRef,
+) -> Buffer<T> {
     if let Some(slices) = useful_cached_slices(mask) {
-        return slice::filter_slice_by_slices(values, slices, mask.true_count());
+        return slice::filter_slice_by_slices(values, slices, mask.true_count(), allocator);
     }
 
-    if mask.density() <= CACHED_INDICES_MAX_DENSITY
-        && let Some(indices) = mask.cached_indices()
-    {
-        return slice::filter_slice_by_indices(values, indices);
+    if let Some(indices) = useful_cached_indices(mask) {
+        return slice::filter_slice_by_indices(values, indices, allocator);
     }
 
-    if let Some(filtered) = simd_compress::filter_slice_by_bitmap(values, mask) {
+    if let Some(filtered) = simd_compress::filter_slice_by_bitmap(values, mask, allocator) {
         return filtered;
     }
 
     if mask.density() >= byte_compress_density_threshold::<T>() {
-        byte_compress::filter_buffer(values, mask)
+        byte_compress::filter_buffer(values, mask, allocator)
     } else {
-        slice::filter_slice_by_bitmap(values, mask)
+        slice::filter_slice_by_bitmap(values, mask, allocator)
     }
 }
 
@@ -79,9 +86,7 @@ fn filter_slice_in_place<T: Copy>(values: &mut [T], mask: &MaskValues) -> usize 
         return slice::filter_slice_mut_by_slices(values, slices);
     }
 
-    if mask.density() <= CACHED_INDICES_MAX_DENSITY
-        && let Some(indices) = mask.cached_indices()
-    {
+    if let Some(indices) = useful_cached_indices(mask) {
         return slice::filter_slice_mut_by_indices(values, indices);
     }
 
@@ -92,13 +97,21 @@ fn filter_slice_in_place<T: Copy>(values: &mut [T], mask: &MaskValues) -> usize 
     slice::filter_slice_mut_by_bitmap(values, mask)
 }
 
-fn useful_cached_slices(mask: &MaskValues) -> Option<&[(usize, usize)]> {
+pub(super) fn useful_cached_indices(mask: &MaskValues) -> Option<&[usize]> {
+    if mask.density() <= CACHED_INDICES_MAX_DENSITY {
+        mask.cached_indices()
+    } else {
+        None
+    }
+}
+
+pub(super) fn useful_cached_slices(mask: &MaskValues) -> Option<&[(usize, usize)]> {
     mask.cached_slices().filter(|slices| {
         slices.len() == 1 || mask.true_count() / slices.len() >= MIN_SLICES_AVERAGE_RUN_LENGTH
     })
 }
 
-fn byte_compress_density_threshold<T>() -> f64 {
+pub(super) fn byte_compress_density_threshold<T>() -> f64 {
     let width = size_of::<T>();
 
     // A density at or above the table entry selects byte compress after the higher-priority
@@ -151,6 +164,10 @@ mod tests {
 
     use super::*;
 
+    fn filter_buffer<T: Copy>(buffer: Buffer<T>, mask: &MaskValues) -> Buffer<T> {
+        super::filter_buffer(buffer, mask, BufferAllocatorRef::static_ref())
+    }
+
     fn mask_values(mask: &Mask) -> &MaskValues {
         match mask {
             Mask::Values(v) => v,
@@ -180,10 +197,12 @@ mod tests {
     #[test]
     fn test_filter_dense_in_place() {
         let buf = buffer![1u32, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let original_ptr = buf.as_ptr();
         let mask = Mask::from_iter([true, true, true, true, false, true, true, true, false, true]);
 
         let result = filter_buffer(buf, mask_values(&mask));
         assert_eq!(result, buffer![1u32, 2, 3, 4, 6, 7, 8, 10]);
+        assert_eq!(result.as_ptr(), original_ptr);
     }
 
     #[test]
@@ -194,7 +213,7 @@ mod tests {
 
         let result = filter_buffer(buf, mask_values(&mask));
         assert_eq!(result, buffer![1u64, 5, 9, 15]);
-        assert_eq!(shared.len(), 16);
+        assert_eq!(shared.as_slice(), &(0u64..16).collect::<Vec<_>>());
     }
 
     #[test]
@@ -206,7 +225,7 @@ mod tests {
         let result = filter_buffer(buf, mask_values(&mask));
         let expected = (3u32..15).chain(20..30).collect::<Vec<_>>();
         assert_eq!(result.as_slice(), expected.as_slice());
-        assert_eq!(shared.len(), 32);
+        assert_eq!(shared.as_slice(), &(0u32..32).collect::<Vec<_>>());
     }
 
     #[test]

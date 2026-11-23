@@ -9,32 +9,16 @@
 //!   - propagates valid-lane overflow as `Err`, and
 //!   - suppresses null-lane overflow without the closure ever inspecting `valid`.
 //!
-//! Each Vortex kernel bench has a sibling `arrow_*` baseline bench using the
-//! equivalent arrow-rs kernel over the same data shape, so the divan report
-//! lines up side-by-side.
-//!
-//! The checked-add pair carries `#[cpu_features]`, so both are measured on every
-//! walltime CPU-feature leg rather than in simulation: they are one lane loop
-//! compiled differently per leg, and comparing them against arrow-rs is only
-//! meaningful under the same build flags. The cast benches stay in simulation.
+//! `lanezip_checked_add_u32` carries `#[cpu_features]`, so it is measured on every
+//! walltime CPU-feature leg rather than in simulation: it is one lane loop compiled
+//! differently per leg. The Vortex cast benches stay in simulation.
 
 #![expect(clippy::unwrap_used)]
-#![expect(clippy::clone_on_ref_ptr)]
 
 use std::mem::MaybeUninit;
-use std::sync::Arc;
 
-use arrow_arith::numeric::add;
-use arrow_array::ArrayRef as ArrowArrayRef;
-use arrow_array::Int32Array;
-use arrow_array::UInt16Array;
-use arrow_array::UInt32Array;
-use arrow_array::UInt64Array;
-use arrow_buffer::NullBuffer;
-use arrow_cast::CastOptions;
-use arrow_cast::cast_with_options;
-use arrow_schema::DataType;
 use divan::Bencher;
+use mimalloc::MiMalloc;
 use num_traits::AsPrimitive;
 use num_traits::NumCast;
 use rand::SeedableRng;
@@ -48,13 +32,25 @@ use vortex_compute::lane_kernels::IndexedSourceExt;
 use vortex_compute::lane_kernels::LaneZip;
 use vortex_compute::lane_kernels::ReinterpretSink;
 
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 fn main() {
     assert_overflow_parity();
     assert_null_overflow_suppressed();
     divan::main();
 }
 
+/// Lanes per cast input; the casts run in simulation.
 const SIZES: &[usize] = &[16_384];
+
+/// Lanes per checked-add input; the checked adds run on the walltime legs.
+///
+/// Walltime needs longer iterations than simulation: at 16_384 lanes an iteration took a few
+/// microseconds and its reported time flipped by up to 25% between runs of identical code.
+/// 65_536 lanes make each iteration several times longer while two inputs, two masks, and the
+/// output still fit in a 1 MiB L2 cache.
+const ADD_SIZES: &[usize] = &[65_536];
 
 // -----------------------------------------------------------------------------
 // Cast fixture (u64/u16/i32 lanes + a single validity mask).
@@ -67,9 +63,6 @@ struct CastFixture {
     /// in-place-vs-out-of-place cast bench.
     values_i32: Buffer<i32>,
     mask: BitBuffer,
-    /// Validity as a plain `Vec<bool>` — the source of truth used to build both
-    /// the Vortex `BitBuffer` mask and the arrow `NullBuffer`.
-    valid: Vec<bool>,
 }
 
 fn cast_fixture(n: usize) -> CastFixture {
@@ -100,7 +93,6 @@ fn cast_fixture(n: usize) -> CastFixture {
         values_u16,
         values_i32,
         mask: BitBufferMut::from_iter(raw_valid.iter().copied()).freeze(),
-        valid: raw_valid,
     }
 }
 
@@ -130,20 +122,6 @@ fn try_map_into_narrow_u64_u32(bencher: Bencher, n: usize) {
                 .unwrap();
             out
         });
-}
-
-#[divan::bench(args = SIZES)]
-fn arrow_narrow_u64_u32(bencher: Bencher, n: usize) {
-    let f = cast_fixture(n);
-    let arr: ArrowArrayRef = Arc::new(UInt64Array::from(f.values_u64.as_slice().to_vec()));
-    let opts = CastOptions {
-        safe: false,
-        ..CastOptions::default()
-    };
-
-    bencher
-        .with_inputs(|| arr.clone())
-        .bench_values(|arr| cast_with_options(&arr, &DataType::UInt32, &opts).unwrap());
 }
 
 #[divan::bench(args = SIZES)]
@@ -177,6 +155,20 @@ fn try_map_masked_into_widen_u16_u32(bencher: Bencher, n: usize) {
 }
 
 #[divan::bench(args = SIZES)]
+fn map_masked_into_widen_u16_u32(bencher: Bencher, n: usize) {
+    let f = cast_fixture(n);
+
+    bencher
+        .with_inputs(|| (f.values_u16.clone(), f.mask.clone(), uninit_out::<u32>(n)))
+        .bench_values(|(values, mask, mut out)| {
+            values
+                .as_slice()
+                .map_masked_into(&mask, out.as_mut_slice(), |v| v.as_());
+            out
+        });
+}
+
+#[divan::bench(args = SIZES)]
 fn map_with_mask_widen_u16_u32(bencher: Bencher, n: usize) {
     let f = cast_fixture(n);
 
@@ -185,20 +177,6 @@ fn map_with_mask_widen_u16_u32(bencher: Bencher, n: usize) {
         .bench_values(|(values, mut out)| {
             values.as_slice().map_into(out.as_mut_slice(), |v| v.as_());
         });
-}
-
-#[divan::bench(args = SIZES)]
-fn arrow_widen_u16_u32(bencher: Bencher, n: usize) {
-    let f = cast_fixture(n);
-    let nulls = NullBuffer::from(f.valid.clone());
-    let arr: ArrowArrayRef = Arc::new(UInt16Array::new(
-        f.values_u16.as_slice().to_vec().into(),
-        Some(nulls),
-    ));
-
-    bencher.with_inputs(|| arr.clone()).bench_values(|arr| {
-        cast_with_options(&arr, &DataType::UInt32, &CastOptions::default()).unwrap()
-    });
 }
 
 // -----------------------------------------------------------------------------
@@ -240,24 +218,6 @@ fn try_map_masked_in_place_narrow_i32_u32(bencher: Bencher, n: usize) {
         });
 }
 
-#[divan::bench(args = SIZES)]
-fn arrow_narrow_i32_u32(bencher: Bencher, n: usize) {
-    let f = cast_fixture(n);
-    let nulls = NullBuffer::from(f.valid.clone());
-    let arr: ArrowArrayRef = Arc::new(Int32Array::new(
-        f.values_i32.as_slice().to_vec().into(),
-        Some(nulls),
-    ));
-    let opts = CastOptions {
-        safe: false,
-        ..CastOptions::default()
-    };
-
-    bencher
-        .with_inputs(|| arr.clone())
-        .bench_values(|arr| cast_with_options(&arr, &DataType::UInt32, &opts).unwrap());
-}
-
 // -----------------------------------------------------------------------------
 // LaneZip binary kernel: checked `u32 + u32 -> u32` over two nullable columns.
 //
@@ -278,10 +238,6 @@ struct AddFixture {
     rhs: Buffer<u32>,
     lhs_mask: BitBuffer,
     rhs_mask: BitBuffer,
-    /// Plain `Vec<bool>` mirrors of the validity masks — used to build the arrow
-    /// `NullBuffer`s for the baseline bench.
-    lhs_valid: Vec<bool>,
-    rhs_valid: Vec<bool>,
 }
 
 fn add_fixture(n: usize) -> AddFixture {
@@ -324,13 +280,11 @@ fn add_fixture(n: usize) -> AddFixture {
         rhs,
         lhs_mask,
         rhs_mask,
-        lhs_valid,
-        rhs_valid,
     }
 }
 
 #[vortex_bench_support::cpu_features]
-#[divan::bench(args = SIZES)]
+#[divan::bench(args = ADD_SIZES)]
 fn lanezip_checked_add_u32(bencher: Bencher, n: usize) {
     let f = add_fixture(n);
     bencher
@@ -350,24 +304,6 @@ fn lanezip_checked_add_u32(bencher: Bencher, n: usize) {
                 .unwrap();
             (combined, out)
         });
-}
-
-#[vortex_bench_support::cpu_features]
-#[divan::bench(args = SIZES)]
-fn arrow_checked_add_u32(bencher: Bencher, n: usize) {
-    let f = add_fixture(n);
-    let lhs_arr: ArrowArrayRef = Arc::new(UInt32Array::new(
-        f.lhs.as_slice().to_vec().into(),
-        Some(NullBuffer::from(f.lhs_valid.clone())),
-    ));
-    let rhs_arr: ArrowArrayRef = Arc::new(UInt32Array::new(
-        f.rhs.as_slice().to_vec().into(),
-        Some(NullBuffer::from(f.rhs_valid.clone())),
-    ));
-
-    bencher
-        .with_inputs(|| (lhs_arr.clone(), rhs_arr.clone()))
-        .bench_values(|(lhs, rhs)| add(&lhs, &rhs).unwrap());
 }
 
 // -----------------------------------------------------------------------------

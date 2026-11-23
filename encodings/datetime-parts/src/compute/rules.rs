@@ -13,12 +13,12 @@ use vortex_array::arrays::scalar_fn::AnyScalarFn;
 use vortex_array::arrays::scalar_fn::ScalarFn;
 use vortex_array::arrays::scalar_fn::ScalarFnArrayExt;
 use vortex_array::arrays::slice::SliceReduceAdaptor;
-use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::DType;
 use vortex_array::extension::datetime::Timestamp;
 use vortex_array::optimizer::ArrayOptimizer;
 use vortex_array::optimizer::rules::ArrayParentReduceRule;
 use vortex_array::optimizer::rules::ParentRuleSet;
+use vortex_array::scalar::Scalar;
 use vortex_array::scalar_fn::fns::between::Between;
 use vortex_array::scalar_fn::fns::binary::Binary;
 use vortex_array::scalar_fn::fns::cast::CastReduceAdaptor;
@@ -62,12 +62,20 @@ impl ArrayParentReduceRule<DateTimeParts> for DTPFilterPushDownRule {
             child.dtype().clone(),
             child.days().clone().filter(parent.filter_mask().clone())?,
             ConstantArray::new(
-                child.seconds().as_constant().vortex_expect("constant"),
+                child
+                    .seconds()
+                    .as_constant()
+                    .vortex_expect("constant")
+                    .clone(),
                 parent.filter_mask().true_count(),
             )
             .into_array(),
             ConstantArray::new(
-                child.subseconds().as_constant().vortex_expect("constant"),
+                child
+                    .subseconds()
+                    .as_constant()
+                    .vortex_expect("constant")
+                    .clone(),
                 parent.filter_mask().true_count(),
             )
             .into_array(),
@@ -127,9 +135,17 @@ impl ArrayParentReduceRule<DateTimeParts> for DTPComparisonPushDownRule {
                     return Ok(None);
                 };
                 let len = days.len();
-                let target_dtype = days.dtype();
-                let constant = ConstantArray::new(days_value, len).into_array();
-                new_children.push(constant.cast(target_dtype.clone())?);
+
+                // Keep the nullability of the replaced constant, so the rewritten comparison has
+                // the same result dtype as the original.
+                let target_dtype = days.dtype().with_nullability(c.dtype().nullability());
+
+                // A valid timestamp literal's days can fall outside the compressed child's range.
+                // Decline the rewrite so the comparison kernel can handle that bound.
+                let Ok(days_scalar) = Scalar::from(days_value).cast(&target_dtype) else {
+                    return Ok(None);
+                };
+                new_children.push(ConstantArray::new(days_scalar, len).into_array());
             }
         }
 
@@ -143,7 +159,7 @@ impl ArrayParentReduceRule<DateTimeParts> for DTPComparisonPushDownRule {
 
 /// Try to extract the days value from a constant timestamp.
 /// Returns None if the constant is not a timestamp or has non-zero seconds/subseconds.
-fn try_extract_days_constant(array: &ArrayRef) -> Option<i32> {
+fn try_extract_days_constant(array: &ArrayRef) -> Option<i64> {
     let constant = array.as_constant()?;
 
     // Extract the timestamp value
@@ -178,13 +194,16 @@ fn is_constant_zero(array: &ArrayRef) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
+    use rstest::rstest;
     use vortex_array::ArrayRef;
-    use vortex_array::ExecutionCtx;
     use vortex_array::VortexSessionExecute;
-    use vortex_array::aggregate_fn::fns::sum::sum;
-    use vortex_array::array_session;
+    use vortex_array::arrays::BoolArray;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::arrays::TemporalArray;
+    use vortex_array::assert_arrays_eq;
+    use vortex_array::dtype::Nullability;
     use vortex_array::extension::datetime::TimeUnit;
     use vortex_array::extension::datetime::TimestampOptions;
     use vortex_array::optimizer::ArrayOptimizer;
@@ -194,21 +213,15 @@ mod tests {
     use vortex_array::scalar_fn::fns::operators::Operator;
     use vortex_array::validity::Validity;
     use vortex_buffer::Buffer;
+    use vortex_session::VortexSession;
 
     use super::*;
     use crate::DateTimeParts;
     use crate::DateTimePartsArray;
 
-    const SECONDS_PER_DAY: i64 = 86400;
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
 
-    /// Count the true values in a boolean array using the provided execution context.
-    fn true_count(array: &ArrayRef, ctx: &mut ExecutionCtx) -> usize {
-        sum(array, ctx)
-            .unwrap()
-            .as_primitive()
-            .as_::<usize>()
-            .unwrap()
-    }
+    const SECONDS_PER_DAY: i64 = 86400;
 
     /// Create a DTP array with the given day values (all at midnight).
     fn dtp_at_midnight(days: &[i64], time_unit: TimeUnit) -> DateTimePartsArray {
@@ -229,7 +242,7 @@ mod tests {
             time_unit,
             None,
         );
-        DateTimeParts::try_from_temporal(temporal, &mut array_session().create_execution_ctx())
+        DateTimeParts::try_from_temporal(temporal, &mut SESSION.create_execution_ctx())
             .vortex_expect("TemporalArray must produce valid DateTimeParts")
     }
 
@@ -274,7 +287,48 @@ mod tests {
     }
 
     #[test]
-    fn test_binary_comparison_pushdown() {
+    fn test_days_constant_outside_i32_days() {
+        let days = i64::from(i32::MAX) + 1;
+        let constant = midnight_constant(days, TimeUnit::Seconds, 1);
+        assert_eq!(try_extract_days_constant(&constant), Some(days));
+    }
+
+    #[rstest]
+    #[case::lt(Operator::Lt, true)]
+    #[case::lte(Operator::Lte, true)]
+    #[case::eq(Operator::Eq, false)]
+    #[case::not_eq(Operator::NotEq, true)]
+    #[case::gt(Operator::Gt, false)]
+    #[case::gte(Operator::Gte, false)]
+    fn test_midnight_comparison_beyond_narrowed_days(
+        #[case] op: Operator,
+        #[case] expected: bool,
+    ) -> VortexResult<()> {
+        let narrowed = DateTimeParts::try_new(
+            DType::Extension(
+                Timestamp::new(TimeUnit::Microseconds, Nullability::NonNullable).erased(),
+            ),
+            PrimitiveArray::from_iter([20_000u16, 20_001]).into_array(),
+            ConstantArray::new(0u8, 2).into_array(),
+            ConstantArray::new(0u8, 2).into_array(),
+        )?;
+
+        // Midnight on 9999-12-31 UTC, beyond the narrowed days child's range.
+        let constant = midnight_constant(2_932_896, TimeUnit::Microseconds, 2);
+        let comparison = Binary::try_new(narrowed.into_array(), constant, op)?.into_array();
+
+        let mut ctx = SESSION.create_execution_ctx();
+        assert_arrays_eq!(
+            comparison.optimize()?,
+            BoolArray::from_iter([expected, expected]),
+            &mut ctx
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_midnight_binary_comparison() {
         // DTP with days [0, 1, 2] at midnight
         let dtp = dtp_at_midnight(&[0, 1, 2], TimeUnit::Seconds);
         let len = dtp.len();
@@ -288,19 +342,17 @@ mod tests {
         // Optimize should push down to days
         let optimized = comparison.optimize().unwrap();
 
-        // The result should be a ScalarFn over primitive days, not over DTP
-        assert!(
-            !optimized.is::<DateTimeParts>(),
-            "Expected pushdown to remove DTP from expression"
-        );
-
         // Verify correctness: days [0, 1, 2] <= 1 should give [true, true, false]
-        let mut ctx = array_session().create_execution_ctx();
-        assert_eq!(true_count(&optimized, &mut ctx), 2);
+        let mut ctx = SESSION.create_execution_ctx();
+        assert_arrays_eq!(
+            optimized,
+            BoolArray::from_iter([true, true, false]),
+            &mut ctx
+        );
     }
 
     #[test]
-    fn test_between_pushdown() {
+    fn test_midnight_between() {
         // DTP with days [0, 1, 2, 3, 4] at midnight
         let dtp = dtp_at_midnight(&[0, 1, 2, 3, 4], TimeUnit::Seconds);
         let len = dtp.len();
@@ -325,12 +377,55 @@ mod tests {
         let optimized = between.optimize().unwrap();
 
         // Verify correctness: days [0, 1, 2, 3, 4] between 1 and 3 should give [false, true, true, true, false]
-        let mut ctx = array_session().create_execution_ctx();
-        assert_eq!(true_count(&optimized, &mut ctx), 3);
+        let mut ctx = SESSION.create_execution_ctx();
+        assert_arrays_eq!(
+            optimized,
+            BoolArray::from_iter([false, true, true, true, false]),
+            &mut ctx
+        );
+    }
+
+    /// Create a non-nullable DTP array at midnight with constant-zero seconds and subseconds.
+    fn dtp_constant_zero_parts(days: &[i32]) -> VortexResult<ArrayRef> {
+        let dtype = midnight_constant(0, TimeUnit::Seconds, 1)
+            .dtype()
+            .as_nonnullable();
+        let len = days.len();
+
+        Ok(DateTimeParts::try_new(
+            dtype,
+            PrimitiveArray::new(Buffer::copy_from(days), Validity::NonNullable).into_array(),
+            ConstantArray::new(0u8, len).into_array(),
+            ConstantArray::new(0u8, len).into_array(),
+        )?
+        .into_array())
     }
 
     #[test]
-    fn test_no_pushdown_non_midnight_constant() {
+    fn test_binary_comparison_pushdown_nullable_constant() -> VortexResult<()> {
+        let dtp = dtp_constant_zero_parts(&[0, 1, 2])?;
+        let scalar = midnight_constant(1, TimeUnit::Seconds, 1)
+            .as_constant()
+            .vortex_expect("midnight_constant must be constant")
+            .clone()
+            .into_nullable();
+        let constant = ConstantArray::new(scalar, dtp.len()).into_array();
+        let comparison = Binary::try_new(dtp, constant, Operator::Lte)?.into_array();
+
+        let optimized = comparison.optimize()?;
+        assert_eq!(optimized.dtype(), comparison.dtype());
+
+        let mut ctx = SESSION.create_execution_ctx();
+        assert_arrays_eq!(
+            optimized,
+            BoolArray::from_iter([Some(true), Some(true), Some(false)]),
+            &mut ctx
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_comparison_with_non_midnight_constant() {
         // DTP with days [0, 1, 2] at midnight
         let dtp = dtp_at_midnight(&[0, 1, 2], TimeUnit::Seconds);
         let len = dtp.len();
@@ -344,16 +439,17 @@ mod tests {
         // Optimize should NOT push down (constant has non-zero seconds)
         let optimized = comparison.optimize().unwrap();
 
-        // The DTP should still be in the expression tree
-        // (optimization doesn't apply, so we keep the original structure)
-        // Just verify it still computes correctly
         // days [0, 1, 2] at midnight <= day 1 at noon: [true, true, false]
-        let mut ctx = array_session().create_execution_ctx();
-        assert_eq!(true_count(&optimized, &mut ctx), 2);
+        let mut ctx = SESSION.create_execution_ctx();
+        assert_arrays_eq!(
+            optimized,
+            BoolArray::from_iter([true, true, false]),
+            &mut ctx
+        );
     }
 
     #[test]
-    fn test_no_pushdown_non_zero_dtp_seconds() {
+    fn test_comparison_with_non_zero_dtp_seconds() {
         // Create a DTP with non-zero seconds (not at midnight)
         let timestamps: Buffer<i64> = vec![
             3600,                       // day 0 + 1 hour
@@ -366,7 +462,7 @@ mod tests {
             TimeUnit::Seconds,
             None,
         );
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let dtp = DateTimeParts::try_from_temporal(temporal, &mut ctx).unwrap();
         let len = dtp.len();
 
@@ -379,6 +475,10 @@ mod tests {
         // Should still compute correctly (just not optimized via pushdown)
         let optimized = comparison.optimize().unwrap();
         // timestamps at 1am on days [0, 1, 2] <= day 1 midnight: [true, false, false]
-        assert_eq!(true_count(&optimized, &mut ctx), 1);
+        assert_arrays_eq!(
+            optimized,
+            BoolArray::from_iter([true, false, false]),
+            &mut ctx
+        );
     }
 }

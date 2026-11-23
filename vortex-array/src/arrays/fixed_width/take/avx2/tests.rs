@@ -7,6 +7,7 @@ use std::panic::RefUnwindSafe;
 use std::panic::catch_unwind;
 
 use vortex_buffer::Buffer;
+use vortex_buffer::BufferAllocatorRef;
 
 use super::super::FixedWidthTakeValue;
 use super::take_avx2;
@@ -22,7 +23,7 @@ fn take_avx2_if_supported<V: FixedWidthTakeValue, I: UnsignedPType>(
 
     // SAFETY: AVX2 support was detected above, and `FixedWidthTakeValue` guarantees that every
     // byte in the values is initialized.
-    Some(unsafe { take_avx2(values, indices) })
+    Some(unsafe { take_avx2(values, indices, &BufferAllocatorRef::statically_allocated()) })
 }
 
 fn assert_avx2_take_panics<V, I>(values: &[V], indices: &[I], expected: &str)
@@ -36,7 +37,9 @@ where
 
     // SAFETY: AVX2 support was detected above, and `FixedWidthTakeValue` guarantees that every
     // byte in the values is initialized.
-    let result = catch_unwind(|| unsafe { take_avx2(values, indices) });
+    let result = catch_unwind(|| unsafe {
+        take_avx2(values, indices, &BufferAllocatorRef::statically_allocated())
+    });
     let Err(payload) = result else {
         panic!("take should panic for an invalid index");
     };
@@ -61,6 +64,10 @@ macro_rules! test_cases {
                         return;
                     };
                     assert_eq!(&values, result.as_slice());
+                    let indices: Vec<$IDX> = (0..127).map(|i| ((i * 37 + 11) % 113) as $IDX).collect();
+                    let expected: Vec<$VAL> = indices.iter().map(|&i| values[i as usize]).collect();
+                    let result = take_avx2_if_supported(&values, &indices).expect("AVX2 already detected");
+                    assert_eq!(result.as_slice(), expected);
                 }
 
                 #[test]
@@ -160,6 +167,12 @@ fn simd_array_u8x4() {
         return;
     };
     assert_eq!(values.as_slice(), result.as_slice());
+    let indices: Vec<u32> = (0..values.len())
+        .map(|i| u32::try_from((i * 37 + 11) % (values.len() - 1)).unwrap())
+        .collect();
+    let expected: Vec<_> = indices.iter().map(|&i| values[i as usize]).collect();
+    let result = take_avx2_if_supported(&values, &indices).expect("AVX2 already detected");
+    assert_eq!(result.as_slice(), expected);
 }
 
 #[test]
@@ -171,6 +184,12 @@ fn scalar_fallback_u16() {
         return;
     };
     assert_eq!(values.as_slice(), result.as_slice());
+    let indices: Vec<u32> = (0..values.len())
+        .map(|i| u32::try_from((i * 37 + 11) % (values.len() - 1)).unwrap())
+        .collect();
+    let expected: Vec<_> = indices.iter().map(|&i| values[i as usize]).collect();
+    let result = take_avx2_if_supported(&values, &indices).expect("AVX2 already detected");
+    assert_eq!(result.as_slice(), expected);
 }
 
 #[test]
@@ -182,6 +201,12 @@ fn scalar_fallback_array_u8x16() {
         return;
     };
     assert_eq!(values.as_slice(), result.as_slice());
+    let indices: Vec<u32> = (0..values.len())
+        .map(|i| u32::try_from((i * 37 + 11) % (values.len() - 1)).unwrap())
+        .collect();
+    let expected: Vec<_> = indices.iter().map(|&i| values[i as usize]).collect();
+    let result = take_avx2_if_supported(&values, &indices).expect("AVX2 already detected");
+    assert_eq!(result.as_slice(), expected);
 }
 
 #[test]

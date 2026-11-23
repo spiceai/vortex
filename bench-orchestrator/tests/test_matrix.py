@@ -36,18 +36,41 @@ REGULAR_IDS = (
 COMPACT_IDS = tuple(
     benchmark_id for benchmark_id in REGULAR_IDS if benchmark_id not in {"polarsignals", "vortex-queries"}
 )
-PR_ALL_IDS = tuple(benchmark_id for benchmark_id in REGULAR_IDS if benchmark_id != "vortex-queries")
+DEVELOP_IDS = (*REGULAR_IDS[:-1], "job-nvme", "tpch-nested-nvme", "vortex-queries")
+# TPC-DS SF=10 on NVMe runs in the PR presets and nightly, not on every develop commit.
+PR_IDS = (*REGULAR_IDS[:7], "tpcds-nvme-10", *REGULAR_IDS[7:])
+PR_FULL_IDS = (*PR_IDS[:-1], "job-nvme", "tpch-nested-nvme", "vortex-queries")
 EXPECTED_IDS = {
-    "develop": REGULAR_IDS,
+    "develop": DEVELOP_IDS,
     "pr": tuple(
         benchmark_id
-        for benchmark_id in REGULAR_IDS
-        if benchmark_id not in {"tpch-s3-10", "appian-nvme", "vortex-queries"}
+        for benchmark_id in PR_IDS
+        if benchmark_id
+        not in {
+            "clickbench-sorted-nvme",
+            "tpch-s3-10",
+            "statpopgen",
+            "fineweb-s3",
+            "appian-nvme",
+            "vortex-queries",
+        }
     ),
     "pr-compact": COMPACT_IDS,
-    "pr-all": PR_ALL_IDS,
-    "pr-full": REGULAR_IDS,
-    "nightly": ("tpch-nvme", "tpch-s3"),
+    "pr-all": PR_FULL_IDS,
+    "pr-full": PR_FULL_IDS,
+    "nightly": (
+        "tpch-nvme",
+        "tpch-s3",
+        "tpcds-nvme-10",
+        "tpcds-s3-10",
+        *(
+            f"tpcds-{storage}-100-{target}"
+            for storage in ("nvme", "s3")
+            for target in ("datafusion-parquet", "datafusion-vortex", "duckdb-parquet", "duckdb-vortex")
+        ),
+        "tpch-nested-nvme",
+        "tpch-nested-s3",
+    ),
 }
 
 
@@ -71,6 +94,17 @@ def test_matrix_presets(preset: str, expected_ids: tuple[str, ...]) -> None:
     assert "${{" not in json.dumps(entries)
 
 
+def test_tpcds_sf100_runs_one_target_per_job() -> None:
+    nightly = [
+        entry for entry in _entries("nightly") if str(entry["id"]).startswith("tpcds-") and "-100-" in str(entry["id"])
+    ]
+
+    assert len(nightly) == 8
+    assert all(len(_targets(entry)) == 1 for entry in nightly)
+    s3_keys = [entry["remote_key"] for entry in nightly if "remote_key" in entry]
+    assert len(s3_keys) == len(set(s3_keys)) == 4
+
+
 def test_pr_target_selection() -> None:
     develop = {entry["id"]: entry for entry in _entries("develop")}
     pr = {entry["id"]: entry for entry in _entries("pr")}
@@ -84,6 +118,8 @@ def test_pr_target_selection() -> None:
         ("duckdb", "vortex"),
     }
     assert ("datafusion", "lance") in _targets(develop["tpch-nvme"])
+    for preset in (pr_full, develop):
+        assert {engine for engine, _format in _targets(preset["statpopgen"])} == {"datafusion", "duckdb"}
     assert all(("datafusion", "lance") not in _targets(entry) for entry in pr_full.values())
     assert "vortex-compact" in cast("list[str]", pr_full["clickbench-nvme"]["data_formats"])
     for entry in pr_compact.values():
@@ -92,22 +128,26 @@ def test_pr_target_selection() -> None:
         assert set(cast("list[str]", entry["data_formats"])) == {"parquet", "vortex-compact"}
 
 
-def test_pr_all_is_union_of_focused_presets() -> None:
-    pr = {entry["id"]: entry for entry in _entries("pr")}
-    pr_compact = {entry["id"]: entry for entry in _entries("pr-compact")}
+def test_pr_all_is_union_of_pr_compact_and_full() -> None:
+    sources = [{entry["id"]: entry for entry in _entries(preset)} for preset in ("pr", "pr-compact", "pr-full")]
     pr_all = {entry["id"]: entry for entry in _entries("pr-all")}
 
-    assert set(pr_all) == set(pr) | set(pr_compact)
+    assert set(pr_all) == set().union(*sources)
     for benchmark_id, entry in pr_all.items():
-        expected_targets: set[tuple[str, str]] = set()
-        expected_formats: set[str] = set()
-        for preset in (pr, pr_compact):
+        assert _targets(entry) == set().union(*(_targets(p[benchmark_id]) for p in sources if benchmark_id in p))
+        for preset in sources:
             if source := preset.get(benchmark_id):
-                expected_targets |= _targets(source)
-                expected_formats |= set(cast("list[str]", source["data_formats"]))
+                assert set(cast("list[str]", source["data_formats"])) <= set(cast("list[str]", entry["data_formats"]))
 
-        assert _targets(entry) == expected_targets
-        assert set(cast("list[str]", entry["data_formats"])) == expected_formats
+
+def test_pr_full_covers_pr() -> None:
+    pr = {entry["id"]: entry for entry in _entries("pr")}
+    pr_full = {entry["id"]: entry for entry in _entries("pr-full")}
+
+    for benchmark_id, entry in pr.items():
+        full_entry = pr_full[benchmark_id]
+        assert _targets(entry) <= _targets(full_entry)
+        assert set(cast("list[str]", entry["data_formats"])) <= set(cast("list[str]", full_entry["data_formats"]))
 
 
 def test_resolver_rejects_empty_targets() -> None:
@@ -131,6 +171,13 @@ def test_resolver_rejects_duplicate_ids() -> None:
 
     with pytest.raises(ValueError, match="Duplicate benchmark ID 'clickbench-nvme'"):
         _ = render_matrix("develop", catalog)
+
+
+def test_matrix_entries_name_their_data_directory() -> None:
+    entries = {entry["id"]: entry for entry in render_matrix("develop", CATALOG)}
+
+    assert entries["clickbench-nvme"]["dataset_dir"] == "clickbench_partitioned"
+    assert entries["tpch-nvme"]["dataset_dir"] == "tpch"
 
 
 def test_matrix_command() -> None:

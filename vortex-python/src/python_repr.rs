@@ -80,7 +80,7 @@ impl Display for DTypePythonRepr<'_> {
                 size,
                 n.python_repr()
             ),
-            DType::Map(..) => write!(f, "{dtype}"),
+            DType::Map(..) | DType::Union(..) => write!(f, "{dtype}"),
             DType::Struct(st, n) => write!(
                 f,
                 "struct({{{}}}, nullable={})",
@@ -91,7 +91,6 @@ impl Display for DTypePythonRepr<'_> {
                     .join(", "),
                 n.python_repr()
             ),
-            DType::Union(..) => todo!("TODO(connor)[Union]: unimplemented"),
             DType::Variant(_) => write!(f, "variant()"),
             DType::Extension(ext) => {
                 write!(

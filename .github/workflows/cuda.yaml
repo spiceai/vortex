@@ -10,7 +10,8 @@ concurrency:
 on:
   push:
     branches: [develop]
-  pull_request: { }
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
   workflow_dispatch: { }
 
 permissions:
@@ -19,10 +20,12 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  TY_VERSION: 0.0.98
 
 jobs:
   changes:
     name: "Detect CUDA changes"
+    if: github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -45,6 +48,8 @@ jobs:
               - "vortex-test/**"
               - "pyproject.toml"
               - "uv.lock"
+              - "Cargo.toml"
+              - "Cargo.lock"
               - ".github/workflows/**"
 
   cuda-build-lint:
@@ -54,12 +59,13 @@ jobs:
       needs.changes.outputs.run-cuda-san == 'true'
     name: "CUDA build & lint"
     timeout-minutes: 30
-    runs-on: runs-on=${{ github.run_id }}/runner=gpu/extras=s3-cache/tag=cuda-build
+    runs-on: runs-on=${{ github.run_id }}/region=us-east-1/runner=gpu/extras=s3-cache/tag=cuda-build
     steps:
-      - uses: runs-on/action@v2
-        with:
-          sccache: s3
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - parallel:
+          - uses: runs-on/action@v2
+            with:
+              sccache: s3
+          - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: ./.github/actions/setup-rust
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
@@ -70,6 +76,8 @@ jobs:
             cargo build --profile ci --locked --all-features --all-targets
             -p vortex-cuda -p vortex-cuda-ffi -p vortex-cub -p vortex-nvcomp
             -p gpu-scan-cli -p vortex-test-e2e-cuda -p vortex-python-cuda
+      - name: Verify generated CUDA FFI header is up to date
+        run: git --no-pager diff --exit-code -- vortex-cuda/ffi/cinclude/vortex_cuda.h
       - name: Clippy CUDA crates
         run: |
           cargo clippy --profile ci --locked --all-features --all-targets \
@@ -89,54 +97,57 @@ jobs:
       needs.changes.outputs.run-cuda-san == 'true'
     name: "CUDA tests"
     timeout-minutes: 30
-    runs-on: runs-on=${{ github.run_id }}/runner=gpu/extras=s3-cache/tag=cuda-tests
+    runs-on: runs-on=${{ github.run_id }}/region=us-east-1/runner=gpu/extras=s3-cache/tag=cuda-tests
     steps:
-      - uses: runs-on/action@v2
-        with:
-          sccache: s3
-      - name: Display NVIDIA SMI details
-        run: |
-          nvidia-smi
-          nvidia-smi -L
-          nvidia-smi -q -d Memory
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
-      - uses: ./.github/actions/setup-rust
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-          enable-sccache: "true"
-      - name: Install uv
-        uses: spiraldb/actions/.github/actions/setup-uv@a746510eafaa926484c354541cfc49b2ec06cc63  # 0.18.6
-        with:
-          sync: false
+      - parallel:
+          - uses: runs-on/action@v2
+            with:
+              sccache: s3
+          - name: Display NVIDIA SMI details
+            run: |
+              nvidia-smi
+              nvidia-smi -L
+              nvidia-smi -q -d Memory
+          - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - parallel:
+          - uses: ./.github/actions/setup-rust
+            with:
+              repo-token: ${{ secrets.GITHUB_TOKEN }}
+              enable-sccache: "true"
+          - name: Install uv
+            uses: spiraldb/actions/.github/actions/setup-uv@a746510eafaa926484c354541cfc49b2ec06cc63  # 0.18.6
+            with:
+              sync: false
       - name: Install nextest
-        uses: taiki-e/install-action@d438492cf8a250514fa2d34b30bc3c0dc37c65ff  # v2
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91  # v2
         with:
           tool: nextest
-      - name: Rust Tests
-        env:
-          FLAT_LAYOUT_INLINE_ARRAY_NODE: true
-        run: |
-          cargo nextest run \
-            --cargo-profile ci \
-            --locked \
-            -p vortex-file \
-            -p vortex-cuda \
-            -p vortex-cuda-ffi \
-            -p vortex-cub \
-            -p vortex-nvcomp \
-            -p vortex-test-e2e-cuda \
-            -p vortex-python-cuda \
-            --all-features \
-            --no-fail-fast \
-            --target x86_64-unknown-linux-gnu \
-            --verbose
-      - name: Python CUDA extension checks
-        env:
-          MATURIN_PEP517_ARGS: "--profile ci"
-        run: |
-          uv sync --all-packages --extra cuda
-          uvx ty check vortex-python vortex-python-cuda
-          uv run --all-packages --extra cuda pytest --benchmark-disable vortex-python/test/test_cuda.py vortex-python-cuda/test
+      - parallel:
+          - name: Rust Tests
+            env:
+              FLAT_LAYOUT_INLINE_ARRAY_NODE: true
+            run: |
+              cargo nextest run \
+                --cargo-profile ci \
+                --locked \
+                -p vortex-file \
+                -p vortex-cuda \
+                -p vortex-cuda-ffi \
+                -p vortex-cub \
+                -p vortex-nvcomp \
+                -p vortex-test-e2e-cuda \
+                -p vortex-python-cuda \
+                --all-features \
+                --no-fail-fast \
+                --target x86_64-unknown-linux-gnu \
+                --verbose
+          - name: Python CUDA extension checks
+            env:
+              MATURIN_PEP517_ARGS: "--profile ci"
+            run: |
+              uv sync --all-packages --extra cuda
+              uvx ty@$TY_VERSION check vortex-python vortex-python-cuda
+              uv run --all-packages --extra cuda pytest --benchmark-disable vortex-python/test/test_cuda.py vortex-python-cuda/test
 
   cuda-test-sanitizer:
     needs: [changes]
@@ -145,7 +156,7 @@ jobs:
       needs.changes.outputs.run-cuda-san == 'true'
     name: "CUDA tests (${{ matrix.sanitizer }})"
     timeout-minutes: 30
-    runs-on: runs-on=${{ github.run_id }}/runner=gpu/extras=s3-cache/tag=cuda-test-sanitizer
+    runs-on: runs-on=${{ github.run_id }}/region=us-east-1/runner=gpu/extras=s3-cache/tag=cuda-test-sanitizer
     strategy:
       fail-fast: false
       matrix:
@@ -160,15 +171,16 @@ jobs:
           - sanitizer: initcheck
             runner_flags: "--tool initcheck --error-exitcode 1"
     steps:
-      - uses: runs-on/action@v2
-        with:
-          sccache: s3
-      - name: Display NVIDIA SMI details
-        run: |
-          nvidia-smi
-          nvidia-smi -L
-          nvidia-smi -q -d Memory
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - parallel:
+          - uses: runs-on/action@v2
+            with:
+              sccache: s3
+          - name: Display NVIDIA SMI details
+            run: |
+              nvidia-smi
+              nvidia-smi -L
+              nvidia-smi -q -d Memory
+          - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: ./.github/actions/setup-rust
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
@@ -187,17 +199,18 @@ jobs:
       needs.changes.outputs.run-cuda-san == 'true'
     name: "CUDA tests (cudf)"
     timeout-minutes: 30
-    runs-on: runs-on=${{ github.run_id }}/runner=gpu/extras=s3-cache/tag=cuda-test-cudf
+    runs-on: runs-on=${{ github.run_id }}/region=us-east-1/runner=gpu/extras=s3-cache/tag=cuda-test-cudf
     steps:
-      - uses: runs-on/action@v2
-        with:
-          sccache: s3
-      - name: Display NVIDIA SMI details
-        run: |
-          nvidia-smi
-          nvidia-smi -L
-          nvidia-smi -q -d Memory
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - parallel:
+          - uses: runs-on/action@v2
+            with:
+              sccache: s3
+          - name: Display NVIDIA SMI details
+            run: |
+              nvidia-smi
+              nvidia-smi -L
+              nvidia-smi -q -d Memory
+          - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: ./.github/actions/setup-rust
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}

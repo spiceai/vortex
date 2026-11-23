@@ -33,8 +33,8 @@ use crate::scalar::UnionValue;
 impl Scalar {
     /// Creates a new boolean scalar with the given value and nullability.
     pub fn bool(value: bool, nullability: Nullability) -> Self {
-        Self::try_new(DType::Bool(nullability), Some(ScalarValue::Bool(value)))
-            .vortex_expect("unable to construct a boolean `Scalar`")
+        // SAFETY: A `Bool` value is always valid for a `Bool` dtype.
+        unsafe { Self::new_unchecked(DType::Bool(nullability), Some(ScalarValue::Bool(value))) }
     }
 
     /// Creates a new primitive scalar from a native value.
@@ -47,24 +47,53 @@ impl Scalar {
     /// Note that an explicit PType is passed since any compatible PValue may be used as the value
     /// for a primitive type.
     pub fn primitive_value(value: PValue, ptype: PType, nullability: Nullability) -> Self {
-        Self::try_new(
-            DType::Primitive(ptype, nullability),
-            Some(ScalarValue::Primitive(value)),
-        )
-        .vortex_expect("unable to construct a primitive `Scalar`")
+        if value.ptype() != ptype {
+            return Self::try_new(
+                DType::Primitive(ptype, nullability),
+                Some(ScalarValue::Primitive(value)),
+            )
+            .vortex_expect("unable to construct a primitive `Scalar`");
+        }
+
+        // SAFETY: The value has the same ptype as the dtype.
+        unsafe {
+            Self::new_unchecked(
+                DType::Primitive(ptype, nullability),
+                Some(ScalarValue::Primitive(value)),
+            )
+        }
     }
 
     /// Creates a new decimal scalar with the given value, precision, scale, and nullability.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `value` does not fit in the precision of `decimal_type`. Use
+    /// [`Scalar::try_decimal`] when the value comes from data that has not been validated.
     pub fn decimal(
         value: DecimalValue,
         decimal_type: DecimalDType,
         nullability: Nullability,
     ) -> Self {
+        Self::try_decimal(value, decimal_type, nullability)
+            .vortex_expect("decimal value must fit the precision of `decimal_type`")
+    }
+
+    /// Attempts to create a new decimal scalar with the given value, precision, scale, and
+    /// nullability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `value` does not fit in the precision of `decimal_type`.
+    pub fn try_decimal(
+        value: DecimalValue,
+        decimal_type: DecimalDType,
+        nullability: Nullability,
+    ) -> VortexResult<Self> {
         Self::try_new(
             DType::Decimal(decimal_type, nullability),
             Some(ScalarValue::Decimal(value)),
         )
-        .vortex_expect("unable to construct a decimal `Scalar`")
     }
 
     /// Creates a new UTF-8 scalar from a string-like value.
@@ -91,20 +120,21 @@ impl Scalar {
     where
         B: TryInto<BufferString>,
     {
-        Ok(Self::try_new(
-            DType::Utf8(nullability),
-            Some(ScalarValue::Utf8(str.try_into()?)),
-        )
-        .vortex_expect("unable to construct a UTF-8 `Scalar`"))
+        let value = ScalarValue::Utf8(str.try_into()?);
+
+        // SAFETY: A `Utf8` value is always valid for a `Utf8` dtype.
+        Ok(unsafe { Self::new_unchecked(DType::Utf8(nullability), Some(value)) })
     }
 
     /// Creates a new binary scalar from a byte buffer.
     pub fn binary(buffer: impl Into<ByteBuffer>, nullability: Nullability) -> Self {
-        Self::try_new(
-            DType::Binary(nullability),
-            Some(ScalarValue::Binary(buffer.into())),
-        )
-        .vortex_expect("unable to construct a binary `Scalar`")
+        // SAFETY: A `Binary` value is always valid for a `Binary` dtype.
+        unsafe {
+            Self::new_unchecked(
+                DType::Binary(nullability),
+                Some(ScalarValue::Binary(buffer.into())),
+            )
+        }
     }
 
     /// Creates a new list scalar with the given element type and children.
@@ -240,21 +270,20 @@ impl Scalar {
     ///
     /// # Panics
     ///
-    /// Panics if the storage dtype of `ext_dtype` does not match `value`'s dtype, or if
-    /// `storage_scalar` is not a valid value for the extension type.
+    /// Panics if [`Self::try_extension_ref`] rejects the storage scalar.
     pub fn extension_ref(ext_dtype: ExtDTypeRef, storage_scalar: Scalar) -> Self {
         Self::try_extension_ref(ext_dtype, storage_scalar)
             .vortex_expect("unable to construct an extension `Scalar`")
     }
 
-    /// Creates a new extension scalar wrapping the given storage value, returning an error if
-    /// `storage_scalar` is not a valid value for the extension type.
+    /// Creates an extension scalar after checking its storage dtype and value.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the storage dtype of `ext_dtype` does not match `storage_scalar`'s dtype.
+    /// Returns an error if the storage dtype differs from the extension's storage dtype, or if
+    /// the extension rejects the storage value. A null storage scalar requires a nullable dtype.
     pub fn try_extension_ref(ext_dtype: ExtDTypeRef, storage_scalar: Scalar) -> VortexResult<Self> {
-        assert_eq!(ext_dtype.storage_dtype(), storage_scalar.dtype());
+        vortex_ensure_eq!(ext_dtype.storage_dtype(), storage_scalar.dtype());
 
         Self::try_new(DType::Extension(ext_dtype), storage_scalar.into_value())
     }
@@ -290,8 +319,7 @@ impl Scalar {
         vortex_ensure_eq!(
             child.dtype(),
             &expected_dtype,
-            "union type ID {type_id} selects child dtype {expected_dtype}, got {}",
-            child.dtype()
+            "union type ID {type_id} selects a different child dtype"
         );
 
         Self::try_new(

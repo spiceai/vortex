@@ -16,6 +16,8 @@ use vortex_array::expr::BoundExpression;
 use vortex_buffer::BitBufferMut;
 use vortex_error::VortexError;
 use vortex_error::VortexResult;
+use vortex_error::vortex_ensure;
+use vortex_error::vortex_ensure_eq;
 use vortex_mask::Mask;
 use vortex_session::VortexSession;
 
@@ -65,6 +67,18 @@ impl ZonedReader {
         let dtype = layout.dtype().clone();
         let row_count = layout.row_count();
         let zone_len = layout.zone_len;
+
+        // A zone count that disagrees with `row_count` / `zone_len` would index past the mask.
+        vortex_ensure!(
+            zone_len > 0,
+            "zoned layout reader requires a non-zero zone length"
+        );
+        let expected_zones = row_count.div_ceil(zone_len as u64);
+        vortex_ensure_eq!(
+            zone_count as u64,
+            expected_zones,
+            "zoned layout zone count must cover {row_count} rows of {zone_len}-row zones"
+        );
 
         Ok(Self {
             pruning: PruningState::new(
@@ -232,6 +246,7 @@ impl LayoutReader for ZonedReader {
 mod test {
     use std::num::NonZeroUsize;
     use std::sync::Arc;
+    use std::sync::LazyLock;
 
     use rstest::fixture;
     use rstest::rstest;
@@ -239,7 +254,6 @@ mod test {
     use vortex_array::IntoArray;
     use vortex_array::MaskFuture;
     use vortex_array::VortexSessionExecute;
-    use vortex_array::array_session;
     use vortex_array::arrays::ChunkedArray;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::assert_arrays_eq;
@@ -269,7 +283,9 @@ mod test {
     use crate::layouts::zoned::LegacyStats;
     use crate::layouts::zoned::LegacyStatsLayoutEncoding;
     use crate::layouts::zoned::LegacyStatsMetadata;
+    use crate::layouts::zoned::ZoneMapSchema;
     use crate::layouts::zoned::Zoned;
+    use crate::layouts::zoned::ZonedLayout;
     use crate::layouts::zoned::writer::ZonedLayoutOptions;
     use crate::layouts::zoned::writer::ZonedStrategy;
     use crate::segments::SegmentSource;
@@ -278,8 +294,10 @@ mod test {
     use crate::sequence::SequentialArrayStreamExt;
     use crate::session::LayoutSession;
 
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
+
     fn session_with_handle(handle: Handle) -> VortexSession {
-        array_session()
+        VortexSession::empty()
             .with::<LayoutSession>()
             .with::<RuntimeSession>()
             .with_handle(handle)
@@ -323,7 +341,7 @@ mod test {
         #[from(stats_layout)] (segments, layout): (Arc<dyn SegmentSource>, LayoutRef),
     ) {
         block_on(|handle| async {
-            let mut ctx = array_session().create_execution_ctx();
+            let mut ctx = SESSION.create_execution_ctx();
             let session = session_with_handle(handle);
             let reader = layout
                 .new_reader("".into(), segments, &session, &Default::default())
@@ -460,7 +478,7 @@ mod test {
                 .slot(1)?
                 .vortex_expect("ZonedLayout always has a stats child"),
         ]);
-        let session = array_session();
+        let session = VortexSession::empty();
         let read_ctx = ReadContext::new([]);
         let build_ctx = LayoutBuildContext {
             session: &session,
@@ -505,7 +523,7 @@ mod test {
                     MaskFuture::new_true(row_count.try_into().unwrap()),
                 )?
                 .await?;
-            let mut ctx = array_session().create_execution_ctx();
+            let mut ctx = SESSION.create_execution_ctx();
             assert_arrays_eq!(
                 projected,
                 buffer![1i32, 2, 3, 4, 5, 6, 7, 8, 9].into_array(),
@@ -513,5 +531,35 @@ mod test {
             );
             Ok(())
         })
+    }
+
+    /// A zone map whose zone count disagrees with `row_count` / `zone_len` is
+    /// rejected on open. The fixture has 9 rows and 3 zones, so zone lengths 2 and 5 are invalid.
+    #[rstest]
+    #[case::too_few_zones(2)]
+    #[case::too_many_zones(5)]
+    #[should_panic(expected = "zone count must cover 9 rows of")]
+    fn new_reader_rejects_mismatched_zone_count(
+        #[from(stats_layout)] (segments, layout): (Arc<dyn SegmentSource>, LayoutRef),
+        #[case] zone_len: usize,
+    ) {
+        let zoned = layout.as_::<Zoned>();
+        let ZoneMapSchema::AggregateFns(aggregate_fns) = &zoned.zone_map_schema else {
+            unreachable!("ZonedStrategy writes aggregate functions")
+        };
+        let invalid_layout = ZonedLayout::try_new(
+            layout.slot(0).unwrap().vortex_expect("data child"),
+            layout.slot(1).unwrap().vortex_expect("zones child"),
+            NonZeroUsize::new(zone_len).vortex_expect("non zero"),
+            Arc::clone(aggregate_fns),
+        )
+        .unwrap()
+        .into_layout();
+
+        block_on(|handle| async {
+            let session = session_with_handle(handle);
+            invalid_layout.new_reader("".into(), segments, &session, &Default::default())
+        })
+        .unwrap();
     }
 }

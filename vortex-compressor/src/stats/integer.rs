@@ -15,7 +15,6 @@ use vortex_array::expr::stats::Stat;
 use vortex_array::match_each_integer_ptype;
 use vortex_array::scalar::PValue;
 use vortex_array::scalar::Scalar;
-use vortex_buffer::BitBuffer;
 use vortex_error::VortexError;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
@@ -363,71 +362,6 @@ where
     let null_count = validity.false_count();
     let value_count = validity.true_count();
 
-    // Initialize loop state.
-    let head_idx = validity
-        .first()
-        .vortex_expect("All null masks have been handled before");
-    let buffer = array.to_buffer::<T>();
-    let head = buffer[head_idx];
-
-    let mut loop_state = LoopState {
-        distinct_values: if count_distinct_values {
-            HashMap::with_capacity_and_hasher(array.len() / 2, FxBuildHasher)
-        } else {
-            HashMap::with_hasher(FxBuildHasher)
-        },
-        prev: head,
-        runs: 1,
-    };
-
-    let sliced = buffer.slice(head_idx..array.len());
-    let (chunks, remainder) = sliced.as_slice().as_chunks::<64>();
-    match validity.bit_buffer() {
-        AllOr::All => {
-            for chunk in chunks {
-                inner_loop_nonnull(chunk, count_distinct_values, &mut loop_state)
-            }
-            inner_loop_naive(
-                remainder,
-                count_distinct_values,
-                &BitBuffer::new_set(remainder.len()),
-                &mut loop_state,
-            );
-        }
-        AllOr::None => unreachable!("All invalid arrays have been handled before"),
-        AllOr::Some(v) => {
-            let mask = v.slice(head_idx..array.len());
-            let mut offset = 0;
-            for chunk in chunks {
-                let validity = mask.slice(offset..(offset + 64));
-                offset += 64;
-
-                match validity.true_count() {
-                    // All nulls -> no stats to update.
-                    0 => continue,
-                    // Inner loop for when validity check can be elided.
-                    64 => inner_loop_nonnull(chunk, count_distinct_values, &mut loop_state),
-                    // Inner loop for when we need to check validity.
-                    _ => inner_loop_nullable(
-                        chunk,
-                        count_distinct_values,
-                        &validity,
-                        &mut loop_state,
-                    ),
-                }
-            }
-            // Final iteration, run naive loop.
-            inner_loop_naive(
-                remainder,
-                count_distinct_values,
-                &mask.slice(offset..(offset + remainder.len())),
-                &mut loop_state,
-            );
-        }
-    }
-
-    let runs = loop_state.runs;
-
     let array_ref = array.as_ref();
     let min = array_ref
         .statistics()
@@ -439,21 +373,70 @@ where
         .compute_as::<T>(Stat::Max, ctx)
         .vortex_expect("max should be computed");
 
-    let distinct = count_distinct_values.then(|| {
-        let (&top_value, &top_count) = loop_state
-            .distinct_values
-            .iter()
-            .max_by_key(|&(_, &count)| count)
-            .vortex_expect("we know this is non-empty");
+    // Initialize loop state.
+    let head_idx = validity
+        .first()
+        .vortex_expect("All null masks have been handled before");
+    let buffer = array.to_buffer::<T>();
+    let head = buffer[head_idx];
 
-        DistinctInfo {
-            distinct_count: u32::try_from(loop_state.distinct_values.len())
-                .vortex_expect("there are more than `u32::MAX` distinct values"),
-            most_frequent_value: top_value.0,
-            top_frequency: top_count,
-            distinct_values: loop_state.distinct_values,
+    let mut loop_state = LoopState {
+        distinct: if count_distinct_values {
+            DistinctCounter::new(min, max, array.len())
+        } else {
+            DistinctCounter::Off
+        },
+        prev: head,
+        pending: 0,
+        runs: 1,
+    };
+
+    let sliced = buffer.slice(head_idx..array.len());
+    let (chunks, remainder) = sliced.as_slice().as_chunks::<64>();
+    let remainder_valid = match validity.bit_buffer() {
+        AllOr::All => {
+            for chunk in chunks {
+                inner_loop_nonnull(chunk, count_distinct_values, &mut loop_state)
+            }
+            (1u64 << remainder.len()) - 1
         }
-    });
+        AllOr::None => unreachable!("All invalid arrays have been handled before"),
+        AllOr::Some(v) => {
+            let mask = v.slice(head_idx..array.len());
+            let words = mask.chunks();
+            // One validity word per chunk of 64 values.
+            for (chunk, valid) in chunks.iter().zip(words.iter()) {
+                match valid {
+                    // All nulls -> no stats to update.
+                    0 => {}
+                    // Inner loop for when validity check can be elided.
+                    u64::MAX => inner_loop_nonnull(chunk, count_distinct_values, &mut loop_state),
+                    // Inner loop for when we need to check validity.
+                    _ => inner_loop_nullable(chunk, count_distinct_values, valid, &mut loop_state),
+                }
+            }
+            words.remainder_bits()
+        }
+    };
+
+    // Pad the trailing values into a last chunk, whose padding is null.
+    if remainder_valid != 0 {
+        let mut last = [loop_state.prev; 64];
+        last[..remainder.len()].copy_from_slice(remainder);
+        inner_loop_nullable(
+            &last,
+            count_distinct_values,
+            remainder_valid,
+            &mut loop_state,
+        );
+    }
+
+    if count_distinct_values {
+        loop_state.flush();
+    }
+
+    let runs = loop_state.runs;
+    let distinct = loop_state.distinct.finish();
 
     let typed = TypedStats { min, max, distinct };
 
@@ -468,14 +451,146 @@ where
     })
 }
 
+/// Value ranges up to this many values may be counted in a dense array instead of a hash map.
+const DENSE_DISTINCT_MAX_RANGE: usize = 1 << 16;
+
+/// Value ranges up to this many values are always counted in a dense array, regardless of the array
+/// length. This covers every `u8` and `i8` array.
+const DENSE_DISTINCT_ALWAYS_RANGE: usize = 1 << 8;
+
+/// Accumulates the occurrences of each distinct valid value.
+enum DistinctCounter<T> {
+    /// Distinct values are not being counted.
+    Off,
+    /// Counts indexed by `value - min`, used when the value range is narrow. This avoids hashing
+    /// entirely.
+    Dense {
+        /// The minimum valid value.
+        min: T,
+        /// `min` cast to `usize`. Casting preserves values modulo `2^usize::BITS`, so the wrapping
+        /// difference of two cast values is the exact difference of any two values in the range.
+        min_index: usize,
+        /// The number of occurrences of `min + index`.
+        counts: Vec<u32>,
+    },
+    /// Counts keyed by value.
+    Hashed(HashMap<NativeValue<T>, u32, FxBuildHasher>),
+}
+
+impl<T: IntegerPType> DistinctCounter<T>
+where
+    NativeValue<T>: Eq + Hash,
+{
+    /// Chooses a dense counter when the valid values span a narrow range, otherwise a hash map.
+    fn new(min: T, max: T, len: usize) -> Self {
+        let range_len = match (min.to_i128(), max.to_i128()) {
+            (Some(min), Some(max)) => usize::try_from(max - min + 1).unwrap_or(usize::MAX),
+            _ => usize::MAX,
+        };
+
+        // A dense counter is only worthwhile when it is not much larger than the array itself.
+        if range_len <= DENSE_DISTINCT_ALWAYS_RANGE
+            || (range_len <= DENSE_DISTINCT_MAX_RANGE && range_len <= len)
+        {
+            Self::Dense {
+                min,
+                min_index: min.as_(),
+                counts: vec![0; range_len],
+            }
+        } else {
+            Self::Hashed(HashMap::with_capacity_and_hasher(len / 2, FxBuildHasher))
+        }
+    }
+
+    /// Records `count` occurrences of a valid value.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    fn add(&mut self, value: T, count: u32) {
+        match self {
+            Self::Off => {}
+            Self::Dense {
+                min_index, counts, ..
+            } => counts[value.as_().wrapping_sub(*min_index)] += count,
+            Self::Hashed(distinct_values) => {
+                *distinct_values.entry(NativeValue(value)).or_insert(0) += count
+            }
+        }
+    }
+
+    /// Returns the distinct value information, or `None` if counting was off.
+    fn finish(self) -> Option<DistinctInfo<T>> {
+        let distinct_values: HashMap<NativeValue<T>, u32, FxBuildHasher> = match self {
+            Self::Off => return None,
+            Self::Dense { min, counts, .. } => {
+                let min = min.to_i128().vortex_expect("integers fit in i128");
+                counts
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &count)| count > 0)
+                    .map(|(index, &count)| {
+                        let value = <T as num_traits::NumCast>::from(min + index as i128)
+                            .vortex_expect("values between min and max fit in the type");
+                        (NativeValue(value), count)
+                    })
+                    .collect()
+            }
+            Self::Hashed(distinct_values) => distinct_values,
+        };
+
+        let (&top_value, &top_count) = distinct_values
+            .iter()
+            .max_by_key(|&(_, &count)| count)
+            .vortex_expect("we know this is non-empty");
+
+        Some(DistinctInfo {
+            distinct_count: u32::try_from(distinct_values.len())
+                .vortex_expect("there are more than `u32::MAX` distinct values"),
+            most_frequent_value: top_value.0,
+            top_frequency: top_count,
+            distinct_values,
+        })
+    }
+}
+
 /// Internal loop state for integer stats computation.
 struct LoopState<T> {
     /// The previous value seen.
     prev: T,
+    /// Occurrences of `prev` in the current run not yet added to `distinct`.
+    pending: u32,
     /// The run count.
     runs: u32,
-    /// The distinct values map.
-    distinct_values: HashMap<NativeValue<T>, u32, FxBuildHasher>,
+    /// The distinct values counter.
+    distinct: DistinctCounter<T>,
+}
+
+impl<T: IntegerPType> LoopState<T>
+where
+    NativeValue<T>: Eq + Hash,
+{
+    /// Adds the pending occurrences of `prev` to the distinct values counter.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    fn flush(&mut self) {
+        self.distinct.add(self.prev, self.pending);
+        self.pending = 0;
+    }
+
+    /// Records one value, hashing only when the value differs from `prev`.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    fn push<const COUNT_DISTINCT_VALUES: bool>(&mut self, value: T) {
+        if value != self.prev {
+            if COUNT_DISTINCT_VALUES {
+                self.flush();
+            }
+            self.prev = value;
+            self.runs += 1;
+        }
+        if COUNT_DISTINCT_VALUES {
+            self.pending += 1;
+        }
+    }
 }
 
 /// Inner loop for non-null chunks of 64 values.
@@ -488,87 +603,115 @@ fn inner_loop_nonnull<T: IntegerPType>(
 ) where
     NativeValue<T>: Eq + Hash,
 {
-    for &value in values {
-        if count_distinct_values {
-            *state.distinct_values.entry(NativeValue(value)).or_insert(0) += 1;
-        }
-
-        if value != state.prev {
-            state.prev = value;
-            state.runs += 1;
-        }
+    if count_distinct_values {
+        inner_loop_nonnull_impl::<T, true>(values, state);
+    } else {
+        inner_loop_nonnull_impl::<T, false>(values, state);
     }
 }
 
-/// Inner loop for nullable chunks of 64 values.
+/// Processes one non-null chunk, monomorphized on whether distinct values are counted.
+#[allow(clippy::inline_always)]
+#[inline(always)]
+fn inner_loop_nonnull_impl<T: IntegerPType, const COUNT_DISTINCT_VALUES: bool>(
+    values: &[T; 64],
+    state: &mut LoopState<T>,
+) where
+    NativeValue<T>: Eq + Hash,
+{
+    // Branch-free count of value changes, including the change from the previous chunk. At
+    // most 64, so a `u8` accumulator lets the comparison use full-width byte lanes.
+    let transitions = u8::from(values[0] != state.prev)
+        + values
+            .iter()
+            .zip(&values[1..])
+            .map(|(a, b)| u8::from(a != b))
+            .sum::<u8>();
+
+    if COUNT_DISTINCT_VALUES {
+        if transitions == 0 {
+            state.pending += 64;
+            return;
+        }
+        for &value in values {
+            if value != state.prev {
+                state.flush();
+                state.prev = value;
+            }
+            state.pending += 1;
+        }
+    }
+
+    state.runs += u32::from(transitions);
+    state.prev = values[63];
+}
+
+/// Inner loop for chunks of 64 values with nulls, whose bits are unset in `valid`.
 #[allow(clippy::inline_always)]
 #[inline(always)]
 fn inner_loop_nullable<T: IntegerPType>(
     values: &[T; 64],
     count_distinct_values: bool,
-    is_valid: &BitBuffer,
+    valid: u64,
     state: &mut LoopState<T>,
 ) where
     NativeValue<T>: Eq + Hash,
 {
-    for (idx, &value) in values.iter().enumerate() {
-        if is_valid.value(idx) {
-            if count_distinct_values {
-                *state.distinct_values.entry(NativeValue(value)).or_insert(0) += 1;
-            }
-
-            if value != state.prev {
-                state.prev = value;
-                state.runs += 1;
-            }
+    if count_distinct_values {
+        // A filled null would count as an occurrence, so only the valid values are pushed.
+        let mut valid = valid;
+        while valid != 0 {
+            state.push::<true>(values[valid.trailing_zeros() as usize]);
+            valid &= valid - 1;
         }
+    } else {
+        // A null filled with the valid value before it adds no run, so the chunk takes the
+        // branch-free loop of non-null chunks.
+        inner_loop_nonnull_impl::<T, false>(&forward_fill(values, valid, state.prev), state);
     }
 }
 
-/// Fallback inner loop for remainder values.
+/// Returns `values` with each null, whose bit is unset in `valid`, replaced by the closest valid
+/// value before it, or by `prev`, the last valid value before the chunk. The cost is one store per
+/// null.
 #[allow(clippy::inline_always)]
 #[inline(always)]
-fn inner_loop_naive<T: IntegerPType>(
-    values: &[T],
-    count_distinct_values: bool,
-    is_valid: &BitBuffer,
-    state: &mut LoopState<T>,
-) where
-    NativeValue<T>: Eq + Hash,
-{
-    for (idx, &value) in values.iter().enumerate() {
-        if is_valid.value(idx) {
-            if count_distinct_values {
-                *state.distinct_values.entry(NativeValue(value)).or_insert(0) += 1;
-            }
-
-            if value != state.prev {
-                state.prev = value;
-                state.runs += 1;
-            }
-        }
+fn forward_fill<T: Copy>(values: &[T; 64], valid: u64, prev: T) -> [T; 64] {
+    let mut filled = *values;
+    let mut nulls = !valid;
+    while nulls != 0 {
+        let i = nulls.trailing_zeros() as usize;
+        filled[i] = if i == 0 { prev } else { filled[i - 1] };
+        nulls &= nulls - 1;
     }
+    filled
 }
 
 #[cfg(test)]
 mod tests {
     use std::iter;
+    use std::sync::LazyLock;
 
+    use rstest::rstest;
     use vortex_array::VortexSessionExecute;
-    use vortex_array::array_session;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::validity::Validity;
     use vortex_buffer::BitBuffer;
     use vortex_buffer::Buffer;
     use vortex_buffer::buffer;
     use vortex_error::VortexResult;
+    use vortex_session::VortexSession;
+    use vortex_utils::aliases::hash_map::HashMap;
 
+    use super::ErasedStats;
     use super::IntegerStats;
     use super::typed_int_stats;
 
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
+
     #[test]
     fn test_naive_count_distinct_values() -> VortexResult<()> {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let array = PrimitiveArray::new(buffer![217u8, 0], Validity::NonNullable);
         let stats = typed_int_stats::<u8>(&array, true, &mut ctx)?;
         assert_eq!(stats.distinct_count().unwrap(), 2);
@@ -577,7 +720,7 @@ mod tests {
 
     #[test]
     fn test_naive_count_distinct_values_nullable() -> VortexResult<()> {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let array = PrimitiveArray::new(
             buffer![217u8, 0],
             Validity::from(BitBuffer::from(vec![true, false])),
@@ -589,7 +732,7 @@ mod tests {
 
     #[test]
     fn test_count_distinct_values() -> VortexResult<()> {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let array = PrimitiveArray::new((0..128u8).collect::<Buffer<u8>>(), Validity::NonNullable);
         let stats = typed_int_stats::<u8>(&array, true, &mut ctx)?;
         assert_eq!(stats.distinct_count().unwrap(), 128);
@@ -598,7 +741,7 @@ mod tests {
 
     #[test]
     fn test_count_distinct_values_nullable() -> VortexResult<()> {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let array = PrimitiveArray::new(
             (0..128u8).collect::<Buffer<u8>>(),
             Validity::from(BitBuffer::from_iter(
@@ -611,8 +754,57 @@ mod tests {
     }
 
     #[test]
+    fn dense_distinct_signed_full_range() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let values: Buffer<i8> = (i8::MIN..=i8::MAX)
+            .chain(i8::MIN..=i8::MAX)
+            .chain(iter::once(i8::MAX))
+            .collect();
+        let array = PrimitiveArray::new(values, Validity::NonNullable);
+
+        let stats = typed_int_stats::<i8>(&array, true, &mut ctx)?;
+        assert_eq!(stats.distinct_count(), Some(256));
+        assert_eq!(
+            stats.most_frequent_value_and_count(),
+            Some((i8::MAX.into(), 3))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dense_distinct_ignores_values_under_nulls() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let array = PrimitiveArray::new(
+            buffer![1000i32, 1001, 1000, 5_000_000, 1003],
+            Validity::from_iter([true, true, true, false, true]),
+        );
+
+        let stats = typed_int_stats::<i32>(&array, true, &mut ctx)?;
+        assert_eq!(stats.distinct_count(), Some(3));
+        assert_eq!(
+            stats.most_frequent_value_and_count(),
+            Some((1000i32.into(), 2))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn wide_range_distinct() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let array = PrimitiveArray::new(buffer![0u64, u64::MAX, 0], Validity::NonNullable);
+
+        let stats = typed_int_stats::<u64>(&array, true, &mut ctx)?;
+        assert_eq!(stats.distinct_count(), Some(2));
+        assert_eq!(
+            stats.most_frequent_value_and_count(),
+            Some((0u64.into(), 2))
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_integer_stats_leading_nulls() {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let ints = PrimitiveArray::new(buffer![0, 1, 2], Validity::from_iter([false, true, true]));
 
         let stats = IntegerStats::generate_opts(
@@ -627,5 +819,64 @@ mod tests {
         assert_eq!(stats.null_count, 1);
         assert_eq!(stats.average_run_length, 1);
         assert_eq!(stats.distinct_count().unwrap(), 2);
+    }
+
+    /// Returns the per-value counts and the run count of the valid values, computed naively.
+    fn naive_stats(values: &[u32], valid: &[bool]) -> (HashMap<u32, u32>, u32) {
+        let mut counts = HashMap::default();
+        let mut runs = 0;
+        let mut prev = None;
+        for (&value, _) in values.iter().zip(valid).filter(|(_, ok)| **ok) {
+            *counts.entry(value).or_insert(0) += 1;
+            if prev.replace(value) != Some(value) {
+                runs += 1;
+            }
+        }
+        (counts, runs)
+    }
+
+    /// Checks the chunked loops against a naive reference. The run lengths cover aligned
+    /// constant chunks (64), runs that cross chunk boundaries (3, 100), and chunks where every
+    /// value changes (1). With nulls, `null_chunks` also nulls two whole chunks.
+    #[rstest]
+    fn test_matches_naive_reference(
+        #[values(1, 63, 64, 65, 64 * 20 + 17)] len: u32,
+        #[values(1, 3, 64, 100)] run_len: u32,
+        #[values(None, Some(97), Some(3))] null_every: Option<u32>,
+        #[values(false, true)] null_chunks: bool,
+        #[values(false, true)] count_distinct_values: bool,
+    ) -> VortexResult<()> {
+        let values: Vec<u32> = (0..len).map(|i| (i / run_len) % 16).collect();
+        let valid: Vec<bool> = (0..len)
+            .map(|i| {
+                null_every.is_none_or(|n| i % n != 0 && !(null_chunks && (64..192).contains(&i)))
+            })
+            .collect();
+        let (expected, runs) = naive_stats(&values, &valid);
+
+        let validity = match null_every {
+            None => Validity::NonNullable,
+            Some(_) => Validity::from(BitBuffer::from(valid)),
+        };
+        let array = PrimitiveArray::new(Buffer::from(values), validity);
+        let mut ctx = SESSION.create_execution_ctx();
+        let stats = typed_int_stats::<u32>(&array, count_distinct_values, &mut ctx)?;
+
+        let ErasedStats::U32(typed) = stats.erased() else {
+            unreachable!()
+        };
+        if count_distinct_values {
+            let actual: HashMap<u32, u32> = typed
+                .distinct()
+                .map(|d| d.distinct_values().iter().map(|(k, &c)| (k.0, c)).collect())
+                .unwrap_or_default();
+            assert_eq!(actual, expected);
+        }
+        let value_count: u32 = expected.values().sum();
+        assert_eq!(stats.value_count, value_count);
+        if value_count > 0 {
+            assert_eq!(stats.average_run_length, value_count / runs);
+        }
+        Ok(())
     }
 }

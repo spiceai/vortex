@@ -20,8 +20,6 @@ use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
-use vortex_array::expr::Expression;
-use vortex_array::expr::union_child_validities;
 use vortex_array::scalar_fn::Arity;
 use vortex_array::scalar_fn::ChildName;
 use vortex_array::scalar_fn::EmptyOptions;
@@ -33,6 +31,7 @@ use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
+use vortex_error::vortex_ensure_eq;
 use vortex_error::vortex_err;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
@@ -47,10 +46,10 @@ use crate::scalar_fn::execute::dispatch_unary;
 
 /// Validate the native lineal operand accepted by `ST_Length`.
 fn validate_length_operands(dtypes: &[DType]) -> VortexResult<()> {
-    vortex_ensure!(
-        dtypes.len() == 1,
-        "spatial: length requires exactly one lineal operand, got {}",
-        dtypes.len()
+    vortex_ensure_eq!(
+        dtypes.len(),
+        1,
+        "spatial: length requires exactly one lineal operand"
     );
     vortex_ensure!(
         dtypes[0].as_extension_opt().is_some_and(|extension| {
@@ -205,14 +204,6 @@ impl ScalarFnVTable for SpatialLength {
         )
     }
 
-    fn validity(
-        &self,
-        _: &Self::Options,
-        expression: &Expression,
-    ) -> VortexResult<Option<Expression>> {
-        union_child_validities(expression)
-    }
-
     fn is_strict(&self, _: &Self::Options) -> bool {
         true
     }
@@ -224,6 +215,8 @@ impl ScalarFnVTable for SpatialLength {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use vortex_array::ArrayRef;
     use vortex_array::Columnar;
     use vortex_array::ExecutionCtx;
@@ -242,11 +235,14 @@ mod tests {
     use vortex_array::validity::Validity;
     use vortex_error::VortexResult;
     use vortex_error::vortex_err;
+    use vortex_session::VortexSession;
 
     use super::SpatialLength;
     use crate::test_harness::linestring_column;
     use crate::test_harness::multilinestring_column;
     use crate::test_harness::point_column;
+
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
 
     fn line_constant(
         line: Vec<(f64, f64)>,
@@ -259,8 +255,7 @@ mod tests {
 
     #[test]
     fn measures_each_linestring() -> VortexResult<()> {
-        let session = vortex_array::array_session();
-        let mut ctx = session.create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let lines = linestring_column(vec![
             vec![(0.0, 0.0), (3.0, 4.0)],
             vec![(0.0, 0.0), (3.0, 4.0), (3.0, 8.0)],
@@ -277,8 +272,7 @@ mod tests {
 
     #[test]
     fn measures_each_multilinestring() -> VortexResult<()> {
-        let session = vortex_array::array_session();
-        let mut ctx = session.create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let lines = multilinestring_column(vec![
             vec![
                 vec![(0.0, 0.0), (3.0, 4.0)],
@@ -297,8 +291,7 @@ mod tests {
 
     #[test]
     fn propagates_nullable_multilinestring_rows() -> VortexResult<()> {
-        let session = vortex_array::array_session();
-        let mut ctx = session.create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let lines = MaskedArray::try_new(
             multilinestring_column(vec![
                 vec![vec![(0.0, 0.0), (3.0, 4.0)]],
@@ -306,6 +299,7 @@ mod tests {
                 vec![vec![(0.0, 0.0), (0.0, 5.0)]],
             ])?,
             Validity::from_iter([true, false, true]),
+            &mut ctx,
         )?
         .into_array();
 
@@ -322,8 +316,7 @@ mod tests {
 
     #[test]
     fn constant_is_computed_once_and_remains_constant() -> VortexResult<()> {
-        let session = vortex_array::array_session();
-        let mut ctx = session.create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let lines = line_constant(vec![(0.0, 0.0), (3.0, 4.0), (3.0, 8.0)], 3, &mut ctx)?;
 
         let result = SpatialLength::try_new(lines)?
@@ -339,8 +332,7 @@ mod tests {
 
     #[test]
     fn null_constant_is_all_null() -> VortexResult<()> {
-        let session = vortex_array::array_session();
-        let mut ctx = session.create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let dtype = linestring_column(vec![vec![]])?.dtype().as_nullable();
         let lines = ConstantArray::new(Scalar::null(dtype), 2).into_array();
 
@@ -359,8 +351,7 @@ mod tests {
 
     #[test]
     fn propagates_nullable_rows() -> VortexResult<()> {
-        let session = vortex_array::array_session();
-        let mut ctx = session.create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let lines = MaskedArray::try_new(
             linestring_column(vec![
                 vec![(0.0, 0.0), (3.0, 4.0)],
@@ -368,6 +359,7 @@ mod tests {
                 vec![(0.0, 0.0), (0.0, 4.0)],
             ])?,
             Validity::from_iter([true, false, true]),
+            &mut ctx,
         )?
         .into_array();
 
@@ -383,14 +375,14 @@ mod tests {
 
     #[test]
     fn propagates_all_null_rows() -> VortexResult<()> {
-        let session = vortex_array::array_session();
-        let mut ctx = session.create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let lines = MaskedArray::try_new(
             linestring_column(vec![
                 vec![(0.0, 0.0), (3.0, 4.0)],
                 vec![(0.0, 0.0), (0.0, 4.0)],
             ])?,
             Validity::from_iter([false, false]),
+            &mut ctx,
         )?
         .into_array();
         let expected =

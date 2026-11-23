@@ -19,6 +19,7 @@
 
 use std::ops::Range;
 
+use vortex_buffer::BufferAllocatorRef;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_mask::Mask;
@@ -48,6 +49,7 @@ mod bitbuffer;
 mod bool;
 pub(crate) mod buffer;
 pub(crate) mod byte_compress;
+pub(crate) mod chunked;
 mod fixed_size_list;
 mod listview;
 mod simd_compress;
@@ -125,13 +127,23 @@ pub(super) fn execute_all_null_filter_fast_path(
 }
 
 /// Filter a canonical array by a mask, returning a new canonical array.
-pub(super) fn execute_filter(canonical: Canonical, mask: &MaskValuesRef) -> Canonical {
+pub(super) fn execute_filter(
+    canonical: Canonical,
+    mask: &MaskValuesRef,
+    allocator: &BufferAllocatorRef,
+) -> Canonical {
     match canonical {
         Canonical::Null(_) => Canonical::Null(NullArray::new(mask.true_count())),
         Canonical::Bool(a) => Canonical::Bool(bool::filter_bool(&a, mask)),
-        Canonical::Primitive(a) => Canonical::Primitive(fixed_width::filter::filter(&a, mask)),
-        Canonical::Decimal(a) => Canonical::Decimal(fixed_width::filter::filter(&a, mask)),
-        Canonical::VarBinView(a) => Canonical::VarBinView(varbinview::filter_varbinview(&a, mask)),
+        Canonical::Primitive(a) => {
+            Canonical::Primitive(fixed_width::filter::filter(&a, mask, allocator))
+        }
+        Canonical::Decimal(a) => {
+            Canonical::Decimal(fixed_width::filter::filter(&a, mask, allocator))
+        }
+        Canonical::VarBinView(a) => {
+            Canonical::VarBinView(varbinview::filter_varbinview(&a, mask, allocator))
+        }
         Canonical::List(a) => Canonical::List(listview::filter_listview(&a, mask)),
         Canonical::Map(a) => Canonical::Map(filter_map(&a, mask)),
         Canonical::FixedSizeList(a) => {
@@ -175,13 +187,18 @@ fn filter_map(array: &MapArray, mask: &MaskValuesRef) -> MapArray {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use vortex_buffer::BitBuffer;
     use vortex_error::VortexResult;
+    use vortex_session::VortexSession;
 
     use super::*;
     use crate::VortexSessionExecute;
-    use crate::array_session;
+    use crate::arrays::Primitive;
     use crate::arrays::PrimitiveArray;
+
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
 
     #[test]
     fn uncached_contiguous_filter_executes_as_zero_copy_slice() -> VortexResult<()> {
@@ -194,10 +211,9 @@ mod tests {
             values.cached_indices().is_none() && values.cached_slices().is_none()
         }));
 
-        let filtered = array
-            .into_array()
-            .filter(mask)?
-            .execute::<PrimitiveArray>(&mut array_session().create_execution_ctx())?;
+        let filtered = array.into_array().filter(mask)?;
+        assert!(filtered.is::<Primitive>());
+        let filtered = filtered.execute::<PrimitiveArray>(&mut SESSION.create_execution_ctx())?;
         let filtered_values = filtered.to_buffer::<i32>();
 
         assert_eq!(filtered_values.as_slice(), &(37..91).collect::<Vec<_>>());

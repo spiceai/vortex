@@ -8,6 +8,7 @@ use bytes::Buf;
 use flatbuffers::root;
 use flatbuffers::root_unchecked;
 use vortex_array::ArrayId;
+use vortex_array::flatbuffers::FlatBuffer;
 use vortex_array::serde::SerializedArray;
 use vortex_buffer::AlignedBuf;
 use vortex_buffer::Alignment;
@@ -16,11 +17,11 @@ use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
-use vortex_flatbuffers::FlatBuffer;
-use vortex_flatbuffers::message as fb;
-use vortex_flatbuffers::message::MessageHeader;
-use vortex_flatbuffers::message::MessageVersion;
 use vortex_session::registry::ReadContext;
+
+use crate::flatbuffers::message as fb;
+use crate::flatbuffers::message::MessageHeader;
+use crate::flatbuffers::message::MessageVersion;
 
 /// A message decoded from an IPC stream.
 #[derive(Debug)]
@@ -166,12 +167,23 @@ impl MessageDecoder {
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use bytes::BytesMut;
     use vortex_array::ArrayRef;
+    use vortex_array::ArrayVTable;
     use vortex_array::IntoArray;
+    use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::ConstantArray;
+    use vortex_array::arrays::DecimalArray;
+    use vortex_array::arrays::Widen;
+    use vortex_array::arrays::WidenArray;
+    use vortex_array::assert_arrays_eq;
+    use vortex_array::dtype::DType;
+    use vortex_array::dtype::DecimalDType;
+    use vortex_array::dtype::Nullability;
+    use vortex_array::validity::Validity;
     use vortex_buffer::buffer;
+    use vortex_error::VortexResult;
     use vortex_error::vortex_panic;
 
     use super::*;
@@ -202,6 +214,7 @@ mod test {
 
         assert_eq!(expected.len(), actual.len());
         assert_eq!(expected.encoding_id(), actual.encoding_id());
+        assert_arrays_eq!(actual, expected, &mut SESSION.create_execution_ctx());
     }
 
     #[test]
@@ -210,10 +223,39 @@ mod test {
     }
 
     #[test]
-    fn array_no_buffers() {
+    fn array_constant_single_buffer() {
         // Constant arrays have a single buffer
         let array = ConstantArray::new(10i32, 20);
         assert_eq!(array.nbuffers(), 1, "Array should have a single buffer");
         write_and_read(&array.into_array());
+    }
+
+    #[test]
+    fn array_ipc_writes_decimal_widen() -> VortexResult<()> {
+        let values = DecimalArray::new(
+            buffer![-125i32, 50, 900],
+            DecimalDType::new(9, 2),
+            Validity::from_iter([true, false, true]),
+        );
+        let dtype = DType::Decimal(DecimalDType::new(38, 2), Nullability::Nullable);
+        let array = WidenArray::try_new(values.into_array(), dtype)?.into_array();
+
+        let mut ipc_bytes = BytesMut::new();
+        let mut encoder = MessageEncoder::new(SESSION.clone());
+        for buf in encoder.encode(EncoderMessage::Array(&array))? {
+            ipc_bytes.extend_from_slice(buf.as_ref());
+        }
+
+        let (array_parts, ctx, row_count) =
+            match MessageDecoder::default().read_next(&mut ipc_bytes)? {
+                PollRead::Some(DecoderMessage::Array(array_parts)) => array_parts,
+                otherwise => vortex_panic!("Expected an array, got {:?}", otherwise),
+            };
+        let actual = array_parts.decode(array.dtype(), row_count, &ctx, &SESSION)?;
+
+        assert!(!ctx.ids().contains(&ArrayVTable::id(&Widen)));
+        assert_arrays_eq!(actual, array, &mut SESSION.create_execution_ctx());
+
+        Ok(())
     }
 }

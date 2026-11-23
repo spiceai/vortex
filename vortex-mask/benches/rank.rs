@@ -6,8 +6,12 @@
 #![allow(clippy::unwrap_used, clippy::cast_possible_truncation)]
 
 use divan::Bencher;
+use mimalloc::MiMalloc;
 use vortex_buffer::BitBuffer;
 use vortex_mask::Mask;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 fn main() {
     // Pre-resolve the one-time CpuKernel selections on the rank/select path so no
@@ -18,14 +22,7 @@ fn main() {
     divan::main();
 }
 
-const BENCH_SIZES: &[(usize, f64)] = &[
-    (1_024, 0.1),
-    (1_024, 0.9),
-    (16_384, 0.1),
-    (16_384, 0.9),
-    (65_536, 0.1),
-    (65_536, 0.9),
-];
+const BENCH_SIZES: &[(usize, f64)] = &[(16_384, 0.1), (16_384, 0.9), (65_536, 0.1), (65_536, 0.9)];
 
 fn create_mask(len: usize, density: f64) -> Mask {
     Mask::from_buffer(BitBuffer::from_iter((0..len).map(|i| {

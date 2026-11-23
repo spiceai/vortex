@@ -17,7 +17,7 @@ use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::Patched;
 use vortex_error::VortexResult;
-use vortex_error::vortex_ensure;
+use vortex_error::vortex_ensure_eq;
 use vortex_error::vortex_err;
 use vortex_session::VortexSession;
 
@@ -38,6 +38,14 @@ impl ArrayPlugin for ALPPatchedPlugin {
         ArrayVTable::id(&ALP)
     }
 
+    fn read_ids(&self) -> Vec<ArrayId> {
+        vec![self.id()]
+    }
+
+    fn write_ids(&self) -> Vec<ArrayId> {
+        vec![self.id()]
+    }
+
     fn serialize(
         &self,
         array: &ArrayRef,
@@ -52,10 +60,10 @@ impl ArrayPlugin for ALPPatchedPlugin {
         parts: ArrayDeserialization<'_>,
         session: &VortexSession,
     ) -> VortexResult<ArrayRef> {
-        vortex_ensure!(
-            parts.serialized_id == self.id(),
-            "ALP plugin does not recognize serialized ID {}",
+        vortex_ensure_eq!(
             parts.serialized_id,
+            self.id(),
+            "ALP plugin does not recognize serialized ID"
         );
         let alp_array = Array::<ALP>::try_from_parts(ArrayVTable::deserialize(
             &ALP,
@@ -105,6 +113,7 @@ mod tests {
     use vortex_array::arrays::PatchedArray;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::arrays::patched::PatchedArraySlotsExt;
+    use vortex_array::assert_arrays_eq;
     use vortex_array::buffer::BufferHandle;
     use vortex_array::session::ArraySessionExt;
     use vortex_error::VortexResult;
@@ -118,7 +127,7 @@ mod tests {
     use crate::alp_encode;
 
     static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
-        let session = vortex_array::array_session();
+        let session = VortexSession::empty();
         session.arrays().register(ALPPatchedPlugin);
         session
     });
@@ -160,6 +169,8 @@ mod tests {
             ),
             &SESSION,
         )?;
+
+        assert_arrays_eq!(deserialized, parray, &mut SESSION.create_execution_ctx());
 
         let patched: PatchedArray = deserialized
             .try_downcast()
@@ -212,6 +223,8 @@ mod tests {
             ),
             &SESSION,
         )?;
+
+        assert_arrays_eq!(deserialized, parray, &mut SESSION.create_execution_ctx());
 
         let result = deserialized
             .try_downcast::<ALP>()

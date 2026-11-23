@@ -3,12 +3,10 @@ name = "vortex-bench"
 authors = { workspace = true }
 description = "End to end vortex benchmarks"
 edition = { workspace = true }
-homepage = { workspace = true }
 include = { workspace = true }
 keywords = { workspace = true }
 license = { workspace = true }
 publish = false
-readme = "README.md"
 repository = { workspace = true }
 rust-version = { workspace = true }
 version = { workspace = true }
@@ -33,6 +31,8 @@ vortex-tensor = { workspace = true } # TODO(connor): In the future, this might b
 
 anyhow = { workspace = true }
 arrow-array = { workspace = true }
+arrow-buffer = { workspace = true }
+arrow-cast = { workspace = true }
 arrow-ipc = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-select = { workspace = true }
@@ -50,17 +50,18 @@ glob = { workspace = true }
 humansize = { workspace = true }
 indicatif = { workspace = true, features = ["futures"] }
 itertools = { workspace = true }
+libmimalloc-sys = { workspace = true }
 mimalloc = { workspace = true }
 noodles-bgzf = { workspace = true, features = ["async"] }
 noodles-vcf = { workspace = true, features = ["async"] }
+object_store = { workspace = true, features = ["aws"] }
 parking_lot = { workspace = true }
-parquet = { workspace = true, features = ["async"] }
+parquet = { workspace = true, features = ["async", "object_store"] }
 rand = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true, features = ["stream"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
 spatialbench = { workspace = true }
 spatialbench-arrow = { workspace = true }
 spatialbench-parquet = { workspace = true }
@@ -71,6 +72,8 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
+tpcdsgen = { workspace = true }
+tpcdsgen-arrow = { workspace = true }
 tpchgen = { workspace = true }
 tpchgen-arrow = { workspace = true }
 tracing = { workspace = true }
@@ -87,3 +90,4 @@ wkb = { workspace = true }
 [dev-dependencies]
 insta = { workspace = true }
 rstest = { workspace = true }
+vortex-array = { workspace = true, features = ["_test-harness"] }

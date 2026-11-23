@@ -11,6 +11,7 @@ use smallvec::smallvec;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
+use vortex_error::vortex_ensure_eq;
 use vortex_error::vortex_panic;
 use vortex_mask::Mask;
 use vortex_session::VortexSession;
@@ -19,6 +20,7 @@ use vortex_session::registry::CachedId;
 use crate::ArrayEq;
 use crate::ArrayHash;
 use crate::ArrayRef;
+use crate::ArraySlots;
 use crate::Canonical;
 use crate::EqMode;
 use crate::ExecutionCtx;
@@ -36,13 +38,11 @@ use crate::arrays::BoolArray;
 use crate::arrays::ChunkedArray;
 use crate::arrays::ConstantArray;
 use crate::arrays::DictArray;
-use crate::arrays::Filter;
 use crate::arrays::FilterArray;
 use crate::arrays::Primitive;
 use crate::arrays::PrimitiveArray;
 use crate::arrays::StructArray;
 use crate::arrays::VarBinViewArray;
-use crate::arrays::filter::FilterArraySlotsExt;
 use crate::assert_arrays_eq;
 use crate::buffer::BufferHandle;
 use crate::dtype::DType;
@@ -85,22 +85,24 @@ fn stack_parent_session() -> VortexSession {
 }
 
 fn stack_child() -> VortexResult<ArrayRef> {
-    Ok(
-        Array::try_from_parts(ArrayParts::new(StackChild, test_dtype(), 3, StackChildData))?
-            .into_array(),
-    )
+    Ok(Array::try_from_parts(ArrayParts::new(
+        StackChild,
+        test_dtype(),
+        3,
+        StackChildData,
+        ArraySlots::new(),
+    ))?
+    .into_array())
 }
 
 fn stack_parent(child: ArrayRef) -> VortexResult<ArrayRef> {
-    Ok(Array::try_from_parts(
-        ArrayParts::new(
-            StackParent,
-            child.dtype().clone(),
-            child.len(),
-            StackParentData,
-        )
-        .with_slots(smallvec![Some(child)]),
-    )?
+    Ok(Array::try_from_parts(ArrayParts::new(
+        StackParent,
+        child.dtype().clone(),
+        child.len(),
+        StackParentData,
+        smallvec![Some(child)],
+    ))?
     .into_array())
 }
 
@@ -153,14 +155,14 @@ impl VTable for StackParent {
         len: usize,
         slots: &[Option<ArrayRef>],
     ) -> VortexResult<()> {
-        vortex_ensure!(dtype == &test_dtype(), "unexpected stack parent dtype");
-        vortex_ensure!(len == 3, "unexpected stack parent length");
-        vortex_ensure!(slots.len() == 1, "stack parent must have one child slot");
+        vortex_ensure_eq!(dtype, &test_dtype(), "unexpected stack parent dtype");
+        vortex_ensure_eq!(len, 3, "unexpected stack parent length");
+        vortex_ensure_eq!(slots.len(), 1, "unexpected stack parent slot count");
         let Some(child) = &slots[0] else {
             vortex_bail!("stack parent child slot is missing");
         };
-        vortex_ensure!(child.dtype() == dtype, "stack parent child dtype mismatch");
-        vortex_ensure!(child.len() == len, "stack parent child length mismatch");
+        vortex_ensure_eq!(child.dtype(), dtype, "stack parent child dtype mismatch");
+        vortex_ensure_eq!(child.len(), len, "stack parent child length mismatch");
         Ok(())
     }
 
@@ -267,8 +269,8 @@ impl VTable for StackChild {
         len: usize,
         slots: &[Option<ArrayRef>],
     ) -> VortexResult<()> {
-        vortex_ensure!(dtype == &test_dtype(), "unexpected stack child dtype");
-        vortex_ensure!(len == 3, "unexpected stack child length");
+        vortex_ensure_eq!(dtype, &test_dtype(), "unexpected stack child dtype");
+        vortex_ensure_eq!(len, 3, "unexpected stack child length");
         vortex_ensure!(slots.is_empty(), "stack child must not have slots");
         Ok(())
     }
@@ -385,7 +387,7 @@ optimize root=vortex.filter(i32, len=4) session=false
 }
 
 #[test]
-fn trace_optimize_parent_reduce_fixpoint_attempts() -> VortexResult<()> {
+fn trace_optimize_contiguous_filter() -> VortexResult<()> {
     let values = PrimitiveArray::from_iter([0i32, 1, 2, 3, 4, 5]).into_array();
     let inner = FilterArray::try_new(
         values,
@@ -402,8 +404,7 @@ fn trace_optimize_parent_reduce_fixpoint_attempts() -> VortexResult<()> {
         || outer.optimize(),
     )?;
 
-    let optimized_filter = traced.output.as_::<Filter>();
-    assert!(optimized_filter.child().is::<Primitive>());
+    assert!(traced.output.is::<Primitive>());
     assert_arrays_eq!(
         traced.output,
         PrimitiveArray::from_iter([2i32, 3]),
@@ -411,8 +412,17 @@ fn trace_optimize_parent_reduce_fixpoint_attempts() -> VortexResult<()> {
     );
     insta::assert_snapshot!(traced.trace.to_string(), @r"
     optimize root=vortex.filter(i32, len=2) session=false
-      reduce_parent static:FilterReduceAdaptor(Filter) slot=0 parent=vortex.filter(i32, len=2) child=vortex.filter(i32, len=4) -> vortex.filter(i32, len=2)
-      done output=vortex.filter(i32, len=2)
+      optimize root=vortex.slice(i32, len=2) session=false
+        optimize root=vortex.slice(i32, len=2) session=false
+          reduce_parent static:SliceReduceAdaptor(Primitive) slot=0 parent=vortex.slice(i32, len=2) child=vortex.primitive(i32, len=6) -> vortex.primitive(i32, len=2)
+          done output=vortex.primitive(i32, len=2)
+        optimize root=vortex.filter(i32, len=2) session=false
+          reduce TrivialFilterRule: vortex.filter(i32, len=2) -> vortex.primitive(i32, len=2)
+          done output=vortex.primitive(i32, len=2)
+        reduce_parent static:SliceReduceAdaptor(Filter) slot=0 parent=vortex.slice(i32, len=2) child=vortex.filter(i32, len=4) -> vortex.primitive(i32, len=2)
+        done output=vortex.primitive(i32, len=2)
+      reduce TrivialFilterRule: vortex.filter(i32, len=2) -> vortex.primitive(i32, len=2)
+      done output=vortex.primitive(i32, len=2)
     ");
 
     let mut ctx = ExecutionCtx::new(VortexSession::empty().with::<ArraySession>());
@@ -434,21 +444,20 @@ fn trace_optimize_parent_reduce_fixpoint_attempts() -> VortexResult<()> {
         &mut execution_ctx()
     );
     insta::assert_snapshot!(traced.trace.to_string(), @"
-    execute_until target=AnyCanonical root=vortex.filter(i32, len=2)
-      iter 0 current=vortex.filter(i32, len=2) builder_active=false
-        Done array=vortex.slice(i32, len=2)
-      iter 1 current=vortex.slice(i32, len=2) builder_active=false
-        ExecuteSlot slot=0 parent=vortex.slice(i32, len=2) child=vortex.filter(i32, len=4)
-      iter 2 current=vortex.filter(i32, len=4) stack_parent=vortex.slice(i32, len=2) slot=0 builder_active=false
-        Done array=vortex.primitive(i32, len=4)
-      iter 3 current=vortex.primitive(i32, len=4) stack_parent=vortex.slice(i32, len=2) slot=0 builder_active=false
-        pop_frame slot=0 output=vortex.slice(i32, len=2)
-      iter 4 current=vortex.slice(i32, len=2) builder_active=false
-    optimize root=vortex.slice(i32, len=2) session=false
-      reduce_parent static:SliceReduceAdaptor(Primitive) slot=0 parent=vortex.slice(i32, len=2) child=vortex.primitive(i32, len=4) -> vortex.primitive(i32, len=2)
+    optimize root=vortex.filter(i32, len=2) session=true
+      optimize root=vortex.slice(i32, len=2) session=false
+        optimize root=vortex.slice(i32, len=2) session=false
+          reduce_parent static:SliceReduceAdaptor(Primitive) slot=0 parent=vortex.slice(i32, len=2) child=vortex.primitive(i32, len=6) -> vortex.primitive(i32, len=2)
+          done output=vortex.primitive(i32, len=2)
+        optimize root=vortex.filter(i32, len=2) session=false
+          reduce TrivialFilterRule: vortex.filter(i32, len=2) -> vortex.primitive(i32, len=2)
+          done output=vortex.primitive(i32, len=2)
+        reduce_parent static:SliceReduceAdaptor(Filter) slot=0 parent=vortex.slice(i32, len=2) child=vortex.filter(i32, len=4) -> vortex.primitive(i32, len=2)
+        done output=vortex.primitive(i32, len=2)
+      reduce TrivialFilterRule: vortex.filter(i32, len=2) -> vortex.primitive(i32, len=2)
       done output=vortex.primitive(i32, len=2)
-        Done array=vortex.primitive(i32, len=2)
-      iter 5 current=vortex.primitive(i32, len=2) builder_active=false
+    execute_until target=AnyCanonical root=vortex.primitive(i32, len=2)
+      iter 0 current=vortex.primitive(i32, len=2) builder_active=false
       return output=vortex.primitive(i32, len=2)
     ");
 
@@ -457,9 +466,6 @@ fn trace_optimize_parent_reduce_fixpoint_attempts() -> VortexResult<()> {
 
 /// A filter whose mask is not one contiguous run cannot be answered as a slice, so it has to
 /// execute through its child.
-///
-/// The test above happens to build a contiguous combined mask, which short-circuits before the
-/// child is reached; without this case no trace would cover an executed filter at all.
 #[test]
 fn trace_execute_filter_with_scattered_mask() -> VortexResult<()> {
     let values = PrimitiveArray::from_iter([0i32, 1, 2, 3, 4, 5]).into_array();
@@ -490,16 +496,13 @@ fn trace_execute_filter_with_scattered_mask() -> VortexResult<()> {
         &mut execution_ctx()
     );
     insta::assert_snapshot!(traced.trace.to_string(), @"
+    optimize root=vortex.filter(i32, len=2) session=true
+      reduce_parent static:FilterReduceAdaptor(Filter) slot=0 parent=vortex.filter(i32, len=2) child=vortex.filter(i32, len=4) -> vortex.filter(i32, len=2)
+      done output=vortex.filter(i32, len=2)
     execute_until target=AnyCanonical root=vortex.filter(i32, len=2)
       iter 0 current=vortex.filter(i32, len=2) builder_active=false
-        ExecuteSlot slot=0 parent=vortex.filter(i32, len=2) child=vortex.filter(i32, len=4)
-      iter 1 current=vortex.filter(i32, len=4) stack_parent=vortex.filter(i32, len=2) slot=0 builder_active=false
-        Done array=vortex.primitive(i32, len=4)
-      iter 2 current=vortex.primitive(i32, len=4) stack_parent=vortex.filter(i32, len=2) slot=0 builder_active=false
-        pop_frame slot=0 output=vortex.filter(i32, len=2)
-      iter 3 current=vortex.filter(i32, len=2) builder_active=false
         Done array=vortex.primitive(i32, len=2)
-      iter 4 current=vortex.primitive(i32, len=2) builder_active=false
+      iter 1 current=vortex.primitive(i32, len=2) builder_active=false
       return output=vortex.primitive(i32, len=2)
     ");
 
@@ -527,6 +530,16 @@ fn trace_execution_stack_parent_kernel_attempts(
         &mut ctx
     );
     insta::assert_snapshot!(traced.trace.to_string(), @"
+    optimize root=vortex.test.stack-parent(i32, len=3) session=true
+      loop input=vortex.test.stack-parent(i32, len=3)
+        reduce none array=vortex.test.stack-parent(i32, len=3)
+        reduce_parent none array=vortex.test.stack-parent(i32, len=3)
+      done output=vortex.test.stack-parent(i32, len=3) changed=false
+    optimize root=vortex.test.stack-child(i32, len=3) session=true
+      loop input=vortex.test.stack-child(i32, len=3)
+        reduce none array=vortex.test.stack-child(i32, len=3)
+        reduce_parent none array=vortex.test.stack-child(i32, len=3)
+      done output=vortex.test.stack-child(i32, len=3) changed=false
     execute_until target=AnyCanonical root=vortex.test.stack-parent(i32, len=3)
       iter 0 current=vortex.test.stack-parent(i32, len=3) builder_active=false
         done_check target=false canonical=false

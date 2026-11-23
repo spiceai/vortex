@@ -3,7 +3,6 @@
 
 //! This module defines the default layout strategy for a Vortex file.
 
-use std::any::Any;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -11,23 +10,27 @@ use vortex_array::dtype::FieldPath;
 use vortex_btrblocks::BtrBlocksCompressorBuilder;
 use vortex_btrblocks::SchemeExt;
 use vortex_btrblocks::schemes::integer::IntDictScheme;
+use vortex_edition::ComponentKind;
+use vortex_edition::EditionSessionExt;
 use vortex_error::VortexExpect;
 use vortex_layout::LayoutStrategy;
+use vortex_layout::VTable;
 use vortex_layout::layouts::buffered::BufferedStrategy;
 use vortex_layout::layouts::chunked::writer::ChunkedLayoutStrategy;
 use vortex_layout::layouts::collect::CollectStrategy;
 use vortex_layout::layouts::compressed::CompressingStrategy;
 use vortex_layout::layouts::compressed::CompressorPlugin;
+use vortex_layout::layouts::dict::writer::DictLayoutOptions;
 use vortex_layout::layouts::dict::writer::DictStrategy;
 use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
+use vortex_layout::layouts::list::List;
 use vortex_layout::layouts::list::writer::ListLayoutStrategy;
 use vortex_layout::layouts::repartition::RepartitionStrategy;
 use vortex_layout::layouts::repartition::RepartitionWriterOptions;
 use vortex_layout::layouts::table::TableStrategy;
-use vortex_layout::layouts::table::use_experimental_list_layout;
 use vortex_layout::layouts::zoned::writer::ZonedLayoutOptions;
 use vortex_layout::layouts::zoned::writer::ZonedStrategy;
-use vortex_session::SessionVar;
+use vortex_session::VortexSession;
 use vortex_utils::aliases::hash_map::HashMap;
 
 const ONE_MEG: u64 = 1 << 20;
@@ -91,34 +94,26 @@ impl std::fmt::Debug for WriteStrategyBuilder {
     }
 }
 
-impl SessionVar for WriteStrategyBuilder {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-}
-
-impl Default for WriteStrategyBuilder {
-    /// Create a new empty builder. It can be further configured,
-    /// and then finally built yielding the [`LayoutStrategy`].
-    fn default() -> Self {
+impl WriteStrategyBuilder {
+    /// Create a new builder that compresses with the schemes registered on `session`. It can be
+    /// further configured, and then finally built yielding the [`LayoutStrategy`].
+    pub fn from_session(session: &VortexSession) -> Self {
         Self {
-            compressor: CompressorConfig::BtrBlocks(BtrBlocksCompressorBuilder::default()),
+            compressor: CompressorConfig::BtrBlocks(BtrBlocksCompressorBuilder::from_session(
+                session,
+            )),
             row_block_size: 8192,
             data_block_target_bytes: Some(ONE_MEG),
             data_block_max_bytes: None,
             field_writers: HashMap::new(),
             flat_strategy: None,
             probe_compressor: None,
-            use_list_layout: use_experimental_list_layout(),
+            use_list_layout: session
+                .enabled_component_ids(ComponentKind::Layout)
+                .contains(&List.id()),
         }
     }
-}
 
-impl WriteStrategyBuilder {
     /// Override the row block size used for row repartitioning and zoned statistics.
     ///
     /// Larger blocks reduce footer/statistics overhead. Smaller blocks can improve pruning and
@@ -150,17 +145,6 @@ impl WriteStrategyBuilder {
     /// `None`, the default, leaves blocks at the row block size.
     pub fn with_data_block_max_bytes(mut self, max_bytes: Option<u64>) -> Self {
         self.data_block_max_bytes = max_bytes;
-        self
-    }
-
-    /// Enable writing list fields with [`ListLayoutStrategy`].
-    ///
-    /// **Note**: this is an unstable and experimental layout that is expected to change.
-    /// Using it may lead to unreadable files in the future.
-    ///
-    /// [`ListLayoutStrategy`]: vortex_layout::layouts::list::writer::ListLayoutStrategy
-    pub fn with_list_layout(mut self) -> Self {
-        self.use_list_layout = true;
         self
     }
 
@@ -284,7 +268,10 @@ impl WriteStrategyBuilder {
             coalescing.clone(),
             compress_then_flat.clone(),
             coalescing,
-            Default::default(),
+            DictLayoutOptions {
+                probe_len: self.row_block_size,
+                ..Default::default()
+            },
             probe_compressor,
         );
 

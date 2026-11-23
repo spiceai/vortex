@@ -9,7 +9,7 @@ use vortex_session::registry::CachedId;
 use crate::ArrayRef;
 use crate::Columnar;
 use crate::ExecutionCtx;
-use crate::IntoArray;
+use crate::aggregate_fn::AggregateArgs;
 use crate::aggregate_fn::AggregateFnId;
 use crate::aggregate_fn::AggregateFnRef;
 use crate::aggregate_fn::AggregateFnSatisfaction;
@@ -17,6 +17,7 @@ use crate::aggregate_fn::AggregateFnVTable;
 use crate::aggregate_fn::NumericalAggregateOpts;
 use crate::aggregate_fn::fns::bounded_min::BoundedMin;
 use crate::aggregate_fn::fns::min_max::MinMax;
+use crate::aggregate_fn::fns::min_max::columnar_min_max;
 use crate::aggregate_fn::fns::min_max::min_max;
 use crate::aggregate_fn::fns::min_max::nan_scalar;
 use crate::aggregate_fn::fns::min_max::scalar_is_nan;
@@ -38,37 +39,43 @@ pub struct Min;
 /// Partial accumulator state for the minimum aggregate.
 pub struct MinPartial {
     min: Option<Scalar>,
-    element_dtype: DType,
-    skip_nans: bool,
 }
 
 impl MinPartial {
-    fn merge(&mut self, min: Scalar) {
+    fn merge(
+        &mut self,
+        args: AggregateArgs<'_, NumericalAggregateOpts>,
+        min: Scalar,
+    ) -> VortexResult<()> {
         if min.is_null() {
-            return;
+            return Ok(());
         }
 
         // NaN scalars are incomparable under `partial_min`; they poison the minimum when NaNs
         // participate, and are dropped when they are skipped.
         if scalar_is_nan(&min) || self.is_poisoned() {
-            if !self.skip_nans {
-                self.poison();
+            if !args.options.skip_nans {
+                self.poison(args)?;
             }
-            return;
+            return Ok(());
         }
 
         self.min = Some(match self.min.take() {
             Some(current) => partial_min(min, current).vortex_expect("incomparable min scalars"),
             None => min,
         });
+
+        Ok(())
     }
 
-    fn poison(&mut self) {
-        self.min = Some(nan_scalar(&self.element_dtype));
+    fn poison(&mut self, args: AggregateArgs<'_, NumericalAggregateOpts>) -> VortexResult<()> {
+        self.min = Some(nan_scalar(args.dtype)?);
+
+        Ok(())
     }
 
     fn is_poisoned(&self) -> bool {
-        self.element_dtype.is_float() && self.min.as_ref().is_some_and(scalar_is_nan)
+        self.min.as_ref().is_some_and(scalar_is_nan)
     }
 }
 
@@ -123,61 +130,83 @@ impl AggregateFnVTable for Min {
 
     fn empty_partial(
         &self,
-        options: &Self::Options,
-        input_dtype: &DType,
+        _args: AggregateArgs<'_, Self::Options>,
     ) -> VortexResult<Self::Partial> {
-        Ok(MinPartial {
-            min: None,
-            element_dtype: input_dtype.clone(),
-            skip_nans: options.skip_nans,
-        })
+        Ok(MinPartial { min: None })
     }
 
-    fn combine_partials(&self, partial: &mut Self::Partial, other: Scalar) -> VortexResult<()> {
-        partial.merge(other);
-        Ok(())
+    fn partial_from_scalar(
+        &self,
+        args: AggregateArgs<'_, Self::Options>,
+        scalar: &Scalar,
+    ) -> VortexResult<Self::Partial> {
+        let mut partial = MinPartial { min: None };
+        // `merge` normalizes the parsed scalar: nulls stay empty and NaNs poison or drop.
+        partial.merge(args, scalar.clone())?;
+        Ok(partial)
     }
 
-    fn to_scalar(&self, partial: &Self::Partial) -> VortexResult<Scalar> {
-        let dtype = partial.element_dtype.as_nullable();
+    fn merge_partials(
+        &self,
+        args: AggregateArgs<'_, Self::Options>,
+        mut first: Self::Partial,
+        second: Self::Partial,
+    ) -> VortexResult<Self::Partial> {
+        if let Some(min) = second.min {
+            first.merge(args, min)?;
+        }
+        Ok(first)
+    }
+
+    fn to_scalar(
+        &self,
+        args: AggregateArgs<'_, Self::Options>,
+        partial: &Self::Partial,
+    ) -> VortexResult<Scalar> {
+        let dtype = args.dtype.as_nullable();
         match &partial.min {
             Some(min) => min.cast(&dtype),
             None => Ok(Scalar::null(dtype)),
         }
     }
 
-    fn reset(&self, partial: &mut Self::Partial) {
-        partial.min = None;
-    }
-
-    fn is_saturated(&self, partial: &Self::Partial) -> bool {
+    fn is_saturated(
+        &self,
+        _args: AggregateArgs<'_, Self::Options>,
+        partial: &Self::Partial,
+    ) -> bool {
         // A poisoned NaN-including minimum is fully determined.
         partial.is_poisoned()
     }
 
     fn try_accumulate(
         &self,
+        args: AggregateArgs<'_, Self::Options>,
         partial: &mut Self::Partial,
         batch: &ArrayRef,
-        _ctx: &mut ExecutionCtx,
+        ctx: &mut ExecutionCtx,
     ) -> VortexResult<bool> {
-        // NaN-aware shortcircuits only apply to the NaN-including float minimum; everything else
-        // takes the default dispatch path.
-        if partial.skip_nans || !partial.element_dtype.is_float() {
-            return Ok(false);
+        if args.options.skip_nans || !args.dtype.is_float() {
+            // `min_max` computes both extrema in one pass and caches both on `batch`, so a
+            // `Max` over the same batch reads the cached value instead of a second scan.
+            if let Some(result) = min_max(batch, ctx, *args.options)? {
+                partial.merge(args, result.min)?;
+            }
+            return Ok(true);
         }
+
         match batch.statistics().get_as::<u64>(Stat::NaNCount) {
             Precision::Exact(0) => {
                 // NaN-free batch: the cached NaN-skipping minimum (if any) is valid. `to_scalar`
                 // re-casts to the result dtype, so the cached scalar can merge as-is.
                 if let Some(min) = batch.statistics().get(Stat::Min).as_exact() {
-                    partial.merge(min);
+                    partial.merge(args, min)?;
                     return Ok(true);
                 }
                 Ok(false)
             }
             Precision::Exact(_) => {
-                partial.poison();
+                partial.poison(args)?;
                 Ok(true)
             }
             _ => Ok(false),
@@ -186,38 +215,43 @@ impl AggregateFnVTable for Min {
 
     fn accumulate(
         &self,
+        args: AggregateArgs<'_, Self::Options>,
         partial: &mut Self::Partial,
         batch: &Columnar,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<()> {
         // Delegate to the existing min_max implementation for now. A dedicated min aggregate
         // would avoid computing max when only min is needed.
-        let array = match batch {
-            Columnar::Canonical(canonical) => canonical.clone().into_array(),
-            Columnar::Constant(constant) => constant.clone().into_array(),
-        };
-        let options = NumericalAggregateOpts {
-            skip_nans: partial.skip_nans,
-        };
-        if let Some(result) = min_max(&array, ctx, options)? {
-            partial.merge(result.min);
+        if let Some(result) = columnar_min_max(batch, *args.options, ctx)? {
+            partial.merge(args, result.min)?;
         }
         Ok(())
     }
 
-    fn finalize(&self, partials: ArrayRef) -> VortexResult<ArrayRef> {
+    fn finalize(
+        &self,
+        _args: AggregateArgs<'_, Self::Options>,
+        partials: ArrayRef,
+    ) -> VortexResult<ArrayRef> {
         Ok(partials)
     }
 
-    fn finalize_scalar(&self, partial: &Self::Partial) -> VortexResult<Scalar> {
-        self.to_scalar(partial)
+    fn finalize_scalar(
+        &self,
+        args: AggregateArgs<'_, Self::Options>,
+        partial: &Self::Partial,
+    ) -> VortexResult<Scalar> {
+        self.to_scalar(args, partial)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use vortex_buffer::buffer;
     use vortex_error::VortexResult;
+    use vortex_session::VortexSession;
 
     use crate::IntoArray as _;
     use crate::VortexSessionExecute;
@@ -225,7 +259,6 @@ mod tests {
     use crate::aggregate_fn::DynAccumulator;
     use crate::aggregate_fn::NumericalAggregateOpts;
     use crate::aggregate_fn::fns::min::Min;
-    use crate::array_session;
     use crate::arrays::PrimitiveArray;
     use crate::dtype::DType;
     use crate::dtype::Nullability;
@@ -236,9 +269,11 @@ mod tests {
     use crate::scalar::ScalarValue;
     use crate::validity::Validity;
 
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
+
     #[test]
     fn min_aggregate_fn() -> VortexResult<()> {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
         let mut acc = Accumulator::try_new(Min, NumericalAggregateOpts::default(), dtype)?;
 
@@ -269,7 +304,7 @@ mod tests {
 
     #[test]
     fn min_with_nan_not_skipping() -> VortexResult<()> {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let dtype = DType::Primitive(PType::F64, Nullability::NonNullable);
         let mut acc = Accumulator::try_new(Min, NumericalAggregateOpts::include_nans(), dtype)?;
 
@@ -289,11 +324,11 @@ mod tests {
     }
 
     #[test]
-    fn min_not_skipping_shortcircuits_on_exact_nan_count_stat() -> VortexResult<()> {
-        let mut ctx = array_session().create_execution_ctx();
-        // The array has no NaNs; a planted exact NaNCount stat proves the poisoning came from
-        // the stat rather than a scan.
-        let batch = PrimitiveArray::new(buffer![1.0f64, 2.0], Validity::NonNullable).into_array();
+    fn min_not_skipping_with_exact_nan_count_stat() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        // The exact NaN count agrees with the batch; including NaNs must poison the result.
+        let batch =
+            PrimitiveArray::new(buffer![1.0f64, 2.0, f64::NAN], Validity::NonNullable).into_array();
         batch
             .statistics()
             .set(Stat::NaNCount, Precision::Exact(ScalarValue::from(1u64)));
@@ -317,7 +352,7 @@ mod tests {
     fn min_nan_including_nullable_cached_stat() -> VortexResult<()> {
         // A nullable float array's cached Min stat is reconstructed as a nullable scalar. The
         // NaN-including shortcircuit merges it as-is; `to_scalar` re-casts to the result dtype.
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let array =
             PrimitiveArray::from_option_iter([Some(1.0f64), Some(2.0), Some(3.0)]).into_array();
         array
@@ -341,11 +376,11 @@ mod tests {
 
     #[test]
     fn min_casts_nonnullable_legacy_stat_to_nullable_partial() -> VortexResult<()> {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let batch = PrimitiveArray::new(buffer![10i32, 20], Validity::NonNullable).into_array();
         batch
             .statistics()
-            .set(Stat::Min, Precision::Exact(ScalarValue::from(3i32)));
+            .set(Stat::Min, Precision::Exact(ScalarValue::from(10i32)));
         let mut acc = Accumulator::try_new(
             Min,
             NumericalAggregateOpts::default(),
@@ -356,7 +391,7 @@ mod tests {
 
         assert_eq!(
             acc.finish()?,
-            Scalar::primitive(3i32, Nullability::Nullable)
+            Scalar::primitive(10i32, Nullability::Nullable)
         );
         Ok(())
     }

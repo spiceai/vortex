@@ -4,18 +4,18 @@
 use flatbuffers::FlatBufferBuilder;
 use flatbuffers::Follow;
 use flatbuffers::WIPOffset;
+use vortex_array::flatbuffers::FlatBufferRoot;
+use vortex_array::flatbuffers::ReadFlatBuffer;
+use vortex_array::flatbuffers::WriteFlatBuffer;
 use vortex_buffer::Alignment;
 use vortex_error::VortexError;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
-use vortex_flatbuffers::FlatBufferRoot;
-use vortex_flatbuffers::ReadFlatBuffer;
-use vortex_flatbuffers::WriteFlatBuffer;
-use vortex_flatbuffers::footer as fb;
 use vortex_utils::aliases::hash_set::HashSet;
 
 use super::MAX_METADATA_KEY_BYTES;
 use super::MAX_METADATA_SEGMENTS;
+use crate::flatbuffers::footer as fb;
 
 /// The postscript captures the locations and compression for the initial segments required for
 /// reading a Vortex file.
@@ -274,10 +274,10 @@ impl ReadFlatBuffer for PostscriptSegment {
 
 #[cfg(test)]
 mod tests {
+    use vortex_array::flatbuffers::FlatBuffer;
+    use vortex_array::flatbuffers::ReadFlatBuffer;
+    use vortex_array::flatbuffers::WriteFlatBufferExt;
     use vortex_buffer::ByteBuffer;
-    use vortex_flatbuffers::FlatBuffer;
-    use vortex_flatbuffers::ReadFlatBuffer;
-    use vortex_flatbuffers::WriteFlatBufferExt;
 
     use super::*;
     use crate::MAX_POSTSCRIPT_SIZE;
@@ -344,7 +344,14 @@ mod tests {
         let postscript = Postscript::read_flatbuffer_bytes(&bytes).unwrap();
         assert_eq!(postscript.metadata.len(), MAX_METADATA_SEGMENTS);
         let mut total_key_bytes = 0;
-        for entry in &postscript.metadata {
+        for (index, entry) in postscript.metadata.iter().enumerate() {
+            assert_eq!(
+                entry.key,
+                format!("{index:0>width$}", width = MAX_METADATA_KEY_BYTES)
+            );
+            assert_eq!(entry.segment.offset, 2 + index as u64);
+            assert_eq!(entry.segment.length, 1);
+            assert_eq!(entry.segment.alignment, Alignment::none());
             assert_eq!(entry.key.len(), MAX_METADATA_KEY_BYTES);
             total_key_bytes += entry.key.len();
         }

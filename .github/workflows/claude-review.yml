@@ -3,10 +3,12 @@ name: Claude Code (Review)
 # Setup
 # - This workflow does not need the GitHub App private key.
 # - Do not attach the `claude-automation` environment here.
-# - Store `CLAUDE_CODE_OAUTH_TOKEN` as a repository or organization Actions secret.
-# - Create a repository or organization Actions variable:
+# - Anthropic auth is workload identity federation, so there is no Anthropic secret.
+# - Create repository or organization Actions variables:
 #   - CLAUDE_APP_LOGIN
 #     Set this to the bot login for the GitHub App, usually `<app-slug>[bot]`.
+#   - ANTHROPIC_ORGANIZATION_ID, ANTHROPIC_SERVICE_ACCOUNT_ID, ANTHROPIC_FEDERATION_RULE_CI
+#     Identifiers, not credentials.
 # - It may use the default GITHUB_TOKEN to read repository data and post review
 #   comments, but it must never be able to push commits or open branches.
 #
@@ -230,6 +232,8 @@ jobs:
       issues: write
       pull-requests: write
       actions: read
+      # Requests the OIDC token exchanged for an Anthropic one. No repo access.
+      id-token: write
     steps:
       - name: Checkout same-repo PR contents
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
@@ -242,9 +246,13 @@ jobs:
 
       - name: Run Claude Code in review-only mode
         id: claude
-        uses: anthropics/claude-code-action@fbda2eb1bdc90d319b8d853f5deb53bca199a7c1  # v1.0.140
+        uses: anthropics/claude-code-action@2dca132ff0e0c4094ce6048b422c6915a071210b  # v1.0.247
         with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # The `vortex-claude-ci` rule refuses any run off the default branch.
+          anthropic_federation_rule_id: ${{ vars.ANTHROPIC_FEDERATION_RULE_CI }}
+          anthropic_organization_id: ${{ vars.ANTHROPIC_ORGANIZATION_ID }}
+          anthropic_service_account_id: ${{ vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+
           # This workflow deliberately uses the built-in token because it only needs
           # to read repository state and post review comments. It cannot write repo
           # contents, and it has no access to the GitHub App private key.
@@ -254,6 +262,6 @@ jobs:
             actions: read
 
           claude_args: |
-            --model claude-opus-4-8
+            --model claude-opus-5-5
             --allowedTools "Read,Grep,Glob,Bash(git diff:*),Bash(git show:*),Bash(git log:*),Bash(head:*),Bash(jq:*),Bash(rg:*)"
-            --system-prompt "You are the repository's read-only Claude review workflow. Review the current same-repo pull request and respond in GitHub. Never modify files, never create commits, never push branches, and never open or update pull requests. Fork pull requests are blocked before this job starts."
+            --system-prompt "You review same-repository pull requests for this repository and reply in GitHub. This workflow is read-only: you can read the code and post comments, but you cannot change files, commits, branches or pull requests. If a request needs code changes, tell the maintainer to restate the task on an issue for the write workflow."

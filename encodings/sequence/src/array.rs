@@ -15,10 +15,12 @@ use vortex_array::ArrayHash;
 use vortex_array::ArrayId;
 use vortex_array::ArrayParts;
 use vortex_array::ArrayRef;
+use vortex_array::ArraySlots;
 use vortex_array::ArrayView;
 use vortex_array::EqMode;
 use vortex_array::ExecutionCtx;
 use vortex_array::ExecutionResult;
+use vortex_array::ProbeState;
 use vortex_array::buffer::BufferHandle;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::NativePType;
@@ -29,6 +31,7 @@ use vortex_array::expr::stats::Precision as StatPrecision;
 use vortex_array::expr::stats::Stat;
 use vortex_array::match_each_integer_ptype;
 use vortex_array::match_each_pvalue;
+use vortex_array::proto::scalar::ScalarValue as ProtoScalarValue;
 use vortex_array::scalar::PValue;
 use vortex_array::scalar::Scalar;
 use vortex_array::scalar::ScalarValue;
@@ -58,9 +61,9 @@ pub type SequenceArray = Array<Sequence>;
 #[derive(Clone, prost::Message)]
 pub struct SequenceMetadata {
     #[prost(message, tag = "1")]
-    base: Option<vortex_proto::scalar::ScalarValue>,
+    base: Option<ProtoScalarValue>,
     #[prost(message, tag = "2")]
-    multiplier: Option<vortex_proto::scalar::ScalarValue>,
+    multiplier: Option<ProtoScalarValue>,
 }
 
 pub(super) const SLOT_NAMES: [&str; 0] = [];
@@ -175,10 +178,8 @@ impl SequenceData {
     }
 
     /// The step's ptype: the serialized form preserves its signedness but not its width.
-    fn multiplier_ptype_from_proto(
-        multiplier: &vortex_proto::scalar::ScalarValue,
-    ) -> VortexResult<PType> {
-        use vortex_proto::scalar::scalar_value::Kind;
+    fn multiplier_ptype_from_proto(multiplier: &ProtoScalarValue) -> VortexResult<PType> {
+        use vortex_array::proto::scalar::scalar_value::Kind;
         match multiplier
             .kind
             .as_ref()
@@ -186,7 +187,9 @@ impl SequenceData {
         {
             Kind::Int64Value(_) => Ok(PType::I64),
             Kind::Uint64Value(_) => Ok(PType::U64),
-            _ => vortex_bail!("only integer ptypes are supported in SequenceArray currently"),
+            _ => {
+                vortex_bail!("only integer ptypes are supported in SequenceArray currently")
+            }
         }
     }
 
@@ -405,7 +408,13 @@ impl VTable for Sequence {
 
         let data =
             SequenceData::try_new(base, multiplier, *output_ptype, dtype.nullability(), len)?;
-        Ok(ArrayParts::new(self.clone(), dtype.clone(), len, data))
+        Ok(ArrayParts::new(
+            self.clone(),
+            dtype.clone(),
+            len,
+            data,
+            ArraySlots::new(),
+        ))
     }
 
     fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {
@@ -426,15 +435,26 @@ impl VTable for Sequence {
 }
 
 impl OperationsVTable<Sequence> for Sequence {
-    fn scalar_at(
-        array: ArrayView<'_, Sequence>,
+    type ProbeState = ();
+
+    fn probe_scalar(
+        state: &mut ProbeState<'_, Sequence>,
         index: usize,
         _ctx: &mut ExecutionCtx,
     ) -> VortexResult<Scalar> {
+        let array = state.array();
         Scalar::try_new(
             array.dtype().clone(),
             Some(ScalarValue::Primitive(array.index_value(index))),
         )
+    }
+
+    fn scalar_at(
+        array: ArrayView<'_, Sequence>,
+        index: usize,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Scalar> {
+        Self::probe_scalar(&mut ProbeState::once(array), index, ctx)
     }
 }
 
@@ -448,15 +468,27 @@ impl ValidityVTable<Sequence> for Sequence {
 pub struct Sequence;
 
 impl Sequence {
-    fn stats(multiplier: PValue) -> StatsSet {
-        // A sequence A[i] = base + i * multiplier is sorted iff multiplier >= 0,
-        // and strictly sorted iff multiplier > 0.
-        let (is_sorted, is_strict_sorted) = match_each_pvalue!(
+    /// Whether a sequence `A[i] = base + i * multiplier` of `length` elements is sorted, or
+    /// strictly sorted when `strict` is set.
+    ///
+    /// With at least two elements it is sorted iff multiplier >= 0, and strictly sorted iff
+    /// multiplier > 0. Zero or one elements have no adjacent pair to compare, so they are
+    /// strictly sorted whatever the multiplier.
+    pub(crate) fn is_sorted(multiplier: PValue, length: usize, strict: bool) -> bool {
+        if length <= 1 {
+            return true;
+        }
+        match_each_pvalue!(
             multiplier,
-            uint: |v| { (true, v > 0) },
-            int: |v| { (v >= 0, v > 0) },
+            uint: |v| { !strict || v > 0 },
+            int: |v| { if strict { v > 0 } else { v >= 0 } },
             float: |_v| { unreachable!("float multiplier not supported") }
-        );
+        )
+    }
+
+    fn stats(multiplier: PValue, length: usize) -> StatsSet {
+        let is_sorted = Self::is_sorted(multiplier, length, false);
+        let is_strict_sorted = Self::is_sorted(multiplier, length, true);
 
         // SAFETY: we don't have duplicate stats.
         unsafe {
@@ -487,10 +519,18 @@ impl Sequence {
         let dtype = DType::Primitive(ptype, nullability);
         let (base, multiplier) = SequenceData::normalize(base, multiplier, ptype)
             .vortex_expect("SequenceArray parts must be representable in the output ptype");
-        let stats = Self::stats(multiplier);
+        let stats = Self::stats(multiplier, length);
         let data = unsafe { SequenceData::new_unchecked(base, multiplier) };
-        unsafe { Array::from_parts_unchecked(ArrayParts::new(Sequence, dtype, length, data)) }
-            .with_stats_set(stats)
+        unsafe {
+            Array::from_parts_unchecked(ArrayParts::new(
+                Sequence,
+                dtype,
+                length,
+                data,
+                ArraySlots::new(),
+            ))
+        }
+        .with_stats_set(stats)
     }
 
     /// Construct a new [`SequenceArray`] from its components.
@@ -503,11 +543,17 @@ impl Sequence {
     ) -> VortexResult<SequenceArray> {
         let dtype = DType::Primitive(ptype, nullability);
         let data = SequenceData::try_new(base, multiplier, ptype, nullability, length)?;
-        let stats = Self::stats(data.multiplier());
-        Ok(
-            unsafe { Array::from_parts_unchecked(ArrayParts::new(Sequence, dtype, length, data)) }
-                .with_stats_set(stats),
-        )
+        let stats = Self::stats(data.multiplier(), length);
+        Ok(unsafe {
+            Array::from_parts_unchecked(ArrayParts::new(
+                Sequence,
+                dtype,
+                length,
+                data,
+                ArraySlots::new(),
+            ))
+        }
+        .with_stats_set(stats))
     }
 
     /// Construct a new typed [`SequenceArray`] from base/multiplier values.
@@ -520,11 +566,17 @@ impl Sequence {
         let ptype = T::PTYPE;
         let dtype = DType::Primitive(ptype, nullability);
         let data = SequenceData::try_new_typed(base, multiplier, nullability, length)?;
-        let stats = Self::stats(data.multiplier());
-        Ok(
-            unsafe { Array::from_parts_unchecked(ArrayParts::new(Sequence, dtype, length, data)) }
-                .with_stats_set(stats),
-        )
+        let stats = Self::stats(data.multiplier(), length);
+        Ok(unsafe {
+            Array::from_parts_unchecked(ArrayParts::new(
+                Sequence,
+                dtype,
+                length,
+                data,
+                ArraySlots::new(),
+            ))
+        }
+        .with_stats_set(stats))
     }
 }
 
@@ -548,7 +600,6 @@ mod tests {
     use vortex_array::expr::stats::StatsProviderExt;
     use vortex_array::scalar::PValue;
     use vortex_array::scalar::Scalar;
-    use vortex_array::scalar::ScalarValue;
     use vortex_array::serde::SerializeOptions;
     use vortex_array::serde::SerializedArray;
     use vortex_buffer::ByteBufferMut;
@@ -560,7 +611,7 @@ mod tests {
     use crate::Sequence;
 
     static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
-        let session = vortex_array::array_session();
+        let session = VortexSession::empty();
         crate::initialize(&session);
         session
     });
@@ -594,9 +645,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            scalar,
-            Scalar::try_new(scalar.dtype().clone(), Some(ScalarValue::from(8i64))).unwrap()
-        )
+            scalar.dtype(),
+            &DType::Primitive(PType::I64, Nullability::NonNullable)
+        );
+        assert_eq!(scalar, Scalar::from(8i64));
     }
 
     #[test]
@@ -656,6 +708,67 @@ mod tests {
             .statistics()
             .with_typed_stats_set(|s| s.get_as::<bool>(Stat::IsStrictSorted));
         assert_eq!(is_strict_sorted, StatPrecision::Exact(false));
+        Ok(())
+    }
+
+    #[rstest]
+    fn singleton_is_strict_sorted(#[values(-1i64, 0, 3)] multiplier: i64) -> VortexResult<()> {
+        let typed = Sequence::try_new_typed(10i64, multiplier, Nullability::NonNullable, 1)?;
+        let untyped = Sequence::try_new(
+            PValue::from(10i64),
+            PValue::from(multiplier),
+            PType::I64,
+            Nullability::NonNullable,
+            1,
+        )?;
+        let sliced = Sequence::try_new_typed(10i64, multiplier, Nullability::NonNullable, 4)?
+            .into_array()
+            .slice(1..2)?;
+        assert!(sliced.is::<Sequence>());
+
+        for array in [typed.into_array(), untyped.into_array(), sliced] {
+            for stat in [Stat::IsSorted, Stat::IsStrictSorted] {
+                let value = array
+                    .statistics()
+                    .with_typed_stats_set(|s| s.get_as::<bool>(stat));
+                assert_eq!(value, StatPrecision::Exact(true));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn decode_keeps_singleton_sorted_over_stale_hints() -> VortexResult<()> {
+        let array = Sequence::try_new_typed(10i64, -1, Nullability::NonNullable, 1)?.into_array();
+        // Older writers stored the multiplier-only answer for one-row sequences.
+        array
+            .statistics()
+            .set(Stat::IsSorted, StatPrecision::Exact(false.into()));
+        array
+            .statistics()
+            .set(Stat::IsStrictSorted, StatPrecision::Exact(false.into()));
+
+        let dtype = array.dtype().clone();
+        let ctx = ArrayContext::empty();
+        let serialized = array.serialize(&ctx, &SESSION, &SerializeOptions::default())?;
+        let mut concat = ByteBufferMut::empty();
+        for buf in serialized {
+            concat.extend_from_slice(buf.as_ref());
+        }
+
+        let decoded = SerializedArray::try_from(concat.freeze())?.decode(
+            &dtype,
+            1,
+            &ReadContext::new(ctx.to_ids()),
+            &SESSION,
+        )?;
+
+        for stat in [Stat::IsSorted, Stat::IsStrictSorted] {
+            let value = decoded
+                .statistics()
+                .with_typed_stats_set(|s| s.get_as::<bool>(stat));
+            assert_eq!(value, StatPrecision::Exact(true));
+        }
         Ok(())
     }
 

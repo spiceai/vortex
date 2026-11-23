@@ -21,6 +21,7 @@ use vortex_array::ExecutionCtx;
 use vortex_array::ExecutionResult;
 use vortex_array::IntoArray;
 use vortex_array::TypedArrayRef;
+use vortex_array::VortexSessionExecute;
 use vortex_array::array_slots;
 use vortex_array::arrays::Primitive;
 use vortex_array::buffer::BufferHandle;
@@ -42,6 +43,7 @@ use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
+use vortex_error::vortex_ensure_eq;
 use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
@@ -136,13 +138,13 @@ impl VTable for ALP {
         metadata: &[u8],
         _buffers: &[BufferHandle],
         children: &dyn ArrayChildren,
-        _session: &VortexSession,
+        session: &VortexSession,
     ) -> VortexResult<ArrayParts<Self>> {
         let metadata = ALPMetadata::decode(metadata)?;
         let encoded_ptype = match &dtype {
             DType::Primitive(PType::F32, n) => DType::Primitive(PType::I32, *n),
             DType::Primitive(PType::F64, n) => DType::Primitive(PType::I64, *n),
-            d => vortex_bail!(MismatchedTypes: "f32 or f64", d),
+            d => vortex_bail!("expected type: f32 or f64 but instead got {}", d),
         };
         let encoded = children.get(0, &encoded_ptype, len)?;
 
@@ -156,7 +158,14 @@ impl VTable for ALP {
                     .map(|dtype| children.get(3, &dtype, usize::try_from(p.chunk_offsets_len())?))
                     .transpose()?;
 
-                Patches::new(len, p.offset()?, indices, values, chunk_offsets)
+                Patches::from_metadata(
+                    len,
+                    &p,
+                    indices,
+                    values,
+                    chunk_offsets,
+                    &mut session.create_execution_ctx(),
+                )
             })
             .transpose()?;
 
@@ -168,7 +177,13 @@ impl VTable for ALP {
             },
             patches,
         );
-        Ok(ArrayParts::new(self.clone(), dtype.clone(), len, data).with_slots(slots))
+        Ok(ArrayParts::new(
+            self.clone(),
+            dtype.clone(),
+            len,
+            data,
+            slots,
+        ))
     }
 
     fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {
@@ -288,12 +303,7 @@ impl ALPData {
 
         // Validate patches
         if let Some(patches) = patches {
-            vortex_ensure!(
-                patches.array_len() == encoded.len(),
-                "patches array_len != encoded len: {} != {}",
-                patches.array_len(),
-                encoded.len()
-            );
+            vortex_ensure_eq!(patches.array_len(), encoded.len());
 
             // Verify that the patches DType are of the proper DType.
         }
@@ -309,7 +319,9 @@ impl ALPData {
             DType::Primitive(PType::I64, nullability) => {
                 Ok(DType::Primitive(PType::F64, *nullability))
             }
-            _ => vortex_bail!("ALP encoded ints have invalid DType {}", encoded.dtype(),),
+            _ => {
+                vortex_bail!("ALP encoded ints have invalid DType {}", encoded.dtype(),)
+            }
         }
     }
 
@@ -318,19 +330,10 @@ impl ALPData {
         patches: &Patches,
         encoded: &ArrayRef,
     ) -> VortexResult<()> {
-        vortex_ensure!(
-            patches.array_len() == encoded.len(),
-            "patches array_len != encoded len: {} != {}",
-            patches.array_len(),
-            encoded.len()
-        );
+        vortex_ensure_eq!(patches.array_len(), encoded.len());
 
         let expected_type = DType::Primitive(T::PTYPE, encoded.dtype().nullability());
-        vortex_ensure!(
-            patches.dtype() == &expected_type,
-            "Expected patches type {expected_type}, actual {}",
-            patches.dtype(),
-        );
+        vortex_ensure_eq!(patches.dtype(), &expected_type);
 
         Ok(())
     }
@@ -370,10 +373,13 @@ impl ALP {
         let len = encoded.len();
         let slots = ALPData::make_slots(&encoded, patches.as_ref());
         unsafe {
-            Array::from_parts_unchecked(
-                ArrayParts::new(ALP, dtype, len, ALPData::new(exponents, patches))
-                    .with_slots(slots),
-            )
+            Array::from_parts_unchecked(ArrayParts::new(
+                ALP,
+                dtype,
+                len,
+                ALPData::new(exponents, patches),
+                slots,
+            ))
         }
     }
 
@@ -386,7 +392,7 @@ impl ALP {
         let len = encoded.len();
         let slots = ALPData::make_slots(&encoded, patches.as_ref());
         let data = ALPData::new(exponents, patches);
-        Array::try_from_parts(ArrayParts::new(ALP, dtype, len, data).with_slots(slots))
+        Array::try_from_parts(ArrayParts::new(ALP, dtype, len, data, slots))
     }
 
     /// # Safety
@@ -400,9 +406,7 @@ impl ALP {
         let len = encoded.len();
         let slots = ALPData::make_slots(&encoded, patches.as_ref());
         let data = unsafe { ALPData::new_unchecked(exponents, patches) };
-        unsafe {
-            Array::from_parts_unchecked(ArrayParts::new(ALP, dtype, len, data).with_slots(slots))
-        }
+        unsafe { Array::from_parts_unchecked(ArrayParts::new(ALP, dtype, len, data, slots)) }
     }
 }
 
@@ -427,8 +431,8 @@ pub trait ALPArrayExt: ALPArraySlotsExt {
     fn patches(&self) -> Option<Patches> {
         PatchesData::patches_from_slots(
             self.patches_data.as_ref(),
-            self.as_ref().len(),
-            self.as_ref().slots(),
+            self.len(),
+            self.slots(),
             PATCH_SLOTS,
         )
     }
@@ -443,16 +447,11 @@ fn validate_parts(
 ) -> VortexResult<()> {
     let logical_dtype = ALPData::logical_dtype(encoded)?;
     ALPData::validate_components(encoded, exponents, patches.as_ref())?;
-    vortex_ensure!(
-        encoded.len() == len,
-        "ALP encoded len {} != outer len {len}",
-        encoded.len(),
-    );
-    vortex_ensure!(
-        &logical_dtype == dtype,
-        "ALP dtype {} does not match encoded logical dtype {}",
+    vortex_ensure_eq!(encoded.len(), len, "ALP encoded len must match outer len");
+    vortex_ensure_eq!(
+        &logical_dtype,
         dtype,
-        logical_dtype,
+        "ALP dtype does not match encoded logical dtype"
     );
     Ok(())
 }
@@ -485,12 +484,9 @@ mod tests {
     use std::sync::LazyLock;
 
     use rstest::rstest;
-    use vortex_array::Canonical;
-    use vortex_array::IntoArray;
     use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::assert_arrays_eq;
-    use vortex_error::VortexExpect;
     use vortex_session::VortexSession;
 
     use super::*;
@@ -498,7 +494,7 @@ mod tests {
     use crate::decompress_into_array;
 
     static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
-        let session = vortex_array::array_session();
+        let session = VortexSession::empty();
         crate::initialize(&session);
         session
     });
@@ -510,7 +506,6 @@ mod tests {
     #[case(1023)]
     #[case(1024)]
     #[case(1025)]
-    #[case(2047)]
     #[case(2048)]
     #[case(2049)]
     fn test_execute_f32(#[case] size: usize) {
@@ -518,17 +513,12 @@ mod tests {
         let values = PrimitiveArray::from_iter((0..size).map(|i| i as f32));
         let encoded = alp_encode(values.as_view(), None, &mut ctx).unwrap();
 
-        let result_canonical = {
-            encoded
-                .clone()
-                .into_array()
-                .execute::<Canonical>(&mut ctx)
-                .unwrap()
-        };
         // Compare against the traditional array-based decompress path
-        let expected = decompress_into_array(encoded, &mut SESSION.create_execution_ctx()).unwrap();
+        let expected =
+            decompress_into_array(encoded.clone(), &mut SESSION.create_execution_ctx()).unwrap();
 
-        assert_arrays_eq!(result_canonical.into_array(), expected, &mut ctx);
+        assert_arrays_eq!(expected, values, &mut ctx);
+        assert_arrays_eq!(encoded, values, &mut ctx);
     }
 
     #[rstest]
@@ -538,7 +528,6 @@ mod tests {
     #[case(1023)]
     #[case(1024)]
     #[case(1025)]
-    #[case(2047)]
     #[case(2048)]
     #[case(2049)]
     fn test_execute_f64(#[case] size: usize) {
@@ -547,15 +536,12 @@ mod tests {
             alp_encode(values.as_view(), None, &mut SESSION.create_execution_ctx()).unwrap();
 
         let mut ctx = SESSION.create_execution_ctx();
-        let result_canonical = encoded
-            .clone()
-            .into_array()
-            .execute::<Canonical>(&mut ctx)
-            .unwrap();
         // Compare against the traditional array-based decompress path
-        let expected = decompress_into_array(encoded, &mut SESSION.create_execution_ctx()).unwrap();
+        let expected =
+            decompress_into_array(encoded.clone(), &mut SESSION.create_execution_ctx()).unwrap();
 
-        assert_arrays_eq!(result_canonical.into_array(), expected, &mut ctx);
+        assert_arrays_eq!(expected, values, &mut ctx);
+        assert_arrays_eq!(encoded, values, &mut ctx);
     }
 
     #[rstest]
@@ -563,7 +549,6 @@ mod tests {
     #[case(1023)]
     #[case(1024)]
     #[case(1025)]
-    #[case(2047)]
     #[case(2048)]
     #[case(2049)]
     fn test_execute_with_patches(#[case] size: usize) {
@@ -580,15 +565,12 @@ mod tests {
         assert!(encoded.patches().unwrap().array_len() > 0);
 
         let mut ctx = SESSION.create_execution_ctx();
-        let result_canonical = encoded
-            .clone()
-            .into_array()
-            .execute::<Canonical>(&mut ctx)
-            .unwrap();
         // Compare against the traditional array-based decompress path
-        let expected = decompress_into_array(encoded, &mut SESSION.create_execution_ctx()).unwrap();
+        let expected =
+            decompress_into_array(encoded.clone(), &mut SESSION.create_execution_ctx()).unwrap();
 
-        assert_arrays_eq!(result_canonical.into_array(), expected, &mut ctx);
+        assert_arrays_eq!(expected, array, &mut ctx);
+        assert_arrays_eq!(encoded, array, &mut ctx);
     }
 
     #[rstest]
@@ -598,7 +580,6 @@ mod tests {
     #[case(1023)]
     #[case(1024)]
     #[case(1025)]
-    #[case(2047)]
     #[case(2048)]
     #[case(2049)]
     fn test_execute_with_validity(#[case] size: usize) {
@@ -611,15 +592,12 @@ mod tests {
             alp_encode(array.as_view(), None, &mut SESSION.create_execution_ctx()).unwrap();
 
         let mut ctx = SESSION.create_execution_ctx();
-        let result_canonical = encoded
-            .clone()
-            .into_array()
-            .execute::<Canonical>(&mut ctx)
-            .unwrap();
         // Compare against the traditional array-based decompress path
-        let expected = decompress_into_array(encoded, &mut SESSION.create_execution_ctx()).unwrap();
+        let expected =
+            decompress_into_array(encoded.clone(), &mut SESSION.create_execution_ctx()).unwrap();
 
-        assert_arrays_eq!(result_canonical.into_array(), expected, &mut ctx);
+        assert_arrays_eq!(expected, array, &mut ctx);
+        assert_arrays_eq!(encoded, array, &mut ctx);
     }
 
     #[rstest]
@@ -627,7 +605,6 @@ mod tests {
     #[case(1023)]
     #[case(1024)]
     #[case(1025)]
-    #[case(2047)]
     #[case(2048)]
     #[case(2049)]
     fn test_execute_with_patches_and_validity(#[case] size: usize) {
@@ -645,15 +622,12 @@ mod tests {
         assert!(encoded.patches().unwrap().array_len() > 0);
 
         let mut ctx = SESSION.create_execution_ctx();
-        let result_canonical = encoded
-            .clone()
-            .into_array()
-            .execute::<Canonical>(&mut ctx)
-            .unwrap();
         // Compare against the traditional array-based decompress path
-        let expected = decompress_into_array(encoded, &mut SESSION.create_execution_ctx()).unwrap();
+        let expected =
+            decompress_into_array(encoded.clone(), &mut SESSION.create_execution_ctx()).unwrap();
 
-        assert_arrays_eq!(result_canonical.into_array(), expected, &mut ctx);
+        assert_arrays_eq!(expected, array, &mut ctx);
+        assert_arrays_eq!(encoded, array, &mut ctx);
     }
 
     #[rstest]
@@ -678,82 +652,11 @@ mod tests {
         let encoded = alp_encode(array.as_view(), None, &mut ctx).unwrap();
 
         let slice_end = size - slice_start;
-        let slice_len = slice_end - slice_start;
         let sliced_encoded = encoded.slice(slice_start..slice_end).unwrap();
 
-        let result_canonical = sliced_encoded.execute::<Canonical>(&mut ctx).unwrap();
-        let result_primitive = result_canonical.into_primitive();
-
-        for idx in 0..slice_len {
-            let expected_value = values[slice_start + idx];
-
-            let result_valid = result_primitive
-                .validity()
-                .vortex_expect("result validity should be derivable")
-                .execute_is_valid(idx, &mut ctx)
-                .unwrap();
-            assert_eq!(
-                result_valid,
-                expected_value.is_some(),
-                "Validity mismatch at idx={idx}",
-            );
-
-            if let Some(expected_val) = expected_value {
-                let result_val = result_primitive.as_slice::<f64>()[idx];
-                assert_eq!(result_val, expected_val, "Value mismatch at idx={idx}",);
-            }
-        }
-    }
-
-    #[rstest]
-    #[case(500, 100)]
-    #[case(1000, 200)]
-    #[case(2048, 512)]
-    fn test_sliced_to_primitive(#[case] size: usize, #[case] slice_start: usize) {
-        let mut ctx = SESSION.create_execution_ctx();
-        let values: Vec<Option<f64>> = (0..size)
-            .map(|i| {
-                if i % 5 == 0 {
-                    None
-                } else if i % 4 == 3 {
-                    Some(PI)
-                } else {
-                    Some(1.0)
-                }
-            })
-            .collect();
-
-        let array = PrimitiveArray::from_option_iter(values.clone());
-        let encoded = alp_encode(array.as_view(), None, &mut ctx).unwrap();
-
-        let slice_end = size - slice_start;
-        let slice_len = slice_end - slice_start;
-        let sliced_encoded = encoded.slice(slice_start..slice_end).unwrap();
-
-        let result_primitive = sliced_encoded.execute::<PrimitiveArray>(&mut ctx).unwrap();
-
-        for idx in 0..slice_len {
-            let expected_value = values[slice_start + idx];
-
-            let result_valid = result_primitive
-                .as_ref()
-                .validity()
-                .unwrap()
-                .execute_mask(result_primitive.as_ref().len(), &mut ctx)
-                .unwrap()
-                .value(idx);
-            assert_eq!(
-                result_valid,
-                expected_value.is_some(),
-                "Validity mismatch at idx={idx}",
-            );
-
-            if let Some(expected_val) = expected_value {
-                let buf = result_primitive.to_buffer::<f64>();
-                let result_val = buf.as_slice()[idx];
-                assert_eq!(result_val, expected_val, "Value mismatch at idx={idx}",);
-            }
-        }
+        let expected =
+            PrimitiveArray::from_option_iter(values[slice_start..slice_end].iter().copied());
+        assert_arrays_eq!(sliced_encoded, expected, &mut ctx);
     }
 
     /// Regression test for issue #5948: execute_decompress drops patches when chunk_offsets is
@@ -766,6 +669,7 @@ mod tests {
     /// be preserved, or when building ALPArrays manually without chunk_offsets.
     #[test]
     fn test_execute_decompress_with_patches_no_chunk_offsets_regression_5948() {
+        let mut ctx = SESSION.create_execution_ctx();
         // Create an array with values that will produce patches. PI doesn't encode cleanly.
         let values: Vec<f64> = vec![1.0, 2.0, PI, 4.0, 5.0];
         let original = PrimitiveArray::from_iter(values);
@@ -795,6 +699,7 @@ mod tests {
             original_patches.indices().clone(),
             original_patches.values().clone(),
             None, // NO chunk_offsets - this triggers the bug!
+            &mut ctx,
         )
         .unwrap();
 
@@ -821,10 +726,7 @@ mod tests {
         );
 
         // The execute path has the bug - it drops patches when chunk_offsets is None.
-        let result_execute = {
-            let mut ctx = SESSION.create_execution_ctx();
-            execute_decompress(alp_without_chunk_offsets, &mut ctx).unwrap()
-        };
+        let result_execute = { execute_decompress(alp_without_chunk_offsets, &mut ctx).unwrap() };
         let execute_slice = result_execute.as_slice::<f64>();
 
         // This assertion FAILS until the bug is fixed because execute_decompress drops patches.

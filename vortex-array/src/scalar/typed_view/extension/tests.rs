@@ -214,7 +214,9 @@ fn test_ext_scalar_storage() {
     let ext_scalar = Scalar::extension::<TestI32Ext>(EmptyMetadata, storage_scalar.clone());
 
     let ext = ext_scalar.as_extension();
-    assert_eq!(ext.to_storage_scalar(), storage_scalar);
+    let storage = ext.to_storage_scalar();
+    assert_eq!(storage.dtype(), storage_scalar.dtype());
+    assert_eq!(storage, storage_scalar);
 }
 
 #[test]
@@ -237,10 +239,8 @@ fn test_ext_scalar_cast_to_storage() {
         Scalar::primitive(42i32, Nullability::NonNullable),
     );
 
-    let ext = scalar.as_extension();
-
     // Cast to storage type
-    let casted = ext
+    let casted = scalar
         .cast(&DType::Primitive(PType::I32, Nullability::NonNullable))
         .unwrap();
     assert_eq!(
@@ -250,7 +250,7 @@ fn test_ext_scalar_cast_to_storage() {
     assert_eq!(casted.as_primitive().typed_value::<i32>(), Some(42));
 
     // Cast to nullable storage type
-    let casted_nullable = ext
+    let casted_nullable = scalar
         .cast(&DType::Primitive(PType::I32, Nullability::Nullable))
         .unwrap();
     assert_eq!(
@@ -272,17 +272,18 @@ fn test_ext_scalar_cast_to_self() {
         Scalar::primitive(42i32, Nullability::NonNullable),
     );
 
-    let ext = scalar.as_extension();
     let ext_dtype = ext_dtype.erased();
 
     // Cast to same extension type
-    let casted = ext.cast(&DType::Extension(ext_dtype.clone())).unwrap();
+    let casted = scalar.cast(&DType::Extension(ext_dtype.clone())).unwrap();
     assert_eq!(casted.dtype(), &DType::Extension(ext_dtype.clone()));
+    assert_eq!(casted.value(), scalar.value());
 
     // Cast to nullable version of same extension type
     let nullable_ext = DType::Extension(ext_dtype).as_nullable();
-    let casted_nullable = ext.cast(&nullable_ext).unwrap();
+    let casted_nullable = scalar.cast(&nullable_ext).unwrap();
     assert_eq!(casted_nullable.dtype(), &nullable_ext);
+    assert_eq!(casted_nullable.value(), scalar.value());
 }
 
 #[test]
@@ -292,10 +293,8 @@ fn test_ext_scalar_cast_incompatible() {
         Scalar::primitive(42i32, Nullability::NonNullable),
     );
 
-    let ext = scalar.as_extension();
-
     // Cast to incompatible type should fail
-    let result = ext.cast(&DType::Utf8(Nullability::NonNullable));
+    let result = scalar.cast(&DType::Utf8(Nullability::NonNullable));
     assert!(result.is_err());
 }
 
@@ -306,10 +305,8 @@ fn test_ext_scalar_cast_null_to_non_nullable() {
         Scalar::null(DType::Primitive(PType::I32, Nullability::Nullable)),
     );
 
-    let ext = scalar.as_extension();
-
     // Cast null to non-nullable should fail
-    let result = ext.cast(&DType::Primitive(PType::I32, Nullability::NonNullable));
+    let result = scalar.cast(&DType::Primitive(PType::I32, Nullability::NonNullable));
     assert!(result.is_err());
 }
 
@@ -411,7 +408,7 @@ fn test_ext_scalar_cast_date_to_timestamp() {
 /// batch containing one unconvertible value would say nothing about the ones beside it.
 #[test]
 fn test_ext_scalar_cast_date_to_timestamp_matches_the_array_kernel() {
-    let session = crate::array_session();
+    let session = vortex_session::VortexSession::empty();
     let mut ctx = session.create_execution_ctx();
 
     // Ordinary dates, then the boundaries: the largest `Date32` value, the first day no

@@ -2,13 +2,11 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use itertools::Itertools as _;
-use num_traits::AsPrimitive;
 use vortex_buffer::BitBuffer;
 use vortex_buffer::BitBufferMut;
-use vortex_buffer::BitBufferView;
-use vortex_buffer::get_bit;
+use vortex_buffer::take_bits;
 use vortex_error::VortexResult;
-use vortex_error::vortex_ensure;
+use vortex_error::vortex_ensure_eq;
 use vortex_error::vortex_err;
 use vortex_mask::Mask;
 
@@ -25,7 +23,6 @@ use crate::arrays::bool::BoolArrayExt;
 use crate::arrays::dict::TakeExecute;
 use crate::arrays::piecewise_sequence::constant_unsigned_usize;
 use crate::arrays::piecewise_sequence::maybe_contiguous_slices;
-use crate::builtins::ArrayBuiltins;
 use crate::dtype::UnsignedPType;
 use crate::executor::ExecutionCtx;
 use crate::match_each_integer_ptype;
@@ -44,29 +41,42 @@ impl TakeExecute for Bool {
             return Ok(Some(taken));
         }
 
-        let indices_nulls_zeroed = match indices.validity()?.execute_mask(indices.len(), ctx)? {
-            Mask::AllTrue(_) => indices.clone(),
-            Mask::AllFalse(_) => {
+        let mask = indices.validity()?.execute_mask(indices.len(), ctx)?;
+        if matches!(mask, Mask::AllFalse(_)) {
+            return Ok(Some(
+                ConstantArray::new(Scalar::null(array.dtype().as_nullable()), indices.len())
+                    .into_array(),
+            ));
+        }
+
+        if matches!(mask, Mask::AllTrue(_)) && !array.dtype().is_nullable() {
+            let source = array.bit_buffer_view();
+            let count = source.true_count();
+            if count == 0 || count == source.len() {
                 return Ok(Some(
-                    ConstantArray::new(Scalar::null(array.dtype().as_nullable()), indices.len())
-                        .into_array(),
+                    ConstantArray::new(
+                        Scalar::bool(
+                            count != 0,
+                            array.dtype().nullability() | indices.dtype().nullability(),
+                        ),
+                        indices.len(),
+                    )
+                    .into_array(),
                 ));
             }
-            Mask::Values(_) => indices
-                .clone()
-                .fill_null(Scalar::from(0).cast(indices.dtype())?)?,
-        };
-        let indices_nulls_zeroed = indices_nulls_zeroed.execute::<PrimitiveArray>(ctx)?;
-        let buffer = match_each_integer_ptype!(indices_nulls_zeroed.ptype(), |I| {
-            take_valid_indices(
+        }
+
+        let indices_values = indices.clone().execute::<PrimitiveArray>(ctx)?;
+        let buffer = match_each_integer_ptype!(indices_values.ptype(), |I| {
+            take_bits(
                 array.bit_buffer_view(),
-                indices_nulls_zeroed.as_slice::<I>(),
+                indices_values.as_slice::<I>(),
+                mask.values().map(|values| values.bit_buffer().as_view()),
             )
         });
 
-        Ok(Some(
-            BoolArray::new(buffer, array.validity()?.take(indices)?).into_array(),
-        ))
+        let validity = array.validity()?.take(indices)?;
+        Ok(Some(BoolArray::new(buffer, validity).into_array()))
     }
 }
 
@@ -113,33 +123,6 @@ fn take_contiguous_ranges(
     ))
 }
 
-fn take_valid_indices<I: AsPrimitive<usize>>(bools: BitBufferView<'_>, indices: &[I]) -> BitBuffer {
-    // For boolean arrays that roughly fit into a single page (at least, on Linux), it's worth
-    // the overhead to convert to a Vec<bool>.
-    if bools.len() <= 4096 {
-        let bools = bools.iter().collect_vec();
-        take_byte_bool(bools, indices)
-    } else {
-        take_bool_impl(bools, indices)
-    }
-}
-
-fn take_byte_bool<I: AsPrimitive<usize>>(bools: Vec<bool>, indices: &[I]) -> BitBuffer {
-    BitBuffer::collect_bool(indices.len(), |idx| {
-        bools[unsafe { indices.get_unchecked(idx).as_() }]
-    })
-}
-
-fn take_bool_impl<I: AsPrimitive<usize>>(bools: BitBufferView<'_>, indices: &[I]) -> BitBuffer {
-    // We dereference to underlying buffer to avoid access cost on every index.
-    let buffer = bools.inner();
-    BitBuffer::collect_bool(indices.len(), |idx| {
-        // SAFETY: we can take from the indices unchecked since collect_bool just iterates len.
-        let idx = unsafe { indices.get_unchecked(idx).as_() };
-        get_bit(buffer, bools.offset() + idx)
-    })
-}
-
 fn take_bit_slices_constant_length<S>(
     source: &BitBuffer,
     starts: &[S],
@@ -153,9 +136,10 @@ where
         .len()
         .checked_mul(length)
         .ok_or_else(|| vortex_err!("PiecewiseSequenceArray output length overflows usize"))?;
-    vortex_ensure!(
-        computed_len == output_len,
-        "PiecewiseSequenceArray expanded length {computed_len} does not match declared length {output_len}"
+    vortex_ensure_eq!(
+        computed_len,
+        output_len,
+        "PiecewiseSequenceArray expanded length does not match declared length",
     );
 
     let mut values = BitBufferMut::with_capacity(output_len);
@@ -184,32 +168,37 @@ where
         values.append_buffer(&source.slice(start..).slice(..length));
     }
 
-    vortex_ensure!(
-        values.len() == output_len,
-        "PiecewiseSequenceArray expanded length {} does not match declared length {output_len}",
-        values.len()
+    vortex_ensure_eq!(
+        values.len(),
+        output_len,
+        "PiecewiseSequenceArray expanded length does not match declared length",
     );
     Ok(values.freeze())
 }
 
 #[cfg(test)]
 mod test {
+    use std::sync::LazyLock;
+
     use rstest::rstest;
     use vortex_buffer::buffer;
+    use vortex_error::VortexResult;
+    use vortex_session::VortexSession;
 
     use crate::IntoArray as _;
     use crate::VortexSessionExecute;
-    use crate::array_session;
     use crate::arrays::BoolArray;
+    use crate::arrays::DictArray;
     use crate::arrays::PrimitiveArray;
-    use crate::arrays::bool::BoolArrayExt;
     use crate::assert_arrays_eq;
     use crate::compute::conformance::take::test_take_conformance;
     use crate::validity::Validity;
 
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
+
     #[test]
     fn take_nullable() {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let reference = BoolArray::from_iter(vec![
             Some(false),
             Some(true),
@@ -218,14 +207,11 @@ mod test {
             Some(false),
         ]);
 
-        let b = reference
-            .take(buffer![0, 3, 4].into_array())
-            .unwrap()
-            .execute::<BoolArray>(&mut ctx)
-            .unwrap();
-        assert_eq!(
-            b.to_bit_buffer(),
-            BoolArray::from_iter([Some(false), None, Some(false)]).to_bit_buffer()
+        let b = reference.take(buffer![0, 3, 4].into_array()).unwrap();
+        assert_arrays_eq!(
+            b,
+            BoolArray::from_iter([Some(false), None, Some(false)]),
+            &mut ctx
         );
 
         let all_invalid_indices = PrimitiveArray::from_option_iter([None::<i32>, None, None]);
@@ -235,7 +221,7 @@ mod test {
 
     #[test]
     fn test_bool_array_take_with_null_out_of_bounds_indices() {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let values = BoolArray::from_iter(vec![Some(false), Some(true), None, None, Some(false)]);
         let indices = PrimitiveArray::new(
             buffer![0, 3, 100],
@@ -253,7 +239,7 @@ mod test {
 
     #[test]
     fn test_non_null_bool_array_take_with_null_out_of_bounds_indices() {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let values = BoolArray::from_iter(vec![false, true, false, true, false]);
         let indices = PrimitiveArray::new(
             buffer![0, 3, 100],
@@ -270,7 +256,7 @@ mod test {
 
     #[test]
     fn test_bool_array_take_all_null_indices() {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let values = BoolArray::from_iter(vec![Some(false), Some(true), None, None, Some(false)]);
         let indices = PrimitiveArray::new(
             buffer![0, 3, 100],
@@ -282,7 +268,7 @@ mod test {
 
     #[test]
     fn test_non_null_bool_array_take_all_null_indices() {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let values = BoolArray::from_iter(vec![false, true, false, true, false]);
         let indices = PrimitiveArray::new(
             buffer![0, 3, 100],
@@ -293,14 +279,31 @@ mod test {
     }
 
     #[rstest]
+    #[case(true)]
+    #[case(false)]
+    fn test_non_null_constant_bool_take_with_nullable_indices(
+        #[case] value: bool,
+    ) -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let values = BoolArray::from_iter([value]);
+        let codes = PrimitiveArray::new(buffer![0i64, 0, 0], Validity::AllValid);
+
+        let actual = DictArray::try_new(codes.into_array(), values.into_array())?.into_array();
+
+        assert_arrays_eq!(
+            actual,
+            BoolArray::from_iter([Some(value), Some(value), Some(value)]),
+            &mut ctx
+        );
+        Ok(())
+    }
+
+    #[rstest]
     #[case(BoolArray::from_iter([true, false, true, true, false]))]
     #[case(BoolArray::from_iter([Some(true), None, Some(false), Some(true), None]))]
     #[case(BoolArray::from_iter([true, false]))]
     #[case(BoolArray::from_iter([true]))]
     fn test_take_bool_conformance(#[case] array: BoolArray) {
-        test_take_conformance(
-            &array.into_array(),
-            &mut array_session().create_execution_ctx(),
-        );
+        test_take_conformance(&array.into_array(), &mut SESSION.create_execution_ctx());
     }
 }

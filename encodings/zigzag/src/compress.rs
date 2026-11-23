@@ -9,6 +9,8 @@ use vortex_array::dtype::NativePType;
 use vortex_array::dtype::PType;
 use vortex_array::validity::Validity;
 use vortex_buffer::BufferMut;
+use vortex_compute::lane_kernels::IndexedSinkExt;
+use vortex_compute::lane_kernels::ReinterpretSink;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
@@ -34,16 +36,19 @@ pub fn zigzag_encode(parray: ArrayView<'_, Primitive>) -> VortexResult<ZigZagArr
 }
 
 fn zigzag_encode_primitive<T: ExternalZigZag + NativePType>(
-    values: BufferMut<T>,
+    mut values: BufferMut<T>,
     validity: Validity,
 ) -> PrimitiveArray
 where
     <T as ExternalZigZag>::UInt: NativePType,
 {
-    PrimitiveArray::new(
-        values.map_each_in_place(|v| T::encode(v)).freeze(),
-        validity,
-    )
+    ReinterpretSink::<T, T::UInt>::new(values.as_mut_slice()).map_into_in_place(T::encode);
+
+    // SAFETY: `ReinterpretSink::new` checks that both types have the same size and alignment,
+    // and `map_into_in_place` writes a valid value into every lane.
+    let encoded = unsafe { values.transmute::<T::UInt>() };
+
+    PrimitiveArray::new(encoded.freeze(), validity)
 }
 
 pub fn zigzag_decode(parray: PrimitiveArray) -> PrimitiveArray {
@@ -63,16 +68,19 @@ pub fn zigzag_decode(parray: PrimitiveArray) -> PrimitiveArray {
 }
 
 fn zigzag_decode_primitive<T: ExternalZigZag + NativePType>(
-    values: BufferMut<T::UInt>,
+    mut values: BufferMut<T::UInt>,
     validity: Validity,
 ) -> PrimitiveArray
 where
     <T as ExternalZigZag>::UInt: NativePType,
 {
-    PrimitiveArray::new(
-        values.map_each_in_place(|v| T::decode(v)).freeze(),
-        validity,
-    )
+    ReinterpretSink::<T::UInt, T>::new(values.as_mut_slice()).map_into_in_place(T::decode);
+
+    // SAFETY: `ReinterpretSink::new` checks that both types have the same size and alignment,
+    // and `map_into_in_place` writes a valid value into every lane.
+    let decoded = unsafe { values.transmute::<T>() };
+
+    PrimitiveArray::new(decoded.freeze(), validity)
 }
 
 #[cfg(test)]
@@ -89,7 +97,7 @@ mod test {
     use crate::ZigZag;
 
     static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
-        let session = vortex_array::array_session();
+        let session = VortexSession::empty();
         crate::initialize(&session);
         session
     });
@@ -103,7 +111,6 @@ mod test {
         let mut ctx = SESSION.create_execution_ctx();
         let compressed = zigzag_encode(input.as_view()).unwrap().into_array();
         assert!(compressed.is::<ZigZag>());
-        let decompressed = compressed.execute::<PrimitiveArray>(&mut ctx).unwrap();
-        assert_arrays_eq!(decompressed, input, &mut ctx);
+        assert_arrays_eq!(compressed, input, &mut ctx);
     }
 }

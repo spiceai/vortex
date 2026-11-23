@@ -19,6 +19,7 @@ use vortex::buffer::ByteBuffer;
 use vortex::error::VortexError;
 use vortex::error::VortexResult;
 use vortex::error::vortex_ensure;
+use vortex::error::vortex_ensure_eq;
 use vortex::error::vortex_err;
 use vortex::io::CoalesceConfig;
 use vortex::io::VortexReadAt;
@@ -32,6 +33,7 @@ mod file;
 
 pub use file::PooledFileReadAt;
 pub use file::PooledFileReadAtOptions;
+pub use file::release_file_mappings;
 
 /// Default number of concurrent requests to allow for object store I/O.
 pub const DEFAULT_OBJECT_STORE_CONCURRENCY: usize = 192;
@@ -177,11 +179,10 @@ impl VortexReadAt for PooledObjectStoreReadAt {
                         filled = end;
                     }
 
-                    vortex_ensure!(
-                        filled == length,
-                        "Object store stream returned {} bytes but expected {} bytes (range: {:?})",
+                    vortex_ensure_eq!(
                         filled,
                         length,
+                        "Object store stream returned too few bytes (range: {:?})",
                         range
                     );
                 }

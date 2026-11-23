@@ -16,7 +16,7 @@ use vortex_array::dtype::StructFields;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
-use vortex_error::vortex_ensure;
+use vortex_error::vortex_ensure_eq;
 use vortex_error::vortex_err;
 use vortex_session::SessionExt;
 use vortex_session::VortexSession;
@@ -33,6 +33,9 @@ use crate::LayoutReaderRef;
 use crate::LayoutRef;
 use crate::VTable;
 use crate::children::OwnedLayoutChildren;
+use crate::plan::physical::PackPlan;
+use crate::plan::physical::PlanRef;
+use crate::plan::physical::PlanSlots;
 use crate::segments::SegmentSource;
 
 /// Struct layout vtable.
@@ -67,8 +70,9 @@ impl VTable for Struct {
 
         for idx in 0..args.children.nchildren() {
             let child_row_count = args.children.child_row_count(idx);
-            vortex_ensure!(
-                child_row_count == args.row_count,
+            vortex_ensure_eq!(
+                child_row_count,
+                args.row_count,
                 "Struct child {idx} row count does not match parent"
             );
         }
@@ -121,6 +125,21 @@ impl VTable for Struct {
             session.session(),
             ctx.clone(),
         )?))
+    }
+
+    fn new_plan(layout: &Layout<Self>) -> VortexResult<PlanRef> {
+        // SAFETY: Struct layout construction validates child count and row counts. Its slots are
+        // validity then one per field, which are the Pack slots, and its logical slot schema
+        // defines every field dtype plus the optional non-nullable boolean validity dtype.
+        let plan = unsafe {
+            PackPlan::from_slots_unchecked(
+                layout.struct_fields().clone(),
+                layout.dtype().nullability(),
+                layout.row_count(),
+                PlanSlots::from_layout(&layout.to_layout()),
+            )
+        };
+        Ok(plan.into_plan())
     }
 }
 
@@ -179,10 +198,7 @@ impl Layout<Struct> {
             .as_struct_fields_opt()
             .ok_or_else(|| vortex_err!("Expected struct dtype"))?;
         let expected = fields.nfields() + usize::from(dtype.is_nullable());
-        vortex_ensure!(
-            nchildren == expected,
-            "Struct layout has {nchildren} children, expected {expected}"
-        );
+        vortex_ensure_eq!(nchildren, expected);
         Ok(())
     }
 

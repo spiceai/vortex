@@ -17,8 +17,6 @@ use vortex::array::iter::ArrayIterator;
 use vortex::array::iter::ArrayIteratorAdapter;
 use vortex::array::iter::ArrayIteratorExt;
 use vortex::compressor::BtrBlocksCompressorBuilder;
-use vortex::editions::ComponentKind;
-use vortex::editions::EditionSessionExt;
 use vortex::error::VortexError;
 use vortex::error::VortexResult;
 use vortex::file::WriteOptionsSessionExt;
@@ -36,6 +34,7 @@ use crate::arrow::FromPyArrow;
 use crate::classes::record_batch_reader_class;
 use crate::classes::table_class;
 use crate::current_runtime;
+use crate::dataset::ProjectionColumn;
 use crate::dataset::PyVortexDataset;
 use crate::error::PyVortexResult;
 use crate::expr::PyExpr;
@@ -47,6 +46,7 @@ use crate::object_store::resolve::resolve_store;
 use crate::opendal_store::CosStore;
 use crate::opendal_store::GoosefsStore;
 use crate::session::session;
+use crate::session::write_session;
 
 pub(crate) fn init(py: Python, parent: &Bound<PyModule>) -> PyResult<()> {
     let m = PyModule::new(py, "io")?;
@@ -127,7 +127,7 @@ pub fn read_url<'py>(
     py: Python<'py>,
     url: &str,
     store: Option<Bound<'py, PyAny>>,
-    projection: Option<Vec<Bound<'py, PyAny>>>,
+    projection: Option<Vec<ProjectionColumn>>,
     row_filter: Option<&Bound<'py, PyExpr>>,
     indices: Option<PyArrayRef>,
     row_range: Option<(u64, u64)>,
@@ -208,6 +208,11 @@ impl<'py> FromPyObject<'_, 'py> for AnyVortexStore {
 /// store : vortex.store.AzureStore | vortex.store.CosStore | vortex.store.GCSStore | vortex.store.HfStore | vortex.store.HTTPStore | vortex.store.LocalStore | vortex.store.MemoryStore | vortex.store.S3Store | None
 ///     An optional object store configuration to use for writing the output.
 ///
+/// edition : str | None
+///     An optional Vortex edition, for example ``"core2025.10.0"``. The file then contains only
+///     the formats of this edition, so that older Vortex readers can read it. If None, the
+///     default edition is used.
+///
 /// Examples
 /// --------
 ///
@@ -242,14 +247,15 @@ impl<'py> FromPyObject<'_, 'py> for AnyVortexStore {
 ///
 /// :func:`vortex.io.VortexWriteOptions`
 #[pyfunction]
-#[pyo3(signature = (iter, path, *, store = None))]
+#[pyo3(signature = (iter, path, *, store = None, edition = None))]
 pub fn write(
     py: Python,
     iter: PyIntoArrayIterator,
     path: &str,
     store: Option<AnyVortexStore>,
+    edition: Option<&str>,
 ) -> PyVortexResult<()> {
-    let session = session();
+    let session = write_session(edition)?;
     py.detach(|| {
         current_runtime().block_on(async move {
             match resolve_store(path, store.map(|x| x.into_inner()))? {
@@ -287,6 +293,7 @@ pub fn write(
 #[pyclass(name = "VortexWriteOptions", module = "io", frozen)]
 pub(crate) struct PyVortexWriteOptions {
     use_compact_encodings: bool,
+    edition: Option<String>,
 }
 
 #[pymethods]
@@ -296,6 +303,7 @@ impl PyVortexWriteOptions {
     pub fn default() -> Self {
         Self {
             use_compact_encodings: false,
+            edition: None,
         }
     }
 
@@ -304,18 +312,16 @@ impl PyVortexWriteOptions {
     /// Let's model some stock ticker data. As you may know, the stock market always (noisly) goes
     /// up:
     ///
-    /// >>> import os
     /// >>> import random
     /// >>> sprl = vx.array([random.randint(i, i + 10) for i in range(100_000)])
     ///
-    /// If we naively wrote 4-bytes for each of these integers to a file we'd have 400,000 bytes!
-    /// Let's see how small this is when we write with the default Vortex write options (which are
-    /// also used by :func:`vortex.io.write`):
+    /// If we naively wrote 8-bytes for each of these integers to a file we'd have 800,000 bytes!
+    /// Let's see how small the array buffers are when we write with the default Vortex write
+    /// options (which are also used by :func:`vortex.io.write`):
     ///
     /// >>> vx.io.VortexWriteOptions.default().write(sprl, "chonky.vortex")
-    /// >>> import os
-    /// >>> os.path.getsize('chonky.vortex')
-    /// 215788
+    /// >>> vx.open("chonky.vortex").scan().read_all().nbytes
+    /// 213248
     ///
     /// Wow, Vortex manages to use about two bytes per integer! So advanced. So tiny.
     ///
@@ -324,15 +330,46 @@ impl PyVortexWriteOptions {
     /// We sure can.
     ///
     /// >>> vx.io.VortexWriteOptions.compact().write(sprl, "tiny.vortex")
-    /// >>> os.path.getsize('tiny.vortex')
-    /// 54992
+    /// >>> vx.open("tiny.vortex").scan().read_all().nbytes
+    /// 52564
     ///
     /// Random numbers are not (usually) composed of random bytes!
     #[staticmethod]
     pub fn compact() -> Self {
         Self {
             use_compact_encodings: true,
+            edition: None,
         }
+    }
+
+    /// Return a copy of these options that writes with the Vortex edition ``edition``.
+    ///
+    /// The file then contains only the formats of this edition, so that older Vortex readers can
+    /// read it. For example, ``"core2025.10.0"`` writes files that Vortex 0.73 can read.
+    ///
+    /// Parameters
+    /// ----------
+    /// edition : str
+    ///     The name of the edition, for example ``"core2025.10.0"``.
+    ///
+    /// Raises
+    /// ------
+    /// ValueError
+    ///     If Vortex does not know the edition.
+    ///
+    /// Examples
+    /// --------
+    ///
+    /// >>> import vortex as vx
+    /// >>> a = vx.array([0, 1, 2, 3, None, 4])
+    /// >>> vx.io.VortexWriteOptions.default().with_edition("core2025.10.0").write(a, "a.vortex") # doctest: +SKIP
+    pub fn with_edition(&self, edition: String) -> PyResult<Self> {
+        write_session(Some(&edition)).map_err(|error| PyValueError::new_err(error.to_string()))?;
+
+        Ok(Self {
+            use_compact_encodings: self.use_compact_encodings,
+            edition: Some(edition),
+        })
     }
 
     /// Write an array or iterator of arrays to a file.
@@ -378,18 +415,14 @@ impl PyVortexWriteOptions {
         path: &str,
         store: Option<AnyVortexStore>,
     ) -> PyVortexResult<()> {
-        let session = session();
+        let session = write_session(self.edition.as_deref())?;
         py.detach(|| {
-            let allowed_encodings = session
-                .enabled_component_ids(ComponentKind::Array)
-                .into_iter()
-                .collect();
-            let mut compressor = BtrBlocksCompressorBuilder::default();
+            let mut compressor = BtrBlocksCompressorBuilder::from_session(&session);
             if self.use_compact_encodings {
                 compressor = compressor.with_compact();
             }
-            let strategy = WriteStrategyBuilder::default()
-                .with_btrblocks_builder(compressor.retain_allowed_encodings(&allowed_encodings));
+            let strategy =
+                WriteStrategyBuilder::from_session(&session).with_btrblocks_builder(compressor);
             let strategy = strategy.build();
             current_runtime().block_on(async move {
                 match resolve_store(path, store.map(|x| x.into_inner()))? {

@@ -6,9 +6,11 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::Parser;
 use clap::ValueEnum;
+use mimalloc::MiMalloc;
 use random_access_bench::AccessPattern;
 use random_access_bench::OpenMode;
 use random_access_bench::RunConfig;
+use url::Url;
 use vortex_bench::Format;
 use vortex_bench::datasets::feature_vectors::FeatureVectorsData;
 use vortex_bench::datasets::nested_lists::NestedListsData;
@@ -16,6 +18,7 @@ use vortex_bench::datasets::nested_structs::NestedStructsData;
 use vortex_bench::datasets::taxi_data::TaxiData;
 use vortex_bench::display::DisplayFormat;
 use vortex_bench::random_access::BenchDataset;
+use vortex_bench::random_access::RemoteDataDir;
 use vortex_bench::setup_logging_and_tracing;
 
 /// Which synthetic dataset to benchmark.
@@ -85,19 +88,38 @@ struct Args {
     /// Whether to reopen the file on each iteration, use a cached handle, or run both.
     #[arg(long, value_enum, default_value_t = OpenMode::Both)]
     open_mode: OpenMode,
+    /// Read the data files from this remote directory (e.g. `s3://bucket/prefix/`) instead of
+    /// local disk. The directory must mirror the layout of the local benchmark data directory,
+    /// as produced by `--prepare-data`.
+    #[arg(long)]
+    remote_data_dir: Option<Url>,
+    /// Materialize the local data files for the selected datasets and formats, print their
+    /// paths, and exit without benchmarking.
+    #[arg(long)]
+    prepare_data: bool,
 }
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    vortex_bench::configure_allocator();
     let args = Args::parse();
     setup_logging_and_tracing(args.verbose, args.tracing)?;
 
+    let datasets: Vec<Box<dyn BenchDataset>> = args
+        .datasets
+        .into_iter()
+        .map(DatasetArg::into_dataset)
+        .collect();
+
+    if args.prepare_data {
+        return random_access_bench::prepare_data(&datasets, &args.formats).await;
+    }
+
     let run_config = RunConfig {
-        datasets: args
-            .datasets
-            .into_iter()
-            .map(DatasetArg::into_dataset)
-            .collect(),
+        datasets,
         formats: args.formats,
         patterns: args.patterns,
         time_limit: args.time_limit,
@@ -105,6 +127,10 @@ async fn main() -> Result<()> {
         display_format: args.display_format,
         output_path: args.output_path,
         ingest_output: args.ingest_output,
+        remote_data_dir: args
+            .remote_data_dir
+            .map(RemoteDataDir::try_new)
+            .transpose()?,
     };
 
     random_access_bench::run(run_config).await

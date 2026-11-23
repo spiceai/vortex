@@ -7,6 +7,7 @@ use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
+use vortex_error::vortex_ensure_eq;
 use vortex_error::vortex_panic;
 use vortex_mask::Mask;
 use vortex_mask::MaskValuesRef;
@@ -86,23 +87,20 @@ impl VTable for Filter {
         let child = slots[FilterSlots::CHILD]
             .as_ref()
             .vortex_expect("validated child slot");
-        vortex_ensure!(
-            child.dtype() == dtype,
-            "FilterArray dtype {} does not match outer dtype {}",
+        vortex_ensure_eq!(
             child.dtype(),
-            dtype
+            dtype,
+            "FilterArray dtype does not match outer dtype",
         );
-        vortex_ensure!(
-            data.len() == len,
-            "FilterArray length {} does not match outer length {}",
+        vortex_ensure_eq!(
             data.len(),
-            len
+            len,
+            "FilterArray length does not match outer length",
         );
-        vortex_ensure!(
-            child.len() == data.mask.len(),
-            "FilterArray child length {} does not match mask length {}",
+        vortex_ensure_eq!(
             child.len(),
-            data.mask.len()
+            data.mask.len(),
+            "FilterArray child length does not match mask length",
         );
         Ok(())
     }
@@ -136,7 +134,7 @@ impl VTable for Filter {
         _session: &VortexSession,
     ) -> VortexResult<Option<Vec<u8>>> {
         // TODO(joe): make this configurable
-        vortex_bail!("Filter array is not serializable")
+        Ok(None)
     }
 
     fn deserialize(
@@ -183,7 +181,7 @@ impl VTable for Filter {
         // TODO(joe): fix the ownership of AnyCanonical
         let child = Canonical::from(array.child().as_::<AnyCanonical>());
         Ok(ExecutionResult::done(
-            execute_filter(child, &mask_values).into_array(),
+            execute_filter(child, &mask_values, ctx.allocator()).into_array(),
         ))
     }
 
@@ -200,6 +198,8 @@ impl VTable for Filter {
     }
 }
 impl OperationsVTable<Filter> for Filter {
+    type ProbeState = ();
+
     fn scalar_at(
         array: ArrayView<'_, Filter>,
         index: usize,

@@ -4,6 +4,7 @@
 use std::iter::repeat_n;
 
 use vortex_buffer::BitBuffer;
+use vortex_buffer::BufferAllocatorRef;
 use vortex_buffer::BufferMut;
 use vortex_buffer::read_u64_le;
 use vortex_error::VortexResult;
@@ -249,6 +250,7 @@ pub fn kleene_boolean_buffers(
         &rhs_valid,
         operator,
         nullability,
+        ctx.allocator(),
     )
 }
 
@@ -285,14 +287,14 @@ pub fn kleene_boolean_buffer_scalar(
                 .execute_mask(len, ctx)?
                 .bitand_not(&Mask::from_buffer(values));
             BoolArray::try_new(
-                BitBuffer::new_unset(len),
+                BitBuffer::new_unset_in(len, ctx.allocator().clone()),
                 Validity::from_mask(valid, nullability),
             )?
         }
         (Operator::Or, None) => {
             let valid = validity.execute_mask(len, ctx)? & &Mask::from_buffer(values);
             BoolArray::try_new(
-                BitBuffer::new_set(len),
+                BitBuffer::new_set_in(len, ctx.allocator().clone()),
                 Validity::from_mask(valid, nullability),
             )?
         }
@@ -302,6 +304,10 @@ pub fn kleene_boolean_buffer_scalar(
     Ok(result.into_array())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "four buffers plus result options"
+)]
 fn fused_boolean_buffers(
     len: usize,
     lhs_values: &BitBuffer,
@@ -310,6 +316,7 @@ fn fused_boolean_buffers(
     rhs_validity: &Mask,
     operator: Operator,
     nullability: Nullability,
+    allocator: &BufferAllocatorRef,
 ) -> VortexResult<ArrayRef> {
     if let Some(result) = fused_boolean_buffers_aligned(
         len,
@@ -319,6 +326,7 @@ fn fused_boolean_buffers(
         rhs_validity,
         operator,
         nullability,
+        allocator,
     )? {
         return Ok(result);
     }
@@ -335,6 +343,7 @@ fn fused_boolean_buffers(
                 $rhs_valid_words,
                 operator,
                 nullability,
+                allocator,
             )
         };
     }
@@ -389,6 +398,10 @@ impl WordSource<'_> {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "four buffers plus result options"
+)]
 fn fused_boolean_buffers_aligned(
     len: usize,
     lhs_values: &BitBuffer,
@@ -397,6 +410,7 @@ fn fused_boolean_buffers_aligned(
     rhs_validity: &Mask,
     operator: Operator,
     nullability: Nullability,
+    allocator: &BufferAllocatorRef,
 ) -> VortexResult<Option<ArrayRef>> {
     let Some(lhs_values) = word_source_from_bit_buffer(lhs_values) else {
         return Ok(None);
@@ -419,6 +433,7 @@ fn fused_boolean_buffers_aligned(
         rhs_validity,
         operator,
         nullability,
+        allocator,
     )?))
 }
 
@@ -434,6 +449,10 @@ fn word_source_from_mask(mask: &Mask) -> Option<WordSource<'_>> {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "four word sources plus result options"
+)]
 fn fused_boolean_word_sources(
     len: usize,
     lhs_words: WordSource<'_>,
@@ -442,6 +461,7 @@ fn fused_boolean_word_sources(
     rhs_valid_words: WordSource<'_>,
     operator: Operator,
     nullability: Nullability,
+    allocator: &BufferAllocatorRef,
 ) -> VortexResult<ArrayRef> {
     match operator {
         Operator::And => fused_boolean_and_word_sources(
@@ -451,6 +471,7 @@ fn fused_boolean_word_sources(
             lhs_valid_words,
             rhs_valid_words,
             nullability,
+            allocator,
         ),
         Operator::Or => fused_boolean_or_word_sources(
             len,
@@ -459,6 +480,7 @@ fn fused_boolean_word_sources(
             lhs_valid_words,
             rhs_valid_words,
             nullability,
+            allocator,
         ),
         other => vortex_bail!("Not a boolean operator: {other}"),
     }
@@ -471,12 +493,13 @@ fn fused_boolean_and_word_sources(
     lhs_valid_words: WordSource<'_>,
     rhs_valid_words: WordSource<'_>,
     nullability: Nullability,
+    allocator: &BufferAllocatorRef,
 ) -> VortexResult<ArrayRef> {
     let n_bytes = len.div_ceil(8);
     let n_words = n_bytes.div_ceil(8);
     let full_bytes = n_bytes - n_bytes % 8;
-    let mut values = BufferMut::<u64>::with_capacity(n_words);
-    let mut validity = BufferMut::<u64>::with_capacity(n_words);
+    let mut values = BufferMut::<u64>::with_capacity_in(n_words, allocator.clone());
+    let mut validity = BufferMut::<u64>::with_capacity_in(n_words, allocator.clone());
 
     for byte_offset in (0..full_bytes).step_by(8) {
         let lhs = lhs_words.word_at(byte_offset, 8);
@@ -518,12 +541,13 @@ fn fused_boolean_or_word_sources(
     lhs_valid_words: WordSource<'_>,
     rhs_valid_words: WordSource<'_>,
     nullability: Nullability,
+    allocator: &BufferAllocatorRef,
 ) -> VortexResult<ArrayRef> {
     let n_bytes = len.div_ceil(8);
     let n_words = n_bytes.div_ceil(8);
     let full_bytes = n_bytes - n_bytes % 8;
-    let mut values = BufferMut::<u64>::with_capacity(n_words);
-    let mut validity = BufferMut::<u64>::with_capacity(n_words);
+    let mut values = BufferMut::<u64>::with_capacity_in(n_words, allocator.clone());
+    let mut validity = BufferMut::<u64>::with_capacity_in(n_words, allocator.clone());
 
     for byte_offset in (0..full_bytes).step_by(8) {
         let lhs = lhs_words.word_at(byte_offset, 8);
@@ -579,6 +603,10 @@ fn finish_fused_boolean_words(
     .into_array())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "four word iterators plus result options"
+)]
 fn fused_boolean_words<L, R, LV, RV>(
     len: usize,
     lhs_words: L,
@@ -587,6 +615,7 @@ fn fused_boolean_words<L, R, LV, RV>(
     rhs_valid_words: RV,
     operator: Operator,
     nullability: Nullability,
+    allocator: &BufferAllocatorRef,
 ) -> VortexResult<ArrayRef>
 where
     L: Iterator<Item = u64>,
@@ -602,6 +631,7 @@ where
             lhs_valid_words,
             rhs_valid_words,
             nullability,
+            allocator,
         ),
         Operator::Or => fused_boolean_or_words(
             len,
@@ -610,6 +640,7 @@ where
             lhs_valid_words,
             rhs_valid_words,
             nullability,
+            allocator,
         ),
         other => vortex_bail!("Not a boolean operator: {other}"),
     }
@@ -622,6 +653,7 @@ fn fused_boolean_and_words<L, R, LV, RV>(
     lhs_valid_words: LV,
     rhs_valid_words: RV,
     nullability: Nullability,
+    allocator: &BufferAllocatorRef,
 ) -> VortexResult<ArrayRef>
 where
     L: Iterator<Item = u64>,
@@ -630,8 +662,8 @@ where
     RV: Iterator<Item = u64>,
 {
     let n_words = len.div_ceil(64);
-    let mut values = BufferMut::<u64>::with_capacity(n_words);
-    let mut validity = BufferMut::<u64>::with_capacity(n_words);
+    let mut values = BufferMut::<u64>::with_capacity_in(n_words, allocator.clone());
+    let mut validity = BufferMut::<u64>::with_capacity_in(n_words, allocator.clone());
 
     for (((lhs, rhs), lhs_valid), rhs_valid) in lhs_words
         .zip(rhs_words)
@@ -658,6 +690,7 @@ fn fused_boolean_or_words<L, R, LV, RV>(
     lhs_valid_words: LV,
     rhs_valid_words: RV,
     nullability: Nullability,
+    allocator: &BufferAllocatorRef,
 ) -> VortexResult<ArrayRef>
 where
     L: Iterator<Item = u64>,
@@ -666,8 +699,8 @@ where
     RV: Iterator<Item = u64>,
 {
     let n_words = len.div_ceil(64);
-    let mut values = BufferMut::<u64>::with_capacity(n_words);
-    let mut validity = BufferMut::<u64>::with_capacity(n_words);
+    let mut values = BufferMut::<u64>::with_capacity_in(n_words, allocator.clone());
+    let mut validity = BufferMut::<u64>::with_capacity_in(n_words, allocator.clone());
 
     for (((lhs, rhs), lhs_valid), rhs_valid) in lhs_words
         .zip(rhs_words)
@@ -715,13 +748,15 @@ fn is_boolean_operator(operator: Operator) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use rstest::rstest;
     use vortex_error::VortexResult;
+    use vortex_session::VortexSession;
 
     use crate::ArrayRef;
     use crate::IntoArray;
     use crate::VortexSessionExecute;
-    use crate::array_session;
     use crate::arrays::BoolArray;
     use crate::arrays::ConstantArray;
     use crate::assert_arrays_eq;
@@ -731,9 +766,11 @@ mod tests {
     use crate::scalar::Scalar;
     use crate::scalar_fn::fns::operators::Operator;
 
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
+
     #[test]
     fn test_kleene_truth_table() -> VortexResult<()> {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let lhs = BoolArray::from_iter([
             Some(true),
             Some(true),
@@ -796,7 +833,7 @@ mod tests {
 
     #[test]
     fn test_null_constant_kleene() -> VortexResult<()> {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let lhs = BoolArray::from_iter([Some(false), Some(true), None]).into_array();
         let null = ConstantArray::new(Scalar::null(DType::Bool(Nullability::Nullable)), lhs.len())
             .into_array();
@@ -825,27 +862,27 @@ mod tests {
         BoolArray::from_iter([Some(true), Some(true), Some(false), Some(false)]).into_array(),
     )]
     fn test_or(#[case] lhs: ArrayRef, #[case] rhs: ArrayRef) {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let r = lhs.binary(rhs, Operator::Or).unwrap();
         let r = r.execute::<BoolArray>(&mut ctx).unwrap().into_array();
 
         let v0 = r
-            .execute_scalar(0, &mut array_session().create_execution_ctx())
+            .execute_scalar(0, &mut SESSION.create_execution_ctx())
             .unwrap()
             .as_bool()
             .value();
         let v1 = r
-            .execute_scalar(1, &mut array_session().create_execution_ctx())
+            .execute_scalar(1, &mut SESSION.create_execution_ctx())
             .unwrap()
             .as_bool()
             .value();
         let v2 = r
-            .execute_scalar(2, &mut array_session().create_execution_ctx())
+            .execute_scalar(2, &mut SESSION.create_execution_ctx())
             .unwrap()
             .as_bool()
             .value();
         let v3 = r
-            .execute_scalar(3, &mut array_session().create_execution_ctx())
+            .execute_scalar(3, &mut SESSION.create_execution_ctx())
             .unwrap()
             .as_bool()
             .value();
@@ -866,7 +903,7 @@ mod tests {
         BoolArray::from_iter([Some(true), Some(true), Some(false), Some(false)]).into_array(),
     )]
     fn test_and(#[case] lhs: ArrayRef, #[case] rhs: ArrayRef) {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let r = lhs
             .binary(rhs, Operator::And)
             .unwrap()
@@ -875,22 +912,22 @@ mod tests {
             .into_array();
 
         let v0 = r
-            .execute_scalar(0, &mut array_session().create_execution_ctx())
+            .execute_scalar(0, &mut SESSION.create_execution_ctx())
             .unwrap()
             .as_bool()
             .value();
         let v1 = r
-            .execute_scalar(1, &mut array_session().create_execution_ctx())
+            .execute_scalar(1, &mut SESSION.create_execution_ctx())
             .unwrap()
             .as_bool()
             .value();
         let v2 = r
-            .execute_scalar(2, &mut array_session().create_execution_ctx())
+            .execute_scalar(2, &mut SESSION.create_execution_ctx())
             .unwrap()
             .as_bool()
             .value();
         let v3 = r
-            .execute_scalar(3, &mut array_session().create_execution_ctx())
+            .execute_scalar(3, &mut SESSION.create_execution_ctx())
             .unwrap()
             .as_bool()
             .value();

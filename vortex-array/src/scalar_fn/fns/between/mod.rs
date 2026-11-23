@@ -10,10 +10,10 @@ pub use kernel::*;
 use prost::Message;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
-use vortex_proto::expr as pb;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
+use crate::AnyCanonical;
 use crate::ArrayRef;
 use crate::Canonical;
 use crate::ExecutionCtx;
@@ -25,12 +25,15 @@ use crate::arrays::ScalarFnArray;
 use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
 use crate::dtype::DType::Bool;
+use crate::dtype::NativePType;
 use crate::expr::display::ExprDisplay;
-use crate::expr::expression::Expression;
+use crate::proto::expr as pb;
+use crate::require_input;
 use crate::scalar::Scalar;
 use crate::scalar_fn::Arity;
 use crate::scalar_fn::ChildName;
 use crate::scalar_fn::ExecutionArgs;
+use crate::scalar_fn::ScalarFnExecutionResult;
 use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::ScalarFnVTable;
 use crate::scalar_fn::ScalarFnVTableExt;
@@ -78,13 +81,21 @@ impl StrictComparison {
     pub const fn is_strict(&self) -> bool {
         matches!(self, StrictComparison::Strict)
     }
+
+    /// Returns the total-order bound check that this comparison applies to two native values.
+    pub fn to_predicate<T: NativePType>(self) -> fn(T, T) -> bool {
+        match self {
+            StrictComparison::Strict => T::is_lt,
+            StrictComparison::NonStrict => T::is_le,
+        }
+    }
 }
 
 /// Short-circuits between for the inputs that need no encoding-specific work.
 ///
-/// Returns `Some(result)` when the answer is already known (empty array, null bounds), or `None`
-/// when between must proceed with the encoding-specific implementation. Kernels can therefore rely
-/// on both bounds being non-null.
+/// Returns `Some(result)` when the answer is already known (empty or null array, null bounds), or
+/// `None` when between must proceed with the encoding-specific implementation. Kernels can therefore
+/// rely on both bounds being non-null.
 ///
 /// The result can be a lazy [`ScalarFn`] array, so a caller that needs a computed array
 /// **must** execute it.
@@ -102,6 +113,14 @@ pub(super) fn short_circuit(
     // Bail early if the array is empty.
     if arr.is_empty() {
         return Ok(Some(Canonical::empty(&return_dtype).into_array()));
+    }
+
+    // An all-null chunk is a null `ConstantArray`, and `Scalar` orders null below every value, so
+    // comparing it in a kernel would give false instead of null.
+    if arr.as_constant().is_some_and(|v| v.is_null()) {
+        return Ok(Some(
+            ConstantArray::new(Scalar::null(return_dtype), arr.len()).into_array(),
+        ));
     }
 
     let lower_is_null = lower.as_constant().is_some_and(|v| v.is_null());
@@ -127,7 +146,7 @@ pub(super) fn short_circuit(
 /// The two compares that `Between` stands for, combined with Kleene `AND`.
 ///
 /// The returned array is lazy, so a reduce rule can call this function.
-fn as_two_compares(
+pub(crate) fn as_two_compares(
     arr: &ArrayRef,
     lower: &ArrayRef,
     upper: &ArrayRef,
@@ -198,7 +217,7 @@ impl Between {
         upper: ArrayRef,
         options: BetweenOptions,
     ) -> VortexResult<ScalarFnArray> {
-        ScalarFnArray::try_new(Between.bind(options), vec![array, lower, upper])
+        ScalarFnArray::try_new(Between.bind(options), [array, lower, upper])
     }
 }
 
@@ -327,21 +346,19 @@ impl ScalarFnVTable for Between {
         between_canonical(&arr, &lower, &upper, options, ctx)
     }
 
-    fn validity(
+    fn execute_step(
         &self,
-        _options: &Self::Options,
-        _expression: &Expression,
-    ) -> VortexResult<Option<Expression>> {
-        // `Between` stands for two compares under Kleene `AND`, and `null AND false` is `false`,
-        // so a null bound does not make a row null. There is no validity expression to derive,
-        // which is also why `Binary` returns `None` for `Operator::And`.
-        Ok(None)
+        options: &Self::Options,
+        args: &dyn ExecutionArgs,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<ScalarFnExecutionResult> {
+        require_input!(args, 0 => AnyCanonical);
+        self.execute(options, args, ctx)
+            .map(ScalarFnExecutionResult::done)
     }
 
     fn is_strict(&self, _options: &Self::Options) -> bool {
-        // Not strict for the same reason `validity` returns `None` above: under Kleene `AND` a
-        // null bound does not force a null row.
-        false
+        false // NULL AND false = false
     }
 
     fn is_infallible(&self, _options: &Self::Options) -> bool {
@@ -378,7 +395,7 @@ mod tests {
     use crate::test_harness::to_int_indices;
     use crate::validity::Validity;
 
-    static SESSION: LazyLock<VortexSession> = LazyLock::new(crate::array_session);
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
 
     const NON_STRICT: BetweenOptions = BetweenOptions {
         lower_strict: StrictComparison::NonStrict,
@@ -389,6 +406,28 @@ mod tests {
     fn null_i32s(len: usize) -> ArrayRef {
         let null = Scalar::null(DType::Primitive(PType::I32, Nullability::Nullable));
         ConstantArray::new(null, len).into_array()
+    }
+
+    #[test]
+    fn lazy_validity() -> VortexResult<()> {
+        let ctx = &mut SESSION.create_execution_ctx();
+
+        let x = PrimitiveArray::from_option_iter([Some(10), Some(10), Some(1)]).into_array();
+        let lo = PrimitiveArray::from_option_iter([None, None, Some(0)]).into_array();
+        let hi = PrimitiveArray::from_option_iter([Some(5), Some(50), Some(5)]).into_array();
+
+        let data = StructArray::from_fields(&[("x", x), ("lo", lo), ("hi", hi)])?.into_array();
+        let lazy = data.apply(&between(col("x"), col("lo"), col("hi"), NON_STRICT))?;
+
+        let Validity::Array(validity) = lazy.validity()? else {
+            vortex_bail!("non-lazy validity");
+        };
+        assert_eq!(
+            validity.encoding_id().to_string(),
+            "vortex.scalar_fn_validity"
+        );
+        assert_arrays_eq!(validity, BoolArray::from_iter([true, false, true]), ctx);
+        Ok(())
     }
 
     /// A declared validity expression must agree with the mask of the executed result.
@@ -416,8 +455,9 @@ mod tests {
             .execute::<BoolArray>(ctx)?
             .opt_bool_vec(ctx);
 
+        let validity_expr = expr.bind(data.dtype())?.validity()?;
         let declared = data
-            .apply(&expr.validity()?)?
+            .apply_bound(&validity_expr)?
             .execute::<BoolArray>(ctx)?
             .bool_vec(ctx);
 
@@ -609,6 +649,36 @@ mod tests {
         Ok(())
     }
 
+    /// Compression stores an all-null chunk as a [`ConstantArray`]. Its rows must come out null
+    /// rather than false, since `NOT` turns a false row into a match.
+    #[rstest]
+    #[case::f64(Scalar::null_native::<f64>(), Scalar::from(-0.0f64), Scalar::from(0.0f64))]
+    #[case::i32(Scalar::null_native::<i32>(), Scalar::from(0i32), Scalar::from(0i32))]
+    fn constant_null_array(
+        #[case] null: Scalar,
+        #[case] lower: Scalar,
+        #[case] upper: Scalar,
+    ) -> VortexResult<()> {
+        let ctx = &mut SESSION.create_execution_ctx();
+        let array = ConstantArray::new(null, 3).into_array();
+        let lower = ConstantArray::new(lower, 3).into_array();
+        let upper = ConstantArray::new(upper, 3).into_array();
+
+        let between = array.between(lower, upper, NON_STRICT)?;
+        let not_between = between.not()?;
+
+        assert_eq!(
+            between.execute::<BoolArray>(ctx)?.opt_bool_vec(ctx),
+            [None, None, None]
+        );
+        assert_eq!(
+            not_between.execute::<BoolArray>(ctx)?.opt_bool_vec(ctx),
+            [None, None, None]
+        );
+
+        Ok(())
+    }
+
     #[test]
     fn test_between_decimal() {
         let ctx = &mut SESSION.create_execution_ctx();
@@ -728,5 +798,32 @@ mod tests {
         .unwrap();
 
         assert_eq!(to_int_indices(result, ctx).unwrap(), expected_indices);
+    }
+
+    /// A non-canonical input is executed through the executor before the between kernel runs.
+    #[test]
+    fn executes_non_canonical_input_iteratively() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let chunks = vec![
+            PrimitiveArray::from_iter([1i32, 5]).into_array(),
+            PrimitiveArray::from_iter([9i32, 12]).into_array(),
+        ];
+        let dtype = chunks[0].dtype().clone();
+        let chunked = crate::arrays::ChunkedArray::try_new(chunks, dtype)?.into_array();
+        let result = chunked.between(
+            ConstantArray::new(5i32, 4).into_array(),
+            ConstantArray::new(10i32, 4).into_array(),
+            BetweenOptions {
+                lower_strict: StrictComparison::NonStrict,
+                upper_strict: StrictComparison::Strict,
+            },
+        )?;
+
+        assert_arrays_eq!(
+            result,
+            BoolArray::from_iter([false, true, true, false]),
+            &mut ctx
+        );
+        Ok(())
     }
 }

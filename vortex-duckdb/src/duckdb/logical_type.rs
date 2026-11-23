@@ -8,6 +8,7 @@ use std::fmt::Formatter;
 use vortex::error::VortexExpect;
 use vortex::error::VortexResult;
 use vortex::error::vortex_bail;
+use vortex::error::vortex_ensure;
 
 use crate::cpp::DUCKDB_TYPE;
 use crate::cpp::duckdb_array_type_array_size;
@@ -16,6 +17,7 @@ use crate::cpp::duckdb_create_array_type;
 use crate::cpp::duckdb_create_decimal_type;
 use crate::cpp::duckdb_create_list_type;
 use crate::cpp::duckdb_create_logical_type;
+use crate::cpp::duckdb_create_map_type;
 use crate::cpp::duckdb_create_struct_type;
 use crate::cpp::duckdb_decimal_scale;
 use crate::cpp::duckdb_decimal_width;
@@ -44,6 +46,9 @@ lifetime_wrapper!(
     duckdb_logical_type,
     duckdb_destroy_logical_type
 );
+
+/// The widest decimal precision DuckDB's `DECIMAL(width, scale)` can represent.
+const DUCKDB_MAX_DECIMAL_PRECISION: u8 = 38;
 
 /// `LogicalType` is Send+Sync, as the wrapped pointer is Send+Sync.
 unsafe impl Send for LogicalType {}
@@ -92,9 +97,10 @@ impl LogicalType {
 
     /// Creates a DuckDB decimal logical type with the specified precision and scale.
     pub fn decimal_type(precision: u8, scale: u8) -> VortexResult<Self> {
-        assert!(
-            precision <= 38,
-            "DuckDB decimal type precision must be <= 38. precision: {precision}"
+        vortex_ensure!(
+            precision <= DUCKDB_MAX_DECIMAL_PRECISION,
+            "DuckDB decimal type precision must be <= {DUCKDB_MAX_DECIMAL_PRECISION}. \
+             precision: {precision}"
         );
 
         let ptr = unsafe { duckdb_create_decimal_type(precision, scale) };
@@ -126,6 +132,16 @@ impl LogicalType {
         }
 
         // SAFETY: This pointer came directly from DuckDB, and we checked that it was not `NULL`.
+        Ok(unsafe { Self::own(ptr) })
+    }
+
+    /// Creates a DuckDB map logical type with the specified key and value types.
+    pub fn map_type(key_type: &LogicalTypeRef, value_type: &LogicalTypeRef) -> VortexResult<Self> {
+        let ptr = unsafe { duckdb_create_map_type(key_type.as_ptr(), value_type.as_ptr()) };
+
+        if ptr.is_null() {
+            vortex_bail!("Failed to create map type");
+        }
         Ok(unsafe { Self::own(ptr) })
     }
 
@@ -494,13 +510,36 @@ mod tests {
             LogicalType::decimal_type(10, 2).vortex_expect("Failed to create decimal type");
         let cloned = decimal_type.clone();
 
-        assert_eq!(decimal_type.as_type_id(), cloned.as_type_id());
+        for ty in [&decimal_type, &cloned] {
+            assert_eq!(ty.as_type_id(), DUCKDB_TYPE::DUCKDB_TYPE_DECIMAL);
+            assert_eq!(ty.as_decimal(), (10, 2));
+        }
+    }
 
-        let (original_width, original_scale) = decimal_type.as_decimal();
-        let (cloned_width, cloned_scale) = cloned.as_decimal();
+    /// Vortex allows a decimal precision up to 76, DuckDB only up to 38, so the wider ones have to
+    /// come back as an error rather than unwinding out of the extension's C entry points.
+    #[test]
+    fn decimal_type_rejects_precision_above_duckdb_maximum() {
+        for precision in [39, 76, u8::MAX] {
+            let message = LogicalType::decimal_type(precision, 0)
+                .err()
+                .map(|err| err.to_string())
+                .unwrap_or_default();
+            assert!(
+                message.contains("must be <= 38"),
+                "precision {precision} should have been rejected, got: {message}"
+            );
+        }
+    }
 
-        assert_eq!(original_width, cloned_width);
-        assert_eq!(original_scale, cloned_scale);
+    #[test]
+    fn decimal_type_accepts_duckdb_maximum_precision() -> VortexResult<()> {
+        for precision in [1, 18, DUCKDB_MAX_DECIMAL_PRECISION] {
+            let ty = LogicalType::decimal_type(precision, 0)?;
+            assert_eq!(ty.as_type_id(), DUCKDB_TYPE::DUCKDB_TYPE_DECIMAL);
+            assert_eq!(ty.as_decimal(), (precision, 0));
+        }
+        Ok(())
     }
 
     #[test]
@@ -601,7 +640,13 @@ mod tests {
         assert_eq!(original_count, cloned_count);
         assert_eq!(original_count, 2);
 
-        for idx in 0..original_count {
+        for (idx, (name, type_id)) in [
+            ("name", DUCKDB_TYPE::DUCKDB_TYPE_VARCHAR),
+            ("age", DUCKDB_TYPE::DUCKDB_TYPE_INTEGER),
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let original_child_type = struct_type.struct_child_type(idx);
             let cloned_child_type = cloned.struct_child_type(idx);
             let original_child_name = struct_type.struct_child_name(idx);
@@ -612,7 +657,9 @@ mod tests {
                 cloned_child_type.as_type_id()
             );
 
-            assert_eq!(original_child_name, cloned_child_name);
+            assert_eq!(original_child_name.to_string(), name);
+            assert_eq!(cloned_child_name.to_string(), name);
+            assert_eq!(original_child_type.as_type_id(), type_id);
         }
     }
 
@@ -623,6 +670,8 @@ mod tests {
 
         let with_crs = LogicalType::geometry_type(Some("EPSG:4326"))?;
         assert_eq!(with_crs.as_type_id(), DUCKDB_TYPE::DUCKDB_TYPE_GEOMETRY);
+        assert!(no_crs.geometry_crs().is_none());
+        assert_eq!(with_crs.geometry_crs().unwrap().to_string(), "EPSG:4326");
         Ok(())
     }
 
@@ -654,7 +703,13 @@ mod tests {
         assert_eq!(original_count, cloned_count);
         assert_eq!(original_count, 2);
 
-        for idx in 0..original_count {
+        for (idx, (name, type_id)) in [
+            ("str", DUCKDB_TYPE::DUCKDB_TYPE_VARCHAR),
+            ("num", DUCKDB_TYPE::DUCKDB_TYPE_INTEGER),
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let original_member_type = union_type.union_member_type(idx);
             let cloned_member_type = cloned.union_member_type(idx);
             let original_member_name = union_type.union_member_name(idx);
@@ -665,7 +720,9 @@ mod tests {
                 cloned_member_type.as_type_id(),
             );
 
-            assert_eq!(original_member_name, cloned_member_name);
+            assert_eq!(original_member_name.to_string(), name);
+            assert_eq!(cloned_member_name.to_string(), name);
+            assert_eq!(original_member_type.as_type_id(), type_id);
         }
     }
 }

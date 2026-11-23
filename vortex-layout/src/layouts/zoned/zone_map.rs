@@ -6,6 +6,8 @@
 use std::sync::Arc;
 
 use vortex_array::ArrayRef;
+use vortex_array::Columnar;
+use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::aggregate_fn::AggregateFnRef;
@@ -16,8 +18,10 @@ use vortex_array::aggregate_fn::fns::all_non_null::AllNonNull;
 use vortex_array::aggregate_fn::fns::all_null::AllNull;
 use vortex_array::aggregate_fn::fns::bounded_max::BOUNDED_MAX_BOUND;
 use vortex_array::aggregate_fn::fns::bounded_max::BoundedMax;
+use vortex_array::arrays::BoolArray;
 use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::PrimitiveArray;
+use vortex_array::arrays::RunEnd;
 use vortex_array::arrays::StructArray;
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::dtype::DType;
@@ -33,15 +37,14 @@ use vortex_array::scalar_fn::ScalarFnVTableExt;
 use vortex_array::scalar_fn::internal::row_count::RowCount;
 use vortex_array::scalar_fn::internal::row_count::contains_row_count;
 use vortex_array::scalar_fn::internal::row_count::substitute_row_count;
-use vortex_array::stats::bind::StatBinder;
-use vortex_array::stats::bind::bind_stats;
 use vortex_array::validity::Validity;
 use vortex_buffer::buffer;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
-use vortex_error::vortex_ensure;
+use vortex_error::vortex_ensure_eq;
+use vortex_expr::stats::bind::StatBinder;
+use vortex_expr::stats::bind::bind_stats;
 use vortex_mask::Mask;
-use vortex_runend::RunEnd;
 use vortex_session::VortexSession;
 
 use crate::layouts::zoned::schema::aggregate_stats_table_dtype;
@@ -128,7 +131,7 @@ impl ZoneMap {
     /// Apply a pruning predicate to this zone map.
     ///
     /// `predicate` should be a stats rewrite expression such as the result of
-    /// [`BoundExpression::falsify`]. The returned mask has one value per zone, where
+    /// [`BoundExpressionPruneExt::falsify`]. The returned mask has one value per zone, where
     /// `true` means the zone cannot contain matching rows and can be skipped.
     ///
     /// If the predicate contains [`row_count`][vortex_array::scalar_fn::internal::row_count]
@@ -138,31 +141,74 @@ impl ZoneMap {
     /// `row_count` is a layout property rather than a stored stats field, and the
     /// final zone may be shorter than the nominal zone length, so it is materialized
     /// only after the predicate has been lowered to the zone-map table.
+    ///
+    /// [`BoundExpressionPruneExt::falsify`]: vortex_expr::stats::rewrite::BoundExpressionPruneExt::falsify
     pub fn prune(
+        &self,
+        predicate: &BoundExpression,
+        session: &VortexSession,
+    ) -> VortexResult<Mask> {
+        let predicate = self.lower_stats(predicate.clone())?;
+        self.prune_lowered(&predicate, session)
+    }
+
+    /// Apply a predicate that [`Self::lower_stats`] already lowered to this zone map's
+    /// stats table.
+    ///
+    /// Lowering depends only on the column and stats-table dtypes, so callers that evaluate
+    /// the same predicate many times lower it once and call this function for each evaluation.
+    pub(super) fn prune_lowered(
         &self,
         predicate: &BoundExpression,
         session: &VortexSession,
     ) -> VortexResult<Mask> {
         let mut ctx = session.create_execution_ctx();
         let num_zones = self.array.len();
-        let predicate = self.lower_stats(predicate.clone())?;
 
         let array = self.array.clone().into_array();
-        let applied = array.apply_bound(&predicate)?;
+        let applied = array.apply_bound(predicate)?;
 
         if !contains_row_count(&applied) {
-            return applied.null_as_false().execute(&mut ctx);
+            return null_as_false_mask(applied, &mut ctx);
         }
 
         let row_count_array = row_count_array(self.zone_len, self.row_count, num_zones)?;
         let substituted = substitute_row_count(applied, &row_count_array)?;
-        substituted.null_as_false().execute(&mut ctx)
+        null_as_false_mask(substituted, &mut ctx)
     }
 
-    fn lower_stats(&self, predicate: BoundExpression) -> VortexResult<BoundExpression> {
+    /// Rewrite the stats references in `predicate` into expressions over the stats table.
+    pub(super) fn lower_stats(&self, predicate: BoundExpression) -> VortexResult<BoundExpression> {
         let binder = ZoneMapStatsBinder { zone_map: self };
         bind_stats(predicate, &binder)
     }
+}
+
+/// This is equivalent to `fill_null(false)?.execute::<Mask>(ctx)`.
+/// However, in the case of very frequend and very short operations the cost of
+/// filling nulls and then canonicalizing is greater than canonicalizing and
+/// then intersecting the bitbuffer.
+fn null_as_false_mask(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Mask> {
+    if !array.dtype().is_nullable() {
+        return array.execute::<Mask>(ctx);
+    }
+    let len = array.len();
+    Ok(match array.execute::<Columnar>(ctx)? {
+        Columnar::Constant(c) => Mask::new(len, c.scalar().as_bool().value().unwrap_or(false)),
+        Columnar::Canonical(c) => {
+            let bool = c.into_array().execute::<BoolArray>(ctx)?;
+            match bool.as_ref().validity()? {
+                Validity::NonNullable | Validity::AllValid => {
+                    Mask::from_buffer(bool.into_bit_buffer())
+                }
+                Validity::AllInvalid => Mask::new_false(len),
+                Validity::Array(v) => {
+                    let validity_bits = v.execute::<BoolArray>(ctx)?.into_bit_buffer();
+                    Mask::from_buffer(bool.into_bit_buffer() & &validity_bits)
+                }
+            }
+        }
+    })
 }
 
 struct ZoneMapStatsBinder<'a> {
@@ -179,11 +225,10 @@ impl StatBinder for ZoneMapStatsBinder<'_> {
         if !input.is_root() {
             return Ok(None);
         }
-        vortex_ensure!(
-            input.dtype() == &self.zone_map.column_dtype,
-            "Stats predicate root dtype {} does not match zone-map column dtype {}",
+        vortex_ensure_eq!(
             input.dtype(),
-            self.zone_map.column_dtype
+            &self.zone_map.column_dtype,
+            "Stats predicate root dtype does not match zone-map column dtype"
         );
 
         if let Some(stat_expr) = self.zone_map.aggregate_field_expr(aggregate_fn) {
@@ -307,12 +352,22 @@ fn row_count_expr() -> Expression {
 /// `zone_len` is the nominal zone size; only the final zone may be shorter. The
 /// result is a [`ConstantArray`] for uniform zone sizes, otherwise a two-run
 /// run-end encoded array whose trailing run carries the final zone length.
+///
+/// All three arguments come from the file — `zone_len` from the zoned layout's metadata,
+/// `row_count` from the layout node, `num_zones` from the zone map's own length — and nothing ties
+/// them together, so a file may declare more zone coverage than the layout has rows.
 fn row_count_array(zone_len: u64, row_count: u64, num_zones: usize) -> VortexResult<ArrayRef> {
     if num_zones == 0 {
         return Ok(ConstantArray::new(0u64, 0).into_array());
     }
 
-    let last_zone_len = row_count - zone_len.saturating_mul((num_zones as u64) - 1);
+    let leading_rows = zone_len.saturating_mul((num_zones as u64) - 1);
+    let Some(last_zone_len) = row_count.checked_sub(leading_rows) else {
+        vortex_bail!(
+            "Zone map declares {num_zones} zones of {zone_len} rows, which is more than the \
+             {row_count} rows of the layout"
+        );
+    };
     if num_zones == 1 || last_zone_len == zone_len {
         return Ok(ConstantArray::new(last_zone_len, num_zones).into_array());
     }
@@ -338,7 +393,10 @@ fn row_count_array(zone_len: u64, row_count: u64, num_zones: usize) -> VortexRes
 mod tests {
     use std::num::NonZeroUsize;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicI32;
+    use std::sync::atomic::Ordering;
 
+    use rstest::rstest;
     use vortex_array::IntoArray;
     use vortex_array::VortexSessionExecute;
     use vortex_array::aggregate_fn::AggregateFnVTableExt;
@@ -368,6 +426,7 @@ mod tests {
     use vortex_array::expr::BoundExpression;
     use vortex_array::expr::Expression;
     use vortex_array::expr::cast;
+    use vortex_array::expr::dynamic;
     use vortex_array::expr::gt;
     use vortex_array::expr::gt_eq;
     use vortex_array::expr::is_not_null;
@@ -377,13 +436,17 @@ mod tests {
     use vortex_array::expr::not_eq;
     use vortex_array::expr::root;
     use vortex_array::expr::stats::Stat;
-    use vortex_array::stats::all_nan;
-    use vortex_array::stats::all_non_nan;
-    use vortex_array::stats::all_non_null;
-    use vortex_array::stats::all_null;
+    use vortex_array::scalar::ScalarValue;
+    use vortex_array::scalar_fn::fns::operators::CompareOperator;
     use vortex_array::validity::Validity;
+    use vortex_buffer::Buffer;
     use vortex_buffer::buffer;
     use vortex_error::VortexResult;
+    use vortex_expr::stats::all_nan;
+    use vortex_expr::stats::all_non_nan;
+    use vortex_expr::stats::all_non_null;
+    use vortex_expr::stats::all_null;
+    use vortex_expr::stats::rewrite::BoundExpressionPruneExt;
     use vortex_mask::Mask;
 
     use crate::layouts::zoned::zone_map::ZoneMap;
@@ -556,6 +619,49 @@ mod tests {
             mask.into_array(),
             BoolArray::from_iter([false, false, true]),
             &mut SESSION.create_execution_ctx()
+        );
+    }
+
+    /// `zone_len`, `row_count` and the zone-map length all come from the file and nothing ties them
+    /// together, so a file can claim more zone coverage than the layout has rows. Pruning must
+    /// report that rather than underflowing the per-zone row-count arithmetic.
+    #[rstest]
+    // 4 zones of 4 rows claims 12 rows of leading coverage for a 10-row layout. (3 zones of 4 is
+    // legal — 4 + 4 + 2 — and is what `row_count_prunes_short_trailing_zone` covers.)
+    #[case::zones_overrun_row_count(4, 4, 10)]
+    // The leading zones alone already exceed the row count.
+    #[case::leading_zones_overrun(8, 3, 10)]
+    // A zero row count with a non-empty zone map.
+    #[case::no_rows_but_zones_present(4, 2, 0)]
+    fn row_count_rejects_zones_overrunning_the_layout(
+        #[case] zone_len: u64,
+        #[case] num_zones: usize,
+        #[case] row_count: u64,
+    ) {
+        let null_counts = PrimitiveArray::new(
+            Buffer::<u64>::from_iter(std::iter::repeat_n(0u64, num_zones)),
+            Validity::AllValid,
+        )
+        .into_array();
+        let zone_map = ZoneMap::try_new_legacy(
+            PType::U64.into(),
+            StructArray::from_fields(&[("null_count", null_counts)]).unwrap(),
+            Arc::new([Stat::NullCount]),
+            zone_len,
+            row_count,
+        )
+        .unwrap();
+
+        let pruning_expr = falsify(&is_not_null(root()), PType::U64.into());
+        let message = zone_map
+            .prune(&pruning_expr, &SESSION)
+            .err()
+            .map(|err| err.to_string())
+            .unwrap_or_default();
+        assert!(
+            message.contains("more than the"),
+            "zone_len {zone_len} x {num_zones} zones over {row_count} rows should have been \
+             rejected, got: {message}"
         );
     }
 
@@ -882,7 +988,7 @@ mod tests {
         let max_fn = Stat::Max
             .aggregate_fn()
             .expect("max should have an aggregate function");
-        let predicate = is_null(vortex_array::stats::stat(root(), max_fn));
+        let predicate = is_null(vortex_expr::stats::stat(root(), max_fn));
 
         // Missing StatFn lowers to a nullable null literal, so `is_null(...)` is true for every zone.
         let mask = prune(&zone_map, &predicate).unwrap();
@@ -907,7 +1013,7 @@ mod tests {
         let max_fn = Stat::Max
             .aggregate_fn()
             .expect("max should have an aggregate function");
-        let predicate = is_null(vortex_array::stats::stat(root(), max_fn));
+        let predicate = is_null(vortex_expr::stats::stat(root(), max_fn));
         let error = prune(&zone_map, &predicate).unwrap_err();
 
         assert!(
@@ -991,5 +1097,61 @@ mod tests {
             BoolArray::from_iter([true, false, false]),
             &mut SESSION.create_execution_ctx()
         );
+    }
+
+    #[test]
+    fn lowered_dynamic_predicate_tracks_rhs_updates() -> VortexResult<()> {
+        let max = Max.bind(NumericalAggregateOpts::skip_nans());
+        let min = Min.bind(NumericalAggregateOpts::skip_nans());
+        let zone_map = ZoneMap::try_new(
+            PType::I32.into(),
+            StructArray::from_fields(&[
+                (
+                    max.to_string(),
+                    PrimitiveArray::new(buffer![5i32, 6i32, 7i32], Validity::AllValid).into_array(),
+                ),
+                (
+                    min.to_string(),
+                    PrimitiveArray::new(buffer![1i32, 2i32, 3i32], Validity::AllValid).into_array(),
+                ),
+            ])?,
+            Arc::new([max, min]),
+            3,
+            10,
+        )?;
+        let ctx = &mut SESSION.create_execution_ctx();
+
+        let threshold = Arc::new(AtomicI32::new(5));
+        let rhs = Arc::clone(&threshold);
+        let expr = dynamic(
+            CompareOperator::Gt,
+            move || Some(ScalarValue::from(rhs.load(Ordering::Relaxed))),
+            PType::I32.into(),
+            true,
+            root(),
+        );
+
+        // Lower once, as the zoned reader does, and evaluate the lowered predicate after each
+        // update of the dynamic value.
+        let lowered = zone_map.lower_stats(falsify(&expr, PType::I32.into()))?;
+
+        // A > 5 => A.max <= 5
+        let mask = zone_map.prune_lowered(&lowered, &SESSION)?;
+        assert_arrays_eq!(
+            mask.into_array(),
+            BoolArray::from_iter([true, false, false]),
+            ctx
+        );
+
+        // A > 6 => A.max <= 6
+        threshold.store(6, Ordering::Relaxed);
+        let mask = zone_map.prune_lowered(&lowered, &SESSION)?;
+        assert_arrays_eq!(
+            mask.into_array(),
+            BoolArray::from_iter([true, true, false]),
+            ctx
+        );
+
+        Ok(())
     }
 }

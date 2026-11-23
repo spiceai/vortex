@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use vortex_buffer::Buffer;
+use vortex_buffer::BufferAllocatorRef;
 use vortex_mask::MaskValuesRef;
 
 use crate::arrays::VarBinViewArray;
@@ -13,11 +14,15 @@ use crate::arrays::varbinview::BinaryView;
 use crate::arrays::varbinview::VarBinViewArrayExt;
 use crate::buffer::BufferHandle;
 
-pub fn filter_varbinview(array: &VarBinViewArray, mask: &MaskValuesRef) -> VarBinViewArray {
+pub fn filter_varbinview(
+    array: &VarBinViewArray,
+    mask: &MaskValuesRef,
+    allocator: &BufferAllocatorRef,
+) -> VarBinViewArray {
     let filtered_validity = filter_validity(array.varbinview_validity(), mask);
 
     let views = Buffer::<BinaryView>::from_byte_buffer(array.views_handle().as_host().clone());
-    let filtered_views = buffer::filter_buffer(views, mask.as_ref());
+    let filtered_views = buffer::filter_buffer(views, mask.as_ref(), allocator);
 
     // SAFETY: the filtered views are a subset of the original views and reference the same data
     // buffers, and the validity is filtered by the same mask so lengths stay aligned.
@@ -33,17 +38,22 @@ pub fn filter_varbinview(array: &VarBinViewArray, mask: &MaskValuesRef) -> VarBi
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
+    use vortex_session::VortexSession;
+
     use crate::IntoArray;
     use crate::VortexSessionExecute;
-    use crate::array_session;
     use crate::arrays::VarBinViewArray;
     use crate::compute::conformance::filter::test_filter_conformance;
+
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
 
     #[test]
     fn test_filter_varbinview_conformance() {
         test_filter_conformance(
             &VarBinViewArray::from_iter_str(["one", "two", "three", "four", "five"]).into_array(),
-            &mut array_session().create_execution_ctx(),
+            &mut SESSION.create_execution_ctx(),
         );
 
         test_filter_conformance(
@@ -55,7 +65,7 @@ mod tests {
                 Some("five"),
             ])
             .into_array(),
-            &mut array_session().create_execution_ctx(),
+            &mut SESSION.create_execution_ctx(),
         );
     }
 }

@@ -33,12 +33,20 @@ pub fn calculate_physical_schema(
         ));
     };
 
+    let reference_fields = reference_logical_schema.fields();
     let fields: Vec<Field> = struct_dtype
         .names()
         .iter()
         .zip(struct_dtype.fields())
-        .map(|(name, field_dtype)| {
-            let logical_field = reference_logical_schema.field_with_name(name.as_ref()).ok();
+        .enumerate()
+        .map(|(idx, (name, field_dtype))| {
+            // Files usually share the table's column order, so try the field at the same position
+            // before searching by name, which would make wide schemas quadratic.
+            let logical_field = reference_fields
+                .get(idx)
+                .filter(|field| field.name() == name.as_ref())
+                .map(|field| field.as_ref())
+                .or_else(|| reference_logical_schema.field_with_name(name.as_ref()).ok());
             match logical_field {
                 Some(logical_field) => {
                     let arrow_type = calculate_physical_field_type(
@@ -71,6 +79,15 @@ fn calculate_physical_field_type(
     logical_type: &DataType,
     arrow_session: &ArrowSession,
 ) -> DFResult<DataType> {
+    // An extension dtype has the layout of its storage dtype, and the field metadata that names the
+    // extension comes from the logical field. So the layout checks below use the storage dtype.
+    // Temporal dtypes export as native Arrow types (see `ArrowSession::to_arrow_field`), which only
+    // the default arm matches.
+    let mut storage_dtype = dtype;
+    while let DType::Extension(ext) = storage_dtype {
+        storage_dtype = ext.storage_dtype();
+    }
+
     // Check if the logical type is one that doesn't roundtrip through DType
     Ok(match logical_type {
         // Dictionary types lose their encoding when converted to DType
@@ -78,7 +95,7 @@ fn calculate_physical_field_type(
 
         // Non-view string/binary types become view types after roundtrip
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
-            if dtype.is_binary() || dtype.is_utf8() {
+            if storage_dtype.is_binary() || storage_dtype.is_utf8() {
                 logical_type.clone()
             } else {
                 return Err(exec_datafusion_err!(
@@ -92,12 +109,7 @@ fn calculate_physical_field_type(
 
         // For struct types, recursively check each field.
         DataType::Struct(logical_fields) => {
-            // Walk through any extension layers to reach the underlying struct fields.
-            let mut inner = dtype;
-            while let DType::Extension(ext) = inner {
-                inner = ext.storage_dtype();
-            }
-            if let DType::Struct(struct_dtype, _) = inner {
+            if let DType::Struct(struct_dtype, _) = storage_dtype {
                 let physical_fields: Vec<Field> = struct_dtype
                     .names()
                     .iter()
@@ -138,7 +150,7 @@ fn calculate_physical_field_type(
 
         // For list types, recursively check the element type
         DataType::List(logical_elem) | DataType::LargeList(logical_elem) => {
-            if let DType::List(elem_dtype, _) = dtype {
+            if let DType::List(elem_dtype, _) = storage_dtype {
                 let physical_elem_type = calculate_physical_field_type(
                     elem_dtype,
                     logical_elem.data_type(),
@@ -148,7 +160,8 @@ fn calculate_physical_field_type(
                     logical_elem.name(),
                     physical_elem_type,
                     logical_elem.is_nullable(),
-                );
+                )
+                .with_metadata(logical_elem.metadata().clone());
                 match logical_type {
                     DataType::List(_) => DataType::List(physical_field.into()),
                     DataType::LargeList(_) => DataType::LargeList(physical_field.into()),
@@ -163,7 +176,7 @@ fn calculate_physical_field_type(
 
         // For fixed-size list types, recursively check the element type
         DataType::FixedSizeList(logical_elem, size) => {
-            if let DType::FixedSizeList(elem_dtype, ..) = dtype {
+            if let DType::FixedSizeList(elem_dtype, ..) = storage_dtype {
                 let physical_elem_type = calculate_physical_field_type(
                     elem_dtype,
                     logical_elem.data_type(),
@@ -173,7 +186,8 @@ fn calculate_physical_field_type(
                     logical_elem.name(),
                     physical_elem_type,
                     logical_elem.is_nullable(),
-                );
+                )
+                .with_metadata(logical_elem.metadata().clone());
                 DataType::FixedSizeList(physical_field.into(), *size)
             } else {
                 return Err(exec_datafusion_err!(
@@ -185,7 +199,7 @@ fn calculate_physical_field_type(
         // Map field names and child metadata come from the reference schema, while child
         // types are recursively reconciled so nested extension metadata is preserved.
         DataType::Map(logical_entries, keys_sorted) => {
-            let DType::Map(map_dtype, _) = dtype else {
+            let DType::Map(map_dtype, _) = storage_dtype else {
                 return Err(exec_datafusion_err!(
                     "Failed to convert dtype to arrow: Vortex DType is {dtype} which is not compatible with {logical_type}"
                 ));
@@ -230,7 +244,7 @@ fn calculate_physical_field_type(
 
         // For list view types, recursively check the element type
         DataType::ListView(logical_elem) | DataType::LargeListView(logical_elem) => {
-            if let DType::List(elem_dtype, _) = dtype {
+            if let DType::List(elem_dtype, _) = storage_dtype {
                 let physical_elem_type = calculate_physical_field_type(
                     elem_dtype,
                     logical_elem.data_type(),
@@ -240,7 +254,8 @@ fn calculate_physical_field_type(
                     logical_elem.name(),
                     physical_elem_type,
                     logical_elem.is_nullable(),
-                );
+                )
+                .with_metadata(logical_elem.metadata().clone());
                 match logical_type {
                     DataType::ListView(_) => DataType::ListView(physical_field.into()),
                     DataType::LargeListView(_) => DataType::LargeListView(physical_field.into()),
@@ -267,9 +282,16 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_schema::Fields;
+    use vortex::array::EmptyMetadata;
     use vortex::dtype::Nullability;
     use vortex::dtype::PType;
     use vortex::dtype::StructFields;
+    use vortex::dtype::extension::ExtDType;
+    use vortex::dtype::extension::ExtId;
+    use vortex::dtype::extension::ExtVTable;
+    use vortex::error::VortexResult;
+    use vortex::scalar::ScalarValue;
+    use vortex::session::registry::CachedId;
 
     use super::*;
 
@@ -291,12 +313,7 @@ mod tests {
 
         let physical_schema =
             calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default()).unwrap();
-
-        // Should preserve the dictionary type from the logical schema
-        assert_eq!(
-            physical_schema.field(0).data_type(),
-            &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
-        );
+        assert_eq!(physical_schema, logical_schema);
     }
 
     #[test]
@@ -317,11 +334,7 @@ mod tests {
 
         let physical_schema =
             calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default())?;
-
-        assert_eq!(
-            physical_schema.metadata().get("table"),
-            Some(&"metadata".to_string())
-        );
+        assert_eq!(physical_schema, logical_schema);
         Ok(())
     }
 
@@ -348,11 +361,7 @@ mod tests {
 
         let physical_schema =
             calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default()).unwrap();
-
-        assert_eq!(physical_schema.field(0).data_type(), &DataType::Utf8);
-        assert_eq!(physical_schema.field(1).data_type(), &DataType::LargeUtf8);
-        assert_eq!(physical_schema.field(2).data_type(), &DataType::Binary);
-        assert_eq!(physical_schema.field(3).data_type(), &DataType::LargeBinary);
+        assert_eq!(physical_schema, logical_schema);
     }
 
     #[test]
@@ -435,19 +444,7 @@ mod tests {
 
         let physical_schema =
             calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default()).unwrap();
-
-        // Check outer structure
-        assert_eq!(physical_schema.fields().len(), 2);
-
-        // Check nested struct preserves Utf8 (not Utf8View)
-        let outer_field = physical_schema.field(0);
-        if let DataType::Struct(inner_fields) = outer_field.data_type() {
-            assert_eq!(inner_fields.len(), 2);
-            assert_eq!(inner_fields[0].data_type(), &DataType::Utf8);
-            assert_eq!(inner_fields[1].data_type(), &DataType::Int64);
-        } else {
-            panic!("Expected struct type for outer_col");
-        }
+        assert_eq!(physical_schema, logical_schema);
     }
 
     #[test]
@@ -477,15 +474,7 @@ mod tests {
 
         let physical_schema =
             calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default()).unwrap();
-
-        if let DataType::List(elem_field) = physical_schema.field(0).data_type() {
-            assert_eq!(
-                elem_field.data_type(),
-                &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
-            );
-        } else {
-            panic!("Expected list type");
-        }
+        assert_eq!(physical_schema, logical_schema);
     }
 
     #[test]
@@ -517,34 +506,7 @@ mod tests {
 
         let physical_schema =
             calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default()).unwrap();
-        let field = physical_schema.field(0);
-        assert!(field.is_nullable());
-        let DataType::Map(entries, keys_sorted) = field.data_type() else {
-            panic!("expected Map type, got {:?}", field.data_type());
-        };
-        assert!(*keys_sorted);
-        assert_eq!(entries.name(), "custom_entries");
-        assert_eq!(
-            entries.metadata().get("entries_metadata"),
-            Some(&"entries_value".to_owned())
-        );
-        let DataType::Struct(fields) = entries.data_type() else {
-            panic!("expected map entries struct, got {:?}", entries.data_type());
-        };
-        assert_eq!(fields[0].name(), "custom_key");
-        assert_eq!(fields[0].data_type(), &DataType::Int32);
-        assert!(!fields[0].is_nullable());
-        assert_eq!(
-            fields[0].metadata().get("key_metadata"),
-            Some(&"key_value".to_owned())
-        );
-        assert_eq!(fields[1].name(), "custom_value");
-        assert_eq!(fields[1].data_type(), &DataType::Utf8);
-        assert!(fields[1].is_nullable());
-        assert_eq!(
-            fields[1].metadata().get("value_metadata"),
-            Some(&"value_value".to_owned())
-        );
+        assert_eq!(physical_schema, logical_schema);
     }
 
     #[test]
@@ -591,13 +553,7 @@ mod tests {
 
         let physical_schema =
             calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default()).unwrap();
-
-        let names: Vec<&str> = physical_schema
-            .fields()
-            .iter()
-            .map(|f| f.name().as_str())
-            .collect();
-        assert_eq!(names, column_names);
+        assert_eq!(physical_schema, logical_schema);
     }
 
     /// Same, one level down: struct children are built at a separate call
@@ -639,11 +595,133 @@ mod tests {
 
         let physical_schema =
             calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default()).unwrap();
+        assert_eq!(physical_schema, logical_schema);
+    }
 
-        let DataType::Struct(labels) = physical_schema.field(0).data_type() else {
-            panic!("expected labels to be a struct");
+    #[test]
+    fn test_list_family_conversion_preserves_element_metadata() -> DFResult<()> {
+        let elem = || {
+            Field::new("item", DataType::Int32, true)
+                .with_metadata([("elem_meta".to_owned(), "v".to_owned())].into())
         };
-        let names: Vec<&str> = labels.iter().map(|f| f.name().as_str()).collect();
-        assert_eq!(names, label_names);
+        let logical_schema = Schema::new(vec![
+            Field::new("list_col", DataType::List(Arc::new(elem())), true),
+            Field::new(
+                "fsl_col",
+                DataType::FixedSizeList(Arc::new(elem()), 3),
+                true,
+            ),
+            Field::new("listview_col", DataType::ListView(Arc::new(elem())), true),
+        ]);
+        let i32n = || Arc::new(DType::Primitive(PType::I32, Nullability::Nullable));
+        let dtype = DType::Struct(
+            StructFields::from_iter([
+                ("list_col", DType::List(i32n(), Nullability::Nullable)),
+                (
+                    "fsl_col",
+                    DType::FixedSizeList(i32n(), 3, Nullability::Nullable),
+                ),
+                ("listview_col", DType::List(i32n(), Nullability::Nullable)),
+            ]),
+            Nullability::NonNullable,
+        );
+
+        let physical_schema =
+            calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default())?;
+        assert_eq!(physical_schema, logical_schema);
+        Ok(())
+    }
+
+    /// An extension type that accepts every storage dtype, so one type can wrap each layout.
+    #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+    struct AnyStorage;
+
+    impl ExtVTable for AnyStorage {
+        type Metadata = EmptyMetadata;
+        type NativeValue<'a> = &'a ScalarValue;
+
+        fn id(&self) -> ExtId {
+            static ID: CachedId = CachedId::new("test.any_storage");
+            *ID
+        }
+
+        fn serialize_metadata(&self, _metadata: &Self::Metadata) -> VortexResult<Vec<u8>> {
+            Ok(Vec::new())
+        }
+
+        fn deserialize_metadata(&self, _metadata: &[u8]) -> VortexResult<Self::Metadata> {
+            Ok(EmptyMetadata)
+        }
+
+        fn validate_dtype(_ext_dtype: &ExtDType<Self>) -> VortexResult<()> {
+            Ok(())
+        }
+
+        fn unpack_native<'a>(
+            _ext_dtype: &'a ExtDType<Self>,
+            storage_value: &'a ScalarValue,
+        ) -> VortexResult<Self::NativeValue<'a>> {
+            Ok(storage_value)
+        }
+    }
+
+    #[test]
+    fn test_extension_storage_layouts_preserved() -> anyhow::Result<()> {
+        let item = || Arc::new(Field::new("item", DataType::Int32, false));
+        let entries = Field::new_struct(
+            "entries",
+            vec![
+                Field::new("key", DataType::Int32, false),
+                Field::new("value", DataType::Int32, false),
+            ],
+            false,
+        );
+        let logical_schema = Schema::new(vec![
+            Field::new("utf8_col", DataType::Utf8, true),
+            Field::new("list_col", DataType::List(item()), true),
+            Field::new("fsl_col", DataType::FixedSizeList(item(), 3), true),
+            Field::new("map_col", DataType::Map(Arc::new(entries), false), true),
+            Field::new("listview_col", DataType::ListView(item()), true),
+        ]);
+
+        let int32 = || DType::Primitive(PType::I32, Nullability::NonNullable);
+        let extension = |storage_dtype| -> VortexResult<DType> {
+            Ok(DType::Extension(
+                ExtDType::<AnyStorage>::try_new(EmptyMetadata, storage_dtype)?.erased(),
+            ))
+        };
+        let dtype = DType::Struct(
+            StructFields::from_iter([
+                ("utf8_col", extension(DType::Utf8(Nullability::Nullable))?),
+                (
+                    "list_col",
+                    extension(DType::list(int32(), Nullability::Nullable))?,
+                ),
+                (
+                    "fsl_col",
+                    extension(DType::FixedSizeList(
+                        Arc::new(int32()),
+                        3,
+                        Nullability::Nullable,
+                    ))?,
+                ),
+                (
+                    "map_col",
+                    extension(DType::map(int32(), int32(), false, Nullability::Nullable)?)?,
+                ),
+                // Vortex has one list dtype, which the table can also read as a `ListView`.
+                (
+                    "listview_col",
+                    extension(DType::list(int32(), Nullability::Nullable))?,
+                ),
+            ]),
+            Nullability::NonNullable,
+        );
+
+        let physical_schema =
+            calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default())?;
+        assert_eq!(physical_schema, logical_schema);
+
+        Ok(())
     }
 }

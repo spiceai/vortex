@@ -6,9 +6,9 @@
 use vortex_array::expr::BoundExpression;
 use vortex_array::scalar_fn::ScalarFnId;
 use vortex_array::scalar_fn::ScalarFnVTable;
-use vortex_array::stats::rewrite::StatsRewriteCtx;
-use vortex_array::stats::rewrite::StatsRewriteRule;
 use vortex_error::VortexResult;
+use vortex_expr::stats::rewrite::StatsRewriteRule;
+use vortex_session::VortexSession;
 
 use super::aabb_stat;
 use super::geometry_and_constant;
@@ -35,12 +35,12 @@ impl StatsRewriteRule for SpatialIntersectsPrune {
     fn falsify(
         &self,
         expr: &BoundExpression,
-        ctx: &StatsRewriteCtx<'_>,
+        session: &VortexSession,
     ) -> VortexResult<Option<BoundExpression>> {
-        let Some((geom, constant)) = geometry_and_constant(expr, ctx)? else {
+        let Some((geom, constant)) = geometry_and_constant(expr)? else {
             return Ok(None);
         };
-        let Some(query) = query_aabb(constant, ctx)? else {
+        let Some(query) = query_aabb(constant, session)? else {
             return Ok(None);
         };
         // Disjoint iff the minimum box-to-box distance is positive. Strictly (`gt`, not `gt_eq`):
@@ -62,9 +62,9 @@ mod tests {
     use vortex_array::scalar::Scalar;
     use vortex_array::scalar_fn::EmptyOptions;
     use vortex_array::scalar_fn::ScalarFnVTableExt;
-    use vortex_array::stats::rewrite::StatsRewriteCtx;
-    use vortex_array::stats::rewrite::StatsRewriteRule;
     use vortex_error::VortexResult;
+    use vortex_expr::stats::rewrite::BoundExpressionPruneExt;
+    use vortex_expr::stats::rewrite::StatsRewriteRule;
 
     use super::SpatialIntersectsPrune;
     use crate::prune::test_harness::aabb_zone_map;
@@ -89,7 +89,7 @@ mod tests {
         let predicate = SpatialIntersects
             .new_expr(EmptyOptions, operands)
             .bind(&scope)?;
-        SpatialIntersectsPrune.falsify(&predicate, &StatsRewriteCtx::new(&session))
+        SpatialIntersectsPrune.falsify(&predicate, &session)
     }
 
     /// Intersects is symmetric: both operand orders produce a proof.
@@ -97,7 +97,16 @@ mod tests {
     #[case(true)]
     #[case(false)]
     fn falsifies_either_operand_order(#[case] geom_first: bool) -> VortexResult<()> {
-        assert!(falsify_intersects(geom_first)?.is_some());
+        let proof = falsify_intersects(geom_first)?.expect("intersection proof");
+        let dtype = point_column(vec![0.0], vec![0.0])?.dtype().clone();
+        let zones = aabb_zone_map(&dtype, &[[0.0, 0.0, 1.0, 1.0], [3.0, 0.0, 4.0, 1.0]])?;
+        assert_eq!(
+            zones
+                .prune(&proof, &spatial_session())?
+                .iter()
+                .collect::<Vec<_>>(),
+            [false, true]
+        );
         Ok(())
     }
 
@@ -126,8 +135,11 @@ mod tests {
             .new_expr(EmptyOptions, [root(), lit(null_query)])
             .bind(&scope)?;
 
-        let ctx = StatsRewriteCtx::new(&session);
-        assert!(SpatialIntersectsPrune.falsify(&predicate, &ctx)?.is_none());
+        assert!(
+            SpatialIntersectsPrune
+                .falsify(&predicate, &session)?
+                .is_none()
+        );
         Ok(())
     }
 

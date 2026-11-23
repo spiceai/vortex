@@ -6,12 +6,18 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use url::Url;
+use vortex::array::ArrayRef;
+use vortex::array::ExecutionCtx;
+use vortex::array::IntoArray;
 
 use crate::Benchmark;
 use crate::BenchmarkDataset;
+use crate::Engine;
 use crate::Format;
 use crate::IdempotentPath;
 use crate::TableSpec;
+use crate::conversions::parquet_to_vortex_chunks;
+use crate::datasets::Dataset;
 use crate::workspace_root;
 
 /// Statistical population genetics benchmark implementation.
@@ -173,6 +179,15 @@ impl Benchmark for StatPopGenBenchmark {
         vec![TableSpec::new("statpopgen", None)]
     }
 
+    /// The queries use DuckDB's `lambda x: ...` syntax, which DataFusion only parses under its
+    /// DuckDB SQL dialect.
+    fn engine_init_sql(&self, engine: Engine) -> Vec<String> {
+        match engine {
+            Engine::DataFusion => vec!["SET datafusion.sql_parser.dialect = 'duckdb'".to_string()],
+            _ => Vec::new(),
+        }
+    }
+
     #[expect(clippy::expect_used)]
     fn pattern(&self, _table_name: &str, format: Format) -> Option<glob::Pattern> {
         Some(
@@ -180,5 +195,23 @@ impl Benchmark for StatPopGenBenchmark {
                 .parse()
                 .expect("valid glob pattern"),
         )
+    }
+}
+
+#[async_trait::async_trait]
+impl Dataset for StatPopGenBenchmark {
+    fn name(&self) -> &str {
+        "statpopgen"
+    }
+
+    async fn to_vortex_array(&self, _ctx: &mut ExecutionCtx) -> Result<ArrayRef> {
+        Ok(parquet_to_vortex_chunks(self.to_parquet_path().await?)
+            .await?
+            .into_array())
+    }
+
+    async fn to_parquet_path(&self) -> Result<PathBuf> {
+        self.download_parquet().await?;
+        self.parquet_path()
     }
 }

@@ -80,7 +80,7 @@ mod unix {
     use vortex_session::VortexSession;
 
     static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
-        let session = vortex_array::array_session()
+        let session = VortexSession::empty()
             .with::<LayoutSession>()
             .with::<RuntimeSession>();
         vortex_file::register_default_encodings(&session);
@@ -272,7 +272,7 @@ mod unix {
     }
 
     async fn write(data: &ArrayRef, max: Option<u64>) -> Vec<u8> {
-        let strategy = WriteStrategyBuilder::default()
+        let strategy = WriteStrategyBuilder::from_session(&SESSION)
             .with_data_block_max_bytes(max)
             .build();
         let mut bytes = Vec::new();

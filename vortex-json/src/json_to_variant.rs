@@ -16,6 +16,7 @@ use vortex_array::arrays::ExtensionArray;
 use vortex_array::arrays::ScalarFnArray;
 use vortex_array::dtype::DType;
 use vortex_array::expr::Expression;
+use vortex_array::proto::expr as pb;
 use vortex_array::scalar_fn::Arity;
 use vortex_array::scalar_fn::ChildName;
 use vortex_array::scalar_fn::ExecutionArgs;
@@ -28,7 +29,6 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
-use vortex_proto::expr as pb;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
@@ -75,7 +75,7 @@ impl JsonToVariant {
     ///
     /// Returns an error if `input` is not a JSON extension array.
     pub fn try_new(input: ArrayRef, options: JsonToVariantOptions) -> VortexResult<ScalarFnArray> {
-        ScalarFnArray::try_new(JsonToVariant.bind(options), vec![input])
+        ScalarFnArray::try_new(JsonToVariant.bind(options), [input])
     }
 }
 

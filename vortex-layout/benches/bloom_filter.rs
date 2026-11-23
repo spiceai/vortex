@@ -12,12 +12,16 @@ use std::num::NonZeroU32;
 
 use divan::Bencher;
 use divan::counter::ItemsCount;
+use mimalloc::MiMalloc;
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use vortex_layout::layouts::zoned::aggregates::bloom_filter::BloomOptions;
 use vortex_layout::layouts::zoned::aggregates::bloom_filter::BloomPartial;
 use vortex_layout::layouts::zoned::aggregates::bloom_filter::HashFn;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 fn main() {
     divan::main();
@@ -30,6 +34,8 @@ const BLOCK_COUNTS: &[u32] = &[
     1_048_576, // 32 MiB
 ];
 const VALUE_COUNT: usize = 8192;
+
+const INSERT_BLOCK_COUNTS: &[u32] = &[256, 32_768];
 
 fn options(block_count: u32) -> BloomOptions {
     BloomOptions::new(
@@ -53,7 +59,7 @@ fn populated_filter(options: &BloomOptions, values: &[[u8; 16]]) -> BloomPartial
     filter
 }
 
-#[divan::bench(args = BLOCK_COUNTS)]
+#[divan::bench(args = INSERT_BLOCK_COUNTS)]
 fn insert(bencher: Bencher, block_count: u32) {
     let options = options(block_count);
     let values = values(0xbeef);

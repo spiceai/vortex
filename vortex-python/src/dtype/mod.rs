@@ -136,7 +136,9 @@ impl PyDType {
                 "Map dtypes are not supported in Python",
             )),
             DType::Struct(..) => Self::with_subclass(py, dtype, PyStructDType),
-            DType::Union(..) => todo!("TODO(connor)[Union]: unimplemented"),
+            DType::Union(..) => Err(PyValueError::new_err(
+                "Union dtypes are not supported in Python yet",
+            )),
             DType::Variant(_) => Err(PyValueError::new_err(
                 "Variant DType is not supported in Python yet",
             )),
@@ -175,8 +177,7 @@ impl PyDType {
     fn to_arrow_type(&self, py: Python) -> PyVortexResult<Py<PyAny>> {
         Ok(session()
             .arrow()
-            .to_arrow_field("", &self.0)?
-            .data_type()
+            .to_arrow_datatype(&self.0)?
             .to_pyarrow(py)?)
     }
 
