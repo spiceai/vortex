@@ -117,6 +117,7 @@ impl ArrayParentReduceRule<ScalarFn> for ScalarFilterPushdownRule {
             prepare_mask_for_reuse(values, nchildren);
         }
 
+        // Selection precedes value evaluation, including errors in unselected rows.
         let new_children: Vec<_> = child
             .iter_children()
             .map(|c| match c.as_opt::<Constant>() {
@@ -136,16 +137,20 @@ impl ArrayParentReduceRule<ScalarFn> for ScalarFilterPushdownRule {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use rstest::rstest;
+    use vortex_buffer::buffer;
     use vortex_error::VortexExpect;
     use vortex_error::VortexResult;
     use vortex_error::vortex_err;
     use vortex_mask::Mask;
+    use vortex_session::VortexSession;
 
     use super::ScalarFilterPushdownRule;
     use crate::VortexSessionExecute;
     use crate::array::IntoArray;
-    use crate::array_session;
+    use crate::arrays::BoolArray;
     use crate::arrays::ChunkedArray;
     use crate::arrays::Constant;
     use crate::arrays::Filter;
@@ -156,18 +161,23 @@ mod tests {
     use crate::arrays::scalar_fn::ScalarFnArrayExt;
     use crate::arrays::scalar_fn::rules::ConstantArray;
     use crate::assert_arrays_eq;
+    use crate::builtins::ArrayBuiltins;
     use crate::dtype::DType;
     use crate::dtype::Nullability;
     use crate::dtype::PType;
     use crate::expr::cast;
+    use crate::expr::is_not_null;
     use crate::expr::is_null;
     use crate::expr::root;
     use crate::optimizer::rules::ArrayParentReduceRule;
     use crate::scalar::Scalar;
     use crate::scalar_fn::TypedScalarFnInstance;
     use crate::scalar_fn::fns::binary::Binary;
-    use crate::scalar_fn::fns::literal::Literal;
+    use crate::scalar_fn::fns::list_contains::PreparedSet;
     use crate::scalar_fn::fns::operators::Operator;
+    use crate::validity::Validity;
+
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
 
     #[rstest]
     #[case(0, [14, 14, 14, 14, 14])]
@@ -185,7 +195,7 @@ mod tests {
                     ConstantArray::new(7i32, 100).into_array()
                 }
             })
-            .collect();
+            .collect::<Vec<_>>();
         let array = ScalarFnArray::try_new(
             TypedScalarFnInstance::new(Binary, Operator::Add).erased(),
             children,
@@ -213,36 +223,30 @@ mod tests {
             }
         }
         let expected = PrimitiveArray::from_iter(expected);
-        assert_arrays_eq!(
-            result,
-            expected,
-            &mut array_session().create_execution_ctx()
-        );
+        assert_arrays_eq!(result, expected, &mut SESSION.create_execution_ctx());
         Ok(())
     }
 
     #[test]
     fn test_filter_pushdown_without_children() -> VortexResult<()> {
-        let array = ScalarFnArray::try_new_with_len(
-            TypedScalarFnInstance::new(Literal, Scalar::from(7i32)).erased(),
-            vec![],
-            3,
-        )?;
-        let parent = FilterArray::try_new(
-            array.clone().into_array(),
-            Mask::from_iter([true, false, true]),
-        )?;
+        let list = Scalar::list(
+            DType::Primitive(PType::I32, Nullability::NonNullable),
+            vec![Scalar::from(7i32)],
+            Nullability::NonNullable,
+        );
+        let array = PreparedSet::try_new_array(list.clone(), 3)?;
+        let parent = FilterArray::try_new(array.clone(), Mask::from_iter([true, false, true]))?;
 
         let result = ScalarFilterPushdownRule
-            .reduce_parent(array.as_view(), parent.as_view(), 0)?
+            .reduce_parent(array.as_::<ScalarFn>(), parent.as_view(), 0)?
             .ok_or_else(|| vortex_err!("expected filter pushdown"))?;
 
         assert_eq!(result.as_::<ScalarFn>().nchildren(), 0);
         assert_eq!(result.len(), 2);
         assert_arrays_eq!(
             result,
-            ConstantArray::new(7i32, 2),
-            &mut array_session().create_execution_ctx()
+            ConstantArray::new(list, 2),
+            &mut SESSION.create_execution_ctx()
         );
         Ok(())
     }
@@ -266,6 +270,36 @@ mod tests {
         .into_array();
 
         let expr = is_null(root());
-        array.apply(&expr).vortex_expect("expr evaluation");
+        let result = array.apply(&expr).vortex_expect("expr evaluation");
+        assert_arrays_eq!(
+            result,
+            BoolArray::from_iter([false]),
+            &mut SESSION.create_execution_ctx()
+        );
+    }
+
+    #[test]
+    fn test_reduce_isnull() -> VortexResult<()> {
+        let ctx = &mut SESSION.create_execution_ctx();
+        let validity = BoolArray::from_iter([true, false, true]).into_array();
+
+        assert_arrays_eq!(
+            validity.clone().apply(&is_null(root()))?,
+            ConstantArray::new(false, 3),
+            ctx
+        );
+        assert_arrays_eq!(
+            validity.clone().apply(&is_not_null(root()))?,
+            ConstantArray::new(true, 3),
+            ctx
+        );
+
+        let buffer = buffer![1, 2, 3];
+        let nullable = PrimitiveArray::new(buffer, Validity::Array(validity.clone())).into_array();
+
+        assert_arrays_eq!(nullable.clone().apply(&is_not_null(root()))?, validity, ctx);
+        assert_arrays_eq!(nullable.apply(&is_null(root()))?, validity.not()?, ctx);
+
+        Ok(())
     }
 }

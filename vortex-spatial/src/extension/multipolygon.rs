@@ -31,6 +31,7 @@ use vortex_array::dtype::extension::ExtId;
 use vortex_array::dtype::extension::ExtVTable;
 use vortex_array::scalar::ScalarValue;
 use vortex_arrow::ArrowExport;
+use vortex_arrow::ArrowExportOptions;
 use vortex_arrow::ArrowExportVTable;
 use vortex_arrow::ArrowImport;
 use vortex_arrow::ArrowImportVTable;
@@ -40,6 +41,7 @@ use vortex_error::VortexError;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
+use vortex_error::vortex_ensure_eq;
 use vortex_error::vortex_err;
 use vortex_session::registry::CachedId;
 use vortex_session::registry::Id;
@@ -94,7 +96,8 @@ pub(crate) fn multipolygon_storage_dtype(dim: Dimension, nullability: Nullabilit
     DType::List(Arc::new(polygon), nullability)
 }
 
-/// Validate `dtype` is `List<List<List<coordinate-struct>>>` and return its [`Dimension`].
+/// Validate that `dtype` equals [`multipolygon_storage_dtype`] for its [`Dimension`] and top-level
+/// nullability, and return that dimension. As in GeoArrow, only the outer `List` can be nullable.
 pub(crate) fn multipolygon_dimension(dtype: &DType) -> VortexResult<Dimension> {
     let DType::List(polygon, _) = dtype else {
         vortex_bail!("multipolygon storage must be a List of polygons, was {dtype}");
@@ -105,7 +108,15 @@ pub(crate) fn multipolygon_dimension(dtype: &DType) -> VortexResult<Dimension> {
     let DType::List(coords, _) = ring.as_ref() else {
         vortex_bail!("multipolygon ring storage must be a List of coordinates, was {ring}");
     };
-    coordinate_dimension(coords)
+    let dimension = coordinate_dimension(coords)?;
+
+    vortex_ensure_eq!(
+        *dtype,
+        multipolygon_storage_dtype(dimension, dtype.nullability()),
+        "multipolygon storage can be nullable only at its outer List"
+    );
+
+    Ok(dimension)
 }
 
 static ARROW_MULTIPOLYGON: CachedId = CachedId::new(MultiPolygonType::NAME);
@@ -200,6 +211,7 @@ impl ArrowExportVTable for MultiPolygon {
         &self,
         array: ArrayRef,
         target: &Field,
+        options: &ArrowExportOptions,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrowExport> {
         let is_multipolygon = array
@@ -227,9 +239,11 @@ impl ArrowExportVTable for MultiPolygon {
             target.is_nullable(),
         );
         let session = ctx.session().clone();
-        let arrow_storage = session
-            .arrow()
-            .execute_arrow(storage, Some(&storage_field), ctx)?;
+        let arrow_storage =
+            session
+                .arrow()
+                .exporter(options)
+                .execute_arrow(storage, Some(&storage_field), ctx)?;
 
         let multipolygons =
             MultiPolygonArray::try_from((arrow_storage.as_ref(), multipolygon_meta))
@@ -256,7 +270,7 @@ impl ArrowImportVTable for MultiPolygon {
                 vortex_ensure!(
                     multipolygon_meta.coord_type() == CoordType::Separated,
                     "geoarrow.multipolygon with interleaved coordinates is not supported; \
-                 re-encode with separated (struct) coordinates"
+             re-encode with separated (struct) coordinates"
                 );
                 (
                     multipolygon_meta.dimension().into(),

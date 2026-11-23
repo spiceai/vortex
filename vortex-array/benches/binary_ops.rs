@@ -4,7 +4,7 @@
 //! Benchmarks for the binary `Operator` path, over primitive, decimal, and boolean inputs.
 //!
 //! The primitive arithmetic and comparison cases carry `#[cpu_features]`, so they are
-//! measured on every walltime CPU-feature leg rather than in simulation. Each is written
+//! measured on walltime CPU-feature legs rather than in simulation. Each is written
 //! once and compiled differently per leg: the kernel underneath is a portable lane loop, and
 //! how wide the compiler vectorizes it is decided by the build flags, not by the source.
 //!
@@ -28,14 +28,16 @@ use vortex_array::ArrayRef;
 use vortex_array::Executable;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
-use vortex_array::array_session;
 use vortex_array::arrays::BoolArray;
 use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::DecimalArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::DecimalDType;
+use vortex_array::memory::MemorySession;
+use vortex_array::optimizer::kernels::KernelSession;
 use vortex_array::scalar_fn::fns::operators::Operator;
+use vortex_array::test_harness::mark_optimized;
 use vortex_session::VortexSession;
 
 #[global_allocator]
@@ -46,27 +48,33 @@ fn main() {
     divan::main();
 }
 
-static SESSION: LazyLock<VortexSession> = LazyLock::new(array_session);
+static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
+    VortexSession::empty()
+        .with::<KernelSession>()
+        .with::<MemorySession>()
+});
 
 /// Sized to keep CodSpeed simulation under 1ms per benchmark.
 const LEN: usize = 4_096;
 
 /// Primitive cases process at least this many rows and this many value bytes per varying input.
-/// This lengthens narrow integer cases while keeping the current CodSpeed simulations below 1 ms.
+///
+/// The primitive cases run on the walltime legs, where short iterations are noisy: at 96 KiB per
+/// input the `u32` multiply took under 6 µs and flipped by 12% between runs of identical code.
+/// 256 KiB per input makes every iteration several times longer while two inputs and the output
+/// still fit in a 1 MiB L2 cache.
 const MIN_PRIMITIVE_LEN: usize = 16_384;
-const MIN_PRIMITIVE_INPUT_BYTES: usize = 96 * 1_024;
+const MIN_PRIMITIVE_INPUT_BYTES: usize = 256 * 1_024;
 
 const I8_LEN: usize = primitive_len::<i8>();
 const I16_LEN: usize = primitive_len::<i16>();
 const I32_LEN: usize = primitive_len::<i32>();
 const I64_LEN: usize = primitive_len::<i64>();
 
-/// Per-row against per-row, short and long. This is the shape the operators are tuned for, so it
-/// is the one every operator is measured on.
-const BINARY_SHAPE_CASES: &[(usize, BinaryShape)] = &[
-    (128, BinaryShape::PerRowPerRow),
-    (I64_LEN, BinaryShape::PerRowPerRow),
-];
+/// Per-row against per-row at the long length. This is the shape the operators are tuned for, so
+/// it is the one every operator is measured on. A 128-row case used to sit alongside it, but at
+/// about 2 µs per iteration its walltime moved by up to 95% between runs of identical code.
+const BINARY_SHAPE_CASES: &[(usize, BinaryShape)] = &[(I64_LEN, BinaryShape::PerRowPerRow)];
 
 /// Constant operands are measured on `Add` alone, at the long length.
 ///
@@ -230,7 +238,8 @@ fn mul_u32_nonnull(bencher: Bencher) {
     bench_primitive(bencher, lhs, rhs, Operator::Mul);
 }
 
-#[vortex_bench_support::cpu_features]
+// This case varies on unchanged code on the NEON leg. The cause is unknown.
+#[vortex_bench_support::cpu_features(exclude = ["neon"])]
 #[divan::bench]
 fn mul_u64_nonnull(bencher: Bencher) {
     let lhs = primitive_u64_small_nonnull(1, I64_LEN).into_array();
@@ -314,11 +323,12 @@ fn div_decimal_i128_nullable(bencher: Bencher) {
     bench_decimal(bencher, lhs, rhs, Operator::Div);
 }
 
-#[vortex_bench_support::cpu_features]
+// The AVX-512 minimum varies by more than 10% while the median stays stable on unchanged code.
+#[vortex_bench_support::cpu_features(exclude = ["avx512"])]
 #[divan::bench]
 fn lt_i64_nullable(bencher: Bencher) {
-    let lhs = primitive_nullable(0, 7, LEN).into_array();
-    let rhs = primitive_nullable(1_000_000, 5, LEN).into_array();
+    let lhs = primitive_nullable(0, 7, I64_LEN).into_array();
+    let rhs = primitive_nullable(1_000_000, 5, I64_LEN).into_array();
 
     bench_bool(bencher, lhs, rhs, Operator::Lt);
 }
@@ -349,6 +359,9 @@ fn bench_binary<T: Executable + 'static>(
     rhs: ArrayRef,
     operator: Operator,
 ) {
+    mark_optimized(&lhs, &SESSION).unwrap();
+    mark_optimized(&rhs, &SESSION).unwrap();
+
     let mut ctx = SESSION.create_execution_ctx();
     let len = lhs.len();
 

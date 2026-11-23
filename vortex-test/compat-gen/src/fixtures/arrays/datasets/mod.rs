@@ -22,6 +22,8 @@ mod tests {
     use vortex::editions::EditionSessionExt;
     use vortex::file::WriteStrategyBuilder;
     use vortex::session::VortexSession;
+    use vortex_array::VortexSessionExecute;
+    use vortex_array::assert_arrays_eq;
     use vortex_arrow::ArrowSessionExt;
     use vortex_error::VortexResult;
 
@@ -44,18 +46,23 @@ mod tests {
             let regular_bytes = adapter::write_compressed_to_bytes_with_session(
                 &session,
                 array.clone(),
-                WriteStrategyBuilder::default().build(),
+                WriteStrategyBuilder::from_session(&session).build(),
             )?;
-            let _regular = adapter::read_file(regular_bytes)?;
+            let regular = adapter::read_file(regular_bytes)?;
 
             let compact_bytes = adapter::write_compressed_to_bytes_with_session(
                 &session,
-                array,
-                WriteStrategyBuilder::default()
-                    .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact())
+                array.clone(),
+                WriteStrategyBuilder::from_session(&session)
+                    .with_btrblocks_builder(
+                        BtrBlocksCompressorBuilder::from_session(&session).with_compact(),
+                    )
                     .build(),
             )?;
-            let _compact = adapter::read_file(compact_bytes)?;
+            let compact = adapter::read_file(compact_bytes)?;
+            let mut ctx = session.create_execution_ctx();
+            assert_arrays_eq!(regular, &array, &mut ctx);
+            assert_arrays_eq!(compact, array, &mut ctx);
         }
         Ok(())
     }

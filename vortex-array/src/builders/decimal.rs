@@ -7,7 +7,7 @@ use vortex_buffer::BufferAllocatorRef;
 use vortex_buffer::BufferMut;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
-use vortex_error::vortex_ensure;
+use vortex_error::vortex_ensure_eq;
 use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
 
@@ -226,11 +226,10 @@ impl ArrayBuilder for DecimalBuilder {
     }
 
     fn append_scalar(&mut self, scalar: &Scalar) -> VortexResult<()> {
-        vortex_ensure!(
-            scalar.dtype() == self.dtype(),
-            "DecimalBuilder expected scalar with dtype {}, got {}",
+        vortex_ensure_eq!(
+            scalar.dtype(),
             self.dtype(),
-            scalar.dtype()
+            "DecimalBuilder received a scalar with the wrong dtype"
         );
 
         match scalar.as_decimal().decimal_value() {
@@ -259,10 +258,7 @@ impl ArrayBuilder for DecimalBuilder {
 
 impl DecimalBuffer {
     fn take(&mut self) -> Self {
-        delegate_fn!(self, |T, buffer| {
-            let allocator = buffer.allocator();
-            DecimalBuffer::from(std::mem::replace(buffer, allocator.with_capacity(0)))
-        })
+        delegate_fn!(self, |T, buffer| { DecimalBuffer::from(buffer.take()) })
     }
 
     fn push<V: NativeDecimalType>(&mut self, value: V) {
@@ -330,15 +326,22 @@ impl_from_buffer!(i256, I256);
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use vortex_buffer::BufferAllocatorRef;
+    use vortex_session::VortexSession;
 
     use crate::VortexSessionExecute;
-    use crate::array_session;
     use crate::assert_arrays_eq;
     use crate::builders::ArrayBuilder;
     use crate::builders::DecimalBuilder;
     use crate::builders::decimal::DecimalArray;
     use crate::dtype::DecimalDType;
+    use crate::dtype::Nullability;
+    use crate::scalar::DecimalValue;
+    use crate::scalar::Scalar;
+
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
 
     #[test]
     fn test_mixed_extend() {
@@ -359,25 +362,42 @@ mod tests {
             false.into(),
             BufferAllocatorRef::static_ref(),
         );
-        i8s.append_to_builder(&mut i128s, &mut array_session().create_execution_ctx())
+        i8s.append_to_builder(&mut i128s, &mut SESSION.create_execution_ctx())
             .unwrap();
         let i128s = i128s.finish();
 
         for i in 0..i8s.len() {
             assert_eq!(
-                i8s.execute_scalar(i, &mut array_session().create_execution_ctx())
+                i8s.execute_scalar(i, &mut SESSION.create_execution_ctx())
                     .unwrap(),
                 i128s
-                    .execute_scalar(i, &mut array_session().create_execution_ctx())
+                    .execute_scalar(i, &mut SESSION.create_execution_ctx())
                     .unwrap()
+            );
+        }
+        assert_eq!(i8s.len(), 42);
+        assert_eq!(i128s.len(), 42);
+        let mut ctx = SESSION.create_execution_ctx();
+        for value in 0i8..42 {
+            let expected = Scalar::decimal(
+                DecimalValue::I8(value),
+                DecimalDType::new(2, 1),
+                Nullability::NonNullable,
+            );
+            assert_eq!(
+                i8s.execute_scalar(value as usize, &mut ctx).unwrap(),
+                expected
+            );
+            assert_eq!(
+                i128s.execute_scalar(value as usize, &mut ctx).unwrap(),
+                expected
             );
         }
     }
 
     #[test]
     fn test_append_scalar() {
-        let mut ctx = array_session().create_execution_ctx();
-        use crate::scalar::Scalar;
+        let mut ctx = SESSION.create_execution_ctx();
 
         // Simply test that the builder accepts its own finish output via scalar.
         let mut builder = DecimalBuilder::new_in::<i64>(
@@ -404,7 +424,7 @@ mod tests {
         );
         for i in 0..array.len() {
             let scalar = array
-                .execute_scalar(i, &mut array_session().create_execution_ctx())
+                .execute_scalar(i, &mut SESSION.create_execution_ctx())
                 .unwrap();
             builder2.append_scalar(&scalar).unwrap();
         }

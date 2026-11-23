@@ -15,11 +15,30 @@ The harness lives in [`src/statpopgen`](../src/statpopgen).
 ## CI variant
 
 CI runs this suite from local NVMe as the `Statistical and Population Genetics` PR
-comment. Only DuckDB is exercised (over Parquet, Vortex, and vortex-compact files),
-because the queries rely on DuckDB list lambdas.
+comment, on DataFusion and DuckDB over Parquet, Vortex, and vortex-compact files.
+
+The queries use DuckDB's `lambda x: ...` list-lambda syntax. DataFusion parses it under its
+DuckDB SQL dialect, which the benchmark enables through `engine_init_sql`. Column names are
+quoted because DataFusion lowercases unquoted identifiers.
 
 ## Running locally
 
 ```bash
-vx-bench run statpopgen --engine duckdb --format parquet,vortex
+vx-bench run statpopgen --engine datafusion,duckdb --format parquet,vortex
 ```
+
+## Compression and decompression
+
+The CPU compression suite also uses this VCF-derived dataset, with a smaller prefix of
+10,000 variants. It retains the full cohort and all typed fields, including the nested
+per-sample genotype fields; only the number of variant rows is reduced. This is separate
+from the 100,000-variant SQL benchmark above.
+
+```bash
+cargo build -p compress-bench --profile release_debug --features lance
+target/release_debug/compress-bench --datasets '^statpopgen$' \
+  --formats parquet,vortex,lance --iterations 5
+```
+
+The suite measures encoding time, decoding time, and compressed size. Source VCF download
+and conversion to staging Parquet happen before the timed measurements.

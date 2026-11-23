@@ -9,6 +9,7 @@ use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
+use vortex_error::vortex_ensure_eq;
 use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
 
@@ -51,7 +52,7 @@ pub(crate) fn initialize(session: &VortexSession) {
 pub struct BoolMetadata {
     // The offset in bits must be <8
     #[prost(uint32, tag = "1")]
-    pub offset: u32,
+    pub(crate) offset: u32,
 }
 
 impl ArrayHash for BoolData {
@@ -101,17 +102,16 @@ impl VTable for Bool {
         array: ArrayView<'_, Self>,
         buffers: &[BufferHandle],
     ) -> VortexResult<ArrayParts<Self>> {
-        vortex_ensure!(
-            buffers.len() == 1,
-            "Expected 1 buffer, got {}",
-            buffers.len()
-        );
+        vortex_ensure_eq!(buffers.len(), 1);
         let mut data = array.data().clone();
         data.bits = buffers[0].clone();
-        Ok(
-            ArrayParts::new(self.clone(), array.dtype().clone(), array.len(), data)
-                .with_slots(array.slots().iter().cloned().collect()),
-        )
+        Ok(ArrayParts::new(
+            self.clone(),
+            array.dtype().clone(),
+            array.len(),
+            data,
+            array.slots().iter().cloned().collect(),
+        ))
     }
 
     fn serialize(
@@ -148,11 +148,10 @@ impl VTable for Bool {
 
         let validity = child_to_validity(slots[BoolSlots::VALIDITY].as_ref(), *nullability);
         if let Some(validity_len) = validity.maybe_len() {
-            vortex_ensure!(
-                validity_len == len,
-                "BoolArray validity len {} does not match outer length {}",
+            vortex_ensure_eq!(
                 validity_len,
-                len
+                len,
+                "BoolArray validity len does not match outer length",
             );
         }
 
@@ -185,7 +184,13 @@ impl VTable for Bool {
         let buffer = buffers[0].clone();
         let slots = BoolData::make_slots(&validity, len);
         let data = BoolData::try_new_from_handle(buffer, metadata.offset as usize, len, validity)?;
-        Ok(ArrayParts::new(self.clone(), dtype.clone(), len, data).with_slots(slots))
+        Ok(ArrayParts::new(
+            self.clone(),
+            dtype.clone(),
+            len,
+            data,
+            slots,
+        ))
     }
 
     fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {
@@ -221,22 +226,25 @@ pub struct Bool;
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use vortex_buffer::ByteBufferMut;
+    use vortex_session::VortexSession;
     use vortex_session::registry::ReadContext;
 
     use crate::ArrayContext;
     use crate::IntoArray;
     use crate::VortexSessionExecute;
-    use crate::array_session;
     use crate::arrays::BoolArray;
     use crate::assert_arrays_eq;
     use crate::serde::SerializeOptions;
     use crate::serde::SerializedArray;
 
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
+
     #[test]
     fn test_nullable_bool_serde_roundtrip() {
-        let session = array_session();
-        let mut ctx = session.create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let array = BoolArray::from_iter([Some(true), None, Some(false), None]);
         let dtype = array.dtype().clone();
         let len = array.len();
@@ -245,7 +253,7 @@ mod tests {
         let serialized = array
             .clone()
             .into_array()
-            .serialize(&array_ctx, &session, &SerializeOptions::default())
+            .serialize(&array_ctx, &SESSION, &SerializeOptions::default())
             .unwrap();
 
         let mut concat = ByteBufferMut::empty();
@@ -254,7 +262,7 @@ mod tests {
         }
         let parts = SerializedArray::try_from(concat.freeze()).unwrap();
         let decoded = parts
-            .decode(&dtype, len, &ReadContext::new(array_ctx.to_ids()), &session)
+            .decode(&dtype, len, &ReadContext::new(array_ctx.to_ids()), &SESSION)
             .unwrap();
 
         assert_arrays_eq!(decoded, array, &mut ctx);

@@ -3,15 +3,16 @@
 
 use std::sync::Arc;
 
+use vortex_array::flatbuffers::FlatBuffer;
+use vortex_array::flatbuffers::FlatBufferRoot;
+use vortex_array::flatbuffers::WriteFlatBuffer;
+use vortex_array::flatbuffers::WriteFlatBufferExt;
 use vortex_buffer::ByteBuffer;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
-use vortex_flatbuffers::FlatBuffer;
-use vortex_flatbuffers::FlatBufferRoot;
-use vortex_flatbuffers::WriteFlatBuffer;
-use vortex_flatbuffers::WriteFlatBufferExt;
 use vortex_layout::LayoutContext;
+use vortex_session::VortexSession;
 use vortex_session::registry::ReadContext;
 use vortex_utils::aliases::hash_map::HashMap;
 
@@ -33,16 +34,18 @@ pub struct FooterSerializer {
     exclude_dtype: bool,
     offset: u64,
     layout_ctx: LayoutContext,
+    session: VortexSession,
 }
 
 impl FooterSerializer {
-    pub(super) fn new(footer: Footer) -> Self {
+    pub(super) fn new(footer: Footer, session: VortexSession) -> Self {
         Self {
             footer,
             metadata: HashMap::default(),
             exclude_dtype: false,
             offset: 0,
             layout_ctx: LayoutContext::default(),
+            session,
         }
     }
 
@@ -141,13 +144,16 @@ impl FooterSerializer {
 
         let (buffer, layout_segment) = write_flatbuffer(
             &mut self.offset,
-            &self.footer.layout().flatbuffer_writer(&layout_ctx),
+            &self
+                .footer
+                .layout()
+                .flatbuffer_writer(&layout_ctx, &self.session),
         )?;
         buffers.push(buffer);
 
         let statistics_segment = match self.footer.statistics() {
             None => None,
-            Some(stats) if stats.stats_sets().is_empty() => None,
+            Some(stats) if stats.is_empty() => None,
             Some(stats) => {
                 let (buffer, stats_segment) = write_flatbuffer(&mut self.offset, stats)?;
                 buffers.push(buffer);

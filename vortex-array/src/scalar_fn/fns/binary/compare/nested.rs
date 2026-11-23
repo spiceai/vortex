@@ -16,6 +16,7 @@ use std::cmp::Ordering;
 
 use num_traits::AsPrimitive;
 use vortex_buffer::BitBuffer;
+use vortex_buffer::BufferAllocatorRef;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_mask::Mask;
@@ -48,7 +49,7 @@ use crate::scalar_fn::fns::binary::compare::compare_validity;
 use crate::scalar_fn::fns::operators::CompareOperator;
 
 /// A row comparator: compares row `i` of the left operand against row `j` of the right operand.
-type RowComparator = Box<dyn Fn(usize, usize) -> Ordering>;
+pub(crate) type RowComparator = Box<dyn Fn(usize, usize) -> Ordering>;
 
 /// Compare two nested arrays row by row.
 pub(super) fn compare_nested(
@@ -75,12 +76,24 @@ pub(super) fn compare_nested(
     // Dispatch the operator outside the row loop so the predicate inlines into each loop; the
     // comparator call itself stays virtual.
     let bits = match op {
-        CompareOperator::Eq => collect_ordering_bits(len, &comparator, Ordering::is_eq),
-        CompareOperator::NotEq => collect_ordering_bits(len, &comparator, Ordering::is_ne),
-        CompareOperator::Gt => collect_ordering_bits(len, &comparator, Ordering::is_gt),
-        CompareOperator::Gte => collect_ordering_bits(len, &comparator, Ordering::is_ge),
-        CompareOperator::Lt => collect_ordering_bits(len, &comparator, Ordering::is_lt),
-        CompareOperator::Lte => collect_ordering_bits(len, &comparator, Ordering::is_le),
+        CompareOperator::Eq => {
+            collect_ordering_bits(len, &comparator, Ordering::is_eq, ctx.allocator())
+        }
+        CompareOperator::NotEq => {
+            collect_ordering_bits(len, &comparator, Ordering::is_ne, ctx.allocator())
+        }
+        CompareOperator::Gt => {
+            collect_ordering_bits(len, &comparator, Ordering::is_gt, ctx.allocator())
+        }
+        CompareOperator::Gte => {
+            collect_ordering_bits(len, &comparator, Ordering::is_ge, ctx.allocator())
+        }
+        CompareOperator::Lt => {
+            collect_ordering_bits(len, &comparator, Ordering::is_lt, ctx.allocator())
+        }
+        CompareOperator::Lte => {
+            collect_ordering_bits(len, &comparator, Ordering::is_le, ctx.allocator())
+        }
     };
 
     Ok(BoolArray::try_new(bits, validity)?.into_array())
@@ -91,8 +104,9 @@ fn collect_ordering_bits(
     len: usize,
     comparator: &RowComparator,
     predicate: impl Fn(Ordering) -> bool,
+    allocator: &BufferAllocatorRef,
 ) -> BitBuffer {
-    BitBuffer::collect_bool(len, |i| predicate(comparator(i, i)))
+    BitBuffer::collect_bool_in(len, |i| predicate(comparator(i, i)), allocator.clone())
 }
 
 /// The validity mask of a recursively canonical array.
@@ -102,7 +116,7 @@ fn validity_mask(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Mask>
 
 /// Build a row comparator over two recursively canonical arrays of the same logical dtype
 /// (ignoring nullability). Null values order before all non-null values at every level.
-fn build_comparator(
+pub(crate) fn build_comparator(
     lhs: &ArrayRef,
     rhs: &ArrayRef,
     ctx: &mut ExecutionCtx,

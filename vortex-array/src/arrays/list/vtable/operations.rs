@@ -13,13 +13,15 @@ use crate::arrays::list::ListArrayExt;
 use crate::scalar::Scalar;
 
 impl OperationsVTable<List> for List {
+    type ProbeState = ();
+
     fn scalar_at(
         array: ArrayView<'_, List>,
         index: usize,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Scalar> {
         // By the preconditions we know that the list scalar is not null.
-        let elems = array.list_elements_at(index)?;
+        let elems = array.list_elements_at(index, ctx)?;
         let scalars: Vec<Scalar> = (0..elems.len())
             .map(|i| elems.execute_scalar(i, ctx))
             .collect::<VortexResult<_>>()?;

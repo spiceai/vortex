@@ -12,7 +12,9 @@ use lending_iterator::prelude::Item;
 use lending_iterator::prelude::LendingIterator;
 use vortex_array::dtype::PhysicalPType;
 use vortex_error::VortexResult;
+use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
+use vortex_error::vortex_ensure_eq;
 
 use crate::BitPackedData;
 use crate::FL_CHUNK_SIZE;
@@ -59,13 +61,14 @@ impl<T: PhysicalPType<Physical: BitPacking>> UnpackStrategy<T> for BitPackingStr
 /// #[gat(Item)]
 /// use lending_iterator::prelude::LendingIterator;
 /// use vortex_array::IntoArray;
+/// use vortex_session::VortexSession;
 /// use vortex_array::VortexSessionExecute;
 /// use vortex_buffer::buffer;
 /// use vortex_fastlanes::BitPackedData;
 /// use vortex_fastlanes::BitPackedArrayExt;
 /// use vortex_fastlanes::unpack_iter::BitUnpackedChunks;
 ///
-/// let mut ctx = vortex_array::array_session().create_execution_ctx();
+/// let mut ctx = VortexSession::empty().create_execution_ctx();
 /// let array = BitPackedData::encode(&buffer![2, 3, 4, 5].into_array(), 2, &mut ctx).unwrap();
 /// let mut scratch = [const { MaybeUninit::<i32>::uninit() }; 1024];
 /// let mut unpacked_chunks: BitUnpackedChunks<i32> =
@@ -106,10 +109,13 @@ impl<'a, T: BitPacked> BitUnpackedChunks<'a, T> {
         len: usize,
         scratch: &'a mut [MaybeUninit<T>; CHUNK_SIZE],
     ) -> VortexResult<Self> {
+        let Some(bit_width) = array.global_bit_width else {
+            vortex_bail!("BitPacked array has per-block bit widths");
+        };
         Self::try_new_with_strategy(
             BitPackingStrategy,
             array.packed_slice::<T::Physical>(),
-            array.bit_width() as usize,
+            bit_width as usize,
             array.offset() as usize,
             len,
             scratch,
@@ -190,20 +196,14 @@ impl<'a, T: PhysicalPType, S: UnpackStrategy<T>> UnpackedChunks<'a, T, S> {
         if let Some(initial) = self.initial() {
             local_idx = initial.len();
 
-            // TODO(connor): use maybe_uninit_write_slice when it gets stabilized.
-            // SAFETY: &[T] and &[MaybeUninit<T>] have the same layout.
-            let init_initial: &[MaybeUninit<T>] = unsafe { mem::transmute(initial) };
-            output[..local_idx].copy_from_slice(init_initial);
+            output[..local_idx].write_copy_of_slice(initial);
         }
 
         local_idx = self.decode_full_chunks_into_at(output, local_idx);
 
         if let Some(trailer) = self.trailer() {
-            // TODO(connor): use maybe_uninit_write_slice when it gets stabilized.
-            // SAFETY: &[T] and &[MaybeUninit<T>] have the same layout.
-            let init_trailer: &[MaybeUninit<T>] = unsafe { mem::transmute(trailer) };
-            output[local_idx..][..init_trailer.len()].copy_from_slice(init_trailer);
-            local_idx += init_trailer.len();
+            output[local_idx..][..trailer.len()].write_copy_of_slice(trailer);
+            local_idx += trailer.len();
         }
 
         debug_assert_eq!(local_idx, self.len);
@@ -354,11 +354,7 @@ fn validate_packed<T: PhysicalPType>(
     );
     let elems_per_chunk = 128 * bit_width / size_of::<T>();
     let num_chunks = (offset + len).div_ceil(CHUNK_SIZE);
-    vortex_ensure!(
-        packed_len == num_chunks * elems_per_chunk,
-        "Invalid packed length: got {packed_len}, expected {}",
-        num_chunks * elems_per_chunk
-    );
+    vortex_ensure_eq!(packed_len, num_chunks * elems_per_chunk);
     Ok((num_chunks, (offset + len) % CHUNK_SIZE))
 }
 

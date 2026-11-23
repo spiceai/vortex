@@ -10,17 +10,18 @@ use vortex_array::scalar_fn::fns::cast::CastReduce;
 use vortex_error::VortexResult;
 
 use crate::DecimalByteParts;
+use crate::decimal_byte_parts::DecimalBytePartsArrayExt;
 use crate::decimal_byte_parts::DecimalBytePartsArraySlotsExt;
 
 impl CastReduce for DecimalByteParts {
     fn cast(array: ArrayView<'_, Self>, dtype: &DType) -> VortexResult<Option<ArrayRef>> {
-        // Check if this is just a nullability change
+        // Check if this is just a nullability change.
+        // TODO(mk): Support non-nullability changes as well, e.g. precision.
         if !dtype.eq_ignore_nullability(array.dtype()) {
             return Ok(None);
         }
-        // DecimalBytePartsArray can only have Decimal dtype, so we only handle decimal-to-decimal casts
-        let DType::Decimal(target_decimal, target_nullability) = dtype else {
-            // Cannot cast decimal to non-decimal types - delegate to canonical form
+        // DecimalBytePartsArray can only have Decimal dtype.
+        let DType::Decimal(_, target_nullability) = dtype else {
             return Ok(None);
         };
 
@@ -29,34 +30,38 @@ impl CastReduce for DecimalByteParts {
             .msp()
             .cast(array.msp().dtype().with_nullability(*target_nullability))?;
 
-        Ok(Some(
-            DecimalByteParts::try_new(new_msp, *target_decimal)?.into_array(),
-        ))
+        array.with_msp(new_msp).map(|a| Some(a.into_array()))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use rstest::rstest;
     use vortex_array::Canonical;
     use vortex_array::IntoArray;
     use vortex_array::VortexSessionExecute;
-    use vortex_array::array_session;
     use vortex_array::arrays::DecimalArray;
     use vortex_array::arrays::PrimitiveArray;
+    use vortex_array::assert_arrays_eq;
     use vortex_array::builtins::ArrayBuiltins;
     use vortex_array::compute::conformance::cast::test_cast_conformance;
     use vortex_array::dtype::DType;
     use vortex_array::dtype::DecimalDType;
     use vortex_array::dtype::Nullability;
+    use vortex_array::validity::Validity;
     use vortex_buffer::buffer;
+    use vortex_session::VortexSession;
 
     use crate::DecimalByteParts;
     use crate::DecimalBytePartsArray;
 
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
+
     #[test]
     fn test_cast_decimal_byte_parts_nullability() {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let decimal_dtype = DecimalDType::new(10, 2);
         let array =
             DecimalByteParts::try_new(buffer![100i32, 200, 300, 400].into_array(), decimal_dtype)
@@ -73,13 +78,20 @@ mod tests {
         );
 
         // Verify the values are preserved
-        let decoded = casted.execute::<DecimalArray>(&mut ctx).unwrap();
-        assert_eq!(decoded.len(), 4);
+        assert_arrays_eq!(
+            casted,
+            DecimalArray::new(
+                buffer![100i32, 200, 300, 400],
+                decimal_dtype,
+                Validity::AllValid
+            ),
+            &mut ctx
+        );
     }
 
     #[test]
     fn test_cast_decimal_byte_parts_nullable_to_non_nullable() {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let decimal_dtype = DecimalDType::new(10, 2);
         let array = DecimalByteParts::try_new(
             PrimitiveArray::from_option_iter([Some(100i32), None, Some(300)]).into_array(),
@@ -118,9 +130,6 @@ mod tests {
         DecimalDType::new(10, 2),
     ).unwrap())]
     fn test_cast_decimal_byte_parts_conformance(#[case] array: DecimalBytePartsArray) {
-        test_cast_conformance(
-            &array.into_array(),
-            &mut array_session().create_execution_ctx(),
-        );
+        test_cast_conformance(&array.into_array(), &mut SESSION.create_execution_ctx());
     }
 }

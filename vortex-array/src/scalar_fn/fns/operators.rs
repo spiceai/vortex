@@ -6,7 +6,9 @@ use std::fmt::Display;
 use std::fmt::Formatter;
 
 use vortex_error::VortexError;
-use vortex_proto::expr::binary_opts::BinaryOp;
+
+use crate::dtype::NativePType;
+use crate::proto::expr::binary_opts::BinaryOp;
 
 /// Equalities, inequalities, and boolean operations over possibly null values.
 ///
@@ -171,10 +173,28 @@ impl Operator {
     }
 
     pub fn is_comparison(&self) -> bool {
-        matches!(
-            self,
-            Self::Eq | Self::NotEq | Self::Gt | Self::Gte | Self::Lt | Self::Lte
-        )
+        self.to_compare_operator().is_some()
+    }
+
+    /// Return the [`CompareOperator`] for this operator, or `None` if it is not a comparison.
+    ///
+    /// Prefer this over [`CompareOperator::try_from`] when a non-comparison operator is an expected
+    /// case, since it does not construct an error.
+    pub fn to_compare_operator(self) -> Option<CompareOperator> {
+        match self {
+            Operator::Eq => Some(CompareOperator::Eq),
+            Operator::NotEq => Some(CompareOperator::NotEq),
+            Operator::Gt => Some(CompareOperator::Gt),
+            Operator::Gte => Some(CompareOperator::Gte),
+            Operator::Lt => Some(CompareOperator::Lt),
+            Operator::Lte => Some(CompareOperator::Lte),
+            Operator::And
+            | Operator::Or
+            | Operator::Add
+            | Operator::Sub
+            | Operator::Mul
+            | Operator::Div => None,
+        }
     }
 }
 
@@ -221,6 +241,18 @@ impl CompareOperator {
             CompareOperator::Lte => CompareOperator::Gte,
         }
     }
+
+    /// Returns the total-order comparison that this operator applies to two native values.
+    pub fn to_predicate<T: NativePType>(self) -> fn(T, T) -> bool {
+        match self {
+            CompareOperator::Eq => T::is_eq,
+            CompareOperator::NotEq => |lhs, rhs| !lhs.is_eq(rhs),
+            CompareOperator::Gt => T::is_gt,
+            CompareOperator::Gte => T::is_ge,
+            CompareOperator::Lt => T::is_lt,
+            CompareOperator::Lte => T::is_le,
+        }
+    }
 }
 
 impl Display for CompareOperator {
@@ -254,17 +286,9 @@ impl TryFrom<Operator> for CompareOperator {
     type Error = VortexError;
 
     fn try_from(value: Operator) -> Result<Self, Self::Error> {
-        match value {
-            Operator::Eq => Ok(CompareOperator::Eq),
-            Operator::NotEq => Ok(CompareOperator::NotEq),
-            Operator::Gt => Ok(CompareOperator::Gt),
-            Operator::Gte => Ok(CompareOperator::Gte),
-            Operator::Lt => Ok(CompareOperator::Lt),
-            Operator::Lte => Ok(CompareOperator::Lte),
-            other => Err(vortex_error::vortex_err!(
-                InvalidArgument: "{other} is not a comparison operator"
-            )),
-        }
+        value
+            .to_compare_operator()
+            .ok_or_else(|| vortex_error::vortex_err!("{value} is not a comparison operator"))
     }
 }
 

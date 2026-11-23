@@ -1,14 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
+use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::IntoArray;
 use crate::aggregate_fn::Accumulator;
+use crate::aggregate_fn::AggregateArgs;
 use crate::aggregate_fn::AggregateFnId;
 use crate::aggregate_fn::DynAccumulator;
 use crate::aggregate_fn::NumericalAggregateOpts;
@@ -88,15 +91,20 @@ impl BinaryCombined for Mean {
         "count"
     }
 
-    fn return_dtype(&self, input_dtype: &DType) -> Option<DType> {
+    fn return_dtype(&self, _options: &CombinedOptions<Self>, input_dtype: &DType) -> Option<DType> {
         Some(mean_output_dtype(input_dtype)?.with_nullability(Nullability::Nullable))
     }
 
-    fn finalize(&self, sum: ArrayRef, count: ArrayRef) -> VortexResult<ArrayRef> {
+    fn finalize(
+        &self,
+        args: AggregateArgs<'_, CombinedOptions<Self>>,
+        sum: ArrayRef,
+        count: ArrayRef,
+    ) -> VortexResult<ArrayRef> {
         if let DType::Decimal(..) = sum.dtype() {
             vortex_bail!("grouped mean over decimals is not yet supported");
         }
-        let target = DType::Primitive(PType::F64, Nullability::Nullable);
+        let target = args.return_dtype.clone();
         let sum = sum.cast(target.clone())?;
         let count = count.cast(target.clone())?;
 
@@ -114,12 +122,22 @@ impl BinaryCombined for Mean {
         sum.binary(count, Operator::Div)
     }
 
-    fn finalize_scalar(&self, left_scalar: Scalar, right_scalar: Scalar) -> VortexResult<Scalar> {
+    fn finalize_scalar(
+        &self,
+        args: AggregateArgs<'_, CombinedOptions<Self>>,
+        left_scalar: Scalar,
+        right_scalar: Scalar,
+    ) -> VortexResult<Scalar> {
         if let DType::Decimal(decimal_dtype, _) = *left_scalar.dtype() {
-            return finalize_decimal_scalar(&left_scalar, &right_scalar, decimal_dtype);
+            return finalize_decimal_scalar(
+                &left_scalar,
+                &right_scalar,
+                decimal_dtype,
+                args.return_dtype,
+            );
         }
 
-        let target = DType::Primitive(PType::F64, Nullability::Nullable);
+        let target = args.return_dtype.clone();
         let sum_cast = left_scalar.cast(&target)?;
         let count_cast = right_scalar.cast(&target)?;
 
@@ -133,8 +151,29 @@ impl BinaryCombined for Mean {
         Ok(Scalar::primitive(value, Nullability::Nullable))
     }
 
-    fn serialize(&self, _options: &CombinedOptions<Self>) -> VortexResult<Option<Vec<u8>>> {
-        unimplemented!("mean is not yet serializable");
+    fn serialize(&self, options: &CombinedOptions<Self>) -> VortexResult<Option<Vec<u8>>> {
+        Ok(Some(vec![
+            u8::from(options.0.skip_nans),
+            u8::from(options.1.skip_nans),
+        ]))
+    }
+
+    fn deserialize(
+        &self,
+        metadata: &[u8],
+        _session: &VortexSession,
+    ) -> VortexResult<CombinedOptions<Self>> {
+        match metadata {
+            &[sum @ 0..=1, count @ 0..=1] => Ok(PairOptions(
+                NumericalAggregateOpts {
+                    skip_nans: sum != 0,
+                },
+                NumericalAggregateOpts {
+                    skip_nans: count != 0,
+                },
+            )),
+            _ => vortex_bail!("Invalid Mean options: expected two boolean bytes"),
+        }
     }
 }
 
@@ -163,18 +202,20 @@ fn finalize_decimal_scalar(
     sum: &Scalar,
     count: &Scalar,
     sum_decimal: DecimalDType,
+    target_dtype: &DType,
 ) -> VortexResult<Scalar> {
-    let target_decimal_dtype = mean_decimal_dtype(&sum_decimal);
-    let target_dtype = DType::Decimal(target_decimal_dtype, Nullability::Nullable);
+    let target_decimal_dtype = *target_dtype
+        .as_decimal_opt()
+        .vortex_expect("decimal mean result dtype");
 
     // overflow
     let Some(sum_value) = sum.as_decimal().decimal_value() else {
-        return Ok(Scalar::null(target_dtype));
+        return Ok(Scalar::null(target_dtype.clone()));
     };
     // empty input
     let count = count.as_primitive().typed_value::<u64>().unwrap_or(0);
     if count == 0 {
-        return Ok(Scalar::null(target_dtype));
+        return Ok(Scalar::null(target_dtype.clone()));
     }
 
     let Ok(sum) = DecimalValue::rescale_i256(
@@ -182,12 +223,12 @@ fn finalize_decimal_scalar(
         sum_decimal.scale(),
         target_decimal_dtype.scale(),
     ) else {
-        return Ok(Scalar::null(target_dtype));
+        return Ok(Scalar::null(target_dtype.clone()));
     };
     let mean = sum / i256::from_i128(i128::from(count));
 
     let Ok(mean) = DecimalValue::try_from_i256(mean, target_decimal_dtype) else {
-        return Ok(Scalar::null(target_dtype));
+        return Ok(Scalar::null(target_dtype.clone()));
     };
     Ok(Scalar::decimal(
         mean,
@@ -198,27 +239,32 @@ fn finalize_decimal_scalar(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use vortex_buffer::buffer;
     use vortex_error::VortexResult;
+    use vortex_session::VortexSession;
 
     use super::*;
     use crate::VortexSessionExecute;
     use crate::aggregate_fn::DynGroupedAccumulator;
     use crate::aggregate_fn::GroupedAccumulator;
-    use crate::array_session;
     use crate::arrays::BoolArray;
     use crate::arrays::ChunkedArray;
     use crate::arrays::DecimalArray;
     use crate::arrays::FixedSizeListArray;
     use crate::arrays::PrimitiveArray;
+    use crate::assert_arrays_eq;
     use crate::dtype::DecimalDType;
     use crate::validity::Validity;
+
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
 
     #[test]
     fn mean_all_valid() -> VortexResult<()> {
         let array = PrimitiveArray::new(buffer![1.0f64, 2.0, 3.0, 4.0, 5.0], Validity::NonNullable)
             .into_array();
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let result = mean(&array, &mut ctx)?;
         assert_eq!(result.as_primitive().as_::<f64>(), Some(3.0));
         Ok(())
@@ -227,7 +273,7 @@ mod tests {
     #[test]
     fn mean_with_nulls() -> VortexResult<()> {
         let array = PrimitiveArray::from_option_iter([Some(2.0f64), None, Some(4.0)]).into_array();
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let result = mean(&array, &mut ctx)?;
         assert_eq!(result.as_primitive().as_::<f64>(), Some(3.0));
         Ok(())
@@ -236,7 +282,7 @@ mod tests {
     #[test]
     fn mean_integers() -> VortexResult<()> {
         let array = PrimitiveArray::new(buffer![10i32, 20, 30], Validity::NonNullable).into_array();
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let result = mean(&array, &mut ctx)?;
         assert_eq!(result.as_primitive().as_::<f64>(), Some(20.0));
         Ok(())
@@ -245,7 +291,7 @@ mod tests {
     #[test]
     fn mean_bool() -> VortexResult<()> {
         let array: BoolArray = [true, false, true, true].into_iter().collect();
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let result = mean(&array.into_array(), &mut ctx)?;
         assert_eq!(result.as_primitive().as_::<f64>(), Some(0.75));
         Ok(())
@@ -254,7 +300,7 @@ mod tests {
     #[test]
     fn mean_constant_non_null() -> VortexResult<()> {
         let array = ConstantArray::new(5.0f64, 4);
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let result = mean(&array.into_array(), &mut ctx)?;
         assert_eq!(result.as_primitive().as_::<f64>(), Some(5.0));
         Ok(())
@@ -266,7 +312,7 @@ mod tests {
         let chunk2 = PrimitiveArray::from_option_iter([Some(5.0f64), None]);
         let dtype = chunk1.dtype().clone();
         let chunked = ChunkedArray::try_new(vec![chunk1.into_array(), chunk2.into_array()], dtype)?;
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let result = mean(&chunked.into_array(), &mut ctx)?;
         assert_eq!(result.as_primitive().as_::<f64>(), Some(3.0));
         Ok(())
@@ -277,7 +323,7 @@ mod tests {
         // NaNs are excluded from both the sum and the count.
         let array =
             PrimitiveArray::new(buffer![1.0f64, f64::NAN, 3.0], Validity::NonNullable).into_array();
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let result = mean(&array, &mut ctx)?;
         assert_eq!(result.as_primitive().as_::<f64>(), Some(2.0));
         Ok(())
@@ -287,7 +333,7 @@ mod tests {
     fn mean_with_nan_not_skipping() -> VortexResult<()> {
         let array =
             PrimitiveArray::new(buffer![1.0f64, f64::NAN, 3.0], Validity::NonNullable).into_array();
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let keep_nans = NumericalAggregateOpts::include_nans();
         let mut acc = Accumulator::try_new(
             Mean::combined(),
@@ -303,7 +349,7 @@ mod tests {
     #[test]
     fn mean_all_null_returns_null() -> VortexResult<()> {
         let array = PrimitiveArray::from_option_iter::<f64, _>([None, None, None]).into_array();
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let result = mean(&array, &mut ctx)?;
         assert_eq!(result.as_primitive().as_::<f64>(), None);
         Ok(())
@@ -314,7 +360,7 @@ mod tests {
         let dtype = DecimalDType::new(6, 2);
         let array =
             DecimalArray::new(buffer![100i32, 200, 300], dtype, Validity::NonNullable).into_array();
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let result = mean(&array, &mut ctx)?;
         assert_eq!(
             result.dtype(),
@@ -333,12 +379,16 @@ mod tests {
         let dtype = DecimalDType::new(6, 2);
         let validity = Validity::from_iter([true, false, true]);
         let array = DecimalArray::new(buffer![150i32, 0, 450], dtype, validity).into_array();
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let result = mean(&array, &mut ctx)?;
         // mean(1.50, 4.50) = 3.000000
         assert_eq!(
             result.as_decimal().decimal_value(),
             Some(DecimalValue::I256(i256::from_i128(3_000_000)))
+        );
+        assert_eq!(
+            result.dtype(),
+            &DType::Decimal(DecimalDType::new(10, 6), Nullability::Nullable)
         );
         Ok(())
     }
@@ -351,12 +401,16 @@ mod tests {
         let chunk2 = DecimalArray::new(buffer![300i32, 400, 500], dtype, validity).into_array();
         let dtype = chunk1.dtype().clone();
         let chunked = ChunkedArray::try_new(vec![chunk1, chunk2], dtype)?;
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let result = mean(&chunked.into_array(), &mut ctx)?;
         // mean(1.00, 2.00, 3.00, 4.00, 5.00) = 3.000000
         assert_eq!(
             result.as_decimal().decimal_value(),
             Some(DecimalValue::I256(i256::from_i128(3_000_000)))
+        );
+        assert_eq!(
+            result.dtype(),
+            &DType::Decimal(DecimalDType::new(10, 6), Nullability::Nullable)
         );
         Ok(())
     }
@@ -366,19 +420,23 @@ mod tests {
         let dtype = DecimalDType::new(6, 2);
         let buf = buffer![100i32, 0, 0];
         let array = DecimalArray::new(buf, dtype, Validity::NonNullable).into_array();
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let result = mean(&array, &mut ctx)?;
         // mean(1.00, 0.00, 0.00) = 1/3 => 0.333333
         assert_eq!(
             result.as_decimal().decimal_value(),
             Some(DecimalValue::I256(i256::from_i128(333_333)))
         );
+        assert_eq!(
+            result.dtype(),
+            &DType::Decimal(DecimalDType::new(10, 6), Nullability::Nullable)
+        );
         Ok(())
     }
 
     #[test]
     fn mean_multi_batch() -> VortexResult<()> {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let dtype = DType::Primitive(PType::F64, Nullability::NonNullable);
         let mut acc = Accumulator::try_new(
             Mean::combined(),
@@ -413,7 +471,7 @@ mod tests {
 
     #[test]
     fn mean_combined_partials() -> VortexResult<()> {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         for (case, (group, expected)) in mean_nan_null().into_iter().enumerate() {
             let mut acc = Accumulator::try_new(
                 Mean::combined(),
@@ -451,7 +509,7 @@ mod tests {
             ),
             DType::Primitive(PType::F64, Nullability::Nullable),
         )?;
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         acc.accumulate_list(&groups.into_array(), &mut ctx)?;
         let result = acc.finish()?;
 
@@ -459,6 +517,10 @@ mod tests {
             let actual = result.execute_scalar(case, &mut ctx)?;
             assert_eq!(actual.as_primitive().as_::<f64>(), expected, "case {case}");
         }
+        let expected =
+            PrimitiveArray::from_option_iter([Some(1.0f64), Some(2.0), None, None, Some(2.0)])
+                .into_array();
+        assert_arrays_eq!(&result, &expected, &mut ctx);
         Ok(())
     }
 }

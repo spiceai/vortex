@@ -3,7 +3,6 @@
 
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
-use vortex_error::vortex_err;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
@@ -12,6 +11,7 @@ use crate::Columnar;
 use crate::ExecutionCtx;
 use crate::IntoArray;
 use crate::aggregate_fn::Accumulator;
+use crate::aggregate_fn::AggregateArgs;
 use crate::aggregate_fn::AggregateFnId;
 use crate::aggregate_fn::AggregateFnVTable;
 use crate::aggregate_fn::DynAccumulator;
@@ -23,13 +23,12 @@ use crate::expr::stats::Precision;
 use crate::expr::stats::Stat;
 use crate::expr::stats::StatsProvider;
 use crate::scalar::Scalar;
-use crate::scalar::ScalarValue;
 
 /// Return the number of null values in an array.
 pub fn null_count(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<usize> {
     if let Precision::Exact(null_count_scalar) = array.statistics().get(Stat::NullCount) {
         return usize::try_from(&null_count_scalar)
-            .map_err(|e| vortex_err!("Failed to convert null count stat to usize: {e}"));
+            .map_err(|e| e.with_context("Failed to convert null count stat to usize"));
     }
 
     let mut acc = Accumulator::try_new(NullCount, EmptyOptions, array.dtype().clone())?;
@@ -40,13 +39,8 @@ pub fn null_count(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<usiz
         .as_primitive()
         .typed_value::<u64>()
         .vortex_expect("null_count result should not be null");
-    let count_usize = usize::try_from(count).vortex_expect("Cannot be more nulls than usize::MAX");
-
-    array
-        .statistics()
-        .set(Stat::NullCount, Precision::Exact(ScalarValue::from(count)));
-
-    Ok(count_usize)
+    // The accumulator caches the null count on `array` as a statistic.
+    Ok(usize::try_from(count).vortex_expect("Cannot be more nulls than usize::MAX"))
 }
 
 /// Count the number of null values in an array.
@@ -86,36 +80,51 @@ impl AggregateFnVTable for NullCount {
 
     fn empty_partial(
         &self,
-        _options: &Self::Options,
-        _input_dtype: &DType,
+        _args: AggregateArgs<'_, Self::Options>,
     ) -> VortexResult<Self::Partial> {
         Ok(0)
     }
 
-    fn combine_partials(&self, partial: &mut Self::Partial, other: Scalar) -> VortexResult<()> {
-        let count = other
+    fn partial_from_scalar(
+        &self,
+        _args: AggregateArgs<'_, Self::Options>,
+        scalar: &Scalar,
+    ) -> VortexResult<Self::Partial> {
+        Ok(scalar
             .as_primitive()
             .typed_value::<u64>()
-            .vortex_expect("null_count partial should not be null");
-        *partial += count;
-        Ok(())
+            .vortex_expect("null_count partial should not be null"))
     }
 
-    fn to_scalar(&self, partial: &Self::Partial) -> VortexResult<Scalar> {
+    fn merge_partials(
+        &self,
+        _args: AggregateArgs<'_, Self::Options>,
+        first: Self::Partial,
+        second: Self::Partial,
+    ) -> VortexResult<Self::Partial> {
+        Ok(first + second)
+    }
+
+    fn to_scalar(
+        &self,
+        _args: AggregateArgs<'_, Self::Options>,
+        partial: &Self::Partial,
+    ) -> VortexResult<Scalar> {
         Ok(Scalar::primitive(*partial, NonNullable))
     }
 
-    fn reset(&self, partial: &mut Self::Partial) {
-        *partial = 0;
-    }
-
     #[inline]
-    fn is_saturated(&self, _partial: &Self::Partial) -> bool {
+    fn is_saturated(
+        &self,
+        _args: AggregateArgs<'_, Self::Options>,
+        _partial: &Self::Partial,
+    ) -> bool {
         false
     }
 
     fn try_accumulate(
         &self,
+        _args: AggregateArgs<'_, Self::Options>,
         state: &mut Self::Partial,
         batch: &ArrayRef,
         ctx: &mut ExecutionCtx,
@@ -126,6 +135,7 @@ impl AggregateFnVTable for NullCount {
 
     fn accumulate(
         &self,
+        _args: AggregateArgs<'_, Self::Options>,
         partial: &mut Self::Partial,
         batch: &Columnar,
         ctx: &mut ExecutionCtx,
@@ -143,18 +153,29 @@ impl AggregateFnVTable for NullCount {
         Ok(())
     }
 
-    fn finalize(&self, partials: ArrayRef) -> VortexResult<ArrayRef> {
+    fn finalize(
+        &self,
+        _args: AggregateArgs<'_, Self::Options>,
+        partials: ArrayRef,
+    ) -> VortexResult<ArrayRef> {
         Ok(partials)
     }
 
-    fn finalize_scalar(&self, partial: &Self::Partial) -> VortexResult<Scalar> {
-        self.to_scalar(partial)
+    fn finalize_scalar(
+        &self,
+        args: AggregateArgs<'_, Self::Options>,
+        partial: &Self::Partial,
+    ) -> VortexResult<Scalar> {
+        self.to_scalar(args, partial)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use vortex_error::VortexResult;
+    use vortex_session::VortexSession;
 
     use crate::IntoArray;
     use crate::VortexSessionExecute;
@@ -163,7 +184,6 @@ mod tests {
     use crate::aggregate_fn::EmptyOptions;
     use crate::aggregate_fn::fns::null_count::NullCount;
     use crate::aggregate_fn::fns::null_count::null_count;
-    use crate::array_session;
     use crate::arrays::PrimitiveArray;
     use crate::dtype::DType;
     use crate::dtype::Nullability;
@@ -172,11 +192,13 @@ mod tests {
     use crate::expr::stats::Stat;
     use crate::expr::stats::StatsProviderExt;
 
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
+
     #[test]
     fn null_count_with_nulls() -> VortexResult<()> {
         let array =
             PrimitiveArray::from_option_iter([Some(1i32), None, Some(3), None]).into_array();
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
 
         assert_eq!(null_count(&array, &mut ctx)?, 2);
         assert_eq!(
@@ -188,7 +210,7 @@ mod tests {
 
     #[test]
     fn null_count_multi_batch() -> VortexResult<()> {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let dtype = DType::Primitive(PType::I32, Nullability::Nullable);
         let mut acc = Accumulator::try_new(NullCount, EmptyOptions, dtype)?;
 

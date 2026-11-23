@@ -6,15 +6,13 @@ use std::sync::Arc;
 use arrow_array::RecordBatchReader;
 use arrow_schema::SchemaRef;
 use itertools::Itertools;
+use pyo3::exceptions::PyIndexError;
 use pyo3::exceptions::PyTypeError;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyString;
 use vortex::array::ArrayRef;
-use vortex::array::ExecutionCtx;
-use vortex::array::VortexSessionExecute;
-use vortex::array::arrays::PrimitiveArray;
 use vortex::array::iter::ArrayIteratorExt;
+use vortex::dtype::DType;
 use vortex::dtype::FieldName;
 use vortex::dtype::FieldNames;
 use vortex::error::VortexResult;
@@ -34,6 +32,7 @@ use crate::arrow::ToPyArrow;
 use crate::current_runtime;
 use crate::error::PyVortexResult;
 use crate::expr::PyExpr;
+use crate::file::row_indices;
 use crate::install_module;
 use crate::object_store::resolve::ResolvedStore;
 use crate::object_store::resolve::resolve_store;
@@ -55,19 +54,12 @@ pub fn read_array_from_reader(
     vortex_file: &VortexFile,
     projection: Expression,
     filter: Option<Expression>,
-    indices: Option<ArrayRef>,
+    indices: Option<StrictSortedBuffer<u64>>,
     row_range: Option<(u64, u64)>,
-    ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
-    let projection = projection
-        .optimize_recursive(vortex_file.dtype())?
-        .bind(vortex_file.dtype())?;
+    let projection = projection.bind(vortex_file.dtype())?.optimize_recursive()?;
     let filter = filter
-        .map(|filter| {
-            filter
-                .optimize_recursive(vortex_file.dtype())?
-                .bind(vortex_file.dtype())
-        })
+        .map(|filter| filter.bind(vortex_file.dtype())?.optimize_recursive())
         .transpose()?;
     let mut scan = vortex_file.scan()?.with_projection(projection);
 
@@ -76,9 +68,7 @@ pub fn read_array_from_reader(
     }
 
     if let Some(indices) = indices {
-        let primitive = indices.execute::<PrimitiveArray>(ctx)?;
-        let indices = primitive.into_buffer();
-        scan = scan.with_row_indices(StrictSortedBuffer::try_new(indices)?);
+        scan = scan.with_row_indices(indices);
     }
 
     if let Some((l, r)) = row_range {
@@ -89,24 +79,40 @@ pub fn read_array_from_reader(
     scan.into_array_iter(&runtime)?.read_all()
 }
 
-fn projection_from_python(columns: Option<Vec<Bound<PyAny>>>) -> PyResult<Expression> {
-    fn field_from_pyany(field: &Bound<PyAny>) -> PyResult<FieldName> {
-        if field.clone().is_instance_of::<PyString>() {
-            Ok(FieldName::from(field.cast::<PyString>()?.to_str()?))
-        } else {
-            Err(PyTypeError::new_err(format!(
-                "projection: expected list of strings or None, but found: {field}.",
-            )))
-        }
-    }
+/// A projected column, selected either by name or by positional index.
+#[derive(FromPyObject)]
+pub enum ProjectionColumn {
+    Name(String),
+    Index(usize),
+}
 
+fn projection_from_python(
+    columns: Option<Vec<ProjectionColumn>>,
+    dtype: &DType,
+) -> PyResult<Expression> {
     Ok(match columns {
         None => root(),
         Some(columns) => {
-            let fields: Vec<_> = columns
-                .iter()
-                .map(field_from_pyany)
-                .collect::<PyResult<_>>()?;
+            let fields = columns
+                .into_iter()
+                .map(|column| match column {
+                    ProjectionColumn::Name(name) => Ok(FieldName::from(name.as_str())),
+                    ProjectionColumn::Index(index) => {
+                        // Positional projection: map the index onto the top-level field name.
+                        let DType::Struct(struct_dtype, _) = dtype else {
+                            return Err(PyTypeError::new_err(
+                                "projection: integer indices are only valid for a struct-typed file",
+                            ));
+                        };
+                        struct_dtype.field_name(index).cloned().ok_or_else(|| {
+                            PyIndexError::new_err(format!(
+                                "projection: column index {index} is out of range for {} columns",
+                                struct_dtype.nfields()
+                            ))
+                        })
+                    }
+                })
+                .collect::<PyResult<Vec<_>>>()?;
             select(FieldNames::from(fields), root())
         }
     })
@@ -148,21 +154,18 @@ impl PyVortexDataset {
     pub(crate) fn to_array_inner<'py>(
         &self,
         py: Python<'py>,
-        columns: Option<Vec<Bound<'py, PyAny>>>,
+        columns: Option<Vec<ProjectionColumn>>,
         row_filter: Option<&Bound<'py, PyExpr>>,
         indices: Option<PyArrayRef>,
         row_range: Option<(u64, u64)>,
     ) -> PyVortexResult<PyArrayRef> {
         let vxf = self.vxf.clone();
-        let projection = projection_from_python(columns)?;
+        let projection = projection_from_python(columns, vxf.dtype())?;
         let filter = filter_from_python(row_filter);
-        let indices = indices.map(|i| i.into_inner());
+        let indices = row_indices(py, indices)?;
 
-        let array = py.detach(move || {
-            let session = session();
-            let mut ctx = session.create_execution_ctx();
-            read_array_from_reader(&vxf, projection, filter, indices, row_range, &mut ctx)
-        })?;
+        let array = py
+            .detach(move || read_array_from_reader(&vxf, projection, filter, indices, row_range))?;
         Ok(PyArrayRef::from(array))
     }
 }
@@ -176,7 +179,7 @@ impl PyVortexDataset {
     #[pyo3(signature = (*, columns = None, row_filter = None, indices = None, row_range = None))]
     pub fn to_array<'py>(
         self_: PyRef<'py, Self>,
-        columns: Option<Vec<Bound<'py, PyAny>>>,
+        columns: Option<Vec<ProjectionColumn>>,
         row_filter: Option<&Bound<'py, PyExpr>>,
         indices: Option<PyArrayRef>,
         row_range: Option<(u64, u64)>,
@@ -187,37 +190,33 @@ impl PyVortexDataset {
     #[pyo3(signature = (*, columns = None, row_filter = None, split_by = None, row_range = None))]
     pub fn to_record_batch_reader(
         self_: PyRef<Self>,
-        columns: Option<Vec<Bound<'_, PyAny>>>,
+        columns: Option<Vec<ProjectionColumn>>,
         row_filter: Option<&Bound<'_, PyExpr>>,
         split_by: Option<usize>,
         row_range: Option<(u64, u64)>,
     ) -> PyVortexResult<Py<PyAny>> {
-        let vxf = self_.vxf.clone();
-        let projection = projection_from_python(columns)?;
+        let vxf = &self_.vxf;
+        let projection = projection_from_python(columns, vxf.dtype())?;
         let filter = filter_from_python(row_filter);
 
-        let reader = self_.py().detach(move || {
-            let projection = projection
-                .optimize_recursive(vxf.dtype())?
-                .bind(vxf.dtype())?;
-            let filter = filter
-                .map(|filter| filter.optimize_recursive(vxf.dtype())?.bind(vxf.dtype()))
-                .transpose()?;
-            let mut scan = vxf
-                .scan()?
-                .with_projection(projection)
-                .with_some_filter(filter)
-                .with_split_by(split_by.map(SplitBy::RowCount).unwrap_or_default());
-            if let Some((l, r)) = row_range {
-                scan = scan.with_row_range(l..r);
-            }
+        // Building the reader is lazy and cheap, so it runs without releasing the GIL. The scan
+        // runs as pyarrow pulls batches, and pyarrow releases the GIL while it does.
+        let projection = projection.bind(vxf.dtype())?.optimize_recursive()?;
+        let filter = filter
+            .map(|filter| filter.bind(vxf.dtype())?.optimize_recursive())
+            .transpose()?;
+        let mut scan = vxf
+            .scan()?
+            .with_projection(projection)
+            .with_some_filter(filter)
+            .with_split_by(split_by.map(SplitBy::RowCount).unwrap_or_default());
+        if let Some((l, r)) = row_range {
+            scan = scan.with_row_range(l..r);
+        }
 
-            let schema = Arc::new(session().arrow().to_arrow_schema(&scan.dtype()?)?);
-            let runtime = current_runtime();
-            let reader: Box<dyn RecordBatchReader + Send> =
-                Box::new(scan.into_record_batch_reader(schema, &runtime)?);
-            VortexResult::Ok(reader)
-        })?;
+        let schema = Arc::new(session().arrow().to_arrow_schema(&scan.dtype()?)?);
+        let reader: Box<dyn RecordBatchReader + Send> =
+            Box::new(scan.into_record_batch_reader(schema, &current_runtime())?);
 
         Ok(reader.into_pyarrow(self_.py())?)
     }
@@ -244,10 +243,10 @@ impl PyVortexDataset {
         let filter = filter_from_python(row_filter);
         let n_rows: usize = self_.py().detach(move || {
             let projection = select(FieldNames::empty(), root())
-                .optimize_recursive(vxf.dtype())?
-                .bind(vxf.dtype())?;
+                .bind(vxf.dtype())?
+                .optimize_recursive()?;
             let filter = filter
-                .map(|filter| filter.optimize_recursive(vxf.dtype())?.bind(vxf.dtype()))
+                .map(|filter| filter.bind(vxf.dtype())?.optimize_recursive())
                 .transpose()?;
             let mut scan = vxf
                 .scan()?

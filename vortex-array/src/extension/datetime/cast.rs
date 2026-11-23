@@ -64,23 +64,21 @@ impl DateToTimestamp {
         let mut scaled = i128::from(value)
             .checked_mul(i128::from(self.multiply))
             .ok_or_else(|| {
-                vortex_error::vortex_err!(
-                    Compute: "Date value {value} overflows while scaling to timestamp"
-                )
+                vortex_error::vortex_err!("Date value {value} overflows while scaling to timestamp")
             })?;
 
         if self.divide != 1 {
             let divisor = i128::from(self.divide);
             if scaled % divisor != 0 {
                 vortex_bail!(
-                    Compute: "Date value {value} cannot be represented exactly in target timestamp unit"
+                    "Date value {value} cannot be represented exactly in target timestamp unit"
                 );
             }
             scaled /= divisor;
         }
 
         let scaled = i64::try_from(scaled).map_err(|_| {
-            vortex_error::vortex_err!(Compute: "Date value {value} overflows target timestamp range")
+            vortex_error::vortex_err!("Date value {value} overflows target timestamp range")
         })?;
 
         // The `i64` range is wider than the instants a timestamp scalar accepts, and this is
@@ -89,9 +87,7 @@ impl DateToTimestamp {
         // file's statistics fail to cast while the rows they gate convert happily. The bounds
         // are `Timestamp`'s own, so there is one range rather than two that must agree.
         if scaled < self.min || scaled > self.max {
-            vortex_bail!(
-                Compute: "Date value {value} is outside the range a timestamp can represent"
-            );
+            vortex_bail!("Date value {value} is outside the range a timestamp can represent");
         }
 
         Ok(scaled)

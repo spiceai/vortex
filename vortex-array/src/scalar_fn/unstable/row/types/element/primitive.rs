@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::mem::MaybeUninit;
+
 use vortex_buffer::Buffer;
+use vortex_buffer::BufferAllocatorRef;
+use vortex_buffer::BufferMut;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure_eq;
@@ -10,12 +14,14 @@ use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::IntoArray;
 use crate::arrays::Constant;
+use crate::arrays::Primitive;
 use crate::arrays::PrimitiveArray;
 use crate::dtype::DType;
 use crate::dtype::NativePType;
 use crate::dtype::Nullability;
 use crate::scalar::ScalarValue;
 use crate::scalar_fn::unstable::row::InputElement;
+use crate::scalar_fn::unstable::row::OutputBuffer;
 use crate::scalar_fn::unstable::row::OutputElement;
 use crate::validity::Validity;
 
@@ -35,16 +41,28 @@ unsafe impl<T: NativePType> InputElement for T {
         let DType::Primitive(ptype, _) = dtype else {
             vortex_bail!("expected a {expected} column, got {dtype}");
         };
-        vortex_ensure_eq!(
-            *ptype,
-            expected,
-            "expected a {expected} column, got {dtype}"
-        );
+        vortex_ensure_eq!(*ptype, expected, "row input column has the wrong ptype");
         Ok(())
     }
 
     fn decode(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Self::Column> {
+        // A canonical input shares its buffer without executing the array.
+        if let Some(primitive) = array.as_opt::<Primitive>() {
+            return Ok(primitive.to_buffer::<T>());
+        }
+
         Ok(array.execute::<PrimitiveArray>(ctx)?.into_buffer::<T>())
+    }
+
+    #[inline]
+    fn decode_ref(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Self::Column> {
+        if let Some(primitive) = array.as_opt::<Primitive>() {
+            return Ok(primitive.to_buffer::<T>());
+        }
+
+        let executed = array.clone().execute::<PrimitiveArray>(ctx)?;
+
+        Ok(executed.into_buffer::<T>())
     }
 
     fn decode_constant(array: ArrayRef, _ctx: &mut ExecutionCtx) -> VortexResult<Self::Constant> {
@@ -98,11 +116,29 @@ unsafe impl<T: NativePType> InputElement for T {
 }
 
 impl<T: NativePType> OutputElement for T {
+    type Buffer = BufferMut<Self>;
+
     fn element_dtype() -> DType {
         DType::Primitive(T::PTYPE, Nullability::NonNullable)
     }
 
-    fn build(values: Vec<Self>) -> ArrayRef {
-        PrimitiveArray::new(values, Validity::NonNullable).into_array()
+    fn with_capacity(rows: usize, allocator: &BufferAllocatorRef) -> Self::Buffer {
+        allocator.with_capacity(rows)
+    }
+}
+
+// SAFETY: clearing the length preserves the contents and exposes the same allocation each time.
+// Native values require no destruction when a partially initialized buffer is abandoned.
+unsafe impl<T: NativePType> OutputBuffer<T> for BufferMut<T> {
+    fn slots(&mut self) -> &mut [MaybeUninit<T>] {
+        self.clear();
+        self.spare_capacity_mut()
+    }
+
+    unsafe fn finish(mut self, len: usize, _allocator: &BufferAllocatorRef) -> ArrayRef {
+        // SAFETY: the caller initialized the first `len` slots of this buffer's spare capacity.
+        unsafe { self.set_len(len) };
+
+        PrimitiveArray::new(self.freeze(), Validity::NonNullable).into_array()
     }
 }

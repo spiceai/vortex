@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+import decimal
+
 import pyarrow as pa
 import pytest
 
@@ -17,6 +19,21 @@ def test_array_with_nulls() -> None:
     a = pa.array([b"123", None], type=pa.string_view())
     arr = vortex.array(a)
     assert arr.to_arrow_array() == a
+
+
+def test_chunked_array_with_nulls_round_trip() -> None:
+    a = pa.chunked_array([[1, None, 2], [3, None]])
+    arr = vortex.array(a)
+    assert isinstance(arr, vortex.ChunkedArray)
+    assert arr.to_arrow_array() == a
+
+
+def test_decimal_array() -> None:
+    a = pa.array([decimal.Decimal("1.23"), None], type=pa.decimal128(10, 2))
+    arr = vortex.array(a)
+    assert isinstance(arr, vortex.DecimalArray)
+    assert arr.precision == 10
+    assert arr.scale == 2
 
 
 def test_varbin_array_round_trip() -> None:
@@ -54,13 +71,13 @@ def test_varbin_array_take() -> None:
 def test_empty_array() -> None:
     a = pa.array([], type=pa.uint8())
     primitive = vortex.array(a)
-    assert primitive.to_arrow_array().type == pa.uint8()
+    assert primitive.to_arrow_array() == a
 
 
-@pytest.mark.xfail(raises=IndexError)
 def test_scalar_at_out_of_bounds() -> None:
     a = vortex.array([10, 42, 999, 1992])
-    _s = a.scalar_at(10)
+    with pytest.raises(IndexError, match="Index 10 out of bounds"):
+        a.scalar_at(10)
 
 
 @pytest.mark.parametrize(
@@ -77,3 +94,33 @@ def test_unsupported_arrow_type_raises_value_error(arrow_type: pa.DataType) -> N
     table = pa.table({"c0": pa.array([], type=arrow_type)})
     with pytest.raises(ValueError):
         _ = vortex.array(table)
+
+
+@pytest.mark.parametrize(
+    ("chunks", "arrow_type"),
+    [
+        ([[1, 2], [3, None]], None),
+        ([["a", "b"], ["c"]], pa.string()),
+        ([[{"x": 1}, {"x": 2}], [{"x": 3}]], None),
+    ],
+)
+def test_chunked_array_combine_chunks(chunks: list[list[object]], arrow_type: pa.DataType | None) -> None:
+    expected = pa.chunked_array(chunks)
+    arr = vortex.array(expected)
+    assert isinstance(arr, vortex.ChunkedArray)
+
+    chunked = arr.to_arrow_array(arrow_type=arrow_type)
+    assert isinstance(chunked, pa.ChunkedArray)
+    assert chunked.num_chunks == len(chunks)
+
+    combined = arr.to_arrow_array(arrow_type=arrow_type, combine_chunks=True)
+    assert isinstance(combined, pa.Array)
+    assert chunked.equals(expected)
+    assert combined.equals(expected.combine_chunks())
+
+
+def test_chunked_struct_to_arrow_table_combine_chunks() -> None:
+    arr = vortex.array(pa.chunked_array([[{"x": 1}], [{"x": 2}, {"x": 3}]]))
+    table = arr.to_arrow_table(combine_chunks=True)
+    assert table.column("x").num_chunks == 1
+    assert table.column("x").to_pylist() == [1, 2, 3]

@@ -5,11 +5,13 @@ mod grouped;
 pub(crate) use grouped::CountGroupedKernel;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
+use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
 use crate::ArrayRef;
 use crate::Columnar;
 use crate::ExecutionCtx;
+use crate::aggregate_fn::AggregateArgs;
 use crate::aggregate_fn::AggregateFnId;
 use crate::aggregate_fn::AggregateFnVTable;
 use crate::aggregate_fn::NumericalAggregateOpts;
@@ -30,24 +32,25 @@ use crate::scalar::Scalar;
 #[derive(Clone, Debug)]
 pub struct Count;
 
-/// Partial accumulator state for the count aggregate.
-pub struct CountPartial {
-    count: u64,
-    /// Whether NaN values must be excluded from the count (float input with `skip_nans`).
-    exclude_nans: bool,
-}
-
 impl AggregateFnVTable for Count {
     type Options = NumericalAggregateOpts;
-    type Partial = CountPartial;
+    type Partial = u64;
 
     fn id(&self) -> AggregateFnId {
         static ID: CachedId = CachedId::new("vortex.count");
         *ID
     }
 
-    fn serialize(&self, _options: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
-        unimplemented!("Count is not yet serializable");
+    fn serialize(&self, options: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
+        Ok(Some(options.serialize()))
+    }
+
+    fn deserialize(
+        &self,
+        metadata: &[u8],
+        _session: &VortexSession,
+    ) -> VortexResult<Self::Options> {
+        NumericalAggregateOpts::deserialize(metadata)
     }
 
     fn return_dtype(&self, _options: &Self::Options, _input_dtype: &DType) -> Option<DType> {
@@ -60,54 +63,68 @@ impl AggregateFnVTable for Count {
 
     fn empty_partial(
         &self,
-        options: &Self::Options,
-        input_dtype: &DType,
+        _args: AggregateArgs<'_, Self::Options>,
     ) -> VortexResult<Self::Partial> {
-        Ok(CountPartial {
-            count: 0,
-            exclude_nans: options.skip_nans && input_dtype.is_float(),
-        })
+        Ok(0)
     }
 
-    fn combine_partials(&self, partial: &mut Self::Partial, other: Scalar) -> VortexResult<()> {
-        let val = other
+    fn partial_from_scalar(
+        &self,
+        _args: AggregateArgs<'_, Self::Options>,
+        scalar: &Scalar,
+    ) -> VortexResult<Self::Partial> {
+        Ok(scalar
             .as_primitive()
             .typed_value::<u64>()
-            .vortex_expect("count partial should not be null");
-        partial.count += val;
-        Ok(())
+            .vortex_expect("count partial should not be null"))
     }
 
-    fn to_scalar(&self, partial: &Self::Partial) -> VortexResult<Scalar> {
-        Ok(Scalar::primitive(partial.count, Nullability::NonNullable))
+    fn merge_partials(
+        &self,
+        _args: AggregateArgs<'_, Self::Options>,
+        first: Self::Partial,
+        second: Self::Partial,
+    ) -> VortexResult<Self::Partial> {
+        Ok(first + second)
     }
 
-    fn reset(&self, partial: &mut Self::Partial) {
-        partial.count = 0;
+    fn to_scalar(
+        &self,
+        _args: AggregateArgs<'_, Self::Options>,
+        partial: &Self::Partial,
+    ) -> VortexResult<Scalar> {
+        Ok(Scalar::primitive(*partial, Nullability::NonNullable))
     }
 
     #[inline]
-    fn is_saturated(&self, _partial: &Self::Partial) -> bool {
+    fn is_saturated(
+        &self,
+        _args: AggregateArgs<'_, Self::Options>,
+        _partial: &Self::Partial,
+    ) -> bool {
         false
     }
 
     fn try_accumulate(
         &self,
+        args: AggregateArgs<'_, Self::Options>,
         state: &mut Self::Partial,
         batch: &ArrayRef,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<bool> {
         let mut count = batch.valid_count(ctx)? as u64;
-        if state.exclude_nans {
+        // NaN values are excluded from the count of a float input when they are skipped.
+        if args.options.skip_nans && args.dtype.is_float() {
             // `nan_count` shortcircuits on an exact `Stat::NaNCount` before scanning the batch.
             count = count.saturating_sub(nan_count(batch, ctx)? as u64);
         }
-        state.count += count;
+        *state += count;
         Ok(true)
     }
 
     fn accumulate(
         &self,
+        _args: AggregateArgs<'_, Self::Options>,
         _partial: &mut Self::Partial,
         _batch: &Columnar,
         _ctx: &mut ExecutionCtx,
@@ -115,12 +132,20 @@ impl AggregateFnVTable for Count {
         unreachable!("Count::try_accumulate handles all arrays")
     }
 
-    fn finalize(&self, partials: ArrayRef) -> VortexResult<ArrayRef> {
+    fn finalize(
+        &self,
+        _args: AggregateArgs<'_, Self::Options>,
+        partials: ArrayRef,
+    ) -> VortexResult<ArrayRef> {
         Ok(partials)
     }
 
-    fn finalize_scalar(&self, partial: &Self::Partial) -> VortexResult<Scalar> {
-        self.to_scalar(partial)
+    fn finalize_scalar(
+        &self,
+        args: AggregateArgs<'_, Self::Options>,
+        partial: &Self::Partial,
+    ) -> VortexResult<Scalar> {
+        self.to_scalar(args, partial)
     }
 }
 
@@ -138,6 +163,7 @@ mod tests {
     use crate::IntoArray;
     use crate::VortexSessionExecute;
     use crate::aggregate_fn::Accumulator;
+    use crate::aggregate_fn::AggregateDTypes;
     use crate::aggregate_fn::AggregateFnVTable;
     use crate::aggregate_fn::DynAccumulator;
     use crate::aggregate_fn::NumericalAggregateOpts;
@@ -154,7 +180,7 @@ mod tests {
     use crate::scalar::ScalarValue;
     use crate::validity::Validity;
 
-    static SESSION: LazyLock<VortexSession> = LazyLock::new(vortex_array::array_session);
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
 
     pub fn count(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<usize> {
         let mut acc = Accumulator::try_new(
@@ -246,16 +272,12 @@ mod tests {
     #[test]
     fn count_state_merge() -> VortexResult<()> {
         let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-        let mut state = Count.empty_partial(&NumericalAggregateOpts::default(), &dtype)?;
+        let options = NumericalAggregateOpts::default();
+        let dtypes = AggregateDTypes::try_new(&Count, &options, dtype)?;
 
-        let scalar1 = Scalar::primitive(5u64, Nullability::NonNullable);
-        Count.combine_partials(&mut state, scalar1)?;
+        let state = Count.merge_partials(dtypes.args(&options), 5, 3)?;
 
-        let scalar2 = Scalar::primitive(3u64, Nullability::NonNullable);
-        Count.combine_partials(&mut state, scalar2)?;
-
-        let result = Count.to_scalar(&state)?;
-        Count.reset(&mut state);
+        let result = Count.to_scalar(dtypes.args(&options), &state)?;
         assert_eq!(result.as_primitive().typed_value::<u64>(), Some(8));
         Ok(())
     }
@@ -298,16 +320,18 @@ mod tests {
     }
 
     #[test]
-    fn count_float_shortcircuits_on_exact_nan_count_stat() -> VortexResult<()> {
-        // The array has no NaNs; a planted exact NaNCount stat proves the count is derived from
-        // the stat rather than a scan.
-        let array =
-            PrimitiveArray::new(buffer![1.0f64, 2.0, 3.0, 4.0], Validity::NonNullable).into_array();
+    fn count_float_with_exact_nan_count_stat() -> VortexResult<()> {
+        // The exact NaN count agrees with the batch; the four finite values remain counted.
+        let array = PrimitiveArray::new(
+            buffer![1.0f64, 2.0, 3.0, 4.0, f64::NAN, f64::NAN, f64::NAN],
+            Validity::NonNullable,
+        )
+        .into_array();
         array
             .statistics()
             .set(Stat::NaNCount, Precision::Exact(ScalarValue::from(3u64)));
         let mut ctx = SESSION.create_execution_ctx();
-        assert_eq!(count(&array, &mut ctx)?, 1);
+        assert_eq!(count(&array, &mut ctx)?, 4);
         Ok(())
     }
 

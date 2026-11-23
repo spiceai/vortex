@@ -29,6 +29,7 @@ use vortex::VortexSessionDefault;
 use vortex::array::ArrayDeserialization;
 use vortex::array::ArrayId;
 use vortex::array::ArrayRef;
+use vortex::array::VortexSessionExecute;
 use vortex::array::buffer::BufferHandle;
 use vortex::array::serde::ArrayChildren;
 use vortex::array::session::ArraySessionExt;
@@ -37,6 +38,7 @@ use vortex::dtype::DType;
 use vortex::error::VortexError;
 use vortex::error::VortexResult;
 use vortex::error::vortex_ensure;
+use vortex::error::vortex_ensure_eq;
 use vortex::error::vortex_err;
 use vortex::flatbuffers::FlatBuffer;
 use vortex::io::runtime::BlockingRuntime;
@@ -218,15 +220,15 @@ impl ArrayChildren for MetadataChildren {
             .get(index)
             .ok_or_else(|| vortex_err!("array metadata child index {index} out of bounds"))?
             .clone();
-        vortex_ensure!(
-            child.dtype() == dtype,
-            "array metadata child {index} has dtype {}, expected {dtype}",
-            child.dtype()
+        vortex_ensure_eq!(
+            child.dtype(),
+            dtype,
+            "array metadata child {index} dtype mismatch"
         );
-        vortex_ensure!(
-            child.len() == len,
-            "array metadata child {index} has length {}, expected {len}",
-            child.len()
+        vortex_ensure_eq!(
+            child.len(),
+            len,
+            "array metadata child {index} length mismatch"
         );
         Ok(child)
     }
@@ -311,19 +313,17 @@ fn deserialize_metadata_tree(
         ),
         session,
     )?;
-    vortex_ensure!(
-        decoded.len() == metadata.len,
-        "Array decoded from {} has incorrect length {}, expected {}",
-        metadata.encoding_id,
+    vortex_ensure_eq!(
         decoded.len(),
-        metadata.len
+        metadata.len,
+        "Array decoded from {} has incorrect length",
+        metadata.encoding_id
     );
-    vortex_ensure!(
-        decoded.dtype() == &dtype,
-        "Array decoded from {} has incorrect dtype {}, expected {}",
-        metadata.encoding_id,
+    vortex_ensure_eq!(
         decoded.dtype(),
-        dtype
+        &dtype,
+        "Array decoded from {} has incorrect dtype",
+        metadata.encoding_id
     );
     vortex_ensure!(
         plugin.is_supported_encoding(&decoded.encoding_id()),
@@ -359,7 +359,9 @@ fn _debug_array_metadata_dtype(array: Bound<'_, PyAny>) -> PyResult<String> {
 fn _debug_array_metadata_display_values(array: Bound<'_, PyAny>) -> PyResult<String> {
     let metadata = extract_array_metadata(&array)?;
     let array = deserialize_metadata_tree(&metadata, &METADATA_SESSION).map_err(to_py_err)?;
-    Ok(array.display_values().to_string())
+    Ok(array
+        .display_values(&METADATA_SESSION.create_execution_ctx())
+        .to_string())
 }
 
 /// Export a PyVortex array as Arrow C Device schema and array PyCapsules.

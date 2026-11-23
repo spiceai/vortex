@@ -21,6 +21,7 @@ use vortex_array::scalar::DecimalValue;
 use vortex_array::scalar::Scalar;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
+use vortex_error::vortex_bail;
 
 /// Baseline implementation of scalar_at that works on canonical arrays.
 /// This implementation manually extracts the scalar value from each canonical type
@@ -47,16 +48,16 @@ pub fn scalar_at_canonical_array(
         }
         Canonical::Decimal(array) => {
             match_each_decimal_value_type!(array.values_type(), |D| {
-                Scalar::decimal(
+                Scalar::try_decimal(
                     DecimalValue::from(array.buffer::<D>()[index]),
                     array.decimal_dtype(),
                     array.dtype().nullability(),
-                )
+                )?
             })
         }
         Canonical::VarBinView(array) => varbin_scalar(array.bytes_at(index), array.dtype()),
         Canonical::List(array) => {
-            let list = array.list_elements_at(index)?;
+            let list = array.list_elements_at(index, ctx)?;
             let children: Vec<Scalar> = (0..list.len())
                 .map(|i| {
                     let canonical = list
@@ -107,10 +108,10 @@ pub fn scalar_at_canonical_array(
             Scalar::extension_ref(array.ext_dtype().clone(), storage_scalar)
         }
         Canonical::Union(_) => {
-            todo!("TODO(connor)[Union]: support Union arrays in the scalar_at fuzzer")
+            vortex_bail!("TODO(connor)[Union]: support Union arrays in the scalar_at fuzzer")
         }
         Canonical::Map(array) => {
-            let entries = array.entries_at(index)?.execute::<StructArray>(ctx)?;
+            let entries = array.entries_at(index, ctx)?.execute::<StructArray>(ctx)?;
             let keys = entries
                 .unmasked_field(0)
                 .clone()

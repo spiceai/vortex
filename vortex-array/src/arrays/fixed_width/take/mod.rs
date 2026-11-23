@@ -6,6 +6,7 @@ mod avx2;
 mod records;
 mod scalar;
 mod slices;
+mod small_table;
 #[cfg(test)]
 mod tests;
 
@@ -13,6 +14,7 @@ mod tests;
 use std::sync::LazyLock;
 
 use vortex_buffer::Buffer;
+use vortex_buffer::BufferAllocatorRef;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_mask::Mask;
@@ -60,7 +62,16 @@ impl<V: FixedWidthArray> TakeExecute for V {
 ///
 /// Implementors must have no uninitialized bytes. The shared AVX2 gather reads the complete
 /// representation through a same-width integer lane before writing those bytes back unchanged.
-pub(crate) unsafe trait FixedWidthTakeValue: Copy {}
+pub(crate) unsafe trait FixedWidthTakeValue: Copy {
+    /// Takes values using the kernel appropriate for this value type.
+    fn take<I: UnsignedPType>(
+        values: &[Self],
+        indices: &[I],
+        allocator: &BufferAllocatorRef,
+    ) -> Buffer<Self> {
+        take_values_fallback(values, indices, allocator)
+    }
+}
 
 macro_rules! impl_fixed_width_take_value {
     ($($ty:ty),+ $(,)?) => {
@@ -71,24 +82,30 @@ macro_rules! impl_fixed_width_take_value {
     };
 }
 
-impl_fixed_width_take_value!(u8, u16, u32, u64, i8, i16, i32, i64, f16, f32, f64,);
-
-// SAFETY: Byte arrays have no padding and every byte is initialized.
-unsafe impl<const N: usize> FixedWidthTakeValue for [u8; N] {}
+impl_fixed_width_take_value!(u16, u32, u64, i16, i32, i64, f16, f32, f64,);
 
 pub(crate) fn take_values<T: FixedWidthTakeValue, I: UnsignedPType>(
     values: &[T],
     indices: &[I],
+    allocator: &BufferAllocatorRef,
+) -> Buffer<T> {
+    T::take(values, indices, allocator)
+}
+
+fn take_values_fallback<T: FixedWidthTakeValue, I: UnsignedPType>(
+    values: &[T],
+    indices: &[I],
+    allocator: &BufferAllocatorRef,
 ) -> Buffer<T> {
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     if *HAS_AVX2 {
         // SAFETY: AVX2 was detected above and `FixedWidthTakeValue` guarantees an initialized byte
         // representation. The AVX2 dispatcher retains Primitive's existing scalar fallbacks and
         // out-of-bounds behavior for every value width.
-        return unsafe { avx2::take_avx2(values, indices) };
+        return unsafe { avx2::take_avx2(values, indices, allocator) };
     }
 
-    take_values_scalar(values, indices)
+    take_values_scalar(values, indices, allocator)
 }
 
 pub(crate) fn take<V: FixedWidthArray>(
@@ -142,6 +159,7 @@ pub(crate) fn take<V: FixedWidthArray>(
             V::byte_width(array),
             array.len(),
             indices.as_slice::<I>(),
+            ctx.allocator(),
         )
     })?;
     Ok(Some(
@@ -173,6 +191,7 @@ fn take_contiguous_ranges<V: FixedWidthArray>(
                     starts.as_slice::<S>(),
                     length,
                     output_len,
+                    ctx.allocator(),
                 )
             })
         }
@@ -187,6 +206,7 @@ fn take_contiguous_ranges<V: FixedWidthArray>(
                         starts.as_slice::<S>(),
                         lengths.as_slice::<L>(),
                         output_len,
+                        ctx.allocator(),
                     )
                 })
             })

@@ -2,7 +2,6 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::iter;
-use std::ptr;
 use std::sync::Arc;
 
 use itertools::Itertools as _;
@@ -10,7 +9,7 @@ use num_traits::AsPrimitive;
 use vortex_buffer::Buffer;
 use vortex_buffer::BufferMut;
 use vortex_error::VortexResult;
-use vortex_error::vortex_ensure;
+use vortex_error::vortex_ensure_eq;
 use vortex_error::vortex_err;
 use vortex_mask::AllOr;
 use vortex_mask::Mask;
@@ -169,9 +168,10 @@ where
         .len()
         .checked_mul(length)
         .ok_or_else(|| vortex_err!("PiecewiseSequenceArray output length overflows usize"))?;
-    vortex_ensure!(
-        computed_len == output_len,
-        "PiecewiseSequenceArray expanded length {computed_len} does not match declared length {output_len}"
+    vortex_ensure_eq!(
+        computed_len,
+        output_len,
+        "PiecewiseSequenceArray expanded length does not match declared length",
     );
 
     let mut views = BufferMut::<BinaryView>::with_capacity(output_len);
@@ -180,24 +180,15 @@ where
     for &start in starts {
         let start = start.as_();
         let src = &source[start..][..length];
-        // SAFETY: `src` and the checked `spare` range have equal lengths and cannot overlap.
-        unsafe {
-            ptr::copy_nonoverlapping(
-                src.as_ptr(),
-                spare[cursor..][..src.len()]
-                    .as_mut_ptr()
-                    .cast::<BinaryView>(),
-                src.len(),
-            );
-        }
+        spare[cursor..][..src.len()].write_copy_of_slice(src);
         cursor += src.len();
     }
     // SAFETY: the loop initialized the prefix `0..cursor` of the spare capacity.
     unsafe { views.set_len(cursor) };
-    vortex_ensure!(
-        views.len() == output_len,
-        "PiecewiseSequenceArray expanded length {} does not match declared length {output_len}",
-        views.len()
+    vortex_ensure_eq!(
+        views.len(),
+        output_len,
+        "PiecewiseSequenceArray expanded length does not match declared length",
     );
     Ok(views.freeze())
 }
@@ -219,44 +210,39 @@ where
         let start = start.as_();
         let length = length.as_();
         let src = &source[start..][..length];
-        // SAFETY: `src` and the checked `spare` range have equal lengths and cannot overlap.
-        unsafe {
-            ptr::copy_nonoverlapping(
-                src.as_ptr(),
-                spare[cursor..][..src.len()]
-                    .as_mut_ptr()
-                    .cast::<BinaryView>(),
-                src.len(),
-            );
-        }
+        spare[cursor..][..src.len()].write_copy_of_slice(src);
         cursor += src.len();
     }
     // SAFETY: the loop initialized the prefix `0..cursor` of the spare capacity.
     unsafe { views.set_len(cursor) };
-    vortex_ensure!(
-        views.len() == output_len,
-        "PiecewiseSequenceArray expanded length {} does not match declared length {output_len}",
-        views.len()
+    vortex_ensure_eq!(
+        views.len(),
+        output_len,
+        "PiecewiseSequenceArray expanded length does not match declared length",
     );
     Ok(views.freeze())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use rstest::rstest;
     use vortex_buffer::BitBuffer;
     use vortex_buffer::buffer;
     use vortex_error::VortexResult;
+    use vortex_session::VortexSession;
 
     use crate::IntoArray;
     use crate::VortexSessionExecute;
-    use crate::array_session;
     use crate::arrays::VarBinViewArray;
     use crate::arrays::varbinview::compute::take::PrimitiveArray;
     use crate::compute::conformance::take::test_take_conformance;
     use crate::dtype::DType;
     use crate::dtype::Nullability::NonNullable;
     use crate::validity::Validity;
+
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
 
     #[test]
     fn take_nullable() -> VortexResult<()> {
@@ -272,7 +258,7 @@ mod tests {
         let taken = arr.take(buffer![0, 3].into_array())?;
 
         assert!(taken.dtype().is_nullable());
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let taken = taken.execute::<VarBinViewArray>(&mut ctx)?;
         let mask = taken.validity()?.execute_mask(taken.len(), &mut ctx)?;
         let result = (0..taken.len())
@@ -298,7 +284,7 @@ mod tests {
         let taken = arr.take(indices.into_array())?;
 
         assert!(taken.dtype().is_nullable());
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let taken = taken.execute::<VarBinViewArray>(&mut ctx)?;
         let mask = taken.validity()?.execute_mask(taken.len(), &mut ctx)?;
         let result = (0..taken.len())
@@ -329,9 +315,6 @@ mod tests {
     ))]
     #[case(VarBinViewArray::from_iter(["single"].map(Some), DType::Utf8(NonNullable)))]
     fn test_take_varbinview_conformance(#[case] array: VarBinViewArray) {
-        test_take_conformance(
-            &array.into_array(),
-            &mut array_session().create_execution_ctx(),
-        );
+        test_take_conformance(&array.into_array(), &mut SESSION.create_execution_ctx());
     }
 }

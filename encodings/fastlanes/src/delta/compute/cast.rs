@@ -4,7 +4,6 @@
 use vortex_array::ArrayRef;
 use vortex_array::ArrayView;
 use vortex_array::IntoArray;
-use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability::NonNullable;
 use vortex_array::scalar_fn::fns::cast::CastReduce;
@@ -29,11 +28,22 @@ impl CastReduce for Delta {
             return Ok(None);
         }
 
-        let casted_bases = array.bases().cast(dtype.with_nullability(NonNullable))?;
-        let casted_deltas = array.deltas().cast(dtype.clone())?;
+        let validity = array.validity()?;
+        let validity = if dtype.is_nullable() {
+            validity.into_nullable()
+        } else {
+            validity
+        };
 
         Ok(Some(
-            Delta::try_new(casted_bases, casted_deltas, array.offset(), array.len())?.into_array(),
+            Delta::try_new(
+                array.bases().clone(),
+                array.deltas().clone(),
+                validity,
+                array.offset(),
+                array.len(),
+            )?
+            .into_array(),
         ))
     }
 }
@@ -43,6 +53,7 @@ mod tests {
     use std::sync::LazyLock;
 
     use rstest::rstest;
+    use vortex_array::Canonical;
     use vortex_array::IntoArray;
     use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::PrimitiveArray;
@@ -54,11 +65,13 @@ mod tests {
     use vortex_array::dtype::PType;
     use vortex_buffer::buffer;
     use vortex_error::VortexResult;
+    use vortex_error::vortex_err;
     use vortex_session::VortexSession;
 
     use crate::Delta;
+    use crate::DeltaArraySlotsExt;
     static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
-        let session = vortex_array::array_session();
+        let session = VortexSession::empty();
         crate::initialize(&session);
         session
     });
@@ -111,7 +124,6 @@ mod tests {
 
     #[test]
     fn test_cast_delta_add_nullability() -> VortexResult<()> {
-        // Same ptype, only adding nullability — handled by the kernel without decompressing.
         let values = PrimitiveArray::from_iter([10u32, 20, 5, 30, 15]);
         let array = Delta::try_from_primitive_array(&values, &mut SESSION.create_execution_ctx())?;
 
@@ -123,6 +135,11 @@ mod tests {
             casted.dtype(),
             &DType::Primitive(PType::U32, Nullability::Nullable)
         );
+        let reduced = casted
+            .as_opt::<Delta>()
+            .ok_or_else(|| vortex_err!("expected nullability cast to preserve Delta"))?;
+        assert!(!reduced.deltas().dtype().is_nullable());
+        assert!(!reduced.bases().dtype().is_nullable());
         assert_arrays_eq!(
             casted,
             PrimitiveArray::from_option_iter([Some(10u32), Some(20), Some(5), Some(30), Some(15)]),
@@ -133,8 +150,6 @@ mod tests {
 
     #[test]
     fn test_cast_delta_nullability_preserves_nulls() -> VortexResult<()> {
-        // A nullable Delta array carries its validity in the deltas child; a same-ptype
-        // nullability cast must round-trip the null positions.
         let values =
             PrimitiveArray::from_option_iter([Some(10u32), None, Some(30), Some(15), None]);
         let array = Delta::try_from_primitive_array(&values, &mut SESSION.create_execution_ctx())?;
@@ -159,11 +174,13 @@ mod tests {
         let array = Delta::try_from_primitive_array(&values, &mut SESSION.create_execution_ctx())?;
 
         // The cast is lazy; the nullability check fires when it is executed.
-        #[expect(deprecated)]
         let result = array
             .into_array()
             .cast(DType::Primitive(PType::U32, Nullability::NonNullable))
-            .and_then(|a| a.to_canonical().map(|c| c.into_array()));
+            .and_then(|a| {
+                a.execute::<Canonical>(&mut SESSION.create_execution_ctx())
+                    .map(|c| c.into_array())
+            });
 
         assert!(
             result.is_err(),
@@ -213,6 +230,17 @@ mod tests {
         assert_eq!(
             casted.dtype(),
             &DType::Primitive(PType::U32, Nullability::Nullable)
+        );
+        assert_arrays_eq!(
+            casted,
+            PrimitiveArray::from_option_iter([
+                Some(100u32),
+                Some(0),
+                Some(200),
+                Some(300),
+                Some(0)
+            ]),
+            &mut SESSION.create_execution_ctx()
         );
     }
 

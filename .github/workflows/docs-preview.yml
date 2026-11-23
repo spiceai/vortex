@@ -1,0 +1,102 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright the Vortex contributors
+
+name: Vortex Docs Preview
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, labeled, unlabeled, edited, ready_for_review]
+
+permissions: { }
+
+jobs:
+  changes:
+    name: Check preview eligibility
+    if: >-
+      github.event.pull_request.draft != true && github.repository == 'vortex-data/vortex' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      ((github.event.action != 'labeled' && github.event.action != 'unlabeled' && github.event.action != 'edited') ||
+       github.event.label.name == 'action/preview-docs' ||
+       (github.event.action == 'edited' && github.event.changes.base.ref))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+    outputs:
+      eligible: ${{ steps.state.outputs.eligible }}
+    steps:
+      - name: Read current PR state
+        id: state
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9
+        with:
+          # Apply the same policy before building and immediately before uploading.
+          script: |
+            const original = context.payload.pull_request;
+            const {data: pr} = await github.rest.pulls.get({
+              ...context.repo, pull_number: original.number,
+            });
+            if (pr.state !== 'open' || pr.head.sha !== original.head.sha || pr.base.ref !== original.base.ref) {
+              core.setOutput('eligible', false);
+              return;
+            }
+            let eligible = pr.labels.some(label => label.name === 'action/preview-docs');
+            if (!eligible) {
+              const files = await github.paginate(github.rest.pulls.listFiles, {
+                ...context.repo, pull_number: pr.number, per_page: 100,
+              });
+              if (files.length !== pr.changed_files) {
+                throw new Error('Incomplete PR file list. Retry, or add action/preview-docs to opt in.');
+              }
+              const workflows = new Set([
+                '.github/workflows/docs.yml',
+                '.github/workflows/docs-build.yml',
+                '.github/workflows/docs-preview.yml',
+                '.github/workflows/deploy-vercel.yml',
+                '.github/workflows/web-build.yml',
+              ]);
+              eligible = files.some(file => [file.filename, file.previous_filename].some(
+                path => path && (path.startsWith('docs/') || path.startsWith('vortex-web/') ||
+                  path.startsWith('.github/vercel-cli/') || workflows.has(path)),
+              ));
+            }
+            core.setOutput('eligible', eligible);
+
+  build:
+    name: Build preview
+    needs: changes
+    if: needs.changes.outputs.eligible == 'true'
+    permissions:
+      contents: read
+    concurrency:
+      group: docs-preview-build-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    uses: ./.github/workflows/docs-build.yml
+
+  web:
+    name: Build Explorer preview
+    needs: changes
+    if: needs.changes.outputs.eligible == 'true'
+    permissions:
+      contents: read
+    concurrency:
+      group: docs-preview-web-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    uses: ./.github/workflows/web-build.yml
+
+  # Each Vercel deployment has its own URL, so a stale build cannot replace
+  # a newer preview, and the PR needs no recheck before publishing.
+  publish:
+    name: Publish preview
+    needs: [build, web]
+    permissions:
+      contents: read
+      deployments: write
+    uses: ./.github/workflows/deploy-vercel.yml
+    # A called workflow only sees the secrets its caller passes, including
+    # the secrets of the environment the called job deploys to.
+    secrets: inherit
+    with:
+      environment: vercel-docs
+      artifact-ids: ${{ needs.build.outputs.artifact-id }},${{ needs.web.outputs.artifact-id }}
+      config: docs/vercel-output-config.json
+      pages-html-handling: true

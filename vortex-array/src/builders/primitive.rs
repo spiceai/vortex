@@ -8,7 +8,7 @@ use vortex_buffer::BufferAllocatorRef;
 use vortex_buffer::BufferMut;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
-use vortex_error::vortex_ensure;
+use vortex_error::vortex_ensure_eq;
 use vortex_mask::Mask;
 
 use crate::ArrayRef;
@@ -138,8 +138,7 @@ impl<T: NativePType> PrimitiveBuilder<T> {
             .nulls
             .finish_with_nullability(self.dtype().nullability());
 
-        let allocator = self.values.allocator().clone();
-        let values = std::mem::replace(&mut self.values, allocator.with_capacity(0)).freeze();
+        let values = self.values.take().freeze();
         PrimitiveArray::new(values, validity)
     }
 
@@ -200,11 +199,10 @@ impl<T: NativePType> ArrayBuilder for PrimitiveBuilder<T> {
     }
 
     fn append_scalar(&mut self, scalar: &Scalar) -> VortexResult<()> {
-        vortex_ensure!(
-            scalar.dtype() == self.dtype(),
-            "PrimitiveBuilder expected scalar with dtype {}, got {}",
+        vortex_ensure_eq!(
+            scalar.dtype(),
             self.dtype(),
-            scalar.dtype()
+            "PrimitiveBuilder received a scalar with the wrong dtype"
         );
 
         if let Some(pv) = scalar.as_primitive().pvalue() {
@@ -321,14 +319,11 @@ impl<T> UninitRange<'_, T> {
             "tried to copy a slice into a `UninitRange` past its boundary"
         );
 
-        // SAFETY: &[T] and &[MaybeUninit<T>] have the same layout.
-        let uninit_src: &[MaybeUninit<T>] = unsafe { std::mem::transmute(src) };
-
         // Note: spare_capacity_mut() returns the spare capacity starting from the current length,
         // so we just use local_offset directly.
         let dst =
             &mut self.builder.values.spare_capacity_mut()[local_offset..local_offset + src.len()];
-        dst.copy_from_slice(uninit_src);
+        dst.write_copy_of_slice(src);
     }
 
     /// Get a mutable slice of uninitialized memory at the specified offset within this range.
@@ -377,12 +372,16 @@ impl<T> UninitRange<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use vortex_error::VortexExpect;
+    use vortex_session::VortexSession;
 
     use super::*;
     use crate::VortexSessionExecute;
-    use crate::array_session;
     use crate::assert_arrays_eq;
+
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
 
     /// REGRESSION TEST: This test verifies that multiple sequential ranges have correct offsets.
     ///
@@ -390,7 +389,7 @@ mod tests {
     /// buffer.
     #[test]
     fn test_multiple_uninit_ranges_correct_offsets() {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let mut builder = PrimitiveBuilder::<i32>::with_capacity_in(
             Nullability::NonNullable,
             10,
@@ -466,21 +465,26 @@ mod tests {
         // Check validity using scalar_at - nulls will return is_null() = true.
         assert!(
             !array
-                .execute_scalar(0, &mut array_session().create_execution_ctx())
+                .execute_scalar(0, &mut SESSION.create_execution_ctx())
                 .unwrap()
                 .is_null()
         );
         assert!(
             array
-                .execute_scalar(1, &mut array_session().create_execution_ctx())
+                .execute_scalar(1, &mut SESSION.create_execution_ctx())
                 .unwrap()
                 .is_null()
         );
         assert!(
             !array
-                .execute_scalar(2, &mut array_session().create_execution_ctx())
+                .execute_scalar(2, &mut SESSION.create_execution_ctx())
                 .unwrap()
                 .is_null()
+        );
+        assert_arrays_eq!(
+            array,
+            PrimitiveArray::from_option_iter([Some(10i32), None, Some(30)]),
+            &mut SESSION.create_execution_ctx()
         );
     }
 
@@ -513,7 +517,7 @@ mod tests {
     /// This verifies the new simplified API without the redundant `len` parameter.
     #[test]
     fn test_copy_from_slice_with_offsets() {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let mut builder = PrimitiveBuilder::<i32>::with_capacity_in(
             Nullability::NonNullable,
             10,
@@ -588,13 +592,13 @@ mod tests {
         // Check validity - the first two should be valid (from append_value).
         assert!(
             !array
-                .execute_scalar(0, &mut array_session().create_execution_ctx())
+                .execute_scalar(0, &mut SESSION.create_execution_ctx())
                 .unwrap()
                 .is_null()
         ); // initial value 100
         assert!(
             !array
-                .execute_scalar(1, &mut array_session().create_execution_ctx())
+                .execute_scalar(1, &mut SESSION.create_execution_ctx())
                 .unwrap()
                 .is_null()
         ); // initial value 200
@@ -602,19 +606,19 @@ mod tests {
         // Check the range items with modified validity.
         assert!(
             !array
-                .execute_scalar(2, &mut array_session().create_execution_ctx())
+                .execute_scalar(2, &mut SESSION.create_execution_ctx())
                 .unwrap()
                 .is_null()
         ); // range index 0 - set to valid
         assert!(
             array
-                .execute_scalar(3, &mut array_session().create_execution_ctx())
+                .execute_scalar(3, &mut SESSION.create_execution_ctx())
                 .unwrap()
                 .is_null()
         ); // range index 1 - left as null
         assert!(
             !array
-                .execute_scalar(4, &mut array_session().create_execution_ctx())
+                .execute_scalar(4, &mut SESSION.create_execution_ctx())
                 .unwrap()
                 .is_null()
         ); // range index 2 - set to valid
@@ -691,6 +695,11 @@ mod tests {
         let array = builder.finish_into_primitive();
         assert_eq!(array.len(), 3);
         assert_eq!(array.as_slice::<i32>(), &[10, 20, 30]);
+        assert_arrays_eq!(
+            array,
+            PrimitiveArray::from_option_iter([Some(10i32), Some(20), None]),
+            &mut SESSION.create_execution_ctx()
+        );
     }
 
     #[test]
@@ -729,7 +738,7 @@ mod tests {
         // values[2] might be any value since it's null.
 
         // Check validity - first two should be valid, third should be null.
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         assert!(
             array
                 .validity()

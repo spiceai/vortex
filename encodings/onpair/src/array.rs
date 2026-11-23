@@ -26,6 +26,7 @@ use vortex_array::EqMode;
 use vortex_array::ExecutionCtx;
 use vortex_array::ExecutionResult;
 use vortex_array::array_slots;
+use vortex_array::arrays::Primitive;
 use vortex_array::buffer::BufferHandle;
 use vortex_array::builders::ArrayBuilder;
 use vortex_array::builders::VarBinBuilder;
@@ -36,6 +37,8 @@ use vortex_array::dtype::OffsetBuilderPType;
 use vortex_array::dtype::PType;
 use vortex_array::match_each_integer_ptype;
 use vortex_array::match_each_varbin_builder;
+use vortex_array::require_child;
+use vortex_array::require_validity;
 use vortex_array::serde::ArrayChildren;
 use vortex_array::validity::Validity;
 use vortex_array::vtable::VTable;
@@ -47,6 +50,7 @@ use vortex_buffer::ByteBuffer;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
+use vortex_error::vortex_ensure_eq;
 use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
@@ -77,24 +81,24 @@ pub type OnPairArray = Array<OnPair>;
 pub struct OnPairMetadata {
     /// Width of the per-row primitive `uncompressed_lengths` child.
     #[prost(enumeration = "PType", tag = "1")]
-    pub uncompressed_lengths_ptype: i32,
+    pub(crate) uncompressed_lengths_ptype: i32,
     /// Number of dictionary tokens. `dict_offsets` has length `dict_size + 1`.
     #[prost(uint32, tag = "3")]
-    pub dict_size: u32,
+    pub(crate) dict_size: u32,
     /// Length of the `codes` slot child. A sliced array may retain codes that
     /// fall outside its visible row range.
     #[prost(uint64, tag = "4")]
-    pub codes_len: u64,
+    pub(crate) codes_len: u64,
     /// PType of the `dict_offsets` slot child (defaults to U32, may be
     /// narrowed to U16/U8 by the cascading compressor when values fit).
     #[prost(enumeration = "PType", tag = "5")]
-    pub dict_offsets_ptype: i32,
+    pub(crate) dict_offsets_ptype: i32,
     /// PType of the `codes` slot child.
     #[prost(enumeration = "PType", tag = "6")]
-    pub codes_ptype: i32,
+    pub(crate) codes_ptype: i32,
     /// PType of the `codes_offsets` slot child.
     #[prost(enumeration = "PType", tag = "7")]
-    pub codes_offsets_ptype: i32,
+    pub(crate) codes_offsets_ptype: i32,
 }
 
 impl OnPairMetadata {
@@ -141,7 +145,9 @@ struct OnPairDictionaryStorage {
     offsets: Buffer<u32>,
 }
 
-impl DictionaryStorage<u32> for OnPairDictionaryStorage {
+// SAFETY: `ByteBuffer` and `Buffer<u32>` are immutable and reference-counted. Every accessor
+// returns the same slice across calls and moves, and a clone shares the same contents.
+unsafe impl DictionaryStorage<u32> for OnPairDictionaryStorage {
     #[inline]
     fn bytes(&self) -> &[u8] {
         self.bytes.as_slice()
@@ -229,7 +235,7 @@ fn build_dictionary(
     offsets: Buffer<u32>,
 ) -> VortexResult<CompactDictionary<OnPairDictionaryStorage>> {
     CompactDictionary::validate_safety(OnPairDictionaryStorage { bytes, offsets })
-        .map_err(|e| vortex_err!(InvalidArgument: "Unsafe OnPair dictionary: {e}"))
+        .map_err(|e| vortex_err!("Unsafe OnPair dictionary: {e}"))
 }
 
 /// A safety-validated dictionary built from host-materialized parts, owned
@@ -396,9 +402,7 @@ impl OnPair {
             validity: validity_to_child(&validity, len),
         }
         .into_slots();
-        unsafe {
-            Array::from_parts_unchecked(ArrayParts::new(OnPair, dtype, len, data).with_slots(slots))
-        }
+        unsafe { Array::from_parts_unchecked(ArrayParts::new(OnPair, dtype, len, data, slots)) }
     }
 }
 
@@ -415,19 +419,19 @@ fn validate_parts(
     );
 
     if !dict_offsets.dtype().is_int() || dict_offsets.dtype().is_nullable() {
-        vortex_bail!(InvalidArgument: "dict_offsets must be non-nullable integer");
+        vortex_bail!("dict_offsets must be non-nullable integer");
     }
     if !codes.dtype().is_int() || codes.dtype().is_nullable() {
-        vortex_bail!(InvalidArgument: "codes must be non-nullable integer");
+        vortex_bail!("codes must be non-nullable integer");
     }
     if !codes_offsets.dtype().is_int() || codes_offsets.dtype().is_nullable() {
-        vortex_bail!(InvalidArgument: "codes_offsets must be non-nullable integer");
+        vortex_bail!("codes_offsets must be non-nullable integer");
     }
     if !uncompressed_lengths.dtype().is_int() || uncompressed_lengths.dtype().is_nullable() {
-        vortex_bail!(InvalidArgument: "uncompressed_lengths must be non-nullable integer");
+        vortex_bail!("uncompressed_lengths must be non-nullable integer");
     }
     if codes_offsets.len() != uncompressed_lengths.len() + 1 {
-        vortex_bail!(InvalidArgument:
+        vortex_bail!(
             "codes_offsets.len ({}) != uncompressed_lengths.len + 1 ({})",
             codes_offsets.len(),
             uncompressed_lengths.len() + 1
@@ -462,7 +466,7 @@ impl VTable for OnPair {
             s.uncompressed_lengths,
         )?;
         if s.uncompressed_lengths.len() != len {
-            vortex_bail!(InvalidArgument: "uncompressed_lengths must have same len as outer array");
+            vortex_bail!("uncompressed_lengths must have same len as outer array");
         }
         Ok(())
     }
@@ -490,21 +494,20 @@ impl VTable for OnPair {
         array: ArrayView<'_, Self>,
         buffers: &[BufferHandle],
     ) -> VortexResult<ArrayParts<Self>> {
-        vortex_ensure!(
-            buffers.len() == 1,
-            "Expected 1 buffer, got {}",
-            buffers.len()
-        );
+        vortex_ensure_eq!(buffers.len(), 1);
         let mut data = array.data().clone();
         data.dict_bytes = buffers[0].clone();
         // The replacement blob may differ from the one the memoized dictionary
         // was validated against, so drop the (shared) cell rather than
         // carry a claim we can no longer prove.
         data.dictionary = Arc::new(OnceLock::new());
-        Ok(
-            ArrayParts::new(self.clone(), array.dtype().clone(), array.len(), data)
-                .with_slots(array.slots().iter().cloned().collect()),
-        )
+        Ok(ArrayParts::new(
+            self.clone(),
+            array.dtype().clone(),
+            array.len(),
+            data,
+            array.slots().iter().cloned().collect(),
+        ))
     }
 
     fn serialize(
@@ -537,7 +540,7 @@ impl VTable for OnPair {
         _session: &VortexSession,
     ) -> VortexResult<ArrayParts<Self>> {
         if buffers.len() != 1 {
-            vortex_bail!(InvalidArgument: "Expected 1 buffer, got {}", buffers.len());
+            vortex_bail!("Expected 1 buffer, got {}", buffers.len());
         }
         let metadata = OnPairMetadata::decode(metadata)?;
         let uncompressed_ptype = metadata.get_uncompressed_lengths_ptype()?;
@@ -584,7 +587,7 @@ impl VTable for OnPair {
         let validity = match children.len() {
             4 => Validity::from(dtype.nullability()),
             5 => Validity::Array(children.get(4, &Validity::DTYPE, len)?),
-            other => vortex_bail!(InvalidArgument: "Expected 4 or 5 children, got {other}"),
+            other => vortex_bail!("Expected 4 or 5 children, got {other}"),
         };
 
         let data = OnPairData::new(buffers[0].clone());
@@ -596,7 +599,13 @@ impl VTable for OnPair {
             validity: validity_to_child(&validity, len),
         }
         .into_slots();
-        Ok(ArrayParts::new(self.clone(), dtype.clone(), len, data).with_slots(slots))
+        Ok(ArrayParts::new(
+            self.clone(),
+            dtype.clone(),
+            len,
+            data,
+            slots,
+        ))
     }
 
     fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {
@@ -604,6 +613,29 @@ impl VTable for OnPair {
     }
 
     fn execute(array: Array<Self>, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
+        let array = require_child!(
+            array,
+            array.uncompressed_lengths(),
+            OnPairSlots::UNCOMPRESSED_LENGTHS => Primitive
+        );
+        let array = require_child!(
+            array,
+            array.codes_offsets(),
+            OnPairSlots::CODES_OFFSETS => Primitive
+        );
+        let array = require_child!(array, array.codes(), OnPairSlots::CODES => Primitive);
+        // The dictionary is built from its offsets once and memoised, so its child is only
+        // required while that has not happened.
+        let array = if array.data().dictionary.get().is_some() {
+            array
+        } else {
+            require_child!(
+                array,
+                array.dict_offsets(),
+                OnPairSlots::DICT_OFFSETS => Primitive
+            )
+        };
+        require_validity!(array, OnPairSlots::VALIDITY);
         canonicalize_onpair(array.as_view(), ctx).map(ExecutionResult::done)
     }
 
@@ -702,8 +734,8 @@ pub trait OnPairArrayExt: OnPairArraySlotsExt {
     /// the outer dtype's nullability.
     fn array_validity(&self) -> Validity {
         child_to_validity(
-            self.as_ref().slots()[OnPairSlots::VALIDITY].as_ref(),
-            self.as_ref().dtype().nullability(),
+            self.slots()[OnPairSlots::VALIDITY].as_ref(),
+            self.dtype().nullability(),
         )
     }
 }

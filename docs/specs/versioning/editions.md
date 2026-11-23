@@ -1,0 +1,176 @@
+# Edition registry
+
+Each entry lists the components added by that edition, which also permits every component from
+earlier editions in the same family. See [Using editions](using-editions.md) for configuration and
+[Versioning design](design.md) for the compatibility rules.
+
+## Frozen `core` editions
+
+The origin of every edition below is `vortex`. Each minimum refers to the shared version of the
+Vortex Rust crates, including the `vortex` crate.
+
+### `core2025.05.0`
+
+Minimum Vortex Rust crate version: `0.36.0`.
+
+- `array`: `fastlanes.bitpacked`, `fastlanes.for`, `vortex.alp`, `vortex.alprd`, `vortex.bool`,
+  `vortex.bytebool`, `vortex.chunked`, `vortex.constant`, `vortex.datetimeparts`, `vortex.decimal`,
+  `vortex.decimal_byte_parts`, `vortex.dict`, `vortex.ext`, `vortex.fsst`, `vortex.list`,
+  `vortex.null`, `vortex.primitive`, `vortex.runend`, `vortex.sparse`, `vortex.struct`,
+  `vortex.varbin`, `vortex.varbinview`, `vortex.zigzag`
+- `layout`: `vortex.chunked`, `vortex.dict`, `vortex.flat`, `vortex.stats`, `vortex.struct`
+- `dtype`: `vortex.date`, `vortex.time`, `vortex.timestamp`
+
+### `core2025.06.0`
+
+Minimum Vortex Rust crate version: `0.40.0`.
+
+- `array`: `vortex.pco`, `vortex.sequence`, `vortex.zstd`
+
+### `core2025.10.0`
+
+Minimum Vortex Rust crate version: `0.54.0`.
+
+- `array`: `fastlanes.rle`, `vortex.fixed_size_list`, `vortex.listview`, `vortex.masked`
+
+### `core2026.08.0`
+
+Minimum Vortex Rust crate version: `0.84.0`.
+
+- `layout`: `vortex.zoned`
+- `aggregate`: `vortex.bounded_max`, `vortex.bounded_min`, `vortex.max`, `vortex.min`,
+  `vortex.nan_count`, `vortex.null_count`
+
+### `core2026.08.1`
+
+Minimum Vortex Rust crate version: `0.84.0`.
+
+- `array`: `vortex.onpair`
+
+### `core2026.08.2`
+
+Minimum Vortex Rust crate version: `0.85.0`.
+
+- `array`: `vortex.map`
+
+### `core2026.08.3`
+
+Minimum Vortex Rust crate version: `0.85.0`.
+
+- `array`: `vortex.parquet.variant`, `vortex.variant`
+- `dtype`: `vortex.uuid`
+
+## Draft editions
+
+Draft editions have no recorded minimum version of their origin project's code. Until a draft
+freezes, its members can change or be removed. Except for `UNSTABLE`, Vortex-maintained draft
+formats are expected to remain compatible unless a defect blocks promotion into `core`, while
+independent plugin projects state their own policy.
+
+### `unstable`
+
+`UNSTABLE` is a draft edition that never freezes. It holds formats whose contracts are still
+changing, so its members and their wire contracts can change under the same IDs. Plugins can add
+members through ordinary edition inclusions.
+
+### `preview2026.08.0`
+
+This edition currently adds no components.
+
+### `tensor2026.04.0`
+
+- `array`: `vortex.tensor.cosine_similarity`, `vortex.tensor.inner_product`,
+  `vortex.tensor.l2_norm`, `vortex.tensor.l2_normalize`
+- `dtype`: `vortex.tensor.fixed_shape_tensor`, `vortex.tensor.vector`
+
+### `zstd2026.02.0`
+
+- `array`: `vortex.zstd_buffers`
+
+### `spatial2026.08.0`
+
+- `dtype`: `vortex.st.box`, `vortex.st.linestring`, `vortex.st.multilinestring`,
+  `vortex.st.multipoint`, `vortex.st.multipolygon`, `vortex.st.point`, `vortex.st.polygon`,
+  `vortex.st.wkb`
+- `aggregate`: `vortex.st.aabb`
+
+### `json2026.08.0`
+
+- `dtype`: `vortex.json`
+
+## Component checks
+
+The writer checks the formats it actually serializes against the selected editions. The checks cover
+four kinds of component:
+
+| Kind                | Writing rule                                                                           |
+| ------------------- | -------------------------------------------------------------------------------------- |
+| Arrays              | Check the serializer's returned wire ID and every serialized child recursively.        |
+| Layouts             | Check every serialized layout ID. The writing strategy must use permitted layouts.     |
+| Extension dtypes    | Check all extension dtypes in the schema, including nested ones, before writing bytes. |
+| Aggregate functions | Check every function stored in a zone map against the edition and its format contract. |
+
+A forbidden zone-map aggregate causes the write to fail. Silently omitting it would change which
+filters can use the configured zone map to skip rows. By contrast, the writer omits an aggregate
+that does not apply to a column's data type, so there is no serialized component to check.
+
+For example, `core2026.08.0` declares `min`, `max`, `bounded_min`, `bounded_max`, `nan_count`, and
+`null_count`. Zone maps do not store sums, so the edition does not declare `sum`. File-level
+statistics, however, do store sums, in a fixed legacy field governed by the enclosing format's
+contract.
+
+Aggregate serialization support alone does not permit an aggregate in persisted zone maps. Its ID
+must belong to a selected edition, including `UNSTABLE` for experimental formats. The `all_*`
+aggregates are in-memory pruning predicates and do not need entries. Legacy file statistics also
+do not need entries.
+
+## Format testing and promotion
+
+A format with a changing contract belongs in `UNSTABLE`. Its inclusion can be added, changed, or
+removed without a new edition or wire ID. Applications writing these formats need readers with
+matching implementations.
+
+Once the contract is settled, move its inclusion from `UNSTABLE` to another edition. A format
+intended for `core` enters `preview` for broader opt-in use, then a later `core` edition for default
+use. Optional modules use their own families. The format can keep its ID, but earlier experimental
+files acquire no compatibility guarantee.
+
+A frozen contract cannot change. A reader-visible correction to a frozen format requires a new wire
+ID and a later edition.
+
+## Freezing an edition
+
+A draft edition other than `UNSTABLE` can freeze when its origin publishes the code that first
+supports all its members. For `core`, this is a Vortex Rust crate release. Independent plugins use
+their own versions.
+
+Until the release version is known, the declaration uses `min_library_version: None`. Once it is
+known, the field records the first release that supports all members, usually while the next release
+is in development. Recording the version documents the freeze, but the guarantee applies from that
+release even if the declaration is updated later.
+
+A frozen edition's membership, origin, and minimum version stay fixed. Deprecating a format can stop
+writers from choosing it, but readers must retain support because existing files can contain it.
+
+## Maintaining edition records
+
+Default declarations live in `vortex-edition/src/declarations/`. Optional modules keep declarations
+with their implementation code. The exported TOML records are under `vortex/editions/`, grouped by
+family.
+
+1. Register a changing format in `UNSTABLE`. Third-party plugins use ordinary edition inclusions.
+2. Once its contract is settled, move its inclusion from `UNSTABLE` to a draft edition. Formats
+   intended for `core` pass through `preview`; optional modules use their own families. Revisions
+   to frozen members require a new ID and a later edition.
+3. When an edition freezes, record the first release of its origin that supports every permitted
+   component, including inherited members.
+4. Regenerate the records:
+
+   ```sh
+   cargo run -p xtask -- generate-editions
+   ```
+
+CI's `check-editions` command rejects changes to frozen records, including renames, unfreezing, and
+deletion, so changes to permitted wire formats require a later edition. The command also rejects a
+new edition that does not follow its family's chronology. Draft records, including `UNSTABLE`, can
+change or be deleted.

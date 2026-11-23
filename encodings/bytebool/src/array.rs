@@ -18,6 +18,7 @@ use vortex_array::EqMode;
 use vortex_array::ExecutionCtx;
 use vortex_array::ExecutionResult;
 use vortex_array::IntoArray;
+use vortex_array::ProbeState;
 use vortex_array::TypedArrayRef;
 use vortex_array::array_slots;
 use vortex_array::arrays::BoolArray;
@@ -35,7 +36,7 @@ use vortex_buffer::BitBufferMut;
 use vortex_buffer::ByteBuffer;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
-use vortex_error::vortex_ensure;
+use vortex_error::vortex_ensure_eq;
 use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
@@ -101,16 +102,15 @@ impl VTable for ByteBool {
         array: ArrayView<'_, Self>,
         buffers: &[BufferHandle],
     ) -> VortexResult<ArrayParts<Self>> {
-        vortex_ensure!(
-            buffers.len() == 1,
-            "Expected 1 buffer, got {}",
-            buffers.len()
-        );
+        vortex_ensure_eq!(buffers.len(), 1);
         let data = ByteBoolData::new(buffers[0].clone());
-        Ok(
-            ArrayParts::new(self.clone(), array.dtype().clone(), array.len(), data)
-                .with_slots(array.slots().iter().cloned().collect()),
-        )
+        Ok(ArrayParts::new(
+            self.clone(),
+            array.dtype().clone(),
+            array.len(),
+            data,
+            array.slots().iter().cloned().collect(),
+        ))
     }
 
     fn serialize(
@@ -151,7 +151,13 @@ impl VTable for ByteBool {
 
         let data = ByteBoolData::new(buffer);
         let slots = ByteBoolData::make_slots(&validity, len);
-        Ok(ArrayParts::new(self.clone(), dtype.clone(), len, data).with_slots(slots))
+        Ok(ArrayParts::new(
+            self.clone(),
+            dtype.clone(),
+            len,
+            data,
+            slots,
+        ))
     }
 
     fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {
@@ -198,8 +204,8 @@ pub trait ByteBoolArrayExt: TypedArrayRef<ByteBool> + ByteBoolArraySlotsExt {
     /// Returns the [`Validity`] derived from the validity slot.
     fn bytebool_validity(&self) -> Validity {
         child_to_validity(
-            self.as_ref().slots()[ByteBoolSlots::VALIDITY].as_ref(),
-            self.as_ref().dtype().nullability(),
+            self.slots()[ByteBoolSlots::VALIDITY].as_ref(),
+            self.dtype().nullability(),
         )
     }
 }
@@ -223,11 +229,7 @@ impl ByteBool {
         let slots = ByteBoolData::make_slots(&validity, buffer.len());
         let data = ByteBoolData::new(buffer);
         let len = data.len();
-        unsafe {
-            Array::from_parts_unchecked(
-                ArrayParts::new(ByteBool, dtype, len, data).with_slots(slots),
-            )
-        }
+        unsafe { Array::from_parts_unchecked(ArrayParts::new(ByteBool, dtype, len, data, slots)) }
     }
 
     /// Construct a [`ByteBoolArray`] from a `Vec<bool>` and validity.
@@ -260,17 +262,10 @@ impl ByteBoolData {
         len: usize,
     ) -> VortexResult<()> {
         let expected_dtype = DType::Bool(validity.nullability());
-        vortex_ensure!(
-            dtype == &expected_dtype,
-            "expected dtype {expected_dtype}, got {dtype}"
-        );
-        vortex_ensure!(
-            buffer.len() == len,
-            "expected len {len}, got {}",
-            buffer.len()
-        );
+        vortex_ensure_eq!(dtype, &expected_dtype);
+        vortex_ensure_eq!(buffer.len(), len);
         if let Some(vlen) = validity.maybe_len() {
-            vortex_ensure!(vlen == len, "expected validity len {len}, got {vlen}");
+            vortex_ensure_eq!(vlen, len);
         }
         Ok(())
     }
@@ -312,15 +307,29 @@ impl ValidityVTable<ByteBool> for ByteBool {
 }
 
 impl OperationsVTable<ByteBool> for ByteBool {
-    fn scalar_at(
-        array: ArrayView<'_, ByteBool>,
+    type ProbeState = ();
+
+    fn probe_scalar(
+        state: &mut ProbeState<'_, ByteBool>,
         index: usize,
-        _ctx: &mut ExecutionCtx,
+        ctx: &mut ExecutionCtx,
     ) -> VortexResult<Scalar> {
+        let array = state.array();
+        if !state.is_valid(index, ctx)? {
+            return Ok(Scalar::null(array.dtype().clone()));
+        }
         Ok(Scalar::bool(
             array.buffer.as_host()[index] == 1,
             array.dtype().nullability(),
         ))
+    }
+
+    fn scalar_at(
+        array: ArrayView<'_, ByteBool>,
+        index: usize,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Scalar> {
+        Self::probe_scalar(&mut ProbeState::once(array), index, ctx)
     }
 }
 
@@ -341,7 +350,7 @@ mod tests {
     use super::*;
 
     static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
-        let session = vortex_array::array_session();
+        let session = VortexSession::empty();
         crate::initialize(&session);
         session
     });
@@ -383,7 +392,7 @@ mod tests {
         let array = ByteBool::from_option_vec(vec![Some(true), None, Some(false), None]);
         let dtype = array.dtype().clone();
         let len = array.len();
-        let session = vortex_array::array_session();
+        let session = VortexSession::empty();
         session.arrays().register(ByteBool);
 
         let ctx = ArrayContext::empty();

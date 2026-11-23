@@ -3,9 +3,12 @@
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use vortex_buffer::Buffer;
     use vortex_error::VortexResult;
     use vortex_error::vortex_err;
+    use vortex_session::VortexSession;
 
     use crate::ArrayRef;
     use crate::Canonical;
@@ -16,7 +19,6 @@ mod tests {
     use crate::aggregate_fn::EmptyOptions;
     use crate::aggregate_fn::fns::uncompressed_size_in_bytes::UncompressedSizeInBytes;
     use crate::aggregate_fn::fns::uncompressed_size_in_bytes::canonical_uncompressed_size_in_bytes;
-    use crate::array_session;
     use crate::arrays::BoolArray;
     use crate::arrays::ConstantArray;
     use crate::arrays::PrimitiveArray;
@@ -26,8 +28,10 @@ mod tests {
     use crate::scalar::Scalar;
     use crate::validity::Validity;
 
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
+
     fn aggregate(array: &ArrayRef) -> VortexResult<u64> {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let mut acc =
             Accumulator::try_new(UncompressedSizeInBytes, EmptyOptions, array.dtype().clone())?;
         acc.accumulate(array, &mut ctx)?;
@@ -44,6 +48,7 @@ mod tests {
             PrimitiveArray::new(Buffer::full(5i32, 10), Validity::NonNullable).into_array();
 
         assert_eq!(aggregate(&constant)?, aggregate(&primitive)?);
+        assert_eq!(aggregate(&constant)?, 40);
         Ok(())
     }
 
@@ -55,6 +60,7 @@ mod tests {
             PrimitiveArray::new(Buffer::full(5i32, 10), Validity::AllValid).into_array();
 
         assert_eq!(aggregate(&constant)?, aggregate(&primitive)?);
+        assert_eq!(aggregate(&constant)?, 40);
         Ok(())
     }
 
@@ -66,6 +72,8 @@ mod tests {
             PrimitiveArray::new(Buffer::<i32>::zeroed(10), Validity::AllInvalid).into_array();
 
         assert_eq!(aggregate(&constant)?, aggregate(&primitive)?);
+        // 40 value bytes plus the serialized false validity scalar.
+        assert_eq!(aggregate(&constant)?, 40 + 2);
         Ok(())
     }
 
@@ -82,11 +90,25 @@ mod tests {
     #[test]
     fn constant_utf8_matches_canonical_size() -> VortexResult<()> {
         let constant = ConstantArray::new("abcdefghijkl".to_string(), 10).into_array();
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let canonical = constant.clone().execute::<Canonical>(&mut ctx)?;
         let expected = canonical_uncompressed_size_in_bytes(&canonical, &mut ctx)?;
 
         assert_eq!(aggregate(&constant)?, expected);
+        assert_eq!(aggregate(&constant)?, 160);
+        Ok(())
+    }
+
+    #[test]
+    fn constant_out_of_line_utf8_matches_canonical_size() -> VortexResult<()> {
+        // Every row references the one out-of-line value, so it is counted once per row.
+        let constant = ConstantArray::new("abcdefghijklmnopqrst".to_string(), 10).into_array();
+        let mut ctx = SESSION.create_execution_ctx();
+        let canonical = constant.clone().execute::<Canonical>(&mut ctx)?;
+        let expected = canonical_uncompressed_size_in_bytes(&canonical, &mut ctx)?;
+
+        assert_eq!(aggregate(&constant)?, expected);
+        assert_eq!(aggregate(&constant)?, 10 * (16 + 20));
         Ok(())
     }
 }

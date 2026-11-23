@@ -28,12 +28,13 @@ use crate::size::RowSize;
 /// # Example
 ///
 /// ```rust
-/// use vortex_array::{IntoArray, VortexSessionExecute, array_session};
+/// use vortex_array::{IntoArray, VortexSessionExecute};
+/// use vortex_session::VortexSession;
 /// use vortex_array::arrays::PrimitiveArray;
 /// use vortex_row::{RowEncoder, RowSortField};
 ///
 /// # fn example() -> vortex_error::VortexResult<()> {
-/// let mut ctx = array_session().create_execution_ctx();
+/// let mut ctx = VortexSession::empty().create_execution_ctx();
 /// let ids = PrimitiveArray::from_iter([3i32, 1, 2]).into_array();
 /// let scores = PrimitiveArray::from_iter([10i32, 20, 10]).into_array();
 ///
@@ -138,6 +139,10 @@ fn reject_extension_dtype(dtype: &DType) -> VortexResult<()> {
         }
         DType::FixedSizeList(elem, ..) | DType::List(elem, _) => {
             reject_extension_dtype(elem)?;
+        }
+        DType::Map(map_dtype, _) => {
+            reject_extension_dtype(&map_dtype.key_dtype())?;
+            reject_extension_dtype(&map_dtype.value_dtype())?;
         }
         _ => {}
     }

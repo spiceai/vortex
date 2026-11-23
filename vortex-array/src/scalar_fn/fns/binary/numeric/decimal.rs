@@ -28,6 +28,8 @@ use num_traits::CheckedDiv;
 use num_traits::CheckedMul;
 use num_traits::CheckedSub;
 use vortex_buffer::Buffer;
+use vortex_buffer::BufferAllocatorRef;
+use vortex_buffer::BufferMut;
 use vortex_compute::lane_kernels::LaneZip;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
@@ -47,7 +49,6 @@ use crate::arrays::decimal::widened_buffer;
 use crate::dtype::BigCast;
 use crate::dtype::DType;
 use crate::dtype::DecimalDType;
-use crate::dtype::DecimalType;
 use crate::dtype::NativeDecimalType;
 use crate::match_each_decimal_value_type;
 use crate::scalar::DecimalValue;
@@ -93,7 +94,7 @@ pub(super) fn execute_numeric_decimal(
     let valid_rows = validity.execute_mask(len, ctx)?;
 
     let work_dtype = decimal_numeric_work_dtype(*decimal_dtype, result_decimal_dtype, op);
-    match_each_decimal_value_type!(DecimalType::smallest_decimal_value_type(&work_dtype), |W| {
+    match_each_decimal_value_type!(work_dtype.canonical_values_type(), |W| {
         let constants = DecimalOpConstants::<W>::new(result_decimal_dtype, op)?;
         macro_rules! execute_typed {
             ($Op:ty) => {
@@ -105,6 +106,7 @@ pub(super) fn execute_numeric_decimal(
                     validity,
                     &valid_rows,
                     &constants,
+                    ctx.allocator(),
                 )
             };
         }
@@ -252,10 +254,7 @@ where
         <W as BigCast>::from(1_i8).vortex_expect("one fits every decimal working width");
     for _ in 0..exp {
         factor = factor.checked_mul(&ten).ok_or_else(|| {
-            vortex_err!(
-                InvalidArgument:
-                "decimal scale factor 10^{exp} cannot be represented at the working width"
-            )
+            vortex_err!("decimal scale factor 10^{exp} cannot be represented at the working width")
         })?;
     }
     Ok(factor)
@@ -324,6 +323,10 @@ impl CheckedDecimalOp for CheckedDecimalDiv {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "typed decimal execution parameters"
+)]
 fn execute_decimal_typed<W, Op>(
     lhs: &DecimalOperand,
     rhs: &DecimalOperand,
@@ -332,6 +335,7 @@ fn execute_decimal_typed<W, Op>(
     validity: Validity,
     valid_rows: &Mask,
     constants: &DecimalOpConstants<W>,
+    allocator: &BufferAllocatorRef,
 ) -> VortexResult<ArrayRef>
 where
     W: NativeDecimalType + CheckedAdd + CheckedSub + CheckedMul + CheckedDiv + Mul<Output = W>,
@@ -342,24 +346,30 @@ where
 
     let values = match (lhs, rhs) {
         (DecimalOperand::Array { values: lhs, .. }, DecimalOperand::Array { values: rhs, .. }) => {
-            checked_decimal_arrays::<W, Op>(lhs, rhs, constants, valid_rows)
+            checked_decimal_arrays::<W, Op>(lhs, rhs, constants, valid_rows, allocator)
         }
         (DecimalOperand::Array { values: lhs, .. }, DecimalOperand::Constant { value, .. }) => {
             let rhs = typed_constant::<W>(value);
             match_each_decimal_value_type!(lhs.values_type(), |L| {
                 let lhs = lhs.buffer::<L>();
-                checked_lanes(lhs.as_slice(), valid_rows, |lhs| {
-                    Op::apply(<W as BigCast>::from(lhs)?, rhs, constants)
-                })
+                checked_lanes(
+                    lhs.as_slice(),
+                    valid_rows,
+                    |lhs| Op::apply(<W as BigCast>::from(lhs)?, rhs, constants),
+                    allocator,
+                )
             })
         }
         (DecimalOperand::Constant { value, .. }, DecimalOperand::Array { values: rhs, .. }) => {
             let lhs = typed_constant::<W>(value);
             match_each_decimal_value_type!(rhs.values_type(), |R| {
                 let rhs = rhs.buffer::<R>();
-                checked_lanes(rhs.as_slice(), valid_rows, |rhs| {
-                    Op::apply(lhs, <W as BigCast>::from(rhs)?, constants)
-                })
+                checked_lanes(
+                    rhs.as_slice(),
+                    valid_rows,
+                    |rhs| Op::apply(lhs, <W as BigCast>::from(rhs)?, constants),
+                    allocator,
+                )
             })
         }
         (
@@ -368,8 +378,8 @@ where
         ) => {
             let lhs = typed_constant::<W>(lhs);
             let rhs = typed_constant::<W>(rhs);
-            let value = Op::apply(lhs, rhs, constants)
-                .ok_or_else(|| vortex_err!(InvalidArgument: "{}", Op::ERROR))?;
+            let value =
+                Op::apply(lhs, rhs, constants).ok_or_else(|| vortex_err!("{}", Op::ERROR))?;
             let value = DecimalValue::from(value)
                 .normalize(result_decimal_dtype)
                 .vortex_expect("bounds-checked result fits the result precision");
@@ -380,12 +390,13 @@ where
             .into_array());
         }
     }
-    .map_err(|_lane| vortex_err!(InvalidArgument: "{}", Op::ERROR))?;
+    .map_err(|_lane| vortex_err!("{}", Op::ERROR))?;
 
     Ok(decimal_array_narrowed(
         values,
         result_decimal_dtype,
         validity.union_nullability(result_dtype.nullability()),
+        allocator,
     ))
 }
 
@@ -396,23 +407,20 @@ fn decimal_array_narrowed<W: NativeDecimalType>(
     values: Buffer<W>,
     decimal_dtype: DecimalDType,
     validity: Validity,
+    allocator: &BufferAllocatorRef,
 ) -> ArrayRef {
-    let target = DecimalType::smallest_decimal_value_type(&decimal_dtype);
+    let target = decimal_dtype.canonical_values_type();
     if target == W::DECIMAL_TYPE {
         return DecimalArray::new(values, decimal_dtype, validity).into_array();
     }
 
     match_each_decimal_value_type!(target, |O| {
-        let narrowed: Buffer<O> = values
-            .as_slice()
-            .iter()
-            .copied()
-            .map(|value| {
-                <O as BigCast>::from(value)
-                    .vortex_expect("precision-checked decimal result must fit the output width")
-            })
-            .collect();
-        DecimalArray::new(narrowed, decimal_dtype, validity).into_array()
+        let mut narrowed = BufferMut::with_capacity_in(values.len(), allocator.clone());
+        narrowed.extend(values.as_slice().iter().copied().map(|value| {
+            <O as BigCast>::from(value)
+                .vortex_expect("precision-checked decimal result must fit the output width")
+        }));
+        DecimalArray::new(narrowed.freeze(), decimal_dtype, validity).into_array()
     })
 }
 
@@ -421,6 +429,7 @@ fn checked_decimal_arrays<W, Op>(
     rhs: &DecimalArray,
     constants: &DecimalOpConstants<W>,
     valid_rows: &Mask,
+    allocator: &BufferAllocatorRef,
 ) -> Result<Buffer<W>, usize>
 where
     W: NativeDecimalType + CheckedAdd + CheckedSub + CheckedMul + CheckedDiv + Mul<Output = W>,
@@ -443,6 +452,7 @@ where
                     constants,
                 )
             },
+            allocator,
         )
     })
 }

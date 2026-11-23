@@ -8,10 +8,11 @@ use vortex_session::registry::CachedId;
 use crate::ArrayRef;
 use crate::Columnar;
 use crate::ExecutionCtx;
-use crate::IntoArray;
+use crate::aggregate_fn::AggregateArgs;
 use crate::aggregate_fn::AggregateFnId;
 use crate::aggregate_fn::AggregateFnVTable;
 use crate::aggregate_fn::EmptyOptions;
+use crate::aggregate_fn::fns::nan_count::columnar_nan_count;
 use crate::aggregate_fn::fns::nan_count::nan_count;
 use crate::dtype::DType;
 use crate::dtype::Nullability;
@@ -62,31 +63,47 @@ impl AggregateFnVTable for AllNan {
 
     fn empty_partial(
         &self,
-        _options: &Self::Options,
-        _input_dtype: &DType,
+        _args: AggregateArgs<'_, Self::Options>,
     ) -> VortexResult<Self::Partial> {
         Ok(true)
     }
 
-    fn combine_partials(&self, partial: &mut Self::Partial, other: Scalar) -> VortexResult<()> {
-        *partial &= bool::try_from(&other)?;
-        Ok(())
+    fn partial_from_scalar(
+        &self,
+        _args: AggregateArgs<'_, Self::Options>,
+        scalar: &Scalar,
+    ) -> VortexResult<Self::Partial> {
+        bool::try_from(scalar)
     }
 
-    fn to_scalar(&self, partial: &Self::Partial) -> VortexResult<Scalar> {
+    fn merge_partials(
+        &self,
+        _args: AggregateArgs<'_, Self::Options>,
+        first: Self::Partial,
+        second: Self::Partial,
+    ) -> VortexResult<Self::Partial> {
+        Ok(first && second)
+    }
+
+    fn to_scalar(
+        &self,
+        _args: AggregateArgs<'_, Self::Options>,
+        partial: &Self::Partial,
+    ) -> VortexResult<Scalar> {
         Ok(Scalar::bool(*partial, Nullability::Nullable))
     }
 
-    fn reset(&self, partial: &mut Self::Partial) {
-        *partial = true;
-    }
-
-    fn is_saturated(&self, partial: &Self::Partial) -> bool {
+    fn is_saturated(
+        &self,
+        _args: AggregateArgs<'_, Self::Options>,
+        partial: &Self::Partial,
+    ) -> bool {
         !*partial
     }
 
     fn try_accumulate(
         &self,
+        _args: AggregateArgs<'_, Self::Options>,
         state: &mut Self::Partial,
         batch: &ArrayRef,
         ctx: &mut ExecutionCtx,
@@ -102,37 +119,45 @@ impl AggregateFnVTable for AllNan {
 
     fn accumulate(
         &self,
+        _args: AggregateArgs<'_, Self::Options>,
         partial: &mut Self::Partial,
         batch: &Columnar,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<()> {
         // Normal array dispatch is handled by `try_accumulate`, which always short-circuits.
         // Keep this fallback in sync for direct Columnar accumulation paths.
-        let array = match batch {
-            Columnar::Constant(c) => c.clone().into_array(),
-            Columnar::Canonical(c) => c.clone().into_array(),
-        };
-        if !matches!(array.dtype(), DType::Primitive(ptype, _) if ptype.is_float()) {
+        if !matches!(batch.dtype(), DType::Primitive(ptype, _) if ptype.is_float()) {
             *partial = false;
             return Ok(());
         }
 
-        *partial &= nan_count(&array, ctx)? == array.len();
+        *partial &= columnar_nan_count(batch, ctx)? == batch.len() as u64;
         Ok(())
     }
 
-    fn finalize(&self, partials: ArrayRef) -> VortexResult<ArrayRef> {
+    fn finalize(
+        &self,
+        _args: AggregateArgs<'_, Self::Options>,
+        partials: ArrayRef,
+    ) -> VortexResult<ArrayRef> {
         Ok(partials)
     }
 
-    fn finalize_scalar(&self, partial: &Self::Partial) -> VortexResult<Scalar> {
-        self.to_scalar(partial)
+    fn finalize_scalar(
+        &self,
+        args: AggregateArgs<'_, Self::Options>,
+        partial: &Self::Partial,
+    ) -> VortexResult<Scalar> {
+        self.to_scalar(args, partial)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use vortex_error::VortexResult;
+    use vortex_session::VortexSession;
 
     use crate::IntoArray;
     use crate::VortexSessionExecute;
@@ -140,15 +165,16 @@ mod tests {
     use crate::aggregate_fn::DynAccumulator;
     use crate::aggregate_fn::EmptyOptions;
     use crate::aggregate_fn::fns::all_nan::AllNan;
-    use crate::array_session;
     use crate::arrays::PrimitiveArray;
     use crate::dtype::DType;
     use crate::dtype::Nullability;
     use crate::dtype::PType;
 
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
+
     #[test]
     fn all_nan_aggregate_fn() -> VortexResult<()> {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let dtype = DType::Primitive(PType::F32, Nullability::Nullable);
         let mut acc = Accumulator::try_new(AllNan, EmptyOptions, dtype)?;
 
@@ -161,7 +187,7 @@ mod tests {
 
     #[test]
     fn all_nan_false_with_non_nan() -> VortexResult<()> {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let dtype = DType::Primitive(PType::F32, Nullability::Nullable);
         let mut acc = Accumulator::try_new(AllNan, EmptyOptions, dtype)?;
 
@@ -181,7 +207,7 @@ mod tests {
 
     #[test]
     fn all_nan_false_with_null() -> VortexResult<()> {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let dtype = DType::Primitive(PType::F32, Nullability::Nullable);
         let mut acc = Accumulator::try_new(AllNan, EmptyOptions, dtype)?;
 

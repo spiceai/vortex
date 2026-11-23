@@ -15,14 +15,15 @@ mod zigzag;
 #[cfg(feature = "pco")]
 mod pco;
 
+pub(crate) use bitpacking::BITPACKING_V1;
 pub use bitpacking::BitPackingScheme;
 pub use delta::DeltaScheme;
+pub(crate) use for_::FOR_V1;
 pub use for_::FoRScheme;
 #[cfg(feature = "pco")]
 pub use pco::PcoScheme;
 pub use rle::IntRLEScheme;
 pub(crate) use rle::rle_compress;
-pub(crate) use rle::try_compress_delta;
 pub use runend::RunEndScheme;
 pub use sequence::SequenceScheme;
 pub use sparse::SparseScheme;
@@ -33,8 +34,3 @@ pub use zigzag::ZigZagScheme;
 
 /// Threshold for the average run length in an array before we consider run-length encoding.
 pub(crate) const RUN_LENGTH_THRESHOLD: u32 = 4;
-
-#[cfg(test)]
-mod scheme_selection_tests;
-#[cfg(test)]
-mod tests;

@@ -8,6 +8,7 @@ use vortex_buffer::BufferMut;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
+use vortex_error::vortex_ensure_eq;
 use vortex_error::vortex_err;
 
 use crate::ArrayRef;
@@ -176,7 +177,12 @@ fn take_piecewise_fsl(
             .checked_add(length)
             .ok_or_else(|| vortex_err!("PiecewiseSequenceArray range overflows usize"))?;
         if end > array_len {
-            vortex_bail!(OutOfBounds: end - 1, 0, array_len);
+            vortex_bail!(
+                "index {} out of bounds from {} to {}",
+                end - 1,
+                0,
+                array_len
+            );
         }
         total_len = total_len
             .checked_add(length)
@@ -184,9 +190,10 @@ fn take_piecewise_fsl(
         element_starts.push(u64::try_from(start * list_size)?);
         element_lengths.push(u64::try_from(length * list_size)?);
     }
-    vortex_ensure!(
-        total_len == new_len,
-        "PiecewiseSequenceArray expanded length {total_len} does not match declared length {new_len}"
+    vortex_ensure_eq!(
+        total_len,
+        new_len,
+        "PiecewiseSequenceArray expanded length does not match declared length",
     );
 
     let new_elements =
@@ -306,7 +313,12 @@ fn take_non_empty_non_degenerate_elements<I: IntegerPType>(
 
             let data_idx: usize = data_idx.as_();
             if data_idx >= array_len {
-                vortex_bail!(OutOfBounds: data_idx, 0, array_len);
+                vortex_bail!(
+                    "index {} out of bounds from {} to {}",
+                    data_idx,
+                    0,
+                    array_len
+                );
             }
             Ok((data_idx * list_size) as u64)
         })
@@ -330,7 +342,12 @@ fn bounds_check_valid_indices<I: IntegerPType>(
         if is_index_valid {
             let data_idx = data_idx.as_();
             if data_idx >= array_len {
-                vortex_bail!(OutOfBounds: data_idx, 0, array_len);
+                vortex_bail!(
+                    "index {} out of bounds from {} to {}",
+                    data_idx,
+                    0,
+                    array_len
+                );
             }
         }
     }

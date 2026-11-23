@@ -4,8 +4,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use cudarc::driver::DeviceRepr;
-use cudarc::driver::PushKernelArg;
 use tracing::instrument;
 use vortex::array::ArrayRef;
 use vortex::array::Canonical;
@@ -30,6 +28,8 @@ use vortex::error::vortex_bail;
 use vortex::error::vortex_ensure;
 use vortex::error::vortex_err;
 use vortex::scalar::Scalar;
+use vortex_cuda_driver::DeviceRepr;
+use vortex_cuda_driver::PushKernelArg;
 
 use crate::CudaBufferExt;
 use crate::CudaDeviceBuffer;
@@ -164,7 +164,7 @@ async fn decode_runend_typed<V: DeviceRepr + NativePType, E: DeviceRepr + Native
 
             // Each thread owns a whole output byte, so threads never race on bits in one byte.
             let output_bytes = output_len.div_ceil(8);
-            let mut validity_out = ctx.device_alloc::<u8>(output_bytes)?;
+            let mut validity_out = ctx.stream().device_alloc_bitmap(output_bytes)?;
             let validity_offset_u64 = validity_meta.offset() as u64;
 
             let ends_ptype = E::PTYPE.to_string();
@@ -180,8 +180,10 @@ async fn decode_runend_typed<V: DeviceRepr + NativePType, E: DeviceRepr + Native
                     .arg(&mut validity_out);
             })?;
 
-            let validity_buffer =
-                BufferHandle::new_device(Arc::new(CudaDeviceBuffer::new(validity_out)));
+            let validity_buffer = BufferHandle::new_device(Arc::new(
+                CudaDeviceBuffer::new_with_zeroed_tail(validity_out, output_bytes)?,
+            ))
+            .slice(0..output_bytes);
             Validity::Array(
                 BoolArray::new_handle(validity_buffer, 0, output_len, Validity::NonNullable)
                     .into_array(),
@@ -189,7 +191,7 @@ async fn decode_runend_typed<V: DeviceRepr + NativePType, E: DeviceRepr + Native
         }
     };
 
-    let output_device = CudaDeviceBuffer::new(output_slice);
+    let output_device = CudaDeviceBuffer::new(output_slice)?;
     Ok(Canonical::Primitive(PrimitiveArray::from_buffer_handle(
         BufferHandle::new_device(Arc::new(output_device)),
         value_ptype,
@@ -199,6 +201,8 @@ async fn decode_runend_typed<V: DeviceRepr + NativePType, E: DeviceRepr + Native
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use rstest::rstest;
     use vortex::array::IntoArray;
     use vortex::array::arrays::BoolArray;
@@ -210,12 +214,18 @@ mod tests {
     use vortex::encodings::runend::RunEndArray;
     use vortex::error::VortexExpect;
     use vortex::error::VortexResult;
+    use vortex::session::VortexSession;
     use vortex_array::ExecutionCtx;
     use vortex_array::VortexSessionExecute;
 
     use super::*;
     use crate::CanonicalCudaExt;
+    use crate::arrow::DeviceArrayExt;
+    use crate::device_buffer::CUDF_VALIDITY_BUFFER_PADDING;
+    use crate::device_buffer::cuda_backing_allocation;
     use crate::session::CudaSession;
+
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
 
     fn make_runend_array<V, E>(ends: Vec<E>, values: Vec<V>, ctx: &mut ExecutionCtx) -> RunEndArray
     where
@@ -240,7 +250,7 @@ mod tests {
     #[case::u64_ends_i32_values(|ctx: &mut ExecutionCtx| make_runend_array(vec![2u64, 5, 10], vec![1i32, 2, 3], ctx))]
     #[crate::test]
     async fn test_cuda_runend_types(#[case] build: RunEndBuilder) -> VortexResult<()> {
-        let mut ctx = vortex_array::array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let mut cuda_ctx = CudaSession::create_execution_ctx(&crate::cuda_session())
             .vortex_expect("failed to create execution context");
 
@@ -249,7 +259,7 @@ mod tests {
             .execute(runend_array.clone().into_array(), &mut cuda_ctx)
             .await
             .vortex_expect("GPU decompression failed")
-            .into_host()
+            .into_host(cuda_ctx.execution_ctx())
             .await?
             .into_array();
 
@@ -260,7 +270,7 @@ mod tests {
 
     #[crate::test]
     async fn test_cuda_runend_large_array() -> VortexResult<()> {
-        let mut ctx = vortex_array::array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let mut cuda_ctx = CudaSession::create_execution_ctx(&crate::cuda_session())
             .vortex_expect("failed to create execution context");
 
@@ -278,7 +288,7 @@ mod tests {
             .execute(runend_array.clone().into_array(), &mut cuda_ctx)
             .await
             .vortex_expect("GPU decompression failed")
-            .into_host()
+            .into_host(cuda_ctx.execution_ctx())
             .await?
             .into_array();
 
@@ -289,7 +299,7 @@ mod tests {
 
     #[crate::test]
     async fn test_cuda_runend_single_run() -> VortexResult<()> {
-        let mut ctx = vortex_array::array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let mut cuda_ctx = CudaSession::create_execution_ctx(&crate::cuda_session())
             .vortex_expect("failed to create execution context");
 
@@ -299,7 +309,7 @@ mod tests {
             .execute(runend_array.clone().into_array(), &mut cuda_ctx)
             .await
             .vortex_expect("GPU decompression failed")
-            .into_host()
+            .into_host(cuda_ctx.execution_ctx())
             .await?
             .into_array();
 
@@ -310,7 +320,7 @@ mod tests {
 
     #[crate::test]
     async fn test_cuda_runend_many_small_runs() -> VortexResult<()> {
-        let mut ctx = vortex_array::array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let mut cuda_ctx = CudaSession::create_execution_ctx(&crate::cuda_session())
             .vortex_expect("failed to create execution context");
 
@@ -325,7 +335,7 @@ mod tests {
             .execute(runend_array.clone().into_array(), &mut cuda_ctx)
             .await
             .vortex_expect("GPU decompression failed")
-            .into_host()
+            .into_host(cuda_ctx.execution_ctx())
             .await?
             .into_array();
 
@@ -336,7 +346,7 @@ mod tests {
 
     #[crate::test]
     async fn test_cuda_runend_nullable_values() -> VortexResult<()> {
-        let mut ctx = vortex_array::array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let mut cuda_ctx = CudaSession::create_execution_ctx(&crate::cuda_session())
             .vortex_expect("failed to create execution context");
 
@@ -357,7 +367,7 @@ mod tests {
             .execute(runend_array.clone().into_array(), &mut cuda_ctx)
             .await
             .vortex_expect("GPU decompression failed")
-            .into_host()
+            .into_host(cuda_ctx.execution_ctx())
             .await?
             .into_array();
 
@@ -370,7 +380,7 @@ mod tests {
     /// straddle output byte boundaries.
     #[crate::test]
     async fn test_cuda_runend_nullable_values_across_byte_boundaries() -> VortexResult<()> {
-        let mut ctx = vortex_array::array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let mut cuda_ctx = CudaSession::create_execution_ctx(&crate::cuda_session())
             .vortex_expect("failed to create execution context");
 
@@ -390,12 +400,41 @@ mod tests {
         // host-resident array, hiding a GPU failure.
         let gpu_result = RunEndExecutor
             .execute(runend_array.clone().into_array(), &mut cuda_ctx)
-            .await
-            .vortex_expect("GPU decompression failed")
-            .into_host()
+            .await?;
+        let Validity::Array(validity) = gpu_result.clone().into_primitive().validity()? else {
+            vortex_bail!("expected expanded validity bitmap");
+        };
+        let bits = &validity.buffer_handles()[0];
+        let logical_bytes = runend_array.len().div_ceil(8);
+        let padded_bytes = logical_bytes.next_multiple_of(CUDF_VALIDITY_BUFFER_PADDING);
+        assert_eq!(bits.len(), logical_bytes);
+
+        assert!(bits.has_zeroed_tail_padding(logical_bytes, padded_bytes)?);
+        let backing = cuda_backing_allocation(bits)?;
+        assert_eq!(backing.len(), padded_bytes);
+        let bytes = backing.try_to_host()?.await?;
+        assert!(bytes[logical_bytes..].iter().all(|byte| *byte == 0));
+
+        let bits_ptr = bits.cuda_device_ptr()?;
+        let mut exported = gpu_result
+            .clone()
+            .into_array()
+            .export_device_array(&mut cuda_ctx)
+            .await?;
+        // SAFETY: The live primitive export has a host-resident buffer table with validity at index 0.
+        let exported_bits_ptr = unsafe { *exported.array.buffers } as u64;
+        let release = exported
+            .array
+            .release
+            .vortex_expect("missing Arrow release callback");
+        // SAFETY: This is the sole release of the successfully exported array.
+        unsafe { release(&raw mut exported.array) };
+        assert_eq!(exported_bits_ptr, bits_ptr);
+
+        let gpu_result = gpu_result
+            .into_host(cuda_ctx.execution_ctx())
             .await?
             .into_array();
-
         assert_arrays_eq!(runend_array, gpu_result, &mut ctx);
 
         Ok(())

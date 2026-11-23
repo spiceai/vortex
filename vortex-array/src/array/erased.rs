@@ -7,12 +7,14 @@ use std::fmt::Formatter;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::ops::Range;
+use std::ptr;
 use std::sync::Arc;
 
 use vortex_buffer::ByteBuffer;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
+use vortex_error::vortex_ensure_eq;
 use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
 use vortex_mask::Mask;
@@ -27,13 +29,14 @@ use crate::ExecutionCtx;
 use crate::ExecutionResult;
 use crate::IntoArray;
 use crate::VTable;
-use crate::VortexSessionExecute;
 use crate::aggregate_fn::fns::sum::sum;
 use crate::array::ArrayData;
 use crate::array::ArrayId;
 use crate::array::ArrayInner;
 use crate::array::ArraySlots;
 use crate::array::DynArrayData;
+use crate::array::probe::ArrayProbe;
+use crate::array::probe::RepeatedArrayProbe;
 use crate::arrays::Constant;
 use crate::arrays::DictArray;
 use crate::arrays::FilterArray;
@@ -44,9 +47,9 @@ use crate::dtype::DType;
 use crate::expr::stats::Precision;
 use crate::expr::stats::Stat;
 use crate::expr::stats::StatsProviderExt;
-use crate::legacy_session;
 use crate::matcher::Matcher;
 use crate::optimizer::ArrayOptimizer;
+use crate::optimizer::OptimizedState;
 use crate::scalar::Scalar;
 use crate::scalar::ScalarValue;
 use crate::stats::StatsSetRef;
@@ -91,10 +94,26 @@ impl ArrayRef {
     }
 
     /// Returns a mutable reference to the inner if this is the sole owner.
+    ///
+    /// The caller may change the array, so it is no longer known to be optimized.
     #[allow(clippy::inline_always)]
     #[inline(always)]
     pub(crate) fn inner_mut(&mut self) -> Option<&mut ArrayInner<dyn DynArrayData>> {
-        Arc::get_mut(&mut self.0)
+        let inner = Arc::get_mut(&mut self.0)?;
+        *inner.optimized.0.get_mut() = false;
+        Some(inner)
+    }
+
+    /// Returns the record of whether the optimizer has already taken this array to its fixpoint.
+    ///
+    /// Only the optimizer can read or set the record.
+    pub(crate) fn optimized_state(&self) -> &OptimizedState {
+        &self.0.optimized
+    }
+
+    /// Returns whether another owner holds this array too.
+    pub(crate) fn is_shared(&self) -> bool {
+        Arc::strong_count(&self.0) > 1
     }
 
     /// Returns the Arc::as_ptr().addr() of the underlying array.
@@ -262,42 +281,64 @@ impl ArrayRef {
             .optimize()
     }
 
-    /// Fetch the scalar at the given index.
-    #[deprecated(
-        note = "Use `execute_scalar` instead, which allows passing an execution context for more \
-        efficient execution when fetching multiple scalars from the same array."
-    )]
-    #[allow(clippy::disallowed_methods)]
-    pub fn scalar_at(&self, index: usize) -> VortexResult<Scalar> {
-        self.execute_scalar(index, &mut legacy_session().create_execution_ctx())
+    /// Execute the array to extract a scalar at the given index.
+    ///
+    /// A one-off read; the same as `self.probe().execute_scalar(index, ctx)`.
+    // TODO(joe): deprecate this in favour of `probe()`.
+    #[inline]
+    pub fn execute_scalar(&self, index: usize, ctx: &mut ExecutionCtx) -> VortexResult<Scalar> {
+        self.probe().execute_scalar(index, ctx)
     }
 
-    /// Execute the array to extract a scalar at the given index.
-    pub fn execute_scalar(&self, index: usize, ctx: &mut ExecutionCtx) -> VortexResult<Scalar> {
-        vortex_ensure!(index < self.len(), OutOfBounds: index, 0, self.len());
-        if self.dtype().is_nullable() && self.is_invalid(index, ctx)? {
-            return Ok(Scalar::null(self.dtype().clone()));
-        }
-        let scalar = self.0.data.execute_scalar(self, index, ctx)?;
-        debug_assert_eq!(self.dtype(), scalar.dtype(), "Scalar dtype mismatch");
-        Ok(scalar)
+    /// A one-off row accessor over this array. It borrows the handle and retains nothing; for
+    /// many reads of the same array use [`Self::repeated_probe`].
+    ///
+    /// ```
+    /// use vortex_session::VortexSession;
+    /// use vortex_array::{IntoArray, VortexSessionExecute};
+    /// use vortex_array::arrays::PrimitiveArray;
+    ///
+    /// let array = PrimitiveArray::from_iter([10i32, 20, 30]).into_array();
+    /// let mut ctx = VortexSession::empty().create_execution_ctx();
+    /// assert_eq!(array.probe().execute_scalar(2, &mut ctx)?, 30i32.into());
+    /// # Ok::<(), vortex_error::VortexError>(())
+    /// ```
+    #[inline]
+    pub fn probe(&self) -> ArrayProbe<'_> {
+        ArrayProbe::Once(self)
+    }
+
+    /// A row accessor that owns a handle to this array and keeps encoding state, its validity
+    /// probe and child probes between reads.
+    ///
+    /// ```
+    /// use vortex_session::VortexSession;
+    /// use vortex_array::{IntoArray, VortexSessionExecute};
+    /// use vortex_array::arrays::PrimitiveArray;
+    ///
+    /// let array = PrimitiveArray::from_iter([10i32, 20, 30]).into_array();
+    /// let mut ctx = VortexSession::empty().create_execution_ctx();
+    /// let mut probe = array.repeated_probe();
+    /// assert_eq!(probe.execute_scalar(2, &mut ctx)?, 30i32.into());
+    /// assert_eq!(probe.execute_scalar(0, &mut ctx)?, 10i32.into());
+    /// # Ok::<(), vortex_error::VortexError>(())
+    /// ```
+    pub fn repeated_probe(&self) -> RepeatedArrayProbe {
+        RepeatedArrayProbe::new(self.clone())
     }
 
     /// Returns whether the item at `index` is valid.
+    ///
+    /// A one-off read; the same as `self.probe().execute_is_valid(index, ctx)`.
+    // TODO(joe): deprecate this in favour of `probe/repeated_probe()`.
+    #[inline]
     pub fn is_valid(&self, index: usize, ctx: &mut ExecutionCtx) -> VortexResult<bool> {
-        vortex_ensure!(index < self.len(), OutOfBounds: index, 0, self.len());
-        match self.validity()? {
-            Validity::NonNullable | Validity::AllValid => Ok(true),
-            Validity::AllInvalid => Ok(false),
-            Validity::Array(a) => a
-                .execute_scalar(index, ctx)?
-                .as_bool()
-                .value()
-                .ok_or_else(|| vortex_err!("validity value at index {} is null", index)),
-        }
+        self.probe().execute_is_valid(index, ctx)
     }
 
     /// Returns whether the item at `index` is invalid.
+    // TODO(joe): deprecate this.
+    #[inline]
     pub fn is_invalid(&self, index: usize, ctx: &mut ExecutionCtx) -> VortexResult<bool> {
         Ok(!self.is_valid(index, ctx)?)
     }
@@ -365,21 +406,6 @@ impl ArrayRef {
         self.0.data.validity(self)
     }
 
-    /// Returns the canonical representation of the array.
-    #[deprecated(note = "use `array.execute::<Canonical>(ctx)` instead")]
-    #[allow(clippy::disallowed_methods)]
-    pub fn into_canonical(self) -> VortexResult<Canonical> {
-        self.execute(&mut legacy_session().create_execution_ctx())
-    }
-
-    /// Returns the canonical representation of the array.
-    #[deprecated(note = "use `array.execute::<Canonical>(ctx)` instead")]
-    pub fn to_canonical(&self) -> VortexResult<Canonical> {
-        #[expect(deprecated)]
-        let result = self.clone().into_canonical();
-        result
-    }
-
     /// Writes the array into the canonical builder.
     pub fn append_to_builder(
         &self,
@@ -433,9 +459,23 @@ impl ArrayRef {
         Some(unsafe { ArrayView::new_unchecked(self, &inner.data) })
     }
 
+    /// Returns a typed view without a runtime type check.
+    ///
+    /// # Safety
+    /// The caller must guarantee the concrete type behind `dyn DynArrayData` is `ArrayData<V>`.
+    #[inline]
+    pub(crate) unsafe fn as_typed_unchecked<V: VTable>(&self) -> ArrayView<'_, V> {
+        debug_assert!(self.is::<V>());
+        // SAFETY: the caller guarantees the concrete type, so the thin data pointer of the
+        // `dyn DynArrayData` points at an `ArrayData<V>`.
+        let inner = unsafe { &*ptr::from_ref(self.dyn_array()).cast::<ArrayData<V>>() };
+        // SAFETY: `inner` is the typed data stored inside `self`.
+        unsafe { ArrayView::new_unchecked(self, &inner.data) }
+    }
+
     /// Returns the constant scalar if this is a constant array.
-    pub fn as_constant(&self) -> Option<Scalar> {
-        self.as_opt::<Constant>().map(|a| a.scalar().clone())
+    pub fn as_constant(&self) -> Option<&Scalar> {
+        self.as_opt::<Constant>().map(|a| a.data().scalar())
     }
 
     /// Total size of the array in bytes, including all children and buffers.
@@ -482,19 +522,17 @@ impl ArrayRef {
         let existing = slots[slot_idx]
             .as_ref()
             .vortex_expect("with_slot cannot replace an absent slot");
-        vortex_ensure!(
-            existing.dtype() == replacement.dtype(),
-            "slot {} dtype changed from {} to {} during physical rewrite",
-            slot_idx,
+        vortex_ensure_eq!(
             existing.dtype(),
-            replacement.dtype()
+            replacement.dtype(),
+            "slot {} dtype changed during physical rewrite",
+            slot_idx
         );
-        vortex_ensure!(
-            existing.len() == replacement.len(),
-            "slot {} len changed from {} to {} during physical rewrite",
-            slot_idx,
+        vortex_ensure_eq!(
             existing.len(),
-            replacement.len()
+            replacement.len(),
+            "slot {} len changed during physical rewrite",
+            slot_idx
         );
         slots[slot_idx] = Some(replacement);
         // SAFETY: upheld by the caller of this unsafe API.
@@ -516,7 +554,7 @@ impl ArrayRef {
         mut self,
         slot_idx: usize,
     ) -> VortexResult<(ArrayRef, ArrayRef)> {
-        if let Some(inner) = Arc::get_mut(&mut self.0) {
+        if let Some(inner) = self.inner_mut() {
             let child = inner.slots[slot_idx]
                 .take()
                 .vortex_expect("take_slot_unchecked cannot take an absent slot");
@@ -551,7 +589,7 @@ impl ArrayRef {
         slot_idx: usize,
         replacement: ArrayRef,
     ) -> VortexResult<ArrayRef> {
-        if let Some(inner) = Arc::get_mut(&mut self.0) {
+        if let Some(inner) = self.inner_mut() {
             inner.slots[slot_idx] = Some(replacement);
             return Ok(self);
         }
@@ -573,32 +611,30 @@ impl ArrayRef {
     /// parent statistics are preserved and must remain valid.
     pub unsafe fn with_slots(self, slots: ArraySlots) -> VortexResult<ArrayRef> {
         let old_slots = self.slots();
-        vortex_ensure!(
-            old_slots.len() == slots.len(),
-            "slot count changed from {} to {} during physical rewrite",
+        vortex_ensure_eq!(
             old_slots.len(),
-            slots.len()
+            slots.len(),
+            "slot count changed during physical rewrite"
         );
         for (idx, (old_slot, new_slot)) in old_slots.iter().zip(slots.iter()).enumerate() {
-            vortex_ensure!(
-                old_slot.is_some() == new_slot.is_some(),
+            vortex_ensure_eq!(
+                old_slot.is_some(),
+                new_slot.is_some(),
                 "slot {} presence changed during physical rewrite",
                 idx
             );
             if let (Some(old_slot), Some(new_slot)) = (old_slot.as_ref(), new_slot.as_ref()) {
-                vortex_ensure!(
-                    old_slot.dtype() == new_slot.dtype(),
-                    "slot {} dtype changed from {} to {} during physical rewrite",
-                    idx,
+                vortex_ensure_eq!(
                     old_slot.dtype(),
-                    new_slot.dtype()
+                    new_slot.dtype(),
+                    "slot {} dtype changed during physical rewrite",
+                    idx
                 );
-                vortex_ensure!(
-                    old_slot.len() == new_slot.len(),
-                    "slot {} len changed from {} to {} during physical rewrite",
-                    idx,
+                vortex_ensure_eq!(
                     old_slot.len(),
-                    new_slot.len()
+                    new_slot.len(),
+                    "slot {} len changed during physical rewrite",
+                    idx
                 );
             }
         }
@@ -623,11 +659,10 @@ impl ArrayRef {
     ) -> VortexResult<ArrayRef> {
         let buffers = buffers.into_iter().collect::<Vec<_>>();
         let nbuffers = self.nbuffers();
-        vortex_ensure!(
-            nbuffers == buffers.len(),
-            "buffer count changed from {} to {} during physical rewrite",
+        vortex_ensure_eq!(
             nbuffers,
-            buffers.len()
+            buffers.len(),
+            "buffer count changed during physical rewrite"
         );
         for (idx, (old_buffer, new_buffer)) in self
             .buffer_handles()
@@ -635,12 +670,11 @@ impl ArrayRef {
             .zip(buffers.iter())
             .enumerate()
         {
-            vortex_ensure!(
-                old_buffer.len() == new_buffer.len(),
-                "buffer {} length changed from {} to {} during physical rewrite",
-                idx,
+            vortex_ensure_eq!(
                 old_buffer.len(),
-                new_buffer.len()
+                new_buffer.len(),
+                "buffer {} length changed during physical rewrite",
+                idx
             );
         }
         self.0.data.with_buffers(&self, buffers)
@@ -700,8 +734,8 @@ impl ArrayRef {
     /// Returns the nth child of the array without allocating a Vec.
     ///
     /// Returns `None` if the index is out of bounds.
-    pub fn nth_child(&self, idx: usize) -> Option<ArrayRef> {
-        self.children_iter().nth(idx).cloned()
+    pub fn nth_child(&self, idx: usize) -> Option<&ArrayRef> {
+        self.children_iter().nth(idx)
     }
 
     /// Returns the names of the children of the array: the slot names of the non-None slots

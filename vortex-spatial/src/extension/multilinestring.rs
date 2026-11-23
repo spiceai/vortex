@@ -32,6 +32,7 @@ use vortex_array::dtype::extension::ExtId;
 use vortex_array::dtype::extension::ExtVTable;
 use vortex_array::scalar::ScalarValue;
 use vortex_arrow::ArrowExport;
+use vortex_arrow::ArrowExportOptions;
 use vortex_arrow::ArrowExportVTable;
 use vortex_arrow::ArrowImport;
 use vortex_arrow::ArrowImportVTable;
@@ -41,6 +42,7 @@ use vortex_error::VortexError;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
+use vortex_error::vortex_ensure_eq;
 use vortex_error::vortex_err;
 use vortex_session::registry::CachedId;
 use vortex_session::registry::Id;
@@ -96,7 +98,9 @@ pub(crate) fn multilinestring_storage_dtype(dim: Dimension, nullability: Nullabi
     DType::List(Arc::new(line), nullability)
 }
 
-/// Validate `dtype` is `List<List<coordinate-struct>>` and return its [`Dimension`].
+/// Validate that `dtype` equals [`multilinestring_storage_dtype`] for its [`Dimension`] and
+/// top-level nullability, and return that dimension. As in GeoArrow, only the outer `List` can be
+/// nullable.
 pub(crate) fn multilinestring_dimension(dtype: &DType) -> VortexResult<Dimension> {
     let DType::List(line, _) = dtype else {
         vortex_bail!("multilinestring storage must be a List of line strings, was {dtype}");
@@ -104,7 +108,15 @@ pub(crate) fn multilinestring_dimension(dtype: &DType) -> VortexResult<Dimension
     let DType::List(coords, _) = line.as_ref() else {
         vortex_bail!("multilinestring line storage must be a List of coordinates, was {line}");
     };
-    coordinate_dimension(coords)
+    let dimension = coordinate_dimension(coords)?;
+
+    vortex_ensure_eq!(
+        *dtype,
+        multilinestring_storage_dtype(dimension, dtype.nullability()),
+        "multilinestring storage can be nullable only at its outer List"
+    );
+
+    Ok(dimension)
 }
 
 static ARROW_MULTILINESTRING: CachedId = CachedId::new(MultiLineStringType::NAME);
@@ -202,6 +214,7 @@ impl ArrowExportVTable for MultiLineString {
         &self,
         array: ArrayRef,
         target: &Field,
+        options: &ArrowExportOptions,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrowExport> {
         let is_multilinestring = array
@@ -229,9 +242,11 @@ impl ArrowExportVTable for MultiLineString {
             target.is_nullable(),
         );
         let session = ctx.session().clone();
-        let arrow_storage = session
-            .arrow()
-            .execute_arrow(storage, Some(&storage_field), ctx)?;
+        let arrow_storage =
+            session
+                .arrow()
+                .exporter(options)
+                .execute_arrow(storage, Some(&storage_field), ctx)?;
 
         let multilinestrings =
             MultiLineStringArray::try_from((arrow_storage.as_ref(), multilinestring_meta))
@@ -260,7 +275,7 @@ impl ArrowImportVTable for MultiLineString {
                 vortex_ensure!(
                     multilinestring_meta.coord_type() == CoordType::Separated,
                     "geoarrow.multilinestring with interleaved coordinates is not supported; \
-                 re-encode with separated (struct) coordinates"
+             re-encode with separated (struct) coordinates"
                 );
                 (
                     multilinestring_meta.dimension().into(),

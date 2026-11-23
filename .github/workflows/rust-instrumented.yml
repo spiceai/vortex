@@ -10,7 +10,8 @@ concurrency:
 on:
   push:
     branches: [develop]
-  pull_request: { }
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
   workflow_dispatch: { }
 
 permissions:
@@ -22,28 +23,10 @@ env:
   NIGHTLY_TOOLCHAIN: nightly-2026-09-10
 
 jobs:
-  duckdb-mirror:
-    name: "Mirror DuckDB to R2"
-    if: github.event_name == 'pull_request'
-    uses: ./.github/workflows/duckdb-r2.yml
-    secrets: inherit
-
-  duckdb-ready:
-    name: "DuckDB libraries available in R2"
-    needs: duckdb-mirror
-    if: ${{ !cancelled() }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Verify DuckDB mirror
-        if: ${{ needs.duckdb-mirror.result == 'failure' }}
-        run: |
-          echo "DuckDB mirror failed"
-          exit 1
-
   rust-coverage:
     name: "Rust tests (coverage) (${{ matrix.suite }})"
-    needs: duckdb-ready
+    # Coverage only runs on develop; PRs get the same tests uninstrumented in ci.yml.
+    if: github.event_name != 'pull_request'
     # An instrumented build and run of the whole workspace does not fit in thirty
     # minutes without the prebuild image and its compile cache.
     timeout-minutes: ${{ github.repository == 'vortex-data/vortex' && 30 || 75 }}
@@ -55,19 +38,22 @@ jobs:
           - suite: tests
     runs-on: >-
       ${{ github.repository == 'vortex-data/vortex'
-          && format('runs-on={0}/runner=amd64-large/volume=200gb/image=ubuntu24-full-x64-pre-v2/tag=rust-coverage-suite-{1}', github.run_id, matrix.suite)
+          && format('runs-on={0}/region=us-east-1/runner=amd64-large/volume=200gb/image=ubuntu26-full-x64-pre-v2/tag=rust-coverage-suite-{1}', github.run_id, matrix.suite)
           || 'ubuntu-latest' }}
     env:
       RUSTFLAGS: "-Cinstrument-coverage -A warnings"
       CARGO_INCREMENTAL: 0  # Disable incremental compilation to get accurate coverage
-      LLVM_PROFILE_FILE: "target/coverage/vortex-%p-%m.profraw"
+      # %8m merges counters online into a pool of 8 files per binary. A per-process (%p) file for
+      # each nextest test process fills the runner disk.
+      LLVM_PROFILE_FILE: "target/coverage/vortex-%8m.profraw"
       GRCOV_OUTPUT_FILE: "target/coverage/vortex.lcov"
     steps:
-      - uses: runs-on/action@v2
-        if: github.repository == 'vortex-data/vortex'
-        with:
-          sccache: s3
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - parallel:
+          - uses: runs-on/action@v2
+            if: github.repository == 'vortex-data/vortex'
+            with:
+              sccache: s3
+          - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: ./.github/actions/setup-prebuild
         with:
           enable-sccache: "true"
@@ -121,14 +107,14 @@ jobs:
             --threads $(nproc) \
             --ignore '../*' --ignore '/*' --ignore 'fuzz/*' --ignore 'vortex-bench/*' \
             --ignore 'home/*' --ignore 'xtask/*' --ignore 'target/*' --ignore 'vortex-error/*' \
-            --ignore 'vortex-python/*' --ignore 'vortex-jni/*' --ignore 'vortex-flatbuffers/*' \
-            --ignore 'vortex-proto/*' --ignore 'vortex-tui/*' --ignore 'vortex-datafusion/examples/*' \
+            --ignore 'vortex-python/*' --ignore 'vortex-jni/*' \
+            --ignore 'vortex-tui/*' --ignore 'vortex-datafusion/examples/*' \
             --ignore 'vortex-ffi/examples/*' --ignore '*/arbitrary/*' --ignore '*/arbitrary.rs' \
             --ignore benchmarks/* --ignore 'vortex-test/*' \
             -o ${{ env.GRCOV_OUTPUT_FILE }}
           test -s ${{ env.GRCOV_OUTPUT_FILE }}
       - name: Codecov
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f  # v7
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5  # v7
         with:
           name: run-${{ matrix.suite }}
           files: ${{ env.GRCOV_OUTPUT_FILE }}
@@ -138,19 +124,24 @@ jobs:
 
   cxx-coverage:
     name: "C++ API (coverage)"
+    if: github.event_name != 'pull_request'
     timeout-minutes: 15
+    env:
+      # Symbolizing error backtrace in debug .so is slow
+      RUST_LIB_BACKTRACE: 0
     permissions:
       id-token: write
     runs-on: >-
       ${{ github.repository == 'vortex-data/vortex'
-          && format('runs-on={0}/runner=amd64-medium/image=ubuntu24-full-x64-pre-v2/extras=s3-cache/tag=cxx-coverage', github.run_id)
+          && format('runs-on={0}/region=us-east-1/runner=amd64-medium/image=ubuntu26-full-x64-pre-v2/extras=s3-cache/tag=cxx-coverage', github.run_id)
           || 'ubuntu-latest' }}
     steps:
-      - uses: runs-on/action@v2
-        if: github.repository == 'vortex-data/vortex'
-        with:
-          sccache: s3
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - parallel:
+          - uses: runs-on/action@v2
+            if: github.repository == 'vortex-data/vortex'
+            with:
+              sccache: s3
+          - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: ./.github/actions/setup-prebuild
         with:
           enable-sccache: "true"
@@ -164,7 +155,7 @@ jobs:
         working-directory: lang/cpp
         run: ./gcov-report.sh
       - name: Codecov
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f  # v7
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5  # v7
         with:
           name: cxx-api
           files: lang/cpp/coverage.info
@@ -173,6 +164,7 @@ jobs:
           use_oidc: true
 
   rust-test-sanitizer:
+    if: github.event.pull_request.draft != true
     strategy:
       fail-fast: false
       matrix:
@@ -186,7 +178,7 @@ jobs:
     name: "Rust tests (${{ matrix.sanitizer }})"
     runs-on: >-
       ${{ github.repository == 'vortex-data/vortex'
-          && format('runs-on={0}/runner=amd64-medium/image=ubuntu24-full-x64-pre-v2/extras=s3-cache/tag=rust-test-sanitizer', github.run_id)
+          && format('runs-on={0}/region=us-east-1/runner=amd64-medium/image=ubuntu26-full-x64-pre-v2/extras=s3-cache/tag=rust-test-sanitizer', github.run_id)
           || 'ubuntu-latest' }}
     # -Zbuild-std with a sanitizer rebuilds core and std, which overran thirty
     # minutes on a fork runner with no compile cache.
@@ -204,11 +196,12 @@ jobs:
       # unset -Zsanitizer flag and we should allow that.
       RUSTFLAGS: "-A warnings -Cunsafe-allow-abi-mismatch=sanitizer -C debuginfo=2 -C opt-level=0 -C strip=none"
     steps:
-      - uses: runs-on/action@v2
-        if: github.repository == 'vortex-data/vortex'
-        with:
-          sccache: s3
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - parallel:
+          - uses: runs-on/action@v2
+            if: github.repository == 'vortex-data/vortex'
+            with:
+              sccache: s3
+          - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: ./.github/actions/setup-prebuild
         with:
           enable-sccache: "true"
@@ -275,6 +268,7 @@ jobs:
             -p vortex-ffi --tests -- --no-capture
 
   rust-ffi-test-sanitizer:
+    if: github.event.pull_request.draft != true
     strategy:
       fail-fast: false
       matrix:
@@ -297,16 +291,19 @@ jobs:
       TSAN_OPTIONS: "symbolize=1:suppressions=${{ github.workspace }}/vortex-ffi/tsan_suppressions.txt"
       TSAN_SYMBOLIZER_PATH: "/usr/bin/llvm-symbolizer"
       VORTEX_SKIP_SLOW_TESTS: "1"
+      # Symbolizing error backtrace in debug .so is slow
+      RUST_LIB_BACKTRACE: 0
     runs-on: >-
       ${{ github.repository == 'vortex-data/vortex'
-          && format('runs-on={0}/runner=amd64-medium/image=ubuntu24-full-x64-pre-v2/tag=rust-ffi-test-sanitizer', github.run_id)
+          && format('runs-on={0}/region=us-east-1/runner=amd64-medium/image=ubuntu26-full-x64-pre-v2/tag=rust-ffi-test-sanitizer', github.run_id)
           || 'ubuntu-latest' }}
     steps:
-      - uses: runs-on/action@v2
-        if: github.repository == 'vortex-data/vortex'
-        with:
-          sccache: s3
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - parallel:
+          - uses: runs-on/action@v2
+            if: github.repository == 'vortex-data/vortex'
+            with:
+              sccache: s3
+          - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: ./.github/actions/setup-prebuild
         with:
           enable-sccache: "true"
@@ -352,6 +349,8 @@ jobs:
         run: |
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_LINKER_TYPE=MOLD \
+            -DBUILD_SHARED_LIBS=ON \
             -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++ \
             -DVORTEX_SANITIZER=${{ matrix.sanitizer }} \
@@ -375,9 +374,10 @@ jobs:
 
   miri:
     name: "Rust tests (miri)"
+    if: github.event.pull_request.draft != true
     runs-on: >-
       ${{ github.repository == 'vortex-data/vortex'
-          && format('runs-on={0}/runner=amd64-medium/image=ubuntu24-full-x64-pre-v2/tag=rust-miri', github.run_id)
+          && format('runs-on={0}/region=us-east-1/runner=amd64-medium/image=ubuntu26-full-x64-pre-v2/tag=rust-miri', github.run_id)
           || 'ubuntu-latest' }}
     timeout-minutes: 30
     env:
@@ -385,11 +385,12 @@ jobs:
       RUSTFLAGS: "-A warnings"
       RUST_BACKTRACE: full
     steps:
-      - uses: runs-on/action@v2
-        if: github.repository == 'vortex-data/vortex'
-        with:
-          sccache: s3
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - parallel:
+          - uses: runs-on/action@v2
+            if: github.repository == 'vortex-data/vortex'
+            with:
+              sccache: s3
+          - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: ./.github/actions/setup-prebuild
         with:
           enable-sccache: "true"

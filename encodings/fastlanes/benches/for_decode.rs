@@ -1,0 +1,166 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright the Vortex contributors
+
+//! Benchmarks decoding a FoR array with a reference per 1024-element chunk, over a primitive child
+//! and over a BitPacked child. An unsigned BitPacked child decodes through a fused unpack, and a
+//! signed one through BitPacked decoding followed by adding the references in place. The blocked
+//! BitPacked child packs every block at the same width as the global one, so the two compare the
+//! cost of per-block bit widths alone.
+//!
+//! Every benchmark carries `#[cpu_features]`, so it is measured on each walltime CPU-feature leg
+//! rather than in simulation: the loops under test are auto-vectorized, so the build decides
+//! their speed.
+//!
+//! Run with `cargo bench -p vortex-fastlanes --bench for_decode`.
+
+#![expect(clippy::unwrap_used)]
+
+use std::sync::LazyLock;
+
+use divan::Bencher;
+use divan::counter::ItemsCount;
+use mimalloc::MiMalloc;
+use vortex_array::ArrayRef;
+use vortex_array::IntoArray;
+use vortex_array::VortexSessionExecute;
+use vortex_array::aggregate_fn::session::AggregateFnSession;
+use vortex_array::arrays::PrimitiveArray;
+use vortex_array::dtype::NativePType;
+use vortex_array::memory::MemorySession;
+use vortex_array::optimizer::kernels::KernelSession;
+use vortex_array::session::ArraySession;
+use vortex_array::test_harness::mark_optimized;
+use vortex_array::validity::Validity;
+use vortex_buffer::Buffer;
+use vortex_error::vortex_panic;
+use vortex_fastlanes::BitPacked;
+use vortex_fastlanes::BitPackedData;
+use vortex_fastlanes::FoR;
+use vortex_fastlanes::FoRArray;
+use vortex_fastlanes::FoRArrayExt;
+use vortex_fastlanes::FoRArraySlotsExt;
+use vortex_fastlanes::FoRReferences;
+use vortex_session::VortexSession;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
+fn main() {
+    LazyLock::force(&SESSION);
+    divan::main();
+}
+
+static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
+    let session = VortexSession::empty()
+        .with::<ArraySession>()
+        .with::<KernelSession>()
+        .with::<AggregateFnSession>()
+        .with::<MemorySession>();
+    vortex_fastlanes::initialize(&session);
+    session
+});
+
+/// Bytes of values per input array.
+const INPUT_BYTES: &[usize] = &[512 * 1024];
+
+/// Enough bits for the values' spread above their minimum.
+const BIT_WIDTH: u8 = 7;
+
+fn values<T: NativePType + TryFrom<usize>>(len: usize) -> Buffer<T> {
+    (0..len)
+        // Each chunk's values climb by 1000, so every chunk has its own reference.
+        .map(|i| {
+            T::try_from(1000 * (1 + i / 1024) + (i * 7919) % 100)
+                .ok()
+                .unwrap()
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+enum Child {
+    BitPacked,
+    BlockedBitPacked,
+}
+
+fn blocked_references(for_array: &FoRArray) -> ArrayRef {
+    let FoRReferences::Blocked(references) = for_array.references() else {
+        vortex_panic!("every chunk has its own reference");
+    };
+    references.clone()
+}
+
+fn bitpacked_for_array<T: NativePType + TryFrom<usize>>(len: usize, child: Child) -> ArrayRef {
+    let mut ctx = SESSION.create_execution_ctx();
+    let array = PrimitiveArray::new(values::<T>(len), Validity::NonNullable);
+    let for_array = FoR::encode_chunked(array, &mut ctx).unwrap();
+    let packed = match child {
+        Child::BitPacked => BitPacked::encode(for_array.encoded(), BIT_WIDTH, &mut ctx).unwrap(),
+        Child::BlockedBitPacked => {
+            let bit_widths = vec![BIT_WIDTH; len.div_ceil(1024)];
+            BitPackedData::encode_blocked(for_array.encoded(), &bit_widths, &mut ctx).unwrap()
+        }
+    };
+    FoR::try_new_chunked(packed.into_array(), blocked_references(&for_array), 0)
+        .unwrap()
+        .into_array()
+}
+
+fn run<T: NativePType + TryFrom<usize>>(bencher: Bencher, bytes: usize, child: Child) {
+    let len = bytes / size_of::<T>();
+    let array = bitpacked_for_array::<T>(len, child);
+    mark_optimized(&array, &SESSION).unwrap();
+
+    bencher
+        .counter(ItemsCount::new(len))
+        .with_inputs(|| (&array, SESSION.create_execution_ctx()))
+        .bench_refs(|(array, ctx)| (*array).clone().execute::<PrimitiveArray>(ctx).unwrap());
+}
+
+/// Each iteration decodes a uniquely owned FoR array over a uniquely owned buffer, so the
+/// references are added in place instead of into a copy.
+#[vortex_bench_support::cpu_features]
+#[divan::bench(types = [i64], args = INPUT_BYTES)]
+fn decode_chunked<T: NativePType + TryFrom<usize>>(bencher: Bencher, bytes: usize) {
+    let len = bytes / size_of::<T>();
+    let mut ctx = SESSION.create_execution_ctx();
+    let array = PrimitiveArray::new(values::<T>(len), Validity::NonNullable);
+    let for_array = FoR::encode_chunked(array, &mut ctx).unwrap();
+    let encoded = for_array
+        .encoded()
+        .clone()
+        .execute::<PrimitiveArray>(&mut ctx)
+        .unwrap();
+    let references = blocked_references(&for_array);
+
+    bencher
+        .counter(ItemsCount::new(len))
+        .with_inputs(|| {
+            let encoded = PrimitiveArray::new(
+                Buffer::<T>::copy_from(encoded.as_slice::<T>()),
+                Validity::NonNullable,
+            );
+            let array = FoR::try_new_chunked(encoded.into_array(), references.clone(), 0)
+                .unwrap()
+                .into_array();
+            mark_optimized(&array, &SESSION).unwrap();
+
+            (array, SESSION.create_execution_ctx())
+        })
+        .bench_values(|(array, mut ctx)| array.execute::<PrimitiveArray>(&mut ctx).unwrap());
+}
+
+#[vortex_bench_support::cpu_features]
+#[divan::bench(types = [u32, i64], args = INPUT_BYTES)]
+fn decode_bitpacked_chunked<T: NativePType + TryFrom<usize>>(bencher: Bencher, bytes: usize) {
+    run::<T>(bencher, bytes, Child::BitPacked);
+}
+
+#[vortex_bench_support::cpu_features]
+#[divan::bench(types = [u32, i64], args = INPUT_BYTES)]
+fn decode_blocked_bitpacked_chunked<T: NativePType + TryFrom<usize>>(
+    bencher: Bencher,
+    bytes: usize,
+) {
+    run::<T>(bencher, bytes, Child::BlockedBitPacked);
+}

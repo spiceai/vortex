@@ -12,8 +12,6 @@ use vortex_array::arrays::StructArray;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::extension::ExtDType;
-use vortex_array::expr::Expression;
-use vortex_array::expr::union_child_validities;
 use vortex_array::scalar_fn::Arity;
 use vortex_array::scalar_fn::ChildName;
 use vortex_array::scalar_fn::EmptyOptions;
@@ -24,6 +22,7 @@ use vortex_array::scalar_fn::TypedScalarFnInstance;
 use vortex_array::validity::Validity;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
+use vortex_error::vortex_ensure_eq;
 use vortex_error::vortex_err;
 use vortex_mask::Mask;
 use vortex_session::VortexSession;
@@ -42,10 +41,10 @@ use crate::scalar_fn::execute::dispatch_binary;
 
 /// Validate the two point operands accepted by `ST_MakeLine`.
 fn validate_make_line_operands(dtypes: &[DType]) -> VortexResult<()> {
-    vortex_ensure!(
-        dtypes.len() == 2,
-        "spatial: make_line requires exactly two point operands, got {}",
-        dtypes.len()
+    vortex_ensure_eq!(
+        dtypes.len(),
+        2,
+        "spatial: make_line requires exactly two point operands"
     );
     for dtype in dtypes {
         vortex_ensure!(
@@ -65,10 +64,10 @@ fn make_line_metadata(
 ) -> VortexResult<SpatialMetadata> {
     match (&left.crs, &right.crs) {
         (Some(left_crs), Some(right_crs)) => {
-            vortex_ensure!(
-                left_crs == right_crs,
-                "spatial: make_line operands have different coordinate reference systems: \
-                 {left_crs} and {right_crs}"
+            vortex_ensure_eq!(
+                left_crs,
+                right_crs,
+                "spatial: make_line operands have different coordinate reference systems"
             );
             Ok(left.clone())
         }
@@ -223,14 +222,6 @@ impl ScalarFnVTable for SpatialMakeLine {
         )
     }
 
-    fn validity(
-        &self,
-        _: &Self::Options,
-        expression: &Expression,
-    ) -> VortexResult<Option<Expression>> {
-        union_child_validities(expression)
-    }
-
     fn is_strict(&self, _: &Self::Options) -> bool {
         true
     }
@@ -242,6 +233,8 @@ impl ScalarFnVTable for SpatialMakeLine {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use geo_types::Coord;
     use geo_types::Geometry;
     use geo_types::LineString as GeoLineString;
@@ -262,6 +255,7 @@ mod tests {
     use vortex_array::scalar_fn::ScalarFnVTable;
     use vortex_error::VortexResult;
     use vortex_error::vortex_err;
+    use vortex_session::VortexSession;
 
     use super::SpatialMakeLine;
     use crate::extension::LineString;
@@ -273,6 +267,8 @@ mod tests {
     use crate::extension::flatten_coordinates;
     use crate::extension::geometries;
     use crate::test_harness::point_column;
+
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
 
     fn dimensional_point(
         dimension: Dimension,
@@ -311,8 +307,7 @@ mod tests {
 
     #[test]
     fn connects_paired_points_in_operand_order() -> VortexResult<()> {
-        let session = vortex_array::array_session();
-        let mut ctx = session.create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let starts = point_column(vec![0.0, 3.0], vec![0.0, 4.0])?;
         let ends = point_column(vec![3.0, 0.0], vec![4.0, 0.0])?;
 
@@ -336,8 +331,7 @@ mod tests {
 
     #[test]
     fn two_constants_are_built_once_and_remain_constant() -> VortexResult<()> {
-        let session = vortex_array::array_session();
-        let mut ctx = session.create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let starts = point_constant(0.0, 0.0, 3, &mut ctx)?;
         let ends = point_constant(3.0, 4.0, 3, &mut ctx)?;
 
@@ -367,8 +361,7 @@ mod tests {
     #[case::constant_start(true)]
     #[case::constant_end(false)]
     fn constant_and_column_are_paired_by_row(#[case] constant_start: bool) -> VortexResult<()> {
-        let session = vortex_array::array_session();
-        let mut ctx = session.create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let constant = point_constant(0.0, 0.0, 2, &mut ctx)?;
         let column = point_column(vec![3.0, 6.0], vec![4.0, 8.0])?;
         let (starts, ends) = if constant_start {
@@ -397,8 +390,7 @@ mod tests {
 
     #[test]
     fn null_constant_is_all_null() -> VortexResult<()> {
-        let session = vortex_array::array_session();
-        let mut ctx = session.create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let point_dtype = point_column(vec![0.0], vec![0.0])?.dtype().as_nullable();
         let starts = ConstantArray::new(Scalar::null(point_dtype), 2).into_array();
         let ends = point_column(vec![3.0, 6.0], vec![4.0, 8.0])?;
@@ -463,8 +455,7 @@ mod tests {
         #[case] expected_z: Option<[f64; 2]>,
         #[case] expected_m: Option<[f64; 2]>,
     ) -> VortexResult<()> {
-        let session = vortex_array::array_session();
-        let mut ctx = session.create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let expected_x = [start[0], end[0]];
         let expected_y = [start[1], end[1]];
         let start = dimensional_point(start_dimension, start, None)?;

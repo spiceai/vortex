@@ -4,11 +4,9 @@ authors = { workspace = true }
 categories = { workspace = true }
 description = "Vortex file readers and writers"
 edition = { workspace = true }
-homepage = { workspace = true }
 include = { workspace = true }
 keywords = { workspace = true }
 license = { workspace = true }
-readme = "README.md"
 repository = { workspace = true }
 rust-version = { workspace = true }
 version = { workspace = true }
@@ -17,22 +15,25 @@ version = { workspace = true }
 all-features = true
 
 [dependencies]
-async-stream = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+async-channel = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 flatbuffers = { workspace = true }
 futures = { workspace = true, features = ["std", "async-await"] }
 itertools = { workspace = true }
-kanal = { workspace = true }
 moka = { workspace = true, features = ["sync"] }
 object_store = { workspace = true, optional = true }
 parking_lot = { workspace = true }
 pin-project-lite = { workspace = true }
+prost = { workspace = true }
 tokio = { workspace = true, features = ["rt"], optional = true }
 tracing = { workspace = true }
 url = { workspace = true }
 vortex-alp = { workspace = true }
 vortex-array = { workspace = true }
+vortex-arrow = { workspace = true }
 vortex-btrblocks = { workspace = true }
 vortex-buffer = { workspace = true }
 vortex-bytebool = { workspace = true }
@@ -41,8 +42,8 @@ vortex-datetime-parts = { workspace = true }
 vortex-decimal-byte-parts = { workspace = true }
 vortex-edition = { workspace = true }
 vortex-error = { workspace = true }
+vortex-expr = { workspace = true }
 vortex-fastlanes = { workspace = true }
-vortex-flatbuffers = { workspace = true, features = ["file"] }
 vortex-fsst = { workspace = true }
 vortex-io = { workspace = true }
 vortex-layout = { workspace = true }
@@ -50,7 +51,6 @@ vortex-mask = { workspace = true }
 vortex-metrics = { workspace = true }
 vortex-onpair = { workspace = true }
 vortex-pco = { workspace = true }
-vortex-runend = { workspace = true }
 vortex-scan = { workspace = true }
 vortex-sequence = { workspace = true }
 vortex-session = { workspace = true }
@@ -64,7 +64,10 @@ vortex-zstd = { workspace = true, optional = true }
 allocator-api2 = { workspace = true }
 divan = { workspace = true }
 libc = "0.2"
+mimalloc = { workspace = true }
+rand = { workspace = true }
 rstest = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 vortex-array = { workspace = true, features = ["_test-harness"] }
 vortex-io = { workspace = true, features = ["tokio"] }

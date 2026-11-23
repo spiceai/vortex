@@ -16,37 +16,66 @@ use std::sync::LazyLock;
 
 use divan::Bencher;
 use divan::counter::ItemsCount;
+use mimalloc::MiMalloc;
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
+use vortex_array::aggregate_fn::session::AggregateFnSession;
 use vortex_array::arrays::BoolArray;
 use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::NativePType;
+use vortex_array::optimizer::kernels::KernelSession;
 use vortex_array::scalar::Scalar;
 use vortex_array::scalar_fn::fns::operators::Operator;
+use vortex_array::session::ArraySession;
+use vortex_array::test_harness::mark_optimized;
 use vortex_array::validity::Validity;
 use vortex_buffer::Alignment;
 use vortex_buffer::BufferMut;
 use vortex_fastlanes::BitPacked;
 use vortex_fastlanes::BitPackedArray;
 use vortex_fastlanes::BitPackedData;
+use vortex_fastlanes::BitWidths;
 use vortex_session::VortexSession;
 
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 fn main() {
+    LazyLock::force(&SESSION);
     divan::main();
 }
 
 static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
-    let session = vortex_array::array_session();
+    let session = VortexSession::empty()
+        .with::<ArraySession>()
+        .with::<KernelSession>()
+        .with::<AggregateFnSession>();
     vortex_fastlanes::initialize(&session);
     session
 });
 
-/// Number of elements per benchmarked array (64 full FastLanes blocks).
-const LEN: usize = 64 * 1024;
+/// Number of elements per benchmarked array
+const LEN: usize = if cfg!(codspeed) { 8 * 1024 } else { 64 * 1024 };
+
+const CODSPEED_WIDTHS: &[usize] = &[1, 3, 5, 7, 9, 15, 17, 31, 33, 63];
+
+/// The bit widths to benchmark for a type of `native_bits` bits. Bit-packing requires the target
+/// width to be strictly narrower than the type, so valid widths are `1..native_bits`.
+fn widths(native_bits: usize) -> Vec<usize> {
+    if cfg!(codspeed) {
+        CODSPEED_WIDTHS
+            .iter()
+            .copied()
+            .filter(|&width| width < native_bits)
+            .collect()
+    } else {
+        (1..native_bits).collect()
+    }
+}
 
 /// Operator under test. `Lt` exercises the full unpack + per-element comparison path.
 const OP: Operator = Operator::Lt;
@@ -80,12 +109,15 @@ impl_bench_int!(u8, u16, u32, u64, i8, i16, i32, i64);
 fn page_aligned(array: BitPackedArray) -> BitPackedArray {
     let ptype = array.dtype().as_ptype();
     let parts = BitPacked::into_parts(array);
+    let BitWidths::Global(bit_width) = parts.bit_widths else {
+        unreachable!("bitpack_encode packs every block at one bit width")
+    };
     BitPacked::try_new(
         parts.packed.ensure_aligned(Alignment::new(4096)).unwrap(),
         ptype,
         parts.validity,
         parts.patches,
-        parts.bit_width,
+        bit_width,
         parts.len,
         parts.offset,
     )
@@ -110,17 +142,19 @@ fn setup<T: BenchInt>(width: usize) -> (ArrayRef, ArrayRef, ExecutionCtx) {
     )
     .into_array();
     let rhs = ConstantArray::new(T::from_counter(cap / 2), LEN).into_array();
+    mark_optimized(&array, &SESSION).unwrap();
+    mark_optimized(&rhs, &SESSION).unwrap();
+
     (array, rhs, ctx)
 }
 
-/// Generate a compare benchmark over every valid bit width for one type. Valid widths are
-/// `1..native_bits` - bit-packing requires the target width to be strictly narrower than the type.
+/// Generate a compare benchmark over the bit widths from [`widths`] for one type.
 macro_rules! bench_type {
     ($modname:ident, $T:ty, $native_bits:expr) => {
         mod $modname {
             use super::*;
 
-            #[divan::bench(args = 1..$native_bits)]
+            #[divan::bench(args = widths($native_bits))]
             fn compare(bencher: Bencher, width: usize) {
                 let (array, rhs, mut ctx) = setup::<$T>(width);
                 bencher.counter(ItemsCount::new(LEN)).bench_local(|| {

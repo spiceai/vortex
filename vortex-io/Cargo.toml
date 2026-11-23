@@ -4,7 +4,6 @@ authors = { workspace = true }
 categories = { workspace = true }
 description = "Core async and blocking IO traits and implementations, used by IPC and file format"
 edition = { workspace = true }
-homepage = { workspace = true }
 include = { workspace = true }
 keywords = { workspace = true }
 license = { workspace = true }
@@ -17,6 +16,7 @@ version = { workspace = true }
 all-features = true
 
 [dependencies]
+async-channel = { workspace = true }
 async-executor = { workspace = true }
 async-fs = { workspace = true }
 async-stream = { workspace = true }
@@ -25,8 +25,6 @@ bytes = { workspace = true }
 crossbeam-channel = { workspace = true }
 futures = { workspace = true, features = ["std", "executor"] }
 glob = { workspace = true }
-kanal = { workspace = true }
-log = { workspace = true }
 object_store = { workspace = true, optional = true, features = ["fs"] }
 parking_lot = { workspace = true }
 pin-project-lite = { workspace = true }

@@ -6,13 +6,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use cudarc::driver::CudaEvent;
-use cudarc::driver::CudaFunction;
-use cudarc::driver::CudaSlice;
-use cudarc::driver::DeviceRepr;
-use cudarc::driver::LaunchArgs;
-use cudarc::driver::LaunchConfig;
-use cudarc::driver::ValidAsZeroBits;
 use futures::future::BoxFuture;
 use tracing::debug;
 use tracing::trace;
@@ -37,9 +30,18 @@ use vortex::dtype::PType;
 use vortex::error::VortexResult;
 use vortex::error::vortex_bail;
 use vortex::error::vortex_ensure;
+use vortex::error::vortex_ensure_eq;
 use vortex::error::vortex_err;
+use vortex_cuda_driver::CudaEvent;
+use vortex_cuda_driver::CudaFunction;
+use vortex_cuda_driver::CudaSlice;
+use vortex_cuda_driver::DeviceRepr;
+use vortex_cuda_driver::LaunchArgs;
+use vortex_cuda_driver::LaunchConfig;
+use vortex_cuda_driver::ValidAsZeroBits;
 
 use crate::CudaSession;
+use crate::DictionaryExport;
 use crate::ExportDeviceArray;
 use crate::hybrid_dispatch;
 use crate::kernel::DefaultLaunchStrategy;
@@ -135,10 +137,16 @@ impl CudaExecutionCtx {
         self
     }
 
+    /// Override the dictionary export policy for this context without changing its backing session.
+    pub fn with_dictionary_export(mut self, policy: DictionaryExport) -> Self {
+        self.cuda_session = self.cuda_session.with_dictionary_export(policy);
+        self
+    }
+
     /// Perform an external kernel launch, with events created and logged via the configured
     /// [`LaunchStrategy`].
     ///
-    /// We use CUB and NVCOMP routines, and those don't match the normal `cudarc` entrypoints, so
+    /// We use CUB and NVCOMP routines, and those don't match the normal launch entrypoints, so
     /// to inject the configured launch strategy we need to bracket it ourselves.
     pub fn launch_external<F: FnMut() -> VortexResult<()>>(
         &self,
@@ -307,7 +315,7 @@ impl CudaExecutionCtx {
     /// Returns a reference to the underlying [`VortexCudaStream`].
     ///
     /// Through [`Deref`][std::ops::Deref], this also provides access to the
-    /// inner [`Arc<CudaStream>`] and all of cudarc's stream methods.
+    /// inner [`Arc<CudaStream>`] and all of its stream methods.
     pub fn stream(&self) -> &VortexCudaStream {
         &self.stream
     }
@@ -355,8 +363,10 @@ impl CudaExecutionCtx {
 ///
 /// - **Page-locked memory** (allocated via `cuMemAllocHost` / `cudaMallocHost`):
 ///   the GPU's DMA engine holds a stable physical address for the allocation and
-///   can transfer directly without CPU involvement. The call returns immediately
-///   and the copy proceeds in parallel with subsequent CPU work.
+///   can transfer directly without CPU involvement. Pooled pinned buffers return
+///   immediately and the copy proceeds in parallel with subsequent CPU work, as
+///   the pool keeps each buffer until its copy completes. Copies of borrowed
+///   page-locked slices wait for the copy instead, as the borrow may end next.
 ///
 /// - **Pageable memory** (ordinary `malloc` / Rust allocator): CUDA must first
 ///   stage the data through an internal page-locked bounce buffer, performing a
@@ -390,7 +400,7 @@ pub(crate) async fn execute_validity_cuda(
         return Ok(validity);
     };
 
-    vortex_ensure!(array.len() == len, "validity array length mismatch");
+    vortex_ensure_eq!(array.len(), len, "validity array length mismatch");
     vortex_ensure!(
         matches!(array.dtype(), DType::Bool(Nullability::NonNullable)),
         "validity array must be non-nullable boolean, got {}",

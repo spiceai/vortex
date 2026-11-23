@@ -45,7 +45,7 @@ where
     let const_values = Args::const_values(&columns);
     let prepared = prepare(const_values);
 
-    let mut sink = Sink::with_capacity(row_count, params)?;
+    let mut sink = Sink::with_capacity(row_count, params, ctx.allocator())?;
 
     // Keep `rows` scoped so its borrow ends before `finish`, which consumes the sink.
     {
@@ -56,7 +56,7 @@ where
         vortex_ensure_eq!(
             sink_row_count,
             row_count,
-            "the output sink must address exactly {row_count} rows, got {sink_row_count}",
+            "the output sink has the wrong row count",
         );
 
         let views = Args::views_if_no_consts(&columns);
@@ -90,7 +90,8 @@ where
         }
     }
 
-    // SAFETY: every row callback completed successfully, so each returned the required write token.
+    // SAFETY: every callback returned its token, which proves that its entire output row remains
+    // initialized under the `OutputSink` contract.
     unsafe { Sink::finish(sink) }
 }
 
@@ -139,7 +140,7 @@ where
         vortex_ensure_eq!(
             initialized_row_count,
             row_count,
-            "the initialized output sink must address exactly {row_count} rows, got {initialized_row_count}",
+            "the initialized output sink has the wrong row count",
         );
 
         if let Some(views) = views {
@@ -174,7 +175,7 @@ where
     }
 
     // SAFETY: the initializer completed before traversal, and every visited callback completed
-    // successfully and returned the required write token.
+    // successfully with a token proving its entire output row remains initialized.
     unsafe { Sink::finish(sink) }.map(Some)
 }
 
@@ -203,12 +204,11 @@ where
     vortex_ensure_eq!(
         valid.true_count(),
         filtered_len,
-        "the filtered batch must contain one row per valid row: {} valid rows, got {filtered_len}",
-        valid.true_count(),
+        "the filtered batch must contain one row per valid row",
     );
 
     let original_len = valid.len();
-    let mut sink = Sink::with_capacity(original_len, params)?;
+    let mut sink = Sink::with_capacity(original_len, params, ctx.allocator())?;
 
     let valid_rows = valid.bit_buffer();
     let views = Args::views_if_no_consts(&columns);
@@ -227,7 +227,7 @@ where
         vortex_ensure_eq!(
             initialized_row_count,
             original_len,
-            "the initialized output sink must address exactly {original_len} rows, got {initialized_row_count}",
+            "the initialized output sink has the wrong row count",
         );
 
         let mut filtered_index = 0;
@@ -267,7 +267,7 @@ where
     }
 
     // SAFETY: the initializer completed before traversal, and every visited callback completed
-    // successfully and returned the required write token.
+    // successfully with a token proving its entire output row remains initialized.
     unsafe { Sink::finish(sink) }
 }
 
@@ -317,14 +317,13 @@ where
     // Keep allocation before the validity and length checks. With multiple CGUs and no LTO,
     // moving it later inlines `Args::get` into every sparse callback, duplicating its bounds
     // checks.
-    let sink = Sink::with_capacity(row_count, params)?;
+    let sink = Sink::with_capacity(row_count, params, ctx.allocator())?;
 
     let valid_rows = valid.bit_buffer();
     vortex_ensure_eq!(
         valid_rows.len(),
         row_count,
-        "the validity mask must address exactly {row_count} rows, got {}",
-        valid_rows.len(),
+        "the validity mask has the wrong row count",
     );
 
     Ok(Some(ValidRowsSetup {
@@ -337,20 +336,25 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
+    use vortex_buffer::BufferAllocatorRef;
     use vortex_error::VortexResult;
     use vortex_error::vortex_bail;
     use vortex_mask::Mask;
+    use vortex_session::VortexSession;
 
     use super::execute_sink_valid_rows;
     use crate::ArrayRef;
     use crate::IntoArray;
     use crate::VortexSessionExecute;
-    use crate::array_session;
     use crate::arrays::PrimitiveArray;
     use crate::dtype::DType;
     use crate::dtype::NativePType;
     use crate::scalar_fn::VecExecutionArgs;
     use crate::scalar_fn::unstable::row::OutputSink;
+
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
 
     struct ShrinkingSink(Vec<i64>);
 
@@ -371,7 +375,11 @@ mod tests {
             DType::from(i64::PTYPE)
         }
 
-        fn with_capacity(rows: usize, _params: &Self::Params) -> VortexResult<Self> {
+        fn with_capacity(
+            rows: usize,
+            _params: &Self::Params,
+            _allocator: &BufferAllocatorRef,
+        ) -> VortexResult<Self> {
             Ok(Self(vec![0; rows]))
         }
 
@@ -395,7 +403,7 @@ mod tests {
         let Mask::Values(valid) = Mask::from_iter([false, true]) else {
             vortex_bail!("the test validity must be partially valid");
         };
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
 
         let result = execute_sink_valid_rows::<(i64,), (), ShrinkingSink, ()>(
             &args,
@@ -410,12 +418,14 @@ mod tests {
 
         let error = match result {
             Err(error) => error,
-            Ok(_) => vortex_bail!("the sink must reject rows changed by its initializer"),
+            Ok(_) => {
+                vortex_bail!("the sink must reject rows changed by its initializer")
+            }
         };
         assert!(
             error
                 .to_string()
-                .contains("initialized output sink must address exactly 2 rows, got 1"),
+                .contains("initialized output sink has the wrong row count"),
             "unexpected error: {error}",
         );
 

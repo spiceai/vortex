@@ -28,12 +28,12 @@ use std::mem::MaybeUninit;
 use std::sync::LazyLock;
 
 use divan::Bencher;
+use mimalloc::MiMalloc;
 use onpair::CompactDictionaryView;
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
-use vortex_array::array_session;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::VarBinArray;
 use vortex_array::arrays::VarBinViewArray;
@@ -49,6 +49,7 @@ use vortex_onpair::DEFAULT_CONFIG;
 use vortex_onpair::OnPair;
 use vortex_onpair::OnPairArray;
 use vortex_onpair::OnPairArraySlotsExt;
+use vortex_session::VortexSession;
 
 /// Host-resident decode inputs, materialised once so the decode-loop benchmark
 /// measures only `onpair::decode_into` (not child `execute`/allocation).
@@ -79,11 +80,15 @@ impl DecodeInputs {
         unsafe { onpair::decode_into(self.codes.as_slice(), self.dict(), out) }
     }
 }
+use vortex_array::optimizer::kernels::KernelSession;
+use vortex_array::session::ArraySession;
+use vortex_array::test_harness::mark_optimized;
 use vortex_onpair::onpair_compress;
-use vortex_session::VortexSession;
 
 static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
-    let session = array_session();
+    let session = VortexSession::empty()
+        .with::<ArraySession>()
+        .with::<KernelSession>();
     vortex_onpair::initialize(&session);
     session
 });
@@ -162,10 +167,13 @@ fn compress(n: usize, shape: Shape, ctx: &mut ExecutionCtx) -> OnPairArray {
         strings.iter().map(|s| Some(s.as_bytes())),
         DType::Utf8(Nullability::NonNullable),
     );
-    onpair_compress(varbin.as_array(), DEFAULT_CONFIG, ctx)
+    let array = onpair_compress(varbin.as_array(), DEFAULT_CONFIG, ctx)
         .unwrap_or_else(|e| panic!("onpair_compress failed: {e}"))
         .try_downcast::<OnPair>()
-        .unwrap_or_else(|array| panic!("expected OnPair array, got {}", array.encoding_id()))
+        .unwrap_or_else(|array| panic!("expected OnPair array, got {}", array.encoding_id()));
+    mark_optimized(array.as_array(), &SESSION).unwrap();
+
+    array
 }
 
 /// Canonicalise a slot child to the decoder's native primitive width.
@@ -258,6 +266,10 @@ fn filter_share_dict(bencher: Bencher, case: (Shape, usize)) {
         });
 }
 
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 fn main() {
+    LazyLock::force(&SESSION);
     divan::main();
 }

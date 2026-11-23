@@ -4,16 +4,34 @@
 #![expect(clippy::unwrap_used)]
 #![expect(clippy::cast_possible_truncation)]
 
+use std::sync::LazyLock;
+
 use divan::Bencher;
+use mimalloc::MiMalloc;
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use vortex_array::IntoArray;
+use vortex_array::VortexSessionExecute;
+use vortex_array::aggregate_fn::session::AggregateFnSession;
+use vortex_array::optimizer::kernels::KernelSession;
 use vortex_array::patches::PATCH_CHUNK_SIZE;
 use vortex_array::patches::Patches;
+use vortex_array::test_harness::mark_optimized;
 use vortex_buffer::Buffer;
+use vortex_session::VortexSession;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
+static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
+    VortexSession::empty()
+        .with::<KernelSession>()
+        .with::<AggregateFnSession>()
+});
 
 fn main() {
+    LazyLock::force(&SESSION);
     divan::main();
 }
 
@@ -26,6 +44,7 @@ const PATCH_LOW: usize = 100_000;
 const PATCH_HIGH: usize = 110_000;
 
 fn patches_from_indices(index_iter: impl Iterator<Item = u64>, chunked: bool) -> Patches {
+    let mut ctx = SESSION.create_execution_ctx();
     let mut indices: Vec<u64> = index_iter.collect();
     indices.sort();
     indices.dedup();
@@ -45,6 +64,7 @@ fn patches_from_indices(index_iter: impl Iterator<Item = u64>, chunked: bool) ->
         Buffer::from(indices).into_array(),
         values.into_array(),
         chunk_offsets,
+        &mut ctx,
     )
     .unwrap();
     if chunked {
@@ -99,11 +119,16 @@ fn queries_full_range() -> Vec<usize> {
 }
 
 fn bench_search_index(bencher: Bencher, patches: Patches, queries: Vec<usize>) {
+    mark_optimized(patches.indices(), &SESSION).unwrap();
+    if let Some(chunk_offsets) = patches.chunk_offsets() {
+        mark_optimized(chunk_offsets, &SESSION).unwrap();
+    }
+
     bencher
-        .with_inputs(|| (&patches, &queries))
-        .bench_refs(|(patches, queries)| {
+        .with_inputs(|| (&patches, &queries, SESSION.create_execution_ctx()))
+        .bench_refs(|(patches, queries, ctx)| {
             for &q in queries.iter() {
-                divan::black_box(patches.search_index(q).unwrap());
+                divan::black_box(patches.search_index(q, ctx).unwrap());
             }
         });
 }

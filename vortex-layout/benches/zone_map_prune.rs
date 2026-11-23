@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 
 use divan::Bencher;
+use mimalloc::MiMalloc;
 use parking_lot::Mutex;
 use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
@@ -36,19 +37,31 @@ use vortex_array::expr::is_not_null;
 use vortex_array::expr::lit;
 use vortex_array::expr::or;
 use vortex_array::expr::root;
+use vortex_array::memory::MemorySession;
+use vortex_array::optimizer::kernels::KernelSession;
+use vortex_array::test_harness::mark_optimized;
 use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
+use vortex_expr::stats::rewrite::BoundExpressionPruneExt;
+use vortex_expr::stats::session::StatsSession;
 use vortex_layout::layouts::zoned::zone_map::ZoneMap;
-use vortex_layout::session::LayoutSession;
 use vortex_session::VortexSession;
 use vortex_utils::aliases::hash_map::HashMap;
 
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 fn main() {
+    LazyLock::force(&SESSION);
     divan::main();
 }
 
-static SESSION: LazyLock<VortexSession> =
-    LazyLock::new(|| vortex_array::array_session().with::<LayoutSession>());
+static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
+    VortexSession::empty()
+        .with::<KernelSession>()
+        .with::<MemorySession>()
+        .with::<StatsSession>()
+});
 
 /// Zone counts to sweep. The small case exposes per-call fixed cost, the large case exposes
 /// per-zone evaluation cost.
@@ -234,6 +247,7 @@ fn build(column_dtype: DType, fields: Vec<(String, ArrayRef)>, num_zones: usize)
             .collect::<Vec<_>>(),
     )
     .unwrap();
+    mark_optimized(stats.as_array(), &SESSION).unwrap();
 
     // A trailing short zone, which is the common shape and forces the run-end row-count array.
     let row_count = ZONE_LEN * (num_zones as u64 - 1) + ZONE_LEN / 2;
@@ -303,11 +317,13 @@ fn is_not_null_pred(bencher: Bencher, num_zones: usize) {
     );
 }
 
-/// A 16-term `OR` chain, which is where lowering cost grows relative to evaluation cost.
+/// A 4-term `OR` chain, which is where lowering cost grows relative to evaluation cost. Sixteen
+/// terms ran for 1.4 ms in the CodSpeed simulation at 1024 zones, over the 1 ms budget, and
+/// longer still at 8192 zones.
 #[divan::bench(args = ZONE_COUNTS)]
 fn or_chain(bencher: Bencher, num_zones: usize) {
     static PREDICATE: LazyLock<BoundExpression> = LazyLock::new(|| {
-        let expr = (0..16i32)
+        let expr = (0..4i32)
             .map(|i| eq(root(), lit(i * 500)))
             .reduce(or)
             .unwrap();

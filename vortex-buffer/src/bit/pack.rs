@@ -21,8 +21,9 @@
 //! simple enough that the per-level duplication and its `#[target_feature]` call boundary pay
 //! off.
 //!
-//! The bit-at-a-time loop lives on as [`collect_bool_word_scalar`], used for tail chunks and as
-//! the reference implementation for tests and benchmarks.
+//! The bit-at-a-time loop lives on as [`collect_bool_word_scalar`], the reference implementation
+//! for tests and benchmarks. The word loop packs its tail chunk with [`collect_bool_word_tail`],
+//! its own copy of that loop.
 
 /// Packs up to 64 boolean values into a little-endian `u64` word one bit at a time.
 ///
@@ -110,6 +111,9 @@ where
 /// conversions, or unchecked slice comparisons like the `between` kernels — where the fused
 /// AVX-512 loop is worth another ~2x over the baseline kernel.
 ///
+/// A build with AVX-512F and AVX-512BW enabled at compile time uses `collect_bool_words_inline`
+/// instead, which already packs with AVX-512.
+///
 /// `words` must hold at least `len.div_ceil(64)` entries and `f` is invoked with `0..len`,
 /// exactly once per index in ascending order.
 ///
@@ -132,7 +136,16 @@ where
         return collect_bool_words_inline(words, len, f);
     }
 
-    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    // NB: A static AVX-512 build must skip the `#[target_feature]` copies, which add nothing there.
+    // Each copy is a generic function without `#[inline]`, so rustc emits it in one codegen unit,
+    // and LLVM can inline it only into callers in that unit. So an unrelated change can put a hot
+    // caller's packing loop behind a call, as happened to the deferred Boolean RowFn loop in the
+    // bench profile (16 codegen units, 15% more instructions per row).
+    #[cfg(all(
+        target_arch = "x86_64",
+        not(all(target_feature = "avx512f", target_feature = "avx512bw")),
+        not(miri)
+    ))]
     {
         if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
             // SAFETY: runtime detection guarantees the required target features.
@@ -172,8 +185,30 @@ where
 
     if remainder != 0 {
         let offset = full * 64;
-        words[full] = collect_bool_word_scalar(remainder, |bit_idx| f(offset + bit_idx));
+        words[full] = collect_bool_word_tail(remainder, |bit_idx| f(offset + bit_idx));
     }
+}
+
+/// Tail chunk of [`collect_bool_words_with`]: a copy of [`collect_bool_word_scalar`] that always
+/// inlines. `len` **must** be at most 64.
+///
+/// The word loop must keep the borrowed callback inline. An out-of-line tail lets the callback
+/// state escape, and the full words packed by the same loop then fail to vectorize.
+/// [`collect_bool_word_scalar`] stays an ordinary `#[inline]` function so that this constraint does
+/// not reach its public callers, which include the scalar benchmark baselines.
+#[expect(clippy::inline_always)]
+#[inline(always)]
+fn collect_bool_word_tail<F>(len: usize, mut f: F) -> u64
+where
+    F: FnMut(usize) -> bool,
+{
+    debug_assert!(len <= 64, "cannot pack {len} bits into a u64 word");
+
+    let mut packed = 0;
+    for bit_idx in 0..len {
+        packed |= (f(bit_idx) as u64) << bit_idx;
+    }
+    packed
 }
 
 /// SSE2 copy of the [`collect_bool_words`](crate::bit::collect_bool_words) word loop.

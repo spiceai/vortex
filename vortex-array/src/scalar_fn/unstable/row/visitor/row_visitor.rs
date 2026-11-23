@@ -183,7 +183,7 @@ pub trait RowVisitor: private::Sealed + Sized {
     /// #[cold]
     /// #[inline(never)]
     /// fn integer_division_error() -> VortexError {
-    ///     vortex_err!(InvalidArgument: "integer division by zero or overflow")
+    ///     vortex_err!("integer division by zero or overflow")
     /// }
     ///
     /// visitor.visit_into::<(i64, i64), UninitElementSink<i64>, _>(
@@ -281,7 +281,7 @@ pub trait RowVisitor: private::Sealed + Sized {
     /// #[cold]
     /// #[inline(never)]
     /// fn integer_addition_error() -> VortexError {
-    ///     vortex_err!(InvalidArgument: "integer overflow in checked add")
+    ///     vortex_err!("integer overflow in checked add")
     /// }
     ///
     /// visitor.visit_deferred::<(i64, i64), i64, bool>(
@@ -350,7 +350,7 @@ pub trait RowVisitor: private::Sealed + Sized {
     /// #[cold]
     /// #[inline(never)]
     /// fn decimal_rescaling_overflow() -> VortexError {
-    ///     vortex_err!(InvalidArgument: "decimal rescaling overflowed")
+    ///     vortex_err!("decimal rescaling overflowed")
     /// }
     ///
     /// visitor.visit_prepared_deferred::<
@@ -393,10 +393,7 @@ pub trait RowVisitor: private::Sealed + Sized {
     ) -> VortexResult<Self::VisitResult>
     where
         Args: IndexedElementTuple,
-        Fail: FailureEvidence,
-    {
-        self.visit_prepared_deferred::<Args, bool, Prepared, Fail>(prepare, apply, finish_failure)
-    }
+        Fail: FailureEvidence;
 }
 
 pub(super) mod private {

@@ -12,14 +12,19 @@
 #![allow(clippy::unwrap_used, clippy::cast_possible_truncation)]
 
 use divan::Bencher;
+use mimalloc::MiMalloc;
 use vortex_buffer::BitBuffer;
 use vortex_mask::Mask;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 fn main() {
     divan::main();
 }
 
 const BENCH_SIZES: &[(usize, f64)] = &[(4_096, 0.1), (4_096, 0.9), (16_384, 0.1), (16_384, 0.9)];
+const SLICE_BOUNDS_SIZES: &[(usize, f64)] = &[(16_384, 0.1), (16_384, 0.9)];
 
 fn create_mask(len: usize, density: f64) -> Mask {
     Mask::from_buffer(BitBuffer::from_iter((0..len).map(|i| {
@@ -30,7 +35,7 @@ fn create_mask(len: usize, density: f64) -> Mask {
 
 /// The pco/zstd slice pattern: two indices bracketing a sub-range. The prefix
 /// up to `slice_stop` must be counted, so `slice_stop` near the end is worst case.
-#[divan::bench(args = BENCH_SIZES)]
+#[divan::bench(args = SLICE_BOUNDS_SIZES)]
 fn slice_bounds(bencher: Bencher, (len, density): (usize, f64)) {
     let mask = create_mask(len, density);
     let indices = [len / 4, len - len / 8];

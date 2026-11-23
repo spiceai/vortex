@@ -26,14 +26,13 @@ Validity::Validity(const Validity &other)
 
 Validity::Validity(ValidityType type) : type_(type), array_(nullptr) {
     if (type == ValidityType::FromArray) {
-        throw VortexException("Validity(ValidityType) called with ValidityType::FromArray",
-                              ErrorCode::InvalidArgument);
+        throw VortexException("Validity(ValidityType) called with ValidityType::FromArray");
     }
 }
 
 Validity Validity::from_array(const Array &bools) {
     if (!bools.has_dtype(DataTypeVariant::Bool)) {
-        throw VortexException("Validity array isn't a Bool array", ErrorCode::InvalidArgument);
+        throw VortexException("Validity array isn't a Bool array");
     }
     return {ValidityType::FromArray, vx_array_clone(Access::c_ptr(bools))};
 }
@@ -67,7 +66,7 @@ Validity::~Validity() {
 
 Array Validity::array() const {
     if (type_ != ValidityType::FromArray || array_ == nullptr) {
-        throw VortexException("validity has no backing array", ErrorCode::InvalidArgument);
+        throw VortexException("validity has no backing array");
     }
     return Access::adopt<Array>(vx_array_clone(array_));
 }
@@ -78,11 +77,10 @@ bool ValidityBits::is_null(size_t index) const {
     if (all_invalid_) {
         return true;
     }
-    if (bits_ == nullptr) {
+    if (owner_ == nullptr) {
         return false;
     }
-    const size_t bit = bit_offset_ + index;
-    return (bits_[bit / 8] >> (bit % 8) & 1) == 0;
+    return !view_[index];
 }
 
 ValidityBits::ValidityBits(const Session &session, const vx_array *canonical) {
@@ -106,29 +104,28 @@ ValidityBits::ValidityBits(const Session &session, const vx_array *canonical) {
     vx_array_free(raw.array);
     throw_on_error(error);
 
-    bits_ = static_cast<const uint8_t *>(vx_array_data_ptr_bool(owner_, &bit_offset_, &error));
+    vx_bool_view view = vx_array_data_ptr_bool(owner_, &error);
     if (error != nullptr) {
         vx_array_free(owner_);
     }
     throw_on_error(error);
+    view_.bit_offset = view.bit_offset;
+    view_.ptr = view.ptr;
+    view_.elements = view.elements;
 }
 
 ValidityBits::ValidityBits(ValidityBits &&other) noexcept
-    : owner_(other.owner_), bits_(other.bits_), bit_offset_(other.bit_offset_),
-      all_invalid_(other.all_invalid_) {
+    : owner_(other.owner_), view_(std::move(other.view_)), all_invalid_(other.all_invalid_) {
     other.owner_ = nullptr;
-    other.bits_ = nullptr;
 }
 
 ValidityBits &ValidityBits::operator=(ValidityBits &&other) noexcept {
     if (this != &other) {
         vx_array_free(owner_);
         owner_ = other.owner_;
-        bits_ = other.bits_;
-        bit_offset_ = other.bit_offset_;
+        view_ = std::move(other.view_);
         all_invalid_ = other.all_invalid_;
         other.owner_ = nullptr;
-        other.bits_ = nullptr;
     }
     return *this;
 }
@@ -141,7 +138,7 @@ ValidityBits::~ValidityBits() {
 static const vx_struct_fields *struct_fields_or_throw(const vx_dtype *dtype) {
     const vx_struct_fields *fields = vx_dtype_struct_dtype(dtype);
     if (fields == nullptr) {
-        throw VortexException("dtype is not a struct", ErrorCode::MismatchedTypes);
+        throw VortexException("dtype is not a struct");
     }
     return fields;
 }
@@ -175,6 +172,22 @@ Array Array::primitive_raw(vx_ptype ptype, const void *data, size_t len, const V
 
     vx_error *error = nullptr;
     const vx_array *out = vx_array_new_primitive(ptype, data, len, &raw, &error);
+    throw_on_error(error);
+    return Access::adopt<Array>(out);
+}
+
+Array Array::bool_array(const BoolView &view, const Validity &validity) {
+    std::optional<Array> keep_alive;
+    vx_validity raw {};
+    raw.type = static_cast<vx_validity_type>(validity.type());
+    if (validity.type() == ValidityType::FromArray) {
+        keep_alive = validity.array();
+        raw.array = Access::c_ptr(*keep_alive);
+    }
+
+    vx_error *error = nullptr;
+    vx_bool_view bool_view {view.ptr, view.elements, view.bit_offset};
+    const vx_array *out = vx_array_new_bool(&bool_view, &raw, &error);
     throw_on_error(error);
     return Access::adopt<Array>(out);
 }
@@ -214,9 +227,9 @@ Validity Array::validity() const {
     return Access::adopt<Validity>(static_cast<ValidityType>(raw.type), raw.array);
 }
 
-size_t Array::null_count() const {
+size_t Array::null_count(const Session &session) const {
     vx_error *error = nullptr;
-    const size_t count = vx_array_invalid_count(handle_.get(), &error);
+    const size_t count = vx_array_invalid_count(Access::c_ptr(session), handle_.get(), &error);
     throw_on_error(error);
     return count;
 }
@@ -240,7 +253,7 @@ Array Array::field(std::string_view name) const {
             return this->field(i);
         }
     }
-    throw VortexException("no field named \"" + std::string(name) + "\"", ErrorCode::InvalidArgument);
+    throw VortexException("no field named \"" + std::string(name) + "\"");
 }
 
 Array Array::slice(size_t begin, size_t end) const {
@@ -297,7 +310,7 @@ PrimitiveView<bool> Array::bools(const Session &session) const {
     Array canonical = canonicalize(session);
     const vx_array *raw = Access::c_ptr(canonical);
     if (!vx_array_has_dtype(raw, DTYPE_BOOL)) {
-        throw VortexException("bools(): array is not a Bool array", ErrorCode::MismatchedTypes);
+        throw VortexException("bools(): array is not a Bool array");
     }
     detail::ValidityBits validity(session, raw);
     const size_t len = vx_array_len(raw);
@@ -308,7 +321,7 @@ StringView Array::strings(const Session &session) const {
     Array canonical = canonicalize(session);
     const vx_array *raw = Access::c_ptr(canonical);
     if (!vx_array_has_dtype(raw, DTYPE_UTF8)) {
-        throw VortexException("strings(): array is not a Utf8 array", ErrorCode::MismatchedTypes);
+        throw VortexException("strings(): array is not a Utf8 array");
     }
     detail::ValidityBits validity(session, raw);
     const size_t len = vx_array_len(raw);
@@ -319,7 +332,7 @@ BytesView Array::bytes(const Session &session) const {
     Array canonical = canonicalize(session);
     const vx_array *raw = Access::c_ptr(canonical);
     if (!vx_array_has_dtype(raw, DTYPE_BINARY)) {
-        throw VortexException("bytes(): array is not a Binary array", ErrorCode::MismatchedTypes);
+        throw VortexException("bytes(): array is not a Binary array");
     }
     detail::ValidityBits validity(session, raw);
     const size_t len = vx_array_len(raw);
@@ -333,13 +346,11 @@ Scalar Array::scalar_at(const Session &session, size_t index) const {
     return Access::adopt<Scalar>(scalar);
 }
 
-bool PrimitiveView<bool>::value(size_t i) const {
-    if (i >= size_) {
-        throw VortexException("index " + std::to_string(i) + " out of bounds for view of size " +
-                                  std::to_string(size_),
-                              ErrorCode::OutOfBounds);
-    }
-    return vx_array_get_bool(Access::c_ptr(canonical_), i);
+BoolView PrimitiveView<bool>::values() const {
+    vx_error *error = nullptr;
+    const vx_bool_view view = vx_array_data_ptr_bool(Access::c_ptr(canonical_), &error);
+    throw_on_error(error);
+    return {view.ptr, view.elements, view.bit_offset};
 }
 
 std::string_view StringView::operator[](size_t i) const {

@@ -22,6 +22,7 @@ use vortex_buffer::Alignment;
 use vortex_error::VortexError;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
+use vortex_error::vortex_ensure_eq;
 
 use crate::CoalesceConfig;
 use crate::ReadAtRequest;
@@ -144,11 +145,10 @@ async fn read_object_store_range(
                 written = end;
             }
 
-            vortex_ensure!(
-                written == length,
-                "Object store stream returned {} bytes but expected {} bytes (range: {:?})",
+            vortex_ensure_eq!(
                 written,
                 length,
+                "Object store stream returned too few bytes (range: {:?})",
                 range
             );
 
@@ -350,7 +350,9 @@ mod tests {
         let results = reader.read_ranges(requests).collect::<Vec<_>>().await;
 
         assert_eq!(results.len(), 3);
+        let mut ranges = Vec::new();
         for (request, result) in results {
+            ranges.push((request.offset, request.length));
             let buffer = result?;
             let offset = usize::try_from(request.offset)?;
             assert_eq!(buffer.len(), request.length);
@@ -359,6 +361,8 @@ mod tests {
                 &TEST_DATA[offset..offset + request.length]
             );
         }
+        ranges.sort_unstable();
+        assert_eq!(ranges, [(0, 6), (7, 5), (18, 4)]);
         assert_eq!(executor.spawn_io_count.load(Ordering::SeqCst), 1);
         assert_eq!(executor.spawn_count.load(Ordering::SeqCst), 0);
 

@@ -3,6 +3,7 @@
 
 use vortex_buffer::BitBuffer;
 use vortex_buffer::BitBufferMut;
+use vortex_buffer::BufferMut;
 use vortex_buffer::CpuKernel;
 use vortex_buffer::get_bit;
 use vortex_error::VortexExpect;
@@ -144,7 +145,7 @@ fn filter_inner(
     let mask_chunks = mask_buf.chunks();
 
     let out_u64s = true_count.div_ceil(64);
-    let mut output: Vec<u64> = Vec::with_capacity(out_u64s + 1);
+    let mut output: BufferMut<u64> = BufferMut::with_capacity(out_u64s + 1);
     let out_ptr = output.as_mut_ptr();
     let mut out_idx: usize = 0;
 
@@ -211,15 +212,10 @@ fn filter_inner(
     // SAFETY: we wrote exactly out_idx words, which is <= out_u64s + 1 = capacity.
     unsafe { output.set_len(out_idx) };
 
+    let mut bytes = output.into_byte_buffer();
     let byte_len = true_count.div_ceil(8);
-    let bytes: Vec<u8> = unsafe {
-        let mut v = std::mem::ManuallyDrop::new(output);
-        let ptr = v.as_mut_ptr() as *mut u8;
-        let cap = v.capacity() * 8;
-        Vec::from_raw_parts(ptr, byte_len, cap)
-    };
-
-    BitBuffer::new(bytes.into(), true_count)
+    bytes.truncate(byte_len); // removes up to 7 extra bytes
+    BitBuffer::new(bytes.freeze(), true_count)
 }
 
 /// Byte-level LUT PEXT fallback.
@@ -306,21 +302,25 @@ fn pext_byte_lut(src: u64, mask: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use itertools::Itertools;
     use rstest::rstest;
     use vortex_mask::Mask;
+    use vortex_session::VortexSession;
 
     use super::*;
     use crate::IntoArray;
     use crate::VortexSessionExecute;
-    use crate::array_session;
     use crate::arrays::BoolArray;
     use crate::assert_arrays_eq;
     use crate::compute::conformance::filter::test_filter_conformance;
 
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
+
     #[test]
     fn filter_bool_test() {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let arr = BoolArray::from_iter([true, true, false]);
         let mask = Mask::from_iter([true, false, true]);
 
@@ -330,9 +330,9 @@ mod tests {
 
     #[test]
     fn filter_bool_sparse_index_mask() {
-        let mut ctx = array_session().create_execution_ctx();
-        let arr = BoolArray::from_iter([true, true, false]);
-        let mask = Mask::from_indices(3, [0, 2]);
+        let mut ctx = SESSION.create_execution_ctx();
+        let arr = BoolArray::from_iter((0..100).map(|i| i % 2 == 0));
+        let mask = Mask::from_indices(100, [0, 99]);
 
         let filtered = arr.filter(mask).unwrap();
         assert_arrays_eq!(filtered, BoolArray::from_iter([true, false]), &mut ctx);
@@ -340,9 +340,9 @@ mod tests {
 
     #[test]
     fn filter_bool_sparse_slice_mask() {
-        let mut ctx = array_session().create_execution_ctx();
-        let arr = BoolArray::from_iter([true, true, false]);
-        let mask = Mask::from_slices(3, vec![(0, 1), (2, 3)]);
+        let mut ctx = SESSION.create_execution_ctx();
+        let arr = BoolArray::from_iter((0..100).map(|i| i % 2 == 0));
+        let mask = Mask::from_slices(100, vec![(0, 1), (99, 100)]);
 
         let filtered = arr.filter(mask).unwrap();
         assert_arrays_eq!(filtered, BoolArray::from_iter([true, false]), &mut ctx);
@@ -350,9 +350,9 @@ mod tests {
 
     #[test]
     fn filter_bool_sparse_buffer_mask() {
-        let mut ctx = array_session().create_execution_ctx();
-        let arr = BoolArray::from_iter([true, true, false]);
-        let mask = Mask::from_buffer(BitBuffer::from_iter([true, false, true]));
+        let mut ctx = SESSION.create_execution_ctx();
+        let arr = BoolArray::from_iter((0..100).map(|i| i % 2 == 0));
+        let mask = Mask::from_buffer(BitBuffer::from_iter((0..100).map(|i| i == 0 || i == 99)));
 
         let filtered = arr.filter(mask).unwrap();
         assert_arrays_eq!(filtered, BoolArray::from_iter([true, false]), &mut ctx);
@@ -375,10 +375,7 @@ mod tests {
     #[case(BoolArray::from_iter((0..100).map(|i| i % 2 == 0)))]
     #[case(BoolArray::from_iter((0..1024).map(|i| i % 3 != 0)))]
     fn test_filter_bool_conformance(#[case] array: BoolArray) {
-        test_filter_conformance(
-            &array.into_array(),
-            &mut array_session().create_execution_ctx(),
-        );
+        test_filter_conformance(&array.into_array(), &mut SESSION.create_execution_ctx());
     }
 
     #[cfg(target_arch = "x86_64")]

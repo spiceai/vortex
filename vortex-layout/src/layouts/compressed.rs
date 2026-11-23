@@ -11,6 +11,8 @@ use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
+use vortex_array::aggregate_fn::fns::uncompressed_size_in_bytes::UncompressedSizeInBytes;
+use vortex_array::aggregate_fn::fns::uncompressed_size_in_bytes::uncompressed_size_in_bytes;
 use vortex_array::arrays::ChunkedArray;
 use vortex_array::dtype::DType;
 use vortex_array::expr::stats::Stat;
@@ -195,9 +197,13 @@ impl LayoutStrategy for CompressingStrategy {
                     let group = group?;
                     let mut ctx = session.create_execution_ctx();
                     let (sequence_ids, chunks): (Vec<_>, Vec<_>) = group.into_iter().unzip();
-                    // Compute the stats for each chunk prior to compression
+                    // Compute the stats for each chunk prior to compression. The exact
+                    // uncompressed size is measured once here and cached for the compressor.
                     for chunk in &chunks {
                         chunk.statistics().compute_all(&stats, &mut ctx)?;
+                        if UncompressedSizeInBytes::supports_dtype(chunk.dtype()) {
+                            uncompressed_size_in_bytes(chunk, &mut ctx)?;
+                        }
                     }
                     let compressed = compressor.compress_chunks(&chunks, &mut ctx)?;
                     vortex_ensure!(
@@ -445,7 +451,10 @@ mod tests {
         let mut ctx = crate::test::SESSION.create_execution_ctx();
         let mut chunks = vec![hex_rows(1024, 7)];
         chunks.extend((1..8).map(|i| documents(1024, i)));
-        let compressor = BtrBlocksCompressor::default();
+        let compressor =
+            vortex_btrblocks::BtrBlocksCompressorBuilder::from_session(&crate::test::SESSION)
+                .unrestricted()
+                .build();
 
         let unsplit =
             ChunkedArray::try_new(chunks.clone(), chunks[0].dtype().clone())?.into_array();

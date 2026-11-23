@@ -49,8 +49,8 @@ pub(crate) fn take_canonical(
     Ok(match values {
         CanonicalView::Null(a) => Canonical::Null(take_null(a, codes)),
         CanonicalView::Bool(a) => Canonical::Bool(take_bool(a, codes, ctx)?),
-        CanonicalView::Primitive(a) => Canonical::Primitive(take_primitive(a, codes, ctx)),
-        CanonicalView::Decimal(a) => Canonical::Decimal(take_decimal(a, codes, ctx)),
+        CanonicalView::Primitive(a) => Canonical::Primitive(take_primitive(a, codes, ctx)?),
+        CanonicalView::Decimal(a) => Canonical::Decimal(take_decimal(a, codes, ctx)?),
         CanonicalView::VarBinView(a) => Canonical::VarBinView(take_varbinview(a, codes, ctx)),
         CanonicalView::List(a) => Canonical::List(take_listview(a, codes, ctx)),
         CanonicalView::Map(a) => Canonical::Map(take_map(a, codes, ctx)),
@@ -83,36 +83,31 @@ fn take_bool(
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<BoolArray> {
     let codes_ref = codes.array();
-    Ok(<Bool as TakeExecute>::take(array, codes_ref, ctx)?
+    <Bool as TakeExecute>::take(array, codes_ref, ctx)?
         .vortex_expect("take bool should not return None")
-        .as_::<Bool>()
-        .into_owned())
+        .execute::<BoolArray>(ctx)
 }
 
 fn take_primitive(
     array: ArrayView<'_, Primitive>,
     codes: ArrayView<'_, Primitive>,
     ctx: &mut ExecutionCtx,
-) -> PrimitiveArray {
+) -> VortexResult<PrimitiveArray> {
     let codes_ref = codes.array();
-    <Primitive as TakeExecute>::take(array, codes_ref, ctx)
-        .vortex_expect("take primitive array")
+    <Primitive as TakeExecute>::take(array, codes_ref, ctx)?
         .vortex_expect("take primitive should not return None")
-        .as_::<Primitive>()
-        .into_owned()
+        .execute::<PrimitiveArray>(ctx)
 }
 
 fn take_decimal(
     array: ArrayView<'_, Decimal>,
     codes: ArrayView<'_, Primitive>,
     ctx: &mut ExecutionCtx,
-) -> DecimalArray {
+) -> VortexResult<DecimalArray> {
     let codes_ref = codes.array();
-    <Decimal as TakeExecute>::take(array, codes_ref, ctx)
-        .vortex_expect("take decimal array")
+    <Decimal as TakeExecute>::take(array, codes_ref, ctx)?
         .vortex_expect("take decimal should not return None")
-        .as_::<Decimal>()
-        .into_owned()
+        .execute::<DecimalArray>(ctx)
 }
 
 fn take_varbinview(
@@ -162,8 +157,8 @@ fn take_fixed_size_list(
     <FixedSizeList as TakeExecute>::take(array, codes_ref, ctx)
         .vortex_expect("take fixed size list array")
         .vortex_expect("take fixed size list should not return None")
-        .as_::<FixedSizeList>()
-        .into_owned()
+        .execute::<FixedSizeListArray>(ctx)
+        .vortex_expect("canonicalize taken fixed size list")
 }
 
 fn take_struct(array: ArrayView<'_, Struct>, codes: ArrayView<'_, Primitive>) -> StructArray {

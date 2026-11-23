@@ -38,6 +38,7 @@ use crate::Columnar;
 use crate::ExecutionCtx;
 use crate::IntoArray;
 use crate::aggregate_fn::Accumulator;
+use crate::aggregate_fn::AggregateArgs;
 use crate::aggregate_fn::AggregateFnId;
 use crate::aggregate_fn::AggregateFnVTable;
 use crate::aggregate_fn::DynAccumulator;
@@ -49,18 +50,17 @@ use crate::arrays::ListView;
 use crate::arrays::map::MapArraySlotsExt;
 use crate::arrays::varbinview::BinaryView;
 use crate::dtype::DType;
-use crate::dtype::DecimalType;
 use crate::dtype::Nullability::NonNullable;
 use crate::dtype::PType;
 use crate::expr::stats::Precision;
 use crate::expr::stats::Stat;
 use crate::expr::stats::StatsProvider;
 use crate::scalar::Scalar;
-use crate::scalar::ScalarValue;
 
 /// Return the uncompressed size of an array in bytes.
 ///
-/// See [`UncompressedSizeInBytes`] for details.
+/// See [`UncompressedSizeInBytes`] for details. The result is cached as a statistic on `array` and
+/// on any children measured.
 pub fn uncompressed_size_in_bytes(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<usize> {
     let size = uncompressed_size_in_bytes_u64(array, ctx)?;
 
@@ -69,37 +69,43 @@ pub fn uncompressed_size_in_bytes(array: &ArrayRef, ctx: &mut ExecutionCtx) -> V
 }
 
 fn uncompressed_size_in_bytes_u64(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<u64> {
-    if let Precision::Exact(size_scalar) = array.statistics().get(Stat::UncompressedSizeInBytes) {
-        return u64::try_from(&size_scalar)
-            .map_err(|e| vortex_err!("Failed to convert uncompressed size stat to u64: {e}"));
+    if let Precision::Exact(size) = array.statistics().get(Stat::UncompressedSizeInBytes) {
+        return u64::try_from(&size)
+            .map_err(|e| e.with_context("Failed to convert uncompressed size stat to u64"));
     }
 
+    // The accumulator caches the size on `array` through the stat slot.
     let mut acc =
         Accumulator::try_new(UncompressedSizeInBytes, EmptyOptions, array.dtype().clone())?;
     acc.accumulate(array, ctx)?;
     let result = acc.finish()?;
 
-    let size = result
+    Ok(result
         .as_primitive()
         .typed_value::<u64>()
-        .vortex_expect("uncompressed_size_in_bytes result should not be null");
-
-    array.statistics().set(
-        Stat::UncompressedSizeInBytes,
-        Precision::Exact(ScalarValue::from(size)),
-    );
-
-    Ok(size)
+        .vortex_expect("uncompressed_size_in_bytes result should not be null"))
 }
 
-/// The byte size of all buffers in children in their canonical representation.
+/// The number of bytes the array's rows use in their canonical representation.
 ///
 /// Applies to all types and returns a non-null `u64`. Encoding kernels can return this aggregate
 /// directly from metadata to avoid decoding arrays whose uncompressed size is known.
 ///
+/// Only the bytes rows reference are counted, as if the array were rebuilt from its rows: a view or
+/// list array sliced from, or sharing, a larger buffer is charged for the part it uses, and values
+/// referenced by several rows are counted once per row. This costs a pass over view and list
+/// arrays.
+///
 /// This is generally useful for various execution engines to pick better join orderings.
 #[derive(Clone, Debug)]
 pub struct UncompressedSizeInBytes;
+
+impl UncompressedSizeInBytes {
+    /// Whether arrays of `dtype` can be measured. Variant arrays cannot.
+    pub fn supports_dtype(dtype: &DType) -> bool {
+        supports_uncompressed_size_in_bytes(dtype)
+    }
+}
 
 impl AggregateFnVTable for UncompressedSizeInBytes {
     type Options = EmptyOptions;
@@ -133,38 +139,53 @@ impl AggregateFnVTable for UncompressedSizeInBytes {
 
     fn empty_partial(
         &self,
-        _options: &Self::Options,
-        _input_dtype: &DType,
+        _args: AggregateArgs<'_, Self::Options>,
     ) -> VortexResult<Self::Partial> {
         Ok(0)
     }
 
-    fn combine_partials(&self, partial: &mut Self::Partial, other: Scalar) -> VortexResult<()> {
-        let size = other
+    fn partial_from_scalar(
+        &self,
+        _args: AggregateArgs<'_, Self::Options>,
+        scalar: &Scalar,
+    ) -> VortexResult<Self::Partial> {
+        Ok(scalar
             .as_primitive()
             .typed_value::<u64>()
-            .vortex_expect("uncompressed_size_in_bytes partial should not be null");
-        *partial = partial
-            .checked_add(size)
-            .ok_or_else(|| vortex_err!("uncompressed size in bytes overflowed u64"))?;
-        Ok(())
+            .vortex_expect("uncompressed_size_in_bytes partial should not be null"))
     }
 
-    fn to_scalar(&self, partial: &Self::Partial) -> VortexResult<Scalar> {
+    fn merge_partials(
+        &self,
+        _args: AggregateArgs<'_, Self::Options>,
+        first: Self::Partial,
+        second: Self::Partial,
+    ) -> VortexResult<Self::Partial> {
+        first
+            .checked_add(second)
+            .ok_or_else(|| vortex_err!("uncompressed size in bytes overflowed u64"))
+    }
+
+    fn to_scalar(
+        &self,
+        _args: AggregateArgs<'_, Self::Options>,
+        partial: &Self::Partial,
+    ) -> VortexResult<Scalar> {
         Ok(Scalar::primitive(*partial, NonNullable))
     }
 
-    fn reset(&self, partial: &mut Self::Partial) {
-        *partial = 0;
-    }
-
     #[inline]
-    fn is_saturated(&self, _partial: &Self::Partial) -> bool {
+    fn is_saturated(
+        &self,
+        _args: AggregateArgs<'_, Self::Options>,
+        _partial: &Self::Partial,
+    ) -> bool {
         false
     }
 
     fn accumulate(
         &self,
+        _args: AggregateArgs<'_, Self::Options>,
         partial: &mut Self::Partial,
         batch: &Columnar,
         ctx: &mut ExecutionCtx,
@@ -181,15 +202,24 @@ impl AggregateFnVTable for UncompressedSizeInBytes {
         Ok(())
     }
 
-    fn finalize(&self, partials: ArrayRef) -> VortexResult<ArrayRef> {
+    fn finalize(
+        &self,
+        _args: AggregateArgs<'_, Self::Options>,
+        partials: ArrayRef,
+    ) -> VortexResult<ArrayRef> {
         Ok(partials)
     }
 
-    fn finalize_scalar(&self, partial: &Self::Partial) -> VortexResult<Scalar> {
-        self.to_scalar(partial)
+    fn finalize_scalar(
+        &self,
+        args: AggregateArgs<'_, Self::Options>,
+        partial: &Self::Partial,
+    ) -> VortexResult<Scalar> {
+        self.to_scalar(args, partial)
     }
 }
 
+/// Measure a canonical array.
 pub(crate) fn canonical_uncompressed_size_in_bytes(
     canonical: &Canonical,
     ctx: &mut ExecutionCtx,
@@ -227,7 +257,7 @@ pub(crate) fn constant_uncompressed_size_in_bytes(
         }
         DType::Decimal(decimal_type, _) => checked_len_mul(
             array.len(),
-            DecimalType::smallest_decimal_value_type(decimal_type).byte_width(),
+            decimal_type.canonical_values_type().byte_width(),
             "decimal",
         )?,
         DType::Utf8(_) => constant_varbinview_value_size(
@@ -259,9 +289,12 @@ pub(crate) fn constant_uncompressed_size_in_bytes(
 
 fn constant_varbinview_value_size(len: usize, scalar_len: Option<usize>) -> VortexResult<u64> {
     let views_size = checked_len_mul(len, size_of::<BinaryView>(), "binary view")?;
+    // Only a value too long to inline adds a data buffer, matching `constant_canonicalize`. Every
+    // row references it, so it is counted once per row, like a canonical array's views.
     let data_size = match scalar_len {
-        Some(scalar_len) if scalar_len >= BinaryView::MAX_INLINED_SIZE => u64::try_from(scalar_len)
-            .map_err(|e| vortex_err!("Failed to convert data buffer length to u64: {e}"))?,
+        Some(scalar_len) if scalar_len > BinaryView::MAX_INLINED_SIZE => {
+            checked_len_mul(len, scalar_len, "binary data")?
+        }
         _ => 0,
     };
 
@@ -331,22 +364,29 @@ pub(crate) fn packed_bit_buffer_size_in_bytes(len: usize) -> VortexResult<u64> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::LazyLock;
+
+    use vortex_buffer::Buffer;
+    use vortex_buffer::ByteBuffer;
     use vortex_buffer::buffer;
     use vortex_error::VortexExpect;
     use vortex_error::VortexResult;
     use vortex_error::vortex_err;
+    use vortex_session::VortexSession;
 
     use crate::ArrayRef;
     use crate::IntoArray;
     use crate::RecursiveCanonical;
     use crate::VortexSessionExecute;
     use crate::aggregate_fn::Accumulator;
+    use crate::aggregate_fn::AggregateDTypes;
     use crate::aggregate_fn::AggregateFnVTable;
+    use crate::aggregate_fn::AggregateFnVTableExt;
     use crate::aggregate_fn::DynAccumulator;
     use crate::aggregate_fn::EmptyOptions;
     use crate::aggregate_fn::fns::uncompressed_size_in_bytes::UncompressedSizeInBytes;
     use crate::aggregate_fn::fns::uncompressed_size_in_bytes::uncompressed_size_in_bytes;
-    use crate::array_session;
     use crate::arrays::BoolArray;
     use crate::arrays::ChunkedArray;
     use crate::arrays::ConstantArray;
@@ -361,6 +401,7 @@ mod tests {
     use crate::arrays::VarBinViewArray;
     use crate::arrays::VariantArray;
     use crate::arrays::listview::ListViewRebuildMode;
+    use crate::arrays::varbinview::BinaryView;
     use crate::builders::builder_with_capacity_in;
     use crate::dtype::DType;
     use crate::dtype::DecimalDType;
@@ -377,15 +418,17 @@ mod tests {
     use crate::scalar::ScalarValue;
     use crate::validity::Validity;
 
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
+
     /// The size the array occupies once rebuilt through the canonical builders, which is the
     /// layout [`UncompressedSizeInBytes`] is defined against: the builders normalize physical
-    /// widths that the input array is free to choose differently, picking the smallest decimal
-    /// value type for a precision and `u64` list-view offsets and sizes.
+    /// widths that the input array is free to choose differently, picking the canonical decimal
+    /// width of a precision and `u64` list-view offsets and sizes.
     ///
     /// Builders no longer canonicalize their children, so the finished array is only canonical at
     /// the top level - recursively canonicalize it before measuring.
     fn materialized_uncompressed_size_in_bytes(array: &ArrayRef) -> u64 {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let mut builder = builder_with_capacity_in(
             array.dtype(),
             array.len(),
@@ -404,7 +447,7 @@ mod tests {
     }
 
     fn aggregate(array: &ArrayRef) -> VortexResult<u64> {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let mut acc =
             Accumulator::try_new(UncompressedSizeInBytes, EmptyOptions, array.dtype().clone())?;
         acc.accumulate(array, &mut ctx)?;
@@ -412,6 +455,26 @@ mod tests {
             .as_primitive()
             .typed_value::<u64>()
             .ok_or_else(|| vortex_err!("uncompressed size result should not be null"))
+    }
+
+    /// A view array whose rows point into one shared data buffer, like Arrow's Parquet reader
+    /// builds, sliced to `rows`.
+    fn views_into_shared_page(rows: std::ops::Range<usize>) -> VortexResult<ArrayRef> {
+        const VALUE_LEN: u32 = 27;
+        let page = ByteBuffer::from(vec![b'x'; 1000 * VALUE_LEN as usize]);
+        let views = (0..1000u32)
+            .map(|row| BinaryView::make_view(&[b'x'; VALUE_LEN as usize], 0, row * VALUE_LEN))
+            .collect::<Buffer<BinaryView>>();
+        // SAFETY: every view points at `VALUE_LEN` bytes inside the page.
+        let page = unsafe {
+            VarBinViewArray::new_unchecked(
+                views,
+                Arc::from([page]),
+                DType::Utf8(Nullability::NonNullable),
+                Validity::NonNullable,
+            )
+        };
+        page.into_array().slice(rows)
     }
 
     #[test]
@@ -422,6 +485,7 @@ mod tests {
             aggregate(&array)?,
             materialized_uncompressed_size_in_bytes(&array)
         );
+        assert_eq!(aggregate(&array)?, 16);
         Ok(())
     }
 
@@ -433,6 +497,7 @@ mod tests {
             aggregate(&array)?,
             materialized_uncompressed_size_in_bytes(&array)
         );
+        assert_eq!(aggregate(&array)?, 13);
         Ok(())
     }
 
@@ -444,6 +509,7 @@ mod tests {
             aggregate(&array)?,
             materialized_uncompressed_size_in_bytes(&array)
         );
+        assert_eq!(aggregate(&array)?, 14);
         Ok(())
     }
 
@@ -455,6 +521,7 @@ mod tests {
             aggregate(&array)?,
             materialized_uncompressed_size_in_bytes(&array)
         );
+        assert_eq!(aggregate(&array)?, 1);
         Ok(())
     }
 
@@ -466,6 +533,7 @@ mod tests {
             aggregate(&array)?,
             materialized_uncompressed_size_in_bytes(&array)
         );
+        assert_eq!(aggregate(&array)?, 2);
         Ok(())
     }
 
@@ -477,6 +545,7 @@ mod tests {
             aggregate(&array)?,
             materialized_uncompressed_size_in_bytes(&array)
         );
+        assert_eq!(aggregate(&array)?, 3);
         Ok(())
     }
 
@@ -488,6 +557,7 @@ mod tests {
             aggregate(&array)?,
             materialized_uncompressed_size_in_bytes(&array)
         );
+        assert_eq!(aggregate(&array)?, 0);
         Ok(())
     }
 
@@ -504,6 +574,7 @@ mod tests {
             aggregate(&array)?,
             materialized_uncompressed_size_in_bytes(&array)
         );
+        assert_eq!(aggregate(&array)?, 12);
         Ok(())
     }
 
@@ -520,33 +591,125 @@ mod tests {
             aggregate(&array)?,
             materialized_uncompressed_size_in_bytes(&array)
         );
+        assert_eq!(aggregate(&array)?, 88);
         Ok(())
     }
 
     #[test]
     fn list_matches_materialized_size() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
         let elements =
             PrimitiveArray::new(buffer![1i32, 2, 3, 4], Validity::NonNullable).into_array();
         let offsets = buffer![2u32, 0].into_array();
         let sizes = buffer![2u32, 1].into_array();
-        let array =
-            ListViewArray::new(elements, offsets, sizes, Validity::NonNullable).into_array();
+        let array = ListViewArray::new(elements, offsets, sizes, Validity::NonNullable, &mut ctx)
+            .into_array();
 
-        // These lists are out of order and leave element 1 unreferenced, which the builder
-        // round-trip inside `materialized_uncompressed_size_in_bytes` now keeps. Compare against
-        // the exact layout instead, which is what "materialized" means here.
-        let mut ctx = array_session().create_execution_ctx();
+        // The lists are out of order and leave element 1 unreferenced, so compare against the
+        // exact layout rather than a builder round-trip.
+        let mut ctx = SESSION.create_execution_ctx();
         let exact = array
             .clone()
             .execute::<ListViewArray>(&mut ctx)?
             .rebuild(ListViewRebuildMode::MakeExact, &mut ctx)?
             .into_array();
 
+        assert_eq!(materialized_uncompressed_size_in_bytes(&exact), 44);
         assert_eq!(
             aggregate(&array)?,
             materialized_uncompressed_size_in_bytes(&exact)
         );
         Ok(())
+    }
+
+    #[test]
+    fn varbinview_counts_referenced_bytes_only() -> VortexResult<()> {
+        let sliced = views_into_shared_page(100..200)?;
+
+        // 100 views of 16 bytes plus 100 values of 27 bytes, not the whole 27,000-byte page.
+        assert_eq!(aggregate(&sliced)?, 100 * (16 + 27));
+        Ok(())
+    }
+
+    #[test]
+    fn varbinview_skips_null_rows_and_inlined_views() -> VortexResult<()> {
+        let array = VarBinViewArray::from_iter_nullable_str([
+            Some("inlined"),
+            None,
+            Some("this string is longer than twelve bytes"),
+        ])
+        .into_array();
+        let nulled = VarBinViewArray::from_iter_nullable_str([Some("inlined"), None, None::<&str>])
+            .into_array();
+
+        // Three views, one validity byte, and only the one out-of-line value.
+        assert_eq!(aggregate(&array)?, 3 * 16 + 1 + 39);
+        // Nulling the long value drops its bytes from the size.
+        assert_eq!(aggregate(&nulled)?, 3 * 16 + 1);
+        Ok(())
+    }
+
+    #[test]
+    fn nested_measures_referenced_bytes_of_children() -> VortexResult<()> {
+        let strings = views_into_shared_page(0..10)?;
+        let array = StructArray::try_new(
+            FieldNames::from(["strings"]),
+            vec![strings.clone()],
+            10,
+            Validity::NonNullable,
+        )?
+        .into_array();
+
+        let size = aggregate(&array)?;
+        assert_eq!(size, aggregate(&strings)?);
+        assert_eq!(size, 430);
+        Ok(())
+    }
+
+    #[test]
+    fn result_is_cached_as_exact_stat() -> VortexResult<()> {
+        let sliced = views_into_shared_page(0..10)?;
+        let mut ctx = SESSION.create_execution_ctx();
+
+        let size = uncompressed_size_in_bytes(&sliced, &mut ctx)?;
+
+        assert_eq!(
+            sliced.statistics().get(Stat::UncompressedSizeInBytes),
+            Precision::exact(u64::try_from(size)?)
+        );
+        assert_eq!(size, 430);
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_value_is_counted_per_row() -> VortexResult<()> {
+        // Every row references the same out-of-line value, which the data buffer holds once.
+        const VALUE_LEN: u32 = 20;
+        let page = ByteBuffer::from(vec![b'x'; VALUE_LEN as usize]);
+        let views = (0..10)
+            .map(|_| BinaryView::make_view(&[b'x'; VALUE_LEN as usize], 0, 0))
+            .collect::<Buffer<BinaryView>>();
+        // SAFETY: every view points at the `VALUE_LEN` bytes of the page.
+        let one_value = unsafe {
+            VarBinViewArray::new_unchecked(
+                views,
+                Arc::from([page]),
+                DType::Utf8(Nullability::NonNullable),
+                Validity::NonNullable,
+            )
+        }
+        .into_array();
+
+        assert_eq!(aggregate(&one_value)?, 10 * (16 + 20));
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_has_stat_slot() {
+        assert_eq!(
+            Stat::from_aggregate_fn(&UncompressedSizeInBytes.bind(EmptyOptions)),
+            Some(Stat::UncompressedSizeInBytes)
+        );
     }
 
     #[test]
@@ -559,6 +722,7 @@ mod tests {
             aggregate(&array)?,
             materialized_uncompressed_size_in_bytes(&array)
         );
+        assert_eq!(aggregate(&array)?, 17);
         Ok(())
     }
 
@@ -579,6 +743,7 @@ mod tests {
             aggregate(&array)?,
             materialized_uncompressed_size_in_bytes(&array)
         );
+        assert_eq!(aggregate(&array)?, 62);
         Ok(())
     }
 
@@ -599,6 +764,7 @@ mod tests {
         let array = UnionArray::try_new(type_ids, variants, vec![numbers, flags])?.into_array();
 
         assert_eq!(aggregate(&array)?, expected);
+        assert_eq!(expected, 16);
         Ok(())
     }
 
@@ -612,6 +778,7 @@ mod tests {
             aggregate(&array)?,
             materialized_uncompressed_size_in_bytes(&array)
         );
+        assert_eq!(aggregate(&array)?, 13);
         Ok(())
     }
 
@@ -619,7 +786,7 @@ mod tests {
     fn variant_stat_is_unsupported() -> VortexResult<()> {
         let child = ConstantArray::new(Scalar::variant(Scalar::from(42i32)), 3).into_array();
         let array = VariantArray::try_new(child, None)?.into_array();
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
 
         assert_eq!(
             array
@@ -638,6 +805,7 @@ mod tests {
             aggregate(&array)?,
             materialized_uncompressed_size_in_bytes(&array)
         );
+        assert_eq!(aggregate(&array)?, 40);
         Ok(())
     }
 
@@ -654,25 +822,26 @@ mod tests {
         .into_array();
 
         assert_eq!(aggregate(&chunked)?, expected);
+        assert_eq!(expected, 20);
         Ok(())
     }
 
     #[test]
-    fn uses_cached_exact_stat() -> VortexResult<()> {
+    fn size_with_cached_exact_stat() -> VortexResult<()> {
         let array = ConstantArray::new(42i32, 10).into_array();
         array.statistics().set(
             Stat::UncompressedSizeInBytes,
-            Precision::Exact(ScalarValue::from(123u64)),
+            Precision::Exact(ScalarValue::from(40u64)),
         );
 
-        assert_eq!(aggregate(&array)?, 123);
+        assert_eq!(aggregate(&array)?, 40);
         Ok(())
     }
 
     #[test]
     fn helper_caches_result() -> VortexResult<()> {
         let array = PrimitiveArray::new(buffer![1i32, 2, 3], Validity::NonNullable).into_array();
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
 
         let size = uncompressed_size_in_bytes(&array, &mut ctx)?;
 
@@ -680,25 +849,19 @@ mod tests {
             array.statistics().get(Stat::UncompressedSizeInBytes),
             Precision::exact(u64::try_from(size)?)
         );
+        assert_eq!(size, 12);
         Ok(())
     }
 
     #[test]
     fn state_merge() -> VortexResult<()> {
         let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-        let mut state = UncompressedSizeInBytes.empty_partial(&EmptyOptions, &dtype)?;
+        let opts = EmptyOptions;
+        let dtypes = AggregateDTypes::try_new(&UncompressedSizeInBytes, &opts, dtype)?;
 
-        UncompressedSizeInBytes.combine_partials(
-            &mut state,
-            Scalar::primitive(5u64, Nullability::NonNullable),
-        )?;
-        UncompressedSizeInBytes.combine_partials(
-            &mut state,
-            Scalar::primitive(3u64, Nullability::NonNullable),
-        )?;
+        let state = UncompressedSizeInBytes.merge_partials(dtypes.args(&opts), 5, 3)?;
 
-        let result = UncompressedSizeInBytes.to_scalar(&state)?;
-        UncompressedSizeInBytes.reset(&mut state);
+        let result = UncompressedSizeInBytes.to_scalar(dtypes.args(&opts), &state)?;
         assert_eq!(result.as_primitive().typed_value::<u64>(), Some(8));
         Ok(())
     }

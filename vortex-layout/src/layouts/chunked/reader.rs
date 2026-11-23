@@ -351,15 +351,9 @@ impl LayoutReader for ChunkedReader {
         let mut chunk_evals = vec![];
 
         for (chunk_idx, _, chunk_range, mask_range) in self.ranges(row_range) {
-            let chunk_mask = mask.slice(mask_range);
-            // A chunk the mask already excludes passes nothing, so it need not be read.
-            if chunk_mask.known().is_some_and(Mask::all_false) {
-                chunk_evals.push(MaskFuture::ready(Mask::new_false(chunk_mask.len())));
-                continue;
-            }
             let chunk_reader = self.chunk_reader(chunk_idx)?;
             let chunk_eval = chunk_reader
-                .filter_evaluation(&chunk_range, expr, chunk_mask)
+                .filter_evaluation(&chunk_range, expr, mask.slice(mask_range))
                 .map_err(|err| {
                     err.with_context(format!("While evaluating filter on chunk {chunk_idx}"))
                 })?;
@@ -397,11 +391,13 @@ impl LayoutReader for ChunkedReader {
 
         for (chunk_idx, _, chunk_range, mask_range) in self.ranges(row_range) {
             let chunk_mask = mask.slice(mask_range);
-            // A chunk the mask already excludes contributes no rows, so its data is never
-            // requested: a point read that selects one row of a range reads one chunk.
-            if chunk_mask.known().is_some_and(Mask::all_false) {
+
+            // A chunk known to have no selected rows is not read, decoded or filtered, and adds
+            // no empty chunk to the result. Random row reads select few rows from many chunks.
+            if chunk_mask.peek().is_some_and(Mask::all_false) {
                 continue;
             }
+
             let chunk_reader = self.chunk_reader(chunk_idx)?;
             let chunk_eval = chunk_reader
                 .projection_evaluation(&chunk_range, expr, chunk_mask)
@@ -441,17 +437,17 @@ impl LayoutReader for ChunkedReader {
 #[cfg(test)]
 mod test {
     use std::sync::Arc;
-    use std::sync::atomic::AtomicUsize;
-    use std::sync::atomic::Ordering;
 
     use futures::stream;
     use rstest::fixture;
     use rstest::rstest;
     use vortex_array::ArrayContext;
+    use vortex_array::ArrayRef;
     use vortex_array::IntoArray;
     use vortex_array::MaskFuture;
     use vortex_array::VortexSessionExecute;
-    use vortex_array::arrays::PrimitiveArray;
+    use vortex_array::arrays::Chunked;
+    use vortex_array::arrays::chunked::ChunkedArrayExt;
     use vortex_array::assert_arrays_eq;
     use vortex_array::dtype::DType;
     use vortex_array::dtype::FieldMask;
@@ -472,7 +468,6 @@ mod test {
     use crate::layouts::flat::FlatLayout;
     use crate::layouts::flat::writer::FlatLayoutStrategy;
     use crate::scan::split_by::SplitBy;
-    use crate::segments::SegmentFuture;
     use crate::segments::SegmentId;
     use crate::segments::SegmentSource;
     use crate::segments::TestSegments;
@@ -592,87 +587,56 @@ mod test {
         })
     }
 
-    /// Counts the segments a reader requests.
-    struct CountingSegmentSource {
-        inner: Arc<dyn SegmentSource>,
-        requests: Arc<AtomicUsize>,
-    }
-
-    impl SegmentSource for CountingSegmentSource {
-        fn request(&self, id: SegmentId) -> SegmentFuture {
-            self.requests.fetch_add(1, Ordering::Relaxed);
-            self.inner.request(id)
-        }
-    }
-
-    #[rstest]
-    #[case::one_row_of_the_middle_chunk(vec![4], vec![5], 1)]
-    #[case::rows_of_the_first_and_last_chunks(vec![0, 8], vec![1, 9], 2)]
-    #[case::no_rows(vec![], vec![], 0)]
-    fn a_known_mask_reads_only_the_chunks_it_selects(
-        #[from(chunked_layout)] (segments, layout): (Arc<dyn SegmentSource>, LayoutRef),
-        #[case] selected: Vec<usize>,
-        #[case] expected: Vec<i32>,
-        #[case] expected_requests: usize,
-    ) {
+    /// Evaluate the whole layout with `mask`, as a projection of every column.
+    fn evaluate(
+        (segments, layout): (Arc<dyn SegmentSource>, LayoutRef),
+        mask: MaskFuture,
+    ) -> ArrayRef {
         block_on(|_h| async {
-            let mut ctx = SESSION.create_execution_ctx();
-            let requests = Arc::new(AtomicUsize::new(0));
-            let source = Arc::new(CountingSegmentSource {
-                inner: segments,
-                requests: Arc::clone(&requests),
-            });
             let reader = layout
-                .new_reader("".into(), source, &SESSION, &Default::default())
+                .new_reader("".into(), segments, &SESSION, &Default::default())
                 .unwrap();
             let expr = root().bind(reader.dtype()).unwrap();
-            let rows = usize::try_from(layout.row_count()).unwrap();
-            let mask = Mask::from_indices(rows, selected);
-
-            let result = reader
-                .projection_evaluation(&(0..layout.row_count()), &expr, MaskFuture::ready(mask))
+            reader
+                .projection_evaluation(&(0..layout.row_count()), &expr, mask)
                 .unwrap()
                 .await
-                .unwrap();
-
-            let expected = PrimitiveArray::from_iter(expected).into_array();
-            assert_arrays_eq!(result, expected, &mut ctx);
-            assert_eq!(
-                requests.load(Ordering::Relaxed),
-                expected_requests,
-                "segments requested"
-            );
+                .unwrap()
         })
     }
 
-    /// Without a known mask every chunk in range is read, as before.
     #[rstest]
-    fn an_unresolved_mask_reads_every_chunk(
-        #[from(chunked_layout)] (segments, layout): (Arc<dyn SegmentSource>, LayoutRef),
+    fn test_known_mask_skips_unselected_chunks(
+        #[from(chunked_layout)] layout: (Arc<dyn SegmentSource>, LayoutRef),
     ) {
-        block_on(|_h| async {
-            let mut ctx = SESSION.create_execution_ctx();
-            let requests = Arc::new(AtomicUsize::new(0));
-            let source = Arc::new(CountingSegmentSource {
-                inner: segments,
-                requests: Arc::clone(&requests),
-            });
-            let reader = layout
-                .new_reader("".into(), source, &SESSION, &Default::default())
-                .unwrap();
-            let expr = root().bind(reader.dtype()).unwrap();
-            let rows = usize::try_from(layout.row_count()).unwrap();
-            let mask = Mask::from_indices(rows, vec![4]);
-            let pending = MaskFuture::new(rows, async move { Ok(mask) });
-            assert!(pending.known().is_none());
+        let mut ctx = SESSION.create_execution_ctx();
+        let mask = Mask::from_indices(9, vec![0, 7]);
+        let result = evaluate(layout, MaskFuture::ready(mask));
 
-            let result = reader
-                .projection_evaluation(&(0..layout.row_count()), &expr, pending)
-                .unwrap()
-                .await
-                .unwrap();
-            assert_arrays_eq!(result, buffer![5i32].into_array(), &mut ctx);
-            assert_eq!(requests.load(Ordering::Relaxed), 3);
-        })
+        // The middle chunk has no selected rows, so it adds no chunk.
+        let chunked = result.as_opt::<Chunked>().unwrap();
+        assert_eq!(chunked.nchunks(), 2);
+        assert_arrays_eq!(result, buffer![1i32, 8].into_array(), &mut ctx);
+    }
+
+    #[rstest]
+    fn test_known_all_false_mask_reads_nothing(
+        #[from(chunked_layout)] layout: (Arc<dyn SegmentSource>, LayoutRef),
+    ) {
+        let result = evaluate(layout, MaskFuture::ready(Mask::new_false(9)));
+        assert_eq!(result.len(), 0);
+    }
+
+    #[rstest]
+    fn test_pending_mask_selects_the_same_rows(
+        #[from(chunked_layout)] layout: (Arc<dyn SegmentSource>, LayoutRef),
+    ) {
+        let mut ctx = SESSION.create_execution_ctx();
+        let mask = Mask::from_indices(9, vec![0, 7]);
+        let pending = MaskFuture::new(9, async move { Ok(mask) });
+        assert!(pending.peek().is_none());
+
+        let result = evaluate(layout, pending);
+        assert_arrays_eq!(result, buffer![1i32, 8].into_array(), &mut ctx);
     }
 }

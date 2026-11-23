@@ -9,6 +9,7 @@ use vortex_buffer::Buffer;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
+use vortex_error::vortex_ensure_eq;
 use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
@@ -93,17 +94,11 @@ impl VTable for VarBinView {
         len: usize,
         slots: &[Option<ArrayRef>],
     ) -> VortexResult<()> {
-        vortex_ensure!(
-            slots.len() == VarBinViewSlots::COUNT,
-            "VarBinViewArray expected {} slots, found {}",
-            VarBinViewSlots::COUNT,
-            slots.len()
-        );
-        vortex_ensure!(
-            data.len() == len,
-            "VarBinViewArray length {} does not match outer length {}",
+        vortex_ensure_eq!(slots.len(), VarBinViewSlots::COUNT);
+        vortex_ensure_eq!(
             data.len(),
-            len
+            len,
+            "VarBinViewArray length does not match outer length",
         );
         vortex_ensure!(
             matches!(dtype, DType::Binary(_) | DType::Utf8(_)),
@@ -148,10 +143,13 @@ impl VTable for VarBinView {
             array.dtype().clone(),
             array.validity()?,
         )?;
-        Ok(
-            ArrayParts::new(self.clone(), array.dtype().clone(), array.len(), data)
-                .with_slots(array.slots().iter().cloned().collect()),
-        )
+        Ok(ArrayParts::new(
+            self.clone(),
+            array.dtype().clone(),
+            array.len(),
+            data,
+            array.slots().iter().cloned().collect(),
+        ))
     }
 
     fn serialize(
@@ -211,7 +209,13 @@ impl VTable for VarBinView {
                 validity.clone(),
             )?;
             let slots = VarBinViewData::make_slots(&validity, len);
-            return Ok(ArrayParts::new(self.clone(), dtype.clone(), len, data).with_slots(slots));
+            return Ok(ArrayParts::new(
+                self.clone(),
+                dtype.clone(),
+                len,
+                data,
+                slots,
+            ));
         }
 
         let data_buffers = data_handles
@@ -228,7 +232,13 @@ impl VTable for VarBinView {
             &mut session.create_execution_ctx(),
         )?;
         let slots = VarBinViewData::make_slots(&validity, len);
-        Ok(ArrayParts::new(self.clone(), dtype.clone(), len, data).with_slots(slots))
+        Ok(ArrayParts::new(
+            self.clone(),
+            dtype.clone(),
+            len,
+            data,
+            slots,
+        ))
     }
 
     fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {
@@ -266,17 +276,21 @@ impl VTable for VarBinView {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use vortex_buffer::ByteBufferMut;
+    use vortex_session::VortexSession;
     use vortex_session::registry::ReadContext;
 
     use super::*;
     use crate::ArrayContext;
     use crate::IntoArray;
     use crate::VortexSessionExecute;
-    use crate::array_session;
     use crate::assert_arrays_eq;
     use crate::serde::SerializeOptions;
     use crate::serde::SerializedArray;
+
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
 
     #[test]
     fn test_nullable_varbinview_serde_roundtrip() {
@@ -290,13 +304,12 @@ mod tests {
         let dtype = array.dtype().clone();
         let len = array.len();
 
-        let session = array_session();
-        let mut ctx = session.create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let array_ctx = ArrayContext::empty();
         let serialized = array
             .clone()
             .into_array()
-            .serialize(&array_ctx, &session, &SerializeOptions::default())
+            .serialize(&array_ctx, &SESSION, &SerializeOptions::default())
             .unwrap();
 
         let mut concat = ByteBufferMut::empty();
@@ -305,7 +318,7 @@ mod tests {
         }
         let parts = SerializedArray::try_from(concat.freeze()).unwrap();
         let decoded = parts
-            .decode(&dtype, len, &ReadContext::new(array_ctx.to_ids()), &session)
+            .decode(&dtype, len, &ReadContext::new(array_ctx.to_ids()), &SESSION)
             .unwrap();
 
         assert_arrays_eq!(decoded, array, &mut ctx);

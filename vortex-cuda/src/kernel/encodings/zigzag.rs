@@ -5,8 +5,6 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use cudarc::driver::DeviceRepr;
-use cudarc::driver::PushKernelArg;
 use tracing::instrument;
 use vortex::array::ArrayRef;
 use vortex::array::Canonical;
@@ -21,7 +19,10 @@ use vortex::encodings::zigzag::ZigZagArray;
 use vortex::encodings::zigzag::ZigZagArraySlotsExt;
 use vortex::error::VortexResult;
 use vortex::error::vortex_ensure;
+use vortex::error::vortex_ensure_eq;
 use vortex::error::vortex_err;
+use vortex_cuda_driver::DeviceRepr;
+use vortex_cuda_driver::PushKernelArg;
 
 use crate::CudaBufferExt;
 use crate::CudaDeviceBuffer;
@@ -54,9 +55,10 @@ impl CudaExecute for ZigZagExecutor {
         // The encoded array is unsigned, we decode to signed of the same width.
         let encoded_ptype = array.encoded().dtype().as_ptype();
         let output_ptype = PType::try_from(array.dtype())?;
-        vortex_ensure!(
-            output_ptype == encoded_ptype.to_signed(),
-            "ZigZag output type {output_ptype} must be the signed equivalent of {encoded_ptype}"
+        vortex_ensure_eq!(
+            output_ptype,
+            encoded_ptype.to_signed(),
+            "ZigZag output type must be the signed equivalent of the encoded type"
         );
 
         match_each_unsigned_integer_ptype!(encoded_ptype, |U| {
@@ -113,7 +115,7 @@ where
         args.arg(&mut output).arg(&array_len_u64);
     })?;
 
-    let output = BufferHandle::new_device(Arc::new(CudaDeviceBuffer::new(output)));
+    let output = BufferHandle::new_device(Arc::new(CudaDeviceBuffer::new(output)?));
     Ok(Canonical::Primitive(PrimitiveArray::from_buffer_handle(
         output,
         output_ptype,
@@ -123,6 +125,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use vortex::array::IntoArray;
     use vortex::array::arrays::PrimitiveArray;
     use vortex::array::assert_arrays_eq;
@@ -130,15 +134,18 @@ mod tests {
     use vortex::buffer::Buffer;
     use vortex::encodings::zigzag::ZigZag;
     use vortex::error::VortexExpect;
+    use vortex::session::VortexSession;
     use vortex_array::VortexSessionExecute;
 
     use super::*;
     use crate::CanonicalCudaExt;
     use crate::session::CudaSession;
 
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
+
     #[crate::test]
     async fn test_cuda_zigzag_decompression_u32() -> VortexResult<()> {
-        let mut ctx = vortex_array::array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         let mut cuda_ctx = CudaSession::create_execution_ctx(&crate::cuda_session())
             .vortex_expect("failed to create execution context");
 
@@ -155,11 +162,15 @@ mod tests {
             .execute(zigzag_array.clone(), &mut cuda_ctx)
             .await
             .vortex_expect("GPU decompression failed")
-            .into_host()
+            .into_host(cuda_ctx.execution_ctx())
             .await?
             .into_array();
 
-        assert_arrays_eq!(zigzag_array, gpu_result, &mut ctx);
+        assert_arrays_eq!(
+            gpu_result,
+            PrimitiveArray::from_iter([0i32, 1, 2, -1, -2]),
+            &mut ctx
+        );
 
         Ok(())
     }

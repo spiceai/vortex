@@ -8,6 +8,7 @@ mod bench_config;
 mod timed_launch_strategy;
 
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
@@ -16,6 +17,7 @@ use criterion::BenchmarkId;
 use criterion::Criterion;
 use criterion::Throughput;
 use futures::executor::block_on;
+use mimalloc::MiMalloc;
 use vortex::array::IntoArray;
 use vortex::array::arrays::BoolArray;
 use vortex::array::arrays::PrimitiveArray;
@@ -27,6 +29,7 @@ use vortex::dtype::PType;
 use vortex::error::VortexExpect;
 use vortex::error::VortexResult;
 use vortex::session::VortexSession;
+use vortex_array::test_harness::mark_optimized;
 use vortex_cuda::CudaExecutionCtx;
 use vortex_cuda::CudaSession;
 use vortex_cuda::arrow::ArrowDeviceArray;
@@ -37,11 +40,16 @@ use vortex_cuda_macros::cuda_not_available;
 
 use crate::timed_launch_strategy::TimedLaunchStrategy;
 
+static SESSION: LazyLock<VortexSession> = LazyLock::new(vortex_cuda::cuda_session);
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 const INPUT_OFFSET: usize = 5;
 const ARROW_OFFSET: usize = 3;
 const EXPORT_BENCH_SIZES: &[(usize, &str)] = &[(100_000_000, "100M")];
 
-fn validity_bitmap_byte_len(len: usize, bit_offset: usize) -> usize {
+fn arrow_bitmap_byte_len(len: usize, bit_offset: usize) -> usize {
     (bit_offset + len).div_ceil(8)
 }
 
@@ -98,22 +106,23 @@ fn benchmark_arrow_validity_export(c: &mut Criterion) {
             [("device_bitmap", 0), ("device_bitmap_repack", INPUT_OFFSET)]
         {
             group.throughput(Throughput::Bytes(
-                validity_bitmap_byte_len(len, validity_offset) as u64,
+                arrow_bitmap_byte_len(len, validity_offset) as u64,
             ));
             group.bench_with_input(
                 BenchmarkId::new(format!("cuda/arrow_validity/export/{case}"), len_label),
                 &len,
                 |b, &len| {
                     b.iter_custom(|iters| {
-                        let mut cuda_ctx =
-                            CudaSession::create_execution_ctx(&VortexSession::empty())
-                                .vortex_expect("failed to create execution context");
+                        let mut cuda_ctx = CudaSession::create_execution_ctx(&SESSION)
+                            .vortex_expect("failed to create execution context");
                         let array = block_on(primitive_with_device_bool_validity(
                             len,
                             validity_offset,
                             &mut cuda_ctx,
                         ))
                         .vortex_expect("failed to create primitive fixture");
+                        mark_optimized(&array, &SESSION)
+                            .vortex_expect("optimize the benchmark input");
 
                         let mut exported_arrays = Vec::with_capacity(
                             usize::try_from(iters)
@@ -148,7 +157,7 @@ fn benchmark_arrow_validity_repack(c: &mut Criterion) {
 
     for &(len, len_label) in bench_config::BENCH_SIZES {
         group.throughput(Throughput::Bytes(
-            validity_bitmap_byte_len(len, INPUT_OFFSET) as u64,
+            arrow_bitmap_byte_len(len, INPUT_OFFSET) as u64
         ));
         group.bench_with_input(
             BenchmarkId::new("cuda/arrow_validity/repack", len_label),
@@ -157,7 +166,7 @@ fn benchmark_arrow_validity_repack(c: &mut Criterion) {
                 b.iter_custom(|iters| {
                     let timed = TimedLaunchStrategy::default();
                     let timer = timed.timer();
-                    let mut cuda_ctx = CudaSession::create_execution_ctx(&VortexSession::empty())
+                    let mut cuda_ctx = CudaSession::create_execution_ctx(&SESSION)
                         .vortex_expect("failed to create execution context")
                         .with_launch_strategy(Arc::new(timed));
                     let (input_offset, input_buffer) =
@@ -165,7 +174,7 @@ fn benchmark_arrow_validity_repack(c: &mut Criterion) {
                             .vortex_expect("failed to create validity fixture");
 
                     for _ in 0..iters {
-                        let output = test_harness::repack_arrow_validity_buffer(
+                        let output = test_harness::repack_arrow_bitmap(
                             &input_buffer,
                             input_offset,
                             len,
@@ -190,7 +199,7 @@ fn benchmark_arrow_validity_count_nulls(c: &mut Criterion) {
 
     for &(len, len_label) in bench_config::BENCH_SIZES {
         group.throughput(Throughput::Bytes(
-            validity_bitmap_byte_len(len, ARROW_OFFSET) as u64,
+            arrow_bitmap_byte_len(len, ARROW_OFFSET) as u64
         ));
         group.bench_with_input(
             BenchmarkId::new("cuda/arrow_validity/count_nulls", len_label),
@@ -199,7 +208,7 @@ fn benchmark_arrow_validity_count_nulls(c: &mut Criterion) {
                 b.iter_custom(|iters| {
                     let timed = TimedLaunchStrategy::default();
                     let timer = timed.timer();
-                    let mut cuda_ctx = CudaSession::create_execution_ctx(&VortexSession::empty())
+                    let mut cuda_ctx = CudaSession::create_execution_ctx(&SESSION)
                         .vortex_expect("failed to create execution context")
                         .with_launch_strategy(Arc::new(timed));
                     let (_, input_buffer) =
@@ -233,7 +242,11 @@ criterion::criterion_group! {
 }
 
 #[cuda_available]
-criterion::criterion_main!(benches);
+fn main() {
+    LazyLock::force(&SESSION);
+    benches();
+    Criterion::default().configure_from_args().final_summary();
+}
 
 #[cuda_not_available]
 fn main() {}

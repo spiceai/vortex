@@ -15,6 +15,7 @@ use crate::Alignment;
 use crate::BitBufferMeta;
 use crate::BitBufferMut;
 use crate::Buffer;
+use crate::BufferAllocatorRef;
 use crate::BufferMut;
 use crate::ByteBuffer;
 use crate::bit::BitChunks;
@@ -30,7 +31,7 @@ use crate::bit::ops::bitwise_binary_op_lhs_owned;
 use crate::bit::ops::bitwise_unary_op;
 use crate::bit::ops::bitwise_unary_op_copy;
 use crate::bit::select::bit_select;
-use crate::buffer;
+use crate::bit::select::bit_select_unset;
 
 /// An immutable bitset stored as a packed byte buffer.
 #[derive(Debug, Clone, Eq)]
@@ -147,8 +148,14 @@ impl BitBuffer {
     /// Create a new `BoolBuffer` of length `len` where all bits are set (true).
     #[inline]
     pub fn new_set(len: usize) -> Self {
+        Self::new_set_in(len, BufferAllocatorRef::statically_allocated())
+    }
+
+    /// Create a set bit buffer with the provided allocator.
+    #[inline]
+    pub fn new_set_in(len: usize, allocator: BufferAllocatorRef) -> Self {
         let words = len.div_ceil(8);
-        let buffer = buffer![0xFF; words];
+        let buffer = Buffer::full_in(0xFF, words, allocator);
 
         Self {
             buffer,
@@ -160,8 +167,14 @@ impl BitBuffer {
     /// Create a new `BoolBuffer` of length `len` where all bits are unset (false).
     #[inline]
     pub fn new_unset(len: usize) -> Self {
+        Self::new_unset_in(len, BufferAllocatorRef::statically_allocated())
+    }
+
+    /// Create an unset bit buffer with the provided allocator.
+    #[inline]
+    pub fn new_unset_in(len: usize, allocator: BufferAllocatorRef) -> Self {
         let words = len.div_ceil(8);
-        let buffer = Buffer::zeroed(words);
+        let buffer = Buffer::zeroed_in(words, allocator);
 
         Self {
             buffer,
@@ -184,10 +197,16 @@ impl BitBuffer {
     /// Create a new `BitBuffer` of length `len` where all bits are set to `value`.
     #[inline]
     pub fn full(value: bool, len: usize) -> Self {
+        Self::full_in(value, len, BufferAllocatorRef::statically_allocated())
+    }
+
+    /// Create a full bit buffer with the provided allocator.
+    #[inline]
+    pub fn full_in(value: bool, len: usize, allocator: BufferAllocatorRef) -> Self {
         if value {
-            Self::new_set(len)
+            Self::new_set_in(len, allocator)
         } else {
-            Self::new_unset(len)
+            Self::new_unset_in(len, allocator)
         }
     }
 
@@ -221,6 +240,16 @@ impl BitBuffer {
         BitBufferMut::collect_bool(len, f).freeze()
     }
 
+    /// Collects predicate results with the provided allocator.
+    #[inline]
+    pub fn collect_bool_in<F: FnMut(usize) -> bool>(
+        len: usize,
+        f: F,
+        allocator: BufferAllocatorRef,
+    ) -> Self {
+        BitBufferMut::collect_bool_in(len, f, allocator).freeze()
+    }
+
     /// Collects Boolean values with a fill-and-pack loop selected for the current CPU.
     ///
     /// This has the same callback contract as [`Self::collect_bool`]. On x86-64,
@@ -233,7 +262,17 @@ impl BitBuffer {
     /// benchmarked. Use [`Self::collect_bool`] for general predicates.
     #[inline]
     pub fn collect_bool_multiversioned<F: FnMut(usize) -> bool>(len: usize, f: F) -> Self {
-        BitBufferMut::collect_bool_multiversioned(len, f).freeze()
+        Self::collect_bool_multiversioned_in(len, f, BufferAllocatorRef::statically_allocated())
+    }
+
+    /// Collects multiversioned predicate results with the provided allocator.
+    #[inline]
+    pub fn collect_bool_multiversioned_in<F: FnMut(usize) -> bool>(
+        len: usize,
+        f: F,
+        allocator: BufferAllocatorRef,
+    ) -> Self {
+        BitBufferMut::collect_bool_multiversioned_in(len, f, allocator).freeze()
     }
 
     /// Maps over each bit in this buffer, calling `f(index, bit_value)` and collecting results.
@@ -438,6 +477,17 @@ impl BitBuffer {
         bit_select(self.buffer.as_slice(), self.offset, self.len, nth)
     }
 
+    /// Returns the position of the `nth` unset bit (0-indexed).
+    ///
+    /// This is the "select0" operation, the counterpart of [`Self::select`] for unset bits:
+    /// given a rank `nth` among the unset bits, find which logical bit position holds it.
+    ///
+    /// Returns `None` if `nth` is greater than or equal to the number of unset bits.
+    #[inline]
+    pub fn select_unset(&self, nth: usize) -> Option<usize> {
+        bit_select_unset(self.buffer.as_slice(), self.offset, self.len, nth)
+    }
+
     /// Returns the index of the last set bit, or `None` if every bit is unset.
     ///
     /// This scans from the end a word at a time, avoiding the full forward scan required by
@@ -512,12 +562,43 @@ impl BitBuffer {
     ///
     /// Stops and returns the first error from `f`.
     #[inline]
-    pub fn try_for_each_set_index<E, F>(&self, mut f: F) -> Result<(), E>
+    pub fn try_for_each_set_index<E, F>(&self, f: F) -> Result<(), E>
+    where
+        F: FnMut(usize) -> Result<(), E>,
+    {
+        self.try_for_each_index::<false, E, F>(f)
+    }
+
+    /// Invoke `f(index)` for every unset bit, in ascending order, processing a `u64` word at a
+    /// time.
+    ///
+    /// This is the counterpart of [`for_each_set_index`](Self::for_each_set_index) for unset bits.
+    #[inline]
+    pub fn for_each_unset_index<F: FnMut(usize)>(&self, mut f: F) {
+        let Ok(()) = self.try_for_each_index::<true, _, _>(|index| {
+            f(index);
+            Ok::<_, Infallible>(())
+        });
+    }
+
+    /// The scan behind [`try_for_each_set_index`](Self::try_for_each_set_index). With `UNSET`,
+    /// each word is inverted as it is read, so the same scan visits the unset bits instead.
+    #[inline]
+    fn try_for_each_index<const UNSET: bool, E, F>(&self, mut f: F) -> Result<(), E>
     where
         F: FnMut(usize) -> Result<(), E>,
     {
         let mut base = 0usize;
         for word in self.chunks().iter_padded() {
+            let word = if UNSET {
+                // The last word is zero padded past `len`. Setting the padding before inverting
+                // keeps it from being visited.
+                let held = self.len - base;
+                let padding = if held < 64 { u64::MAX << held } else { 0 };
+                !(word | padding)
+            } else {
+                word
+            };
             if word == u64::MAX {
                 for k in 0..64 {
                     f(base + k)?;
@@ -755,7 +836,11 @@ impl<'a> IntoIterator for &'a BitBuffer {
 
 #[cfg(test)]
 mod tests {
+    use rand::RngExt;
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
     use rstest::rstest;
+    use vortex_error::VortexResult;
 
     use crate::ByteBuffer;
     use crate::bit::BitBuffer;
@@ -908,11 +993,8 @@ mod tests {
             collected.push((idx, is_set));
         });
 
-        assert_eq!(collected.len(), len);
-
-        for (idx, is_set) in collected {
-            assert_eq!(is_set, idx % 2 == 0);
-        }
+        let expected: Vec<_> = (0..len).map(|idx| (idx, idx % 2 == 0)).collect();
+        assert_eq!(collected, expected);
     }
 
     #[rstest]
@@ -933,12 +1015,10 @@ mod tests {
             collected.push((idx, is_set));
         });
 
-        assert_eq!(collected.len(), len);
-
-        for (idx, is_set) in collected {
-            // The bits should match the original buffer at positions offset + idx
-            assert_eq!(is_set, (offset + idx).is_multiple_of(2));
-        }
+        let expected: Vec<_> = (0..len)
+            .map(|idx| (idx, (offset + idx).is_multiple_of(2)))
+            .collect();
+        assert_eq!(collected, expected);
     }
 
     #[rstest]
@@ -958,19 +1038,10 @@ mod tests {
             collected.push((idx, is_set));
         });
 
-        assert_eq!(collected.len(), len);
-
-        for (idx, is_set) in collected {
-            let bit_position = offset + idx;
-            let byte_index = bit_position / 8;
-            let expected_is_set = byte_index.is_multiple_of(2);
-
-            assert_eq!(
-                is_set, expected_is_set,
-                "Bit mismatch at index {}: expected {} got {}",
-                bit_position, expected_is_set, is_set
-            );
-        }
+        let expected: Vec<_> = (0..len)
+            .map(|idx| (idx, ((offset + idx) / 8).is_multiple_of(2)))
+            .collect();
+        assert_eq!(collected, expected);
     }
 
     #[rstest]
@@ -1114,6 +1185,37 @@ mod tests {
         }
     }
 
+    #[rstest]
+    #[case(0)]
+    #[case(1)]
+    #[case(63)]
+    #[case(64)]
+    #[case(65)]
+    #[case(128)]
+    #[case(200)]
+    fn test_for_each_unset_index_agrees_with_naive(#[case] len: usize) -> VortexResult<()> {
+        let mut rng = StdRng::seed_from_u64(u64::try_from(len)?);
+        let random: BitBuffer = (0..len).map(|_| rng.random_bool(0.5)).collect();
+        // The same kind of bits, starting 3 bits into their buffer.
+        let offset: BitBuffer = (0..len + 3).map(|_| rng.random_bool(0.5)).collect();
+        for bits in [
+            random,
+            offset.slice(3..),
+            BitBuffer::new_set(len),
+            BitBuffer::new_unset(len),
+        ] {
+            let expected: Vec<usize> = bits
+                .iter()
+                .enumerate()
+                .filter_map(|(index, set)| (!set).then_some(index))
+                .collect();
+            let mut found = Vec::new();
+            bits.for_each_unset_index(|index| found.push(index));
+            assert_eq!(found, expected);
+        }
+        Ok(())
+    }
+
     #[test]
     fn test_map_cmp_conditional() {
         // map_cmp with conditional logic based on index and bit value
@@ -1127,5 +1229,28 @@ mod tests {
             let expected = (i % 2 == 0) && (i % 4 == 0);
             assert_eq!(mapped.value(i), expected, "Mismatch at index {}", i);
         }
+    }
+
+    #[rstest]
+    #[case(0, 200)]
+    #[case(3, 197)]
+    #[case(13, 600)]
+    fn test_select_unset_sliced(#[case] start: usize, #[case] len: usize) {
+        let buf = BitBuffer::collect_bool(start + len, |i| i % 3 == 0 || i % 7 == 0);
+        let sliced = buf.slice(start..start + len);
+        let expected: Vec<usize> = sliced
+            .iter()
+            .enumerate()
+            .filter_map(|(index, set)| (!set).then_some(index))
+            .collect();
+
+        for (nth, &index) in expected.iter().enumerate() {
+            assert_eq!(
+                sliced.select_unset(nth),
+                Some(index),
+                "start={start} nth={nth}"
+            );
+        }
+        assert_eq!(sliced.select_unset(expected.len()), None);
     }
 }

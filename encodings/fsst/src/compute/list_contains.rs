@@ -16,6 +16,8 @@ use vortex_array::scalar::Scalar;
 use vortex_array::scalar::ScalarValue;
 use vortex_array::scalar_fn::fns::list_contains::ListContains;
 use vortex_array::scalar_fn::fns::list_contains::ListContainsElementKernel;
+use vortex_array::scalar_fn::fns::list_contains::ListContainsOptions;
+use vortex_array::scalar_fn::fns::list_contains::PreparedSet;
 use vortex_buffer::ByteBuffer;
 use vortex_error::VortexResult;
 
@@ -45,14 +47,22 @@ impl ListContainsElementKernel for FSST {
     fn list_contains(
         list: &ArrayRef,
         element: ArrayView<'_, Self>,
+        options: &ListContainsOptions,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
         // The list is compressed once and probed by every row, so it has to be
-        // the same list for every row.
-        let Some(list_constant) = list.as_opt::<Constant>() else {
+        // the same list for every row: a constant, or the set an optimized
+        // expression prepared from one.
+        let constant = list.as_opt::<Constant>();
+        let list_scalar = if let Some(constant) = &constant {
+            constant.scalar()
+        } else if let Some(set) = PreparedSet::set_of(list) {
+            set.list()
+        } else {
             return Ok(None);
         };
-        let list_scalar = list_constant.scalar().as_list();
+        let list_nullability = list_scalar.dtype().nullability();
+        let list_scalar = list_scalar.as_list();
         let Some(elements) = list_scalar.element_values() else {
             return Ok(None);
         };
@@ -96,18 +106,20 @@ impl ListContainsElementKernel for FSST {
             ));
         }
 
-        let code_list = Scalar::list(
-            Arc::new(code_dtype),
-            codes,
-            list_constant.scalar().dtype().nullability(),
-        );
+        let code_list = Scalar::list(Arc::new(code_dtype), codes, list_nullability);
         let needles = element.codes().into_array();
         let len = needles.len();
 
-        ListContains::try_new(ConstantArray::new(code_list, len).into_array(), needles)?
-            .into_array()
-            .execute::<BoolArray>(ctx)
-            .map(|array| Some(array.into_array()))
+        // The same options, so the codes answer with the null semantics the
+        // expression asked for.
+        ListContains::try_new_opts(
+            ConstantArray::new(code_list, len).into_array(),
+            needles,
+            *options,
+        )?
+        .into_array()
+        .execute::<BoolArray>(ctx)
+        .map(|array| Some(array.into_array()))
     }
 }
 
@@ -150,13 +162,15 @@ mod tests {
     }
 
     static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
-        let session = vortex_array::array_session();
+        let session = VortexSession::empty();
         crate::initialize(&session);
         session
     });
 
     /// The values the tests below compress. Deliberately includes an empty
-    /// string, a value sharing a long prefix with another, and nulls.
+    /// string, a value sharing a long prefix with another, and nulls. A null
+    /// needle answers null against a list with elements, SQL's answer to
+    /// `NULL IN (...)`, and `false` against an empty one.
     const VALUES: [Option<&str>; 8] = [
         Some("hello"),
         None,
@@ -252,13 +266,13 @@ mod tests {
             )?,
             vec![
                 Some(true),
-                Some(false),
+                None,
                 Some(true),
                 Some(false),
                 Some(false),
                 Some(false),
                 Some(true),
-                Some(false)
+                None
             ]
         );
         Ok(())
@@ -271,13 +285,13 @@ mod tests {
             answers(vec!["", "a", "b", "c"], Nullability::Nullable)?,
             vec![
                 Some(false),
-                Some(false),
+                None,
                 Some(false),
                 Some(true),
                 Some(false),
                 Some(false),
                 Some(false),
-                Some(false)
+                None
             ]
         );
         Ok(())
@@ -301,13 +315,13 @@ mod tests {
             )?,
             vec![
                 Some(false),
-                Some(false),
+                None,
                 Some(false),
                 Some(false),
                 Some(true),
                 Some(false),
                 Some(false),
-                Some(false)
+                None
             ]
         );
         Ok(())
@@ -320,13 +334,13 @@ mod tests {
             answers(vec!["hello", ""], Nullability::Nullable)?,
             vec![
                 Some(true),
+                None,
+                Some(false),
+                Some(true),
                 Some(false),
                 Some(false),
                 Some(true),
-                Some(false),
-                Some(false),
-                Some(true),
-                Some(false)
+                None
             ]
         );
         Ok(())

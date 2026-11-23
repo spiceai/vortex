@@ -12,10 +12,6 @@ use vortex_error::VortexError;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
-use vortex_flatbuffers::FlatBuffer;
-use vortex_flatbuffers::FlatBufferRoot;
-use vortex_flatbuffers::WriteFlatBuffer;
-use vortex_flatbuffers::dtype as fbd;
 use vortex_session::VortexSession;
 
 use crate::dtype::DType;
@@ -30,6 +26,10 @@ use crate::dtype::extension::ExtId;
 use crate::dtype::extension::ForeignExtDType;
 use crate::dtype::flatbuffers as fb;
 use crate::dtype::session::DTypeSessionExt;
+use crate::flatbuffers::FlatBuffer;
+use crate::flatbuffers::FlatBufferRoot;
+use crate::flatbuffers::WriteFlatBuffer;
+use crate::flatbuffers::dtype as fbd;
 
 /// A lazily evaluated DType, parsed on access from an underlying flatbuffer.
 #[derive(Debug, Clone)]
@@ -296,8 +296,7 @@ impl TryFrom<ViewedDType> for DType {
                         vortex_err!("failed to parse extension id from flatbuffer")
                     })?);
                 let storage_dtype = fb_ext.storage_dtype().ok_or_else(|| {
-                    vortex_err!(
-                Serde: "storage_dtype must be present on DType fbs message")
+                    vortex_err!("storage_dtype must be present on DType fbs message")
                 })?;
                 let storage_view = ViewedDType::from_fb_loc(
                     storage_dtype._tab.loc(),
@@ -305,7 +304,7 @@ impl TryFrom<ViewedDType> for DType {
                     vfdt.session.clone(),
                 );
                 let storage_dtype = DType::try_from(storage_view)
-                    .map_err(|e| vortex_err!("failed to create DType from fbs message: {e}"))?;
+                    .map_err(|e| e.with_context("failed to create DType from fbs message"))?;
 
                 let metadata = fb_ext
                     .metadata()
@@ -556,7 +555,10 @@ impl TryFrom<fb::PType> for PType {
             fb::PType::F16 => Self::F16,
             fb::PType::F32 => Self::F32,
             fb::PType::F64 => Self::F64,
-            _ => vortex_bail!(Serde: "Unknown PType variant"),
+            _ => vortex_bail!(
+                "flatbuffer Primitive ptype must be a known PType, got {}",
+                value.0
+            ),
         })
     }
 }
@@ -568,9 +570,6 @@ mod test {
     use flatbuffers::FlatBufferBuilder;
     use flatbuffers::root;
     use vortex_buffer::ByteBuffer;
-    use vortex_flatbuffers::FlatBuffer;
-    use vortex_flatbuffers::WriteFlatBuffer;
-    use vortex_flatbuffers::WriteFlatBufferExt;
 
     use crate::dtype::DType;
     use crate::dtype::PType;
@@ -580,6 +579,9 @@ mod test {
     use crate::dtype::nullability::Nullability;
     use crate::dtype::serde::flatbuffers::ViewedDType;
     use crate::dtype::test::SESSION;
+    use crate::flatbuffers::FlatBuffer;
+    use crate::flatbuffers::WriteFlatBuffer;
+    use crate::flatbuffers::WriteFlatBufferExt;
 
     fn roundtrip_dtype(dtype: DType) {
         let bytes = dtype.write_flatbuffer_bytes().unwrap();
@@ -802,7 +804,8 @@ mod test {
     fn test_union_malformed_flatbuffer_errors() {
         use flatbuffers::FlatBufferBuilder;
         use vortex_buffer::ByteBuffer;
-        use vortex_flatbuffers::WriteFlatBuffer;
+
+        use crate::flatbuffers::WriteFlatBuffer;
 
         let mut fbb = FlatBufferBuilder::new();
 
@@ -849,5 +852,14 @@ mod test {
         let result = DType::try_from(view);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("length mismatch"));
+    }
+
+    #[test]
+    fn test_unknown_ptype_from_flatbuffer() {
+        let result = PType::try_from(fb::PType(11));
+        assert!(result.is_err_and(|err| {
+            err.to_string()
+                .contains("flatbuffer Primitive ptype must be a known PType, got 11")
+        }));
     }
 }

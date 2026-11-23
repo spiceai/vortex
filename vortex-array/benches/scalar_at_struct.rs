@@ -6,6 +6,7 @@
 use std::sync::LazyLock;
 
 use divan::Bencher;
+use mimalloc::MiMalloc;
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::distr::Uniform;
@@ -13,12 +14,16 @@ use rand::rngs::StdRng;
 use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
-use vortex_array::array_session;
 use vortex_array::arrays::StructArray;
 use vortex_array::dtype::FieldNames;
+use vortex_array::optimizer::kernels::KernelSession;
+use vortex_array::test_harness::mark_optimized;
 use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
 use vortex_session::VortexSession;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 fn main() {
     LazyLock::force(&SESSION);
@@ -29,7 +34,8 @@ const ARRAY_SIZE: usize = 100_000;
 // Sized to keep the CodSpeed simulation under 1ms per benchmark.
 const NUM_ACCESSES: usize = 100;
 
-static SESSION: LazyLock<VortexSession> = LazyLock::new(array_session);
+static SESSION: LazyLock<VortexSession> =
+    LazyLock::new(|| VortexSession::empty().with::<KernelSession>());
 
 #[divan::bench]
 fn execute_scalar_struct_simple(bencher: Bencher) {
@@ -50,6 +56,7 @@ fn execute_scalar_struct_simple(bencher: Bencher) {
     )
     .unwrap();
     let struct_array: ArrayRef = struct_array.into_array();
+    mark_optimized(&struct_array, &SESSION).unwrap();
 
     let indices: Vec<usize> = (0..NUM_ACCESSES)
         .map(|_| rng.random_range(0..ARRAY_SIZE))
@@ -87,6 +94,7 @@ fn execute_scalar_struct_wide(bencher: Bencher) {
         StructArray::try_new(field_names, fields, ARRAY_SIZE, Validity::NonNullable)
             .unwrap()
             .into_array();
+    mark_optimized(&struct_array, &SESSION).unwrap();
 
     let indices: Vec<usize> = (0..NUM_ACCESSES)
         .map(|_| rng.random_range(0..ARRAY_SIZE))

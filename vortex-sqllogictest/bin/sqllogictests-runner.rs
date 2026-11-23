@@ -63,7 +63,8 @@ fn build_runtime() -> anyhow::Result<tokio::runtime::Runtime> {
 fn drive_datafusion(path: &Path, work_dir: &Path, mode: Mode) -> anyhow::Result<()> {
     reset_dir(work_dir)?;
     let _guard = WorkDirGuard::new(work_dir.to_path_buf());
-    let work_dir = work_dir.to_string_lossy().into_owned();
+    // Windows get us backslashes slashes but Duckdb produces forward slashes
+    let work_dir = work_dir.to_string_lossy().replace('\\', "/");
 
     let rt = build_runtime()?;
     rt.block_on(async {
@@ -109,7 +110,8 @@ fn drive_datafusion(path: &Path, work_dir: &Path, mode: Mode) -> anyhow::Result<
 fn drive_duckdb(path: &Path, work_dir: &Path, mode: Mode) -> anyhow::Result<()> {
     reset_dir(work_dir)?;
     let _guard = WorkDirGuard::new(work_dir.to_path_buf());
-    let work_dir = work_dir.to_string_lossy().into_owned();
+    // Windows get us backslashes slashes but Duckdb produces forward slashes
+    let work_dir = work_dir.to_string_lossy().replace('\\', "/");
 
     // Deliberately not a Tokio runtime. DuckDB scans drive Vortex's own runtime, and a Vortex
     // runtime driven from a thread inside `tokio::runtime::Runtime::block_on` loses the wakeups
@@ -173,6 +175,7 @@ fn engines_for(path: &Path) -> (bool, bool) {
 /// Vortex and Parquet versions both have to exist for the suite to run.
 const GENERATED_DATASETS: &[(&str, &str)] = &[
     ("tpch", "tpch/data/lineitem"),
+    ("tpcds", "tpcds/data/store_sales"),
     ("clickbench", "clickbench/data/hits"),
 ];
 
@@ -245,9 +248,9 @@ fn main() -> anyhow::Result<ExitCode> {
     let mut trials = Vec::new();
     for path in files {
         let (run_datafusion, run_duckdb) = engines_for(&path);
-        // TPC-H and ClickBench trials are ignored (rather than removed) when the
-        // generated data is absent, so `--list` and the run summary still
-        // account for them.
+        // Generated-data trials (TPC-H, TPC-DS, ClickBench) are ignored (rather
+        // than removed) when the data is absent, so `--list` and the run summary
+        // still account for them.
         let ignored = missing_generated_data(&path);
         let name = path
             .strip_prefix(SLT_ROOT.as_path())

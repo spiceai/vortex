@@ -1,16 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::sync::LazyLock;
+use std::sync::atomic::Ordering;
+
 use rstest::rstest;
 use vortex_buffer::Buffer;
+use vortex_buffer::BufferAllocatorRef;
 use vortex_buffer::buffer;
 use vortex_mask::Mask;
+use vortex_session::VortexSession;
 
 use super::filter_records;
 use crate::ArrayRef;
 use crate::IntoArray;
 use crate::VortexSessionExecute;
-use crate::array_session;
 use crate::arrays::DecimalArray;
 use crate::arrays::PrimitiveArray;
 use crate::compute::conformance::filter::LARGE_SIZE;
@@ -18,7 +22,10 @@ use crate::compute::conformance::filter::MEDIUM_SIZE;
 use crate::compute::conformance::filter::test_filter_conformance;
 use crate::dtype::DecimalDType;
 use crate::dtype::i256;
+use crate::memory::test_allocator::counting_allocator;
 use crate::validity::Validity;
+
+static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
 
 #[test]
 fn filter_fallback_width_records() {
@@ -29,14 +36,31 @@ fn filter_fallback_width_records() {
 
     // A uniquely owned buffer takes the in-place `copy_within` path.
     let owned = Buffer::from_iter(0u8..12);
-    let filtered = filter_records(owned, 3, &mask);
+    let original_ptr = owned.as_ptr();
+    let filtered = filter_records(owned, 3, &mask, BufferAllocatorRef::static_ref());
+    assert_eq!(filtered.as_ptr(), original_ptr);
     assert_eq!(filtered.as_slice(), &expected);
 
     // Retaining a second reference forces the copying path instead.
     let shared = Buffer::from_iter(0u8..12);
-    let _retained = shared.clone();
-    let filtered = filter_records(shared, 3, &mask);
+    let retained = shared.clone();
+    let filtered = filter_records(shared, 3, &mask, BufferAllocatorRef::static_ref());
+    assert_eq!(retained.as_slice(), &(0u8..12).collect::<Vec<_>>());
     assert_eq!(filtered.as_slice(), &expected);
+}
+
+#[test]
+fn filter_records_use_execution_allocator() {
+    let Mask::Values(mask) = Mask::from_iter([true, false, true, false]) else {
+        panic!("a mixed mask must have mask values");
+    };
+    let (allocator, allocations) = counting_allocator();
+    for byte_width in [3, 4] {
+        let values = Buffer::from_iter(0..4 * byte_width as u8);
+        let _retained = values.clone();
+        drop(filter_records(values, byte_width, &mask, &allocator));
+    }
+    assert_eq!(allocations.load(Ordering::Relaxed), 2);
 }
 
 #[rstest]
@@ -81,5 +105,5 @@ fn filter_fallback_width_records() {
     Validity::NonNullable,
 ).into_array())]
 fn fixed_width_filter_conformance(#[case] array: ArrayRef) {
-    test_filter_conformance(&array, &mut array_session().create_execution_ctx());
+    test_filter_conformance(&array, &mut SESSION.create_execution_ctx());
 }

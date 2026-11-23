@@ -4,7 +4,7 @@
 use std::any::Any;
 
 use vortex_error::VortexResult;
-use vortex_error::vortex_ensure;
+use vortex_error::vortex_ensure_eq;
 
 use crate::ArrayRef;
 use crate::ExecutionCtx;
@@ -58,11 +58,10 @@ impl ArrayBuilder for NullBuilder {
     }
 
     fn append_scalar(&mut self, scalar: &Scalar) -> VortexResult<()> {
-        vortex_ensure!(
-            scalar.dtype() == self.dtype(),
-            "NullBuilder expected scalar with dtype {}, got {}",
+        vortex_ensure_eq!(
+            scalar.dtype(),
             self.dtype(),
-            scalar.dtype()
+            "NullBuilder received a scalar with the wrong dtype"
         );
 
         self.append_null();
@@ -107,5 +106,6 @@ mod tests {
         let mut builder = NullBuilder::new();
         let wrong_scalar = Scalar::from(42i32);
         assert!(builder.append_scalar(&wrong_scalar).is_err());
+        assert_eq!(array.dtype(), &DType::Null);
     }
 }

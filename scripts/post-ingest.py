@@ -13,12 +13,13 @@
 fills commit metadata from `git show`, computes the internal `measurement_id`,
 then atomically upserts the whole file into the RDS fact tables.
 
-The wire contract is shared with the benchmarks-website repository:
+The wire contract is shared with bench, which lives under `bench/` in the
+vortex-data/vortex.dev repository:
 
 - `vortex-bench/src/v3.rs` owns the producer record shape.
-- `benchmarks-website/CONTRACT.md` documents the transport and schema contract.
-- `benchmarks-website/web/lib/schema-version.ts` is the `SCHEMA_VERSION` source
-  of truth that the constant below must match.
+- `bench/CONTRACT.md` documents the transport and schema contract.
+- `bench/web/lib/schema-version.ts` is the `SCHEMA_VERSION` source of truth
+  that the constant below must match.
 """
 
 from __future__ import annotations
@@ -26,17 +27,17 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import subprocess
 import sys
-import urllib.request
+import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import ModuleType
 from typing import TypeVar
 
-# MUST equal `benchmarks-website/web/lib/schema-version.ts::SCHEMA_VERSION`.
+T = TypeVar("T")
+
+# MUST equal `bench/web/lib/schema-version.ts::SCHEMA_VERSION` in vortex-data/vortex.dev.
 # Bumping this is a coordinated change across the website contract, v3.rs, and
 # this script.
 SCHEMA_VERSION = 3
@@ -76,6 +77,11 @@ def parse_args() -> argparse.Namespace:
         help="40-hex commit SHA. Usually ${{ github.sha }} in CI.",
     )
     parser.add_argument(
+        "--branch",
+        required=True,
+        help="Branch the results were measured on, stored as commits.branch. Usually ${{ github.ref_name }} in CI.",
+    )
+    parser.add_argument(
         "--repo-url",
         default="https://github.com/vortex-data/vortex",
         help="Base repo URL used to build the commits.url field.",
@@ -85,12 +91,6 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Run `git show` in this directory (default: current directory).",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=float,
-        default=30.0,
-        help="Site cache refresh timeout in seconds (default: 30).",
     )
     return parser.parse_args()
 
@@ -126,10 +126,12 @@ def git_show_field(sha: str, fmt: str, cwd: Path | None) -> str:
     return result.stdout.strip()
 
 
-def build_commit(sha: str, repo_url: str, git_dir: Path | None) -> dict:
+def build_commit(sha: str, branch: str, repo_url: str, git_dir: Path | None) -> dict:
     sha = sha.strip().lower()
     if len(sha) != 40 or any(c not in "0123456789abcdef" for c in sha):
         raise SystemExit(f"commit SHA must be 40-hex lowercase, got: {sha!r}")
+    if not branch:
+        raise SystemExit("--branch must not be empty")
 
     timestamp = git_show_field(sha, "%cI", git_dir)
     message = git_show_field(sha, "%s", git_dir)
@@ -141,6 +143,7 @@ def build_commit(sha: str, repo_url: str, git_dir: Path | None) -> dict:
 
     return {
         "sha": sha,
+        "branch": branch,
         "timestamp": timestamp,
         "message": message,
         "author_name": author_name,
@@ -216,8 +219,6 @@ _RECORD_FIELDS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
         frozenset({"env_triple"}),
     ),
 }
-
-_T = TypeVar("_T")
 
 _MEASUREMENT_ID_MODULE: ModuleType | None = None
 
@@ -424,7 +425,7 @@ _FIELD_TYPES: dict[str, tuple[tuple[str, str], ...]] = {
 def _validate_record_values(record: dict, kind: str, index: int) -> None:
     """Validate every field's type/range before the Postgres write.
 
-    Runs in `ingest_postgres`'s loop, where the record index is known. It drives
+    Runs before any transaction, where the record index is known. It drives
     type/range checks from `_FIELD_TYPES`, then applies semantic checks the type
     alone does not cover (the storage enum + memory quartet for query_measurements).
     """
@@ -479,12 +480,9 @@ def _upsert_returning_was_update(conn, sql: str, params: tuple) -> bool:
     return not row[0]
 
 
-def _insert_query_measurement(conn, mid_mod, r: dict) -> bool:
-    """Upsert a `query_measurements` row.
-
-    Record values are validated by `_validate_record_values` before dispatch.
-    """
-    mid = mid_mod.measurement_id_query(
+def _query_measurement_id(mid_mod, r: dict) -> int:
+    """Compute the `query_measurements` primary key."""
+    return mid_mod.measurement_id_query(
         commit_sha=r["commit_sha"],
         dataset=r["dataset"],
         dataset_variant=r.get("dataset_variant"),
@@ -494,6 +492,13 @@ def _insert_query_measurement(conn, mid_mod, r: dict) -> bool:
         engine=r["engine"],
         format=r["format"],
     )
+
+
+def _insert_query_measurement(conn, mid: int, r: dict) -> bool:
+    """Upsert a `query_measurements` row.
+
+    Record values are validated by `_validate_record_values` before dispatch.
+    """
     return _upsert_returning_was_update(
         conn,
         """
@@ -535,22 +540,26 @@ def _insert_query_measurement(conn, mid_mod, r: dict) -> bool:
             r.get("virtual_delta"),
             r.get("env_triple"),
             # The denormalized `commit_timestamp` (migration 006) is resolved from the
-            # `commits` row this same transaction upserted first, so the read path's
-            # latest-per-series summary never sees a NULL from this writer.
+            # `commits` row that `ingest_postgres` commits before the fact transaction, so the
+            # read path's latest-per-series summary never sees a NULL from this writer.
             r["commit_sha"],
         ),
     )
 
 
-def _insert_compression_time(conn, mid_mod, r: dict) -> bool:
-    """Upsert a `compression_times` row."""
-    mid = mid_mod.measurement_id_compression_time(
+def _compression_time_id(mid_mod, r: dict) -> int:
+    """Compute the `compression_times` primary key."""
+    return mid_mod.measurement_id_compression_time(
         commit_sha=r["commit_sha"],
         dataset=r["dataset"],
         dataset_variant=r.get("dataset_variant"),
         format=r["format"],
         op=r["op"],
     )
+
+
+def _insert_compression_time(conn, mid: int, r: dict) -> bool:
+    """Upsert a `compression_times` row."""
     return _upsert_returning_was_update(
         conn,
         """
@@ -579,14 +588,18 @@ def _insert_compression_time(conn, mid_mod, r: dict) -> bool:
     )
 
 
-def _insert_compression_size(conn, mid_mod, r: dict) -> bool:
-    """Upsert a `compression_sizes` row."""
-    mid = mid_mod.measurement_id_compression_size(
+def _compression_size_id(mid_mod, r: dict) -> int:
+    """Compute the `compression_sizes` primary key."""
+    return mid_mod.measurement_id_compression_size(
         commit_sha=r["commit_sha"],
         dataset=r["dataset"],
         dataset_variant=r.get("dataset_variant"),
         format=r["format"],
     )
+
+
+def _insert_compression_size(conn, mid: int, r: dict) -> bool:
+    """Upsert a `compression_sizes` row."""
     return _upsert_returning_was_update(
         conn,
         """
@@ -612,14 +625,18 @@ def _insert_compression_size(conn, mid_mod, r: dict) -> bool:
     )
 
 
-def _insert_random_access(conn, mid_mod, r: dict) -> bool:
-    """Upsert a `random_access_times` row."""
-    mid = mid_mod.measurement_id_random_access(
+def _random_access_time_id(mid_mod, r: dict) -> int:
+    """Compute the `random_access_times` primary key."""
+    return mid_mod.measurement_id_random_access(
         commit_sha=r["commit_sha"],
         dataset=r["dataset"],
         format=r["format"],
         open_mode=r["open_mode"],
     )
+
+
+def _insert_random_access(conn, mid: int, r: dict) -> bool:
+    """Upsert a `random_access_times` row."""
     return _upsert_returning_was_update(
         conn,
         """
@@ -648,19 +665,23 @@ def _insert_random_access(conn, mid_mod, r: dict) -> bool:
     )
 
 
-def _insert_vector_search(conn, mid_mod, r: dict) -> bool:
+def _vector_search_run_id(mid_mod, r: dict) -> int:
+    """Compute the `vector_search_runs` primary key."""
+    return mid_mod.measurement_id_vector_search(
+        commit_sha=r["commit_sha"],
+        dataset=r["dataset"],
+        layout=r["layout"],
+        flavor=r["flavor"],
+        threshold=float(r["threshold"]),
+    )
+
+
+def _insert_vector_search(conn, mid: int, r: dict) -> bool:
     """Upsert a `vector_search_runs` row.
 
     `threshold` is validated finite by `_validate_record_values` before dispatch.
     """
     threshold = float(r["threshold"])
-    mid = mid_mod.measurement_id_vector_search(
-        commit_sha=r["commit_sha"],
-        dataset=r["dataset"],
-        layout=r["layout"],
-        flavor=r["flavor"],
-        threshold=threshold,
-    )
     return _upsert_returning_was_update(
         conn,
         """
@@ -698,8 +719,16 @@ def _insert_vector_search(conn, mid_mod, r: dict) -> bool:
     )
 
 
-# Dispatch from a record's `kind` to its per-table upsert. Keyed identically to
-# `_RECORD_FIELDS`; the two maps are wired together when adding a fact table.
+# Dispatch from a record's `kind` to its per-table primary key and upsert. Keyed identically to
+# `_RECORD_FIELDS`; the three maps are wired together when adding a fact table.
+_MEASUREMENT_ID = {
+    "query_measurement": _query_measurement_id,
+    "compression_time": _compression_time_id,
+    "compression_size": _compression_size_id,
+    "random_access_time": _random_access_time_id,
+    "vector_search_run": _vector_search_run_id,
+}
+
 _APPLY_RECORD = {
     "query_measurement": _insert_query_measurement,
     "compression_time": _insert_compression_time,
@@ -714,10 +743,11 @@ def _upsert_commit(conn, commit: dict) -> None:
     conn.execute(
         """
         INSERT INTO commits (
-            commit_sha, timestamp, message, author_name, author_email,
+            commit_sha, branch, timestamp, message, author_name, author_email,
             committer_name, committer_email, tree_sha, url
-        ) VALUES (%s, %s::timestamptz, %s, %s, %s, %s, %s, %s, %s)
+        ) VALUES (%s, %s, %s::timestamptz, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (commit_sha) DO UPDATE SET
+            branch          = excluded.branch,
             timestamp       = excluded.timestamp,
             message         = excluded.message,
             author_name     = excluded.author_name,
@@ -729,6 +759,7 @@ def _upsert_commit(conn, commit: dict) -> None:
         """,
         (
             commit["sha"],
+            commit["branch"],
             commit["timestamp"],
             commit["message"],
             commit["author_name"],
@@ -741,60 +772,42 @@ def _upsert_commit(conn, commit: dict) -> None:
     )
 
 
-# CI runs concurrent writers whose upserts can touch commits and dimensions in
-# conflicting orders. Retrying transaction-level deadlocks and serialization
-# failures keeps each JSONL file all-or-nothing.
-_WRITE_CONFLICT_ATTEMPTS = 128
-
-
-def _retry_write_conflicts(op: Callable[[], _T]) -> _T:
-    """Retry `op` on a Postgres write conflict.
-
-    Row-level `ON CONFLICT DO UPDATE` upserts touching the same commits or
-    dimensions in conflicting orders can deadlock. The retryable Postgres errors are deadlock
-    (`SQLSTATE 40P01`) and serialization failure (`40001`); both abort one transaction cleanly,
-    so re-running the whole transaction is safe. A non-retryable error (e.g. a validation
-    `SystemExit`) propagates immediately. Returns `op`'s value on the first success.
-    """
-    from psycopg import errors as pg_errors
-
-    for attempt in range(1, _WRITE_CONFLICT_ATTEMPTS + 1):
-        try:
-            return op()
-        except (pg_errors.DeadlockDetected, pg_errors.SerializationFailure):
-            # The failing `op`'s `with conn.transaction()` block already rolled back, so the
-            # connection is idle and the whole transaction can be retried. Re-raise on the
-            # final attempt.
-            if attempt >= _WRITE_CONFLICT_ATTEMPTS:
-                raise
-    raise AssertionError("unreachable: _retry_write_conflicts exited without return or raise")
-
-
 def ingest_postgres(conn, commit: dict, records: list[dict]) -> tuple[int, int]:
-    """Upsert a commit and its records into Postgres, retrying on write conflicts."""
-    mid_mod = _measurement_id_module()
-    return _retry_write_conflicts(lambda: _ingest_postgres_once(conn, commit, records, mid_mod))
+    """Validate every record, then upsert the commit row and the file's fact rows.
 
+    Concurrent CI writers wait on each other only when their fact rows overlap, and never deadlock:
 
-def _ingest_postgres_once(conn, commit: dict, records: list[dict], mid_mod) -> tuple[int, int]:
-    """Upsert a commit and its records in one transaction (a single attempt).
+    - The `commits` upsert commits in its own short transaction. Holding its row lock for the
+      whole file would make every writer for the same commit queue behind the others. Commit
+      metadata is a pure function of the SHA, and `commit-metadata.yml` already writes commit
+      rows without fact rows, so this row may land even when the fact transaction fails.
+    - The fact rows are upserted in one transaction, so a file lands all or nothing. They are
+      applied in (table, `measurement_id`) order, so two writers whose rows overlap take their
+      row locks in the same order and cannot deadlock.
 
-    Upsert `commits` first, then each fact record while classifying it as inserted
-    or updated. Any validation failure rolls the whole transaction back.
+    Returns the number of fact rows inserted and updated.
     """
+    for idx, record in enumerate(records):
+        kind = _validate_record_fields(record, idx)
+        _validate_record_values(record, kind, idx)
+        if record["commit_sha"] != commit["sha"]:
+            raise SystemExit(
+                f"record {idx} ({kind}): commit_sha {record['commit_sha']!r} does not "
+                f"match the requested commit SHA {commit['sha']!r}"
+            )
+
+    mid_mod = _measurement_id_module()
+    rows = [(record["kind"], _MEASUREMENT_ID[record["kind"]](mid_mod, record), record) for record in records]
+    rows.sort(key=lambda row: row[:2])
+
+    with conn.transaction():
+        _upsert_commit(conn, commit)
+
     inserted = 0
     updated = 0
     with conn.transaction():
-        _upsert_commit(conn, commit)
-        for idx, record in enumerate(records):
-            kind = _validate_record_fields(record, idx)
-            if record["commit_sha"] != commit["sha"]:
-                raise SystemExit(
-                    f"record {idx} ({kind}): commit_sha {record['commit_sha']!r} does not "
-                    f"match the requested commit SHA {commit['sha']!r}"
-                )
-            _validate_record_values(record, kind, idx)
-            if _APPLY_RECORD[kind](conn, mid_mod, record):
+        for kind, mid, record in rows:
+            if _APPLY_RECORD[kind](conn, mid, record):
                 updated += 1
             else:
                 inserted += 1
@@ -890,9 +903,12 @@ def connect_postgres(dsn: str, region: str | None) -> object:
     # migration-owned `public.*` tables, regardless of any `search_path` baked into the DSN's
     # `options=-c search_path=...` or the role's default. libpq applies repeated `-c` settings
     # left-to-right (last wins), so appending ours last makes it authoritative even if the DSN
-    # already set one.
+    # already set one. The connect and statement timeouts stop a network or server hang from
+    # holding the job until its own timeout. `statement_timeout` also covers time spent waiting
+    # for locks, so no separate `lock_timeout` is needed.
     existing_options = params.get("options") or ""
-    params["options"] = f"{existing_options} -c search_path=public".strip()
+    params["options"] = f"{existing_options} -c search_path=public -c statement_timeout=30000".strip()
+    params["connect_timeout"] = 10
 
     conn = psycopg.connect(**params)
     # Verify the RESOLVED transport actually used TLS, not merely that the DSN requested
@@ -914,83 +930,65 @@ def connect_postgres(dsn: str, region: str | None) -> object:
     return conn
 
 
-def _http(method: str, url: str, token: str | None, timeout: float) -> bytes:
-    """Issue one HTTP request and return the body. Raises on any non-2xx or
-    transport error; callers in `refresh_site_cache` swallow those."""
-    headers = {"accept": "application/json"}
-    if token is not None:
-        headers["authorization"] = f"Bearer {token}"
-    req = urllib.request.Request(url, method=method, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read()
+# A restart of the RDS instance refuses connections for 30 seconds to a few minutes: on 2026-10-28
+# an engine upgrade took 33 seconds and an OS update about 3 minutes, and four ingest jobs failed.
+# These waits, about 4 minutes in all, span that window.
+_RETRY_DELAYS_S = (5, 10, 20, 40, 60, 60, 60)
 
 
-def _warm_default_windows(base: str, timeout: float) -> None:
-    """Best-effort warm pass: prime the freshly invalidated Data Cache for the
-    landing page and every group's default last-100 bundle, so the first human
-    request after an ingest is already hot. Each request is independent; one
-    failure does not abort the others."""
-
-    def warm(url: str) -> None:
+def _with_retries(
+    attempt: Callable[[], T],
+    *,
+    should_retry: Callable[[Exception], bool],
+    delays: tuple[float, ...] = _RETRY_DELAYS_S,
+    sleep: Callable[[float], None] = time.sleep,
+) -> T:
+    """Run `attempt`, and run it again after each delay while it raises an error that
+    `should_retry` accepts. The last error is raised once the delays run out."""
+    for delay in delays:
         try:
-            _http("GET", url, None, timeout)
-        except Exception as exc:  # noqa: BLE001 -- warm is best-effort.
-            print(f"warning: warm {url} failed: {exc}", file=sys.stderr)
-
-    warm(f"{base}/")
-    try:
-        groups_body = _http("GET", f"{base}/api/groups", None, timeout)
-        slugs = [g["slug"] for g in json.loads(groups_body).get("groups", []) if "slug" in g]
-    except Exception as exc:  # noqa: BLE001 -- group discovery is best-effort.
-        print(f"warning: warm group discovery failed: {exc}", file=sys.stderr)
-        return
-    # A whole-bundle recompute is a few seconds cold, so warm with bounded
-    # concurrency rather than one slow serial pass.
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        pool.map(lambda s: warm(f"{base}/api/group/{s}?n=100"), slugs)
+            return attempt()
+        except Exception as exc:
+            if not should_retry(exc):
+                raise
+            print(f"warning: database unavailable ({exc}); retrying in {delay:g}s", file=sys.stderr)
+            sleep(delay)
+    return attempt()
 
 
-def refresh_site_cache(base_url: str, token: str, timeout: float) -> None:
-    """Revalidate the site's Data Cache tag, then warm the default windows.
+def _is_transient_db_error(exc: Exception) -> bool:
+    """True for a lost or refused connection. A statement timeout is not retried: it is a slow
+    query, not an outage."""
+    import psycopg
 
-    BEST-EFFORT: every failure is logged to stderr and swallowed so a cache
-    refresh can never change the ingest exit code. The warm pass is skipped
-    when revalidation fails: warming after a failed flush would repopulate the
-    Data Cache with stale data, which is the opposite of the intent.
-    """
-    base = base_url.rstrip("/")
-    try:
-        _http("POST", f"{base}/api/revalidate", token, timeout)
-    except Exception as exc:  # noqa: BLE001 -- refresh must never raise into ingest.
-        print(f"warning: cache revalidate failed: {exc}", file=sys.stderr)
-        return  # Skip the warm pass: no point warming a cache that was not flushed.
-    _warm_default_windows(base, timeout)
+    return isinstance(exc, psycopg.OperationalError) and not isinstance(exc, psycopg.errors.QueryCanceled)
 
 
 def _main_postgres(args: argparse.Namespace) -> int:
     records = read_records(args.jsonl_path)
     # `build_commit` runs `git show <commit_sha>`, so the SHA must be in the runner's local git
-    # history. The v4 ingest step inherits the v3 `--server` step's checkout assumption (the default
-    # checkout provides the head SHA); a shallow checkout missing the SHA fails loud here, and the
-    # v4 step is best-effort (continue-on-error), so it never fails the job.
-    commit = build_commit(args.commit_sha, args.repo_url, args.git_dir)
-    conn = connect_postgres(args.postgres, args.region)
-    try:
-        inserted, updated = ingest_postgres(conn, commit, records)
-    finally:
-        conn.close()
+    # history. A shallow checkout missing the SHA fails before opening a database connection.
+    commit = build_commit(args.commit_sha, args.branch, args.repo_url, args.git_dir)
+
+    # Each attempt connects again, with a fresh IAM token, and writes the whole file. Retrying the
+    # write is safe: the commit row is an idempotent upsert, and the fact rows land in one
+    # transaction, so a connection lost mid-write leaves nothing half-written.
+    def write() -> tuple[int, int]:
+        conn = connect_postgres(args.postgres, args.region)
+        try:
+            return ingest_postgres(conn, commit, records)
+        finally:
+            conn.close()
+
+    inserted, updated = _with_retries(write, should_retry=_is_transient_db_error)
     print(
         json.dumps(
             {"records": len(records), "inserted": inserted, "updated": updated},
             separators=(",", ":"),
         )
     )
-    # Best-effort site-cache refresh after a successful write. It runs only
-    # when both environment variables are configured and can never fail ingest.
-    base_url = os.environ.get("BENCH_SITE_BASE_URL")
-    revalidate_token = os.environ.get("BENCH_REVALIDATE_TOKEN")
-    if base_url and revalidate_token:
-        refresh_site_cache(base_url, revalidate_token, args.timeout)
+    # The site cache is refreshed once per push by `refresh-bench-site.py`, after the last
+    # benchmark job of the push, not after each ingest.
     return 0
 
 

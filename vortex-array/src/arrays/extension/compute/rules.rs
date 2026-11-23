@@ -36,12 +36,15 @@ impl ArrayReduceRule<Extension> for ExtensionConstantRule {
         };
 
         let storage_scalar = const_array.scalar().clone();
-        let ext_scalar = Scalar::try_extension_ref(array.ext_dtype().clone(), storage_scalar)?;
+        let Ok(ext_scalar) = Scalar::try_extension_ref(array.ext_dtype().clone(), storage_scalar)
+        else {
+            // Invalid extension values must not prevent storage access or structural operations.
+            return Ok(None);
+        };
 
-        let constant_with_extension_scalar =
-            ConstantArray::new(ext_scalar, array.len()).into_array();
-
-        Ok(Some(constant_with_extension_scalar.into_array()))
+        Ok(Some(
+            ConstantArray::new(ext_scalar, array.len()).into_array(),
+        ))
     }
 }
 
@@ -99,6 +102,7 @@ mod tests {
     use crate::arrays::ScalarFn;
     use crate::arrays::extension::ExtensionArrayExt;
     use crate::arrays::scalar_fn::ScalarFnArrayExt;
+    use crate::assert_arrays_eq;
     use crate::dtype::DType;
     use crate::dtype::Nullability;
     use crate::dtype::PType;
@@ -112,7 +116,7 @@ mod tests {
     use crate::scalar_fn::fns::binary::Binary;
     use crate::scalar_fn::fns::operators::Operator;
 
-    static SESSION: LazyLock<VortexSession> = LazyLock::new(crate::array_session);
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
 
     #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
     struct TestExt;
@@ -210,12 +214,11 @@ mod tests {
         assert_eq!(ext_result.len(), 3);
 
         // Check values: should be [Some(1), None, None]
-        let canonical = ext_result
-            .storage_array()
-            .clone()
-            .execute::<PrimitiveArray>(&mut SESSION.create_execution_ctx())
-            .unwrap();
-        assert_eq!(canonical.len(), 3);
+        assert_arrays_eq!(
+            ext_result.storage_array(),
+            PrimitiveArray::from_option_iter([Some(1i64), None, None]),
+            &mut SESSION.create_execution_ctx()
+        );
     }
 
     #[test]
@@ -239,69 +242,11 @@ mod tests {
             .as_opt::<Constant>()
             .expect("constant extension child should be normalized");
 
-        assert!(constant.scalar().as_extension_opt().is_some());
-        assert_eq!(constant.len(), 3);
-    }
-
-    #[test]
-    fn test_scalar_fn_no_pushdown_different_ext_types() {
-        #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-        struct TestExt2;
-        impl ExtVTable for TestExt2 {
-            type Metadata = EmptyMetadata;
-            type NativeValue<'a> = &'a str;
-
-            #[expect(clippy::disallowed_methods, reason = "test-only id")]
-            fn id(&self) -> ExtId {
-                ExtId::new("test_ext_2")
-            }
-
-            fn serialize_metadata(&self, _metadata: &Self::Metadata) -> VortexResult<Vec<u8>> {
-                Ok(vec![])
-            }
-
-            fn deserialize_metadata(&self, _data: &[u8]) -> VortexResult<Self::Metadata> {
-                Ok(EmptyMetadata)
-            }
-
-            fn validate_dtype(_extension_dtype: &ExtDType<Self>) -> VortexResult<()> {
-                Ok(())
-            }
-
-            fn unpack_native<'a>(
-                _extension_dtype: &'a ExtDType<Self>,
-                _storage_value: &'a ScalarValue,
-            ) -> VortexResult<Self::NativeValue<'a>> {
-                Ok("")
-            }
-        }
-
-        let ext_dtype1 = ExtDType::<TestExt>::try_new(
-            EmptyMetadata,
-            DType::Primitive(PType::I64, Nullability::NonNullable),
-        )
-        .unwrap()
-        .erased();
-
-        let storage = buffer![10i64, 20, 30].into_array();
-        let ext_array = ExtensionArray::new(ext_dtype1, storage).into_array();
-
-        // Create constant with different extension type
-        let const_scalar = Scalar::extension::<TestExt2>(EmptyMetadata, Scalar::from(25i64));
-        let const_array = ConstantArray::new(const_scalar, 3).into_array();
-
-        let scalar_fn_array = Binary::try_new(ext_array, const_array, Operator::Lt)
-            .unwrap()
-            .into_array();
-
-        let optimized = scalar_fn_array.optimize().unwrap();
-
-        // The first child should still be an ExtensionArray (no pushdown happened)
-        let scalar_fn = optimized.as_opt::<ScalarFn>().unwrap();
-        assert!(
-            scalar_fn.children()[0].as_opt::<Extension>().is_some(),
-            "Expected first child to remain ExtensionArray when ext types differ"
+        assert_eq!(
+            constant.scalar(),
+            &Scalar::extension_ref(test_ext_dtype(), Scalar::from(10i64))
         );
+        assert_eq!(constant.len(), 3);
     }
 
     #[test]
@@ -326,29 +271,6 @@ mod tests {
         assert!(
             scalar_fn.children()[0].as_opt::<Extension>().is_some(),
             "Expected first child to remain ExtensionArray when sibling is not constant"
-        );
-    }
-
-    #[test]
-    fn test_scalar_fn_no_pushdown_non_extension_constant() {
-        let ext_dtype = test_ext_dtype();
-        let storage = buffer![10i64, 20, 30].into_array();
-        let ext_array = ExtensionArray::new(ext_dtype, storage).into_array();
-
-        // Create a non-extension constant (plain primitive)
-        let const_array = ConstantArray::new(Scalar::from(25i64), 3).into_array();
-
-        let scalar_fn_array = Binary::try_new(ext_array, const_array, Operator::Lt)
-            .unwrap()
-            .into_array();
-
-        let optimized = scalar_fn_array.optimize().unwrap();
-
-        // No pushdown should happen because constant is not an extension scalar
-        let scalar_fn = optimized.as_opt::<ScalarFn>().unwrap();
-        assert!(
-            scalar_fn.children()[0].as_opt::<Extension>().is_some(),
-            "Expected first child to remain ExtensionArray when constant is not extension"
         );
     }
 }

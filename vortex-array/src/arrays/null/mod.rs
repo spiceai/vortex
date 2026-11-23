@@ -4,11 +4,14 @@
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
+use vortex_error::vortex_ensure_eq;
 use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
 use crate::ArrayRef;
+use crate::ArraySlots;
+use crate::ArrayVTable;
 use crate::ExecutionCtx;
 use crate::ExecutionResult;
 use crate::array::Array;
@@ -17,14 +20,18 @@ use crate::array::ArrayParts;
 use crate::array::ArrayView;
 use crate::array::EmptyArrayData;
 use crate::array::OperationsVTable;
+use crate::array::ProbeState;
 use crate::array::VTable;
 use crate::array::ValidityVTable;
 use crate::array::with_empty_buffers;
+use crate::arrays::Dict;
+use crate::arrays::dict::TakeExecuteAdaptor;
 use crate::arrays::null::compute::rules::PARENT_RULES;
 use crate::buffer::BufferHandle;
 use crate::builders::ArrayBuilder;
 use crate::builders::NullBuilder;
 use crate::dtype::DType;
+use crate::optimizer::kernels::ArrayKernelsExt;
 use crate::scalar::Scalar;
 use crate::serde::ArrayChildren;
 use crate::validity::Validity;
@@ -33,6 +40,12 @@ pub(crate) mod compute;
 
 /// A [`Null`]-encoded Vortex array.
 pub type NullArray = Array<Null>;
+
+pub(crate) fn initialize(session: &VortexSession) {
+    session
+        .kernels()
+        .register_execute_parent_kernel(Dict.id(), Null, TakeExecuteAdaptor(Null));
+}
 
 impl VTable for Null {
     type TypedArrayData = EmptyArrayData;
@@ -52,7 +65,7 @@ impl VTable for Null {
         _len: usize,
         _slots: &[Option<ArrayRef>],
     ) -> VortexResult<()> {
-        vortex_ensure!(*dtype == DType::Null, "NullArray dtype must be DType::Null");
+        vortex_ensure_eq!(*dtype, DType::Null, "NullArray dtype must be DType::Null");
         Ok(())
     }
 
@@ -107,6 +120,7 @@ impl VTable for Null {
             dtype.clone(),
             len,
             EmptyArrayData,
+            ArraySlots::new(),
         ))
     }
 
@@ -147,7 +161,8 @@ impl VTable for Null {
 /// ```
 /// # fn main() -> vortex_error::VortexResult<()> {
 /// use vortex_array::arrays::NullArray;
-/// use vortex_array::{IntoArray, VortexSessionExecute, array_session};
+/// use vortex_array::{IntoArray, VortexSessionExecute};
+/// use vortex_session::VortexSession;
 ///
 /// // Create a null array with 5 elements
 /// let array = NullArray::new(5);
@@ -157,7 +172,7 @@ impl VTable for Null {
 /// assert_eq!(sliced.len(), 2);
 ///
 /// // All elements are null
-/// let mut ctx = array_session().create_execution_ctx();
+/// let mut ctx = VortexSession::empty().create_execution_ctx();
 /// let scalar = array.execute_scalar(0, &mut ctx).unwrap();
 /// assert!(scalar.is_null());
 /// # Ok(())
@@ -169,18 +184,34 @@ pub struct Null;
 impl Array<Null> {
     pub fn new(len: usize) -> Self {
         unsafe {
-            Array::from_parts_unchecked(ArrayParts::new(Null, DType::Null, len, EmptyArrayData))
+            Array::from_parts_unchecked(ArrayParts::new(
+                Null,
+                DType::Null,
+                len,
+                EmptyArrayData,
+                ArraySlots::new(),
+            ))
         }
     }
 }
 
 impl OperationsVTable<Null> for Null {
-    fn scalar_at(
-        _array: ArrayView<'_, Null>,
+    type ProbeState = ();
+
+    fn probe_scalar(
+        _state: &mut ProbeState<'_, Null>,
         _index: usize,
         _ctx: &mut ExecutionCtx,
     ) -> VortexResult<Scalar> {
         Ok(Scalar::null(DType::Null))
+    }
+
+    fn scalar_at(
+        array: ArrayView<'_, Null>,
+        index: usize,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Scalar> {
+        Self::probe_scalar(&mut ProbeState::once(array), index, ctx)
     }
 }
 

@@ -25,8 +25,29 @@ void duckdb_vx_string_map_insert(duckdb_vx_string_map map, const char *key, cons
 // Input data passed into the init_global and init_local callbacks.
 typedef struct {
     const void *bind_data;
+
+    /**
+     * Projected columns that are requested to be read. These are not
+     * all columns, only the ones DuckDB optimizer thinks we should read.
+     */
     idx_t *column_ids;
     size_t column_ids_count;
+
+    /**
+     * Post filter projected columns. Our table function implements filter
+     * pushdown so this list is a subset of columns referenced in column_ids
+     * after filter pushdown and filter pruning. May be empty, in which case
+     * column_ids should be used.
+     * Indices in this list reference values from column_ids. I.e. if
+     * column_ids=[1,5,6], projection_ids=[1], output column should be
+     * column_ids[1] = 5
+     *
+     * Example usage:
+     * https://github.com/duckdb/duckdb/blob/dc11eadd8f0a7c600f0034810706605ebe10d5b9/src/include/duckdb/function/table_function.hpp#L147
+     */
+    const idx_t *projection_ids;
+    size_t projection_ids_count;
+
     duckdb_vx_table_filter_set filters;
     duckdb_client_context client_context;
 } duckdb_vx_tfunc_init_input;
@@ -49,6 +70,9 @@ typedef struct {
     bool has_null;
     // owned column type
     duckdb_logical_type type;
+    // TODO(myrrc) remove after https://github.com/duckdb/duckdb/pull/28099
+    // is merged
+    uint64_t row_count;
 } duckdb_column_statistics;
 
 // File-level statistics of a written Vortex file, for the DuckLake
@@ -62,6 +86,8 @@ typedef struct {
 
 // Per-column statistics of a written Vortex file.
 typedef struct {
+    // Owned VARCHAR holding column's dot-separated path.
+    duckdb_value column_key;
     // Owned values, null if absent; the caller must destroy them.
     duckdb_value min;
     duckdb_value max;
@@ -81,6 +107,8 @@ duckdb_state duckdb_vx_register_version_function(duckdb_database ffi_db, const c
 typedef struct duckdb_vx_agg_input_ *duckdb_vx_agg_input;
 idx_t duckdb_vx_aggregate_len(duckdb_vx_agg_input ffi);
 duckdb_vx_expr duckdb_vx_aggregate_at(duckdb_vx_agg_input ffi, idx_t index, idx_t *proj_idx);
+duckdb_vx_table_filter_set duckdb_vx_aggregate_table_filters(duckdb_vx_agg_input ffi);
+idx_t duckdb_vx_aggregate_column_id(duckdb_vx_agg_input ffi, idx_t scan_index);
 
 #ifdef __cplusplus
 }

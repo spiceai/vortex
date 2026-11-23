@@ -3,11 +3,17 @@
 
 //! Differential oracle for `list_contains` over a constant list.
 //!
-//! Every answer below was recorded by running this test against the commit
-//! before the set probe was introduced, so the table pins the previous
-//! implementation's results rather than the current one's. A change that makes
-//! `list_contains` faster leaves it untouched; a change that makes it answer
-//! differently fails here.
+//! Every answer below was first recorded against the implementation before the
+//! set probe was introduced, so the table pins a previous implementation's
+//! results rather than the current one's. A change that makes `list_contains`
+//! faster leaves it untouched; a change that makes it answer differently fails
+//! here.
+//!
+//! The table was re-recorded once, on the move to upstream Vortex 0.93, whose
+//! `list_contains` answers a null needle with null (`?`) where the previous
+//! implementation answered `false` (`.`). Null is SQL's answer to
+//! `NULL IN (...)`, and the one `NOT` needs: negating `false` keeps the row. No
+//! other answer changed.
 //!
 //! The matrix is built around what the probe covers and what it declines. List
 //! lengths straddle the threshold at which membership stops being answered by
@@ -51,7 +57,7 @@ use vortex_buffer::buffer;
 /// One row per case: the answers `list_contains` gave, as `T` (true), `.`
 /// (false) and `?` (invalid).
 fn render(case: &str, list: Scalar, needles: ArrayRef) -> String {
-    let session = vortex_array::array_session();
+    let session = vortex_session::VortexSession::empty();
     let mut ctx = session.create_execution_ctx();
 
     let result = needles
@@ -303,25 +309,25 @@ fn main_table() -> String {
     rows.join("\n")
 }
 
-/// Recorded from the implementation before the set probe. See the module doc.
+/// Recorded from upstream Vortex 0.93's `list_contains`. See the module doc.
 const EXPECTED: &str = "\
-i64 m=1 list=nonnull               ..............T.\n\
-i64 m=1 list=nullable              ..............T.\n\
-i64 m=2 list=nonnull               ..T...........T.\n\
-i64 m=2 list=nullable              ..T...........T.\n\
-i64 m=3 list=nonnull               ..T.T.........T.\n\
-i64 m=3 list=nullable              ..T.T.........T.\n\
-i64 m=4 list=nonnull               ..T.T.........T.\n\
-i64 m=4 list=nullable              ..T.T.........T.\n\
-i64 m=5 list=nonnull               ..T.T.........T.\n\
-i64 m=5 list=nullable              ..T.T.........T.\n\
-i64 m=8 list=nonnull               ..T.T.........T.\n\
-i64 m=8 list=nullable              ..T.T.........T.\n\
-i64 m=64 list=nonnull              ..T.T......T..T.\n\
-i64 m=64 list=nullable             ..T.T......T..T.\n\
-i64 m=2048 list=nonnull            ..T.T......T.TT.\n\
-i64 m=2048 list=nullable           ..T.T......T.TT.\n\
-i64 m=9 one-null-element           ..T.T.........T.\n\
+i64 m=1 list=nonnull               ?..?..?..?..?.T?\n\
+i64 m=1 list=nullable              ?..?..?..?..?.T?\n\
+i64 m=2 list=nonnull               ?.T?..?..?..?.T?\n\
+i64 m=2 list=nullable              ?.T?..?..?..?.T?\n\
+i64 m=3 list=nonnull               ?.T?T.?..?..?.T?\n\
+i64 m=3 list=nullable              ?.T?T.?..?..?.T?\n\
+i64 m=4 list=nonnull               ?.T?T.?..?..?.T?\n\
+i64 m=4 list=nullable              ?.T?T.?..?..?.T?\n\
+i64 m=5 list=nonnull               ?.T?T.?..?..?.T?\n\
+i64 m=5 list=nullable              ?.T?T.?..?..?.T?\n\
+i64 m=8 list=nonnull               ?.T?T.?..?..?.T?\n\
+i64 m=8 list=nullable              ?.T?T.?..?..?.T?\n\
+i64 m=64 list=nonnull              ?.T?T.?..?.T?.T?\n\
+i64 m=64 list=nullable             ?.T?T.?..?.T?.T?\n\
+i64 m=2048 list=nonnull            ?.T?T.?..?.T?TT?\n\
+i64 m=2048 list=nullable           ?.T?T.?..?.T?TT?\n\
+i64 m=9 one-null-element           ?.T?T.?..?..?.T?\n\
 f64 m=1                            T.......\n\
 f64 m=2                            T.T.....\n\
 f64 m=3                            T.T.T...\n\
@@ -338,11 +344,11 @@ utf8 m=4                           TTT...\n\
 utf8 m=5                           TTT...\n\
 utf8 m=64                          TTT.TT\n\
 utf8 m=8 long                      T.T.T\n\
-utf8 m=4 nullable-needles          T.T..\n\
-binary m=4                         TT..T\n\
-i32 m=8                            T.T.T.\n\
+utf8 m=4 nullable-needles          T?T?.\n\
+binary m=4                         TT.?T\n\
+i32 m=8                            T.T?T.\n\
 u8 m=8                             T.T.T.\n\
-i64 m=8 duplicates                 ..T.T.........T.\n\
+i64 m=8 duplicates                 ?.T?T.?..?..?.T?\n\
 i64 m=0 empty                      ................";
 
 #[test]

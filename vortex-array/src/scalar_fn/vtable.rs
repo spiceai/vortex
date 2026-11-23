@@ -14,19 +14,72 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
 use vortex_session::VortexSession;
+use vortex_utils::iter::ReduceBalancedIterExt;
 
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::IntoArray;
+use crate::arrays::ConstantArray;
 use crate::arrays::ScalarFn;
 use crate::arrays::ScalarFnArray;
 use crate::dtype::DType;
+use crate::executor::DonePredicate;
 use crate::expr::BoundExpression;
 use crate::expr::Expression;
+use crate::expr::bound;
 use crate::expr::display::ExprDisplay;
+use crate::matcher::Matcher;
+use crate::scalar::Scalar;
 use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::ScalarFnRef;
 use crate::scalar_fn::TypedScalarFnInstance;
+use crate::scalar_fn::fns::binary::Binary;
+use crate::scalar_fn::fns::is_not_null::IsNotNull;
+use crate::scalar_fn::fns::literal::Literal;
+use crate::scalar_fn::fns::operators::Operator;
+use crate::validity::Validity;
+
+// Here and beyond we use validity(x) interchangeably with is_not_null(x).
+#[derive(Clone)]
+pub enum ReduceNodeValidity<T: ReduceNode> {
+    /// Validity of T can be symbolically reduced (i.e. without evaluating T)
+    /// to a function over validities of this node's children. For an
+    /// expression reduce node, one example is byte_length(x).
+    /// validity(byte_length(x)) can be symbolically reduced to validity(x)
+    /// since byte_length doesn't change validity.
+    Reduced(T),
+    /// Validity of T can't be symbolically reduced to anything, and all
+    /// further reductions require evaluating T first. For an expression reduce
+    /// node, one example is list_contains(x, C) since you can't reduce
+    /// validity(list_contains(x, C)). list_contains([], null) is false, but to
+    /// know that, you need to evaluate x's offsets.
+    ///
+    /// This is also the default case.
+    Irreducible,
+}
+
+/// IsNotNull(child) as a reducible node
+pub(crate) fn is_not_null_node<T: ReduceNode>(child: &T) -> VortexResult<T> {
+    child.new_node(IsNotNull.bind(EmptyOptions), std::slice::from_ref(child))
+}
+
+/// "And" over "node's" non-nullable children
+pub fn union_child_validities<T: ReduceNode>(node: &T) -> VortexResult<T> {
+    let mut parts = Vec::with_capacity(node.child_count());
+    for i in 0..node.child_count() {
+        let child = node.child(i);
+        if child.node_dtype()?.is_nullable() {
+            parts.push(is_not_null_node(&child)?);
+        }
+    }
+    let parts = parts
+        .into_iter()
+        .try_reduce_balanced(|lhs, rhs| {
+            lhs.new_node(Binary.bind(Operator::And), &[lhs.clone(), rhs])
+        })?
+        .unwrap_or_else(|| node.new_constant(true.into()));
+    Ok(parts)
+}
 
 /// This trait defines the interface for scalar function vtables, including methods for
 /// serialization, deserialization, validation, child naming, return type computation,
@@ -107,7 +160,33 @@ pub trait ScalarFnVTable: 'static + Sized + Clone + Send + Sync {
     /// [`Expression::try_new`]: crate::expr::Expression::try_new
     fn return_dtype(&self, options: &Self::Options, args: &[DType]) -> VortexResult<DType>;
 
+    /// Bind whatever in the options depends on the argument dtypes, such as the body of a
+    /// [`Lambda`](crate::expr::Lambda), returning the bound options.
+    ///
+    /// This is called whenever a bound node is built and whenever a
+    /// [`ScalarFnArray`] is built from its children, before
+    /// [`return_dtype`](Self::return_dtype), so [`execute`](Self::execute) finds the options bound.
+    /// A rebuilt node calls it again, possibly with other dtypes: options that are already bound
+    /// must be checked against these dtypes, returning `None` if they fit and an error if they
+    /// don't. Return `None` to keep the options as they are, which the default does.
+    #[doc(hidden)]
+    fn bind_options(
+        &self,
+        options: &Self::Options,
+        args: &[DType],
+    ) -> VortexResult<Option<Self::Options>> {
+        _ = (options, args);
+        Ok(None)
+    }
+
     /// Execute the expression over the input arguments.
+    ///
+    /// Superseded by [`execute_step`](Self::execute_step). Vortex only calls this method through
+    /// the default `execute_step`. A function that implements `execute_step` either implements
+    /// `execute` with [`vortex_panic!`], or keeps its logic here and calls it from `execute_step`
+    /// once [`require_input!`](crate::require_input) has its inputs in the form it needs.
+    ///
+    /// [`vortex_panic!`]: vortex_error::vortex_panic
     ///
     /// Implementations are encouraged to check their inputs for constant arrays to perform
     /// more optimized execution.
@@ -125,6 +204,30 @@ pub trait ScalarFnVTable: 'static + Sized + Clone + Send + Sync {
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef>;
 
+    /// Perform a single step of execution over the input arguments.
+    ///
+    /// This is used by the iterative executor when executing a
+    /// [`ScalarFnArray`]. Instead of executing an input itself, an implementation can return
+    /// [`ScalarFnExecutionResult::execute_input`] to ask the scheduler to execute that input until
+    /// it matches a [`Matcher`]. The scheduler then calls `execute_step` again with the executed
+    /// input in its place, so deep trees of scalar functions run without recursion.
+    ///
+    /// Only request an input that does not already match, otherwise execution cannot make
+    /// progress and fails.
+    ///
+    /// The default delegates to [`execute`](Self::execute), for functions that have not been
+    /// migrated yet. [`ScalarFnRef::execute`] is defined in terms of this method, so once a
+    /// function overrides it, its [`execute`](Self::execute) is never called.
+    fn execute_step(
+        &self,
+        options: &Self::Options,
+        args: &dyn ExecutionArgs,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<ScalarFnExecutionResult> {
+        self.execute(options, args, ctx)
+            .map(ScalarFnExecutionResult::done)
+    }
+
     /// Implement an abstract reduction rule over a tree of scalar functions.
     ///
     /// The [`ReduceNode`] can be used to traverse children, inspect their types, and
@@ -138,42 +241,48 @@ pub trait ScalarFnVTable: 'static + Sized + Clone + Send + Sync {
         Ok(None)
     }
 
-    /// Simplify the expression if possible.
+    /// For node, returns node' which is exactly the result of evaluating
+    /// validity(node). Returned node' is either a lazy computation over
+    /// children of node, a constant, or Irreducible which means you need to
+    /// evaluate node to get its validity.
+    fn validity<T: ReduceNode>(
+        &self,
+        options: &Self::Options,
+        node: &T,
+    ) -> VortexResult<ReduceNodeValidity<T>> {
+        if !self.is_strict(options) {
+            return Ok(ReduceNodeValidity::Irreducible);
+        }
+
+        let mut dtypes = Vec::with_capacity(node.child_count());
+        for i in 0..node.child_count() {
+            let dtype = node.child(i).node_dtype()?;
+            if matches!(dtype, DType::Null) {
+                return Ok(ReduceNodeValidity::Irreducible);
+            }
+            dtypes.push(dtype.as_nonnullable());
+        }
+
+        let res = if let Ok(dtype) = self.return_dtype(options, &dtypes)
+            && !dtype.is_nullable()
+        {
+            ReduceNodeValidity::Reduced(union_child_validities(node)?)
+        } else {
+            ReduceNodeValidity::Irreducible
+        };
+        Ok(res)
+    }
+
+    /// Simplify the bound expression if possible.
+    ///
+    /// Every node of `expr` carries its dtype, so rules read types directly from the tree.
     fn simplify(
         &self,
         options: &Self::Options,
-        expr: &Expression,
-        ctx: &dyn SimplifyCtx,
-    ) -> VortexResult<Option<Expression>> {
+        expr: &BoundExpression,
+    ) -> VortexResult<Option<BoundExpression>> {
         _ = options;
         _ = expr;
-        _ = ctx;
-        Ok(None)
-    }
-
-    /// Simplify the expression if possible, without type information.
-    fn simplify_untyped(
-        &self,
-        options: &Self::Options,
-        expr: &Expression,
-    ) -> VortexResult<Option<Expression>> {
-        _ = options;
-        _ = expr;
-        Ok(None)
-    }
-
-    /// Returns an expression that evaluates to the validity of the result of this expression.
-    ///
-    /// If a validity expression cannot be constructed, returns `None` and the expression will
-    /// be evaluated as normal before extracting the validity mask from the result.
-    ///
-    /// This is essentially a specialized form of a `reduce_parent`
-    fn validity(
-        &self,
-        options: &Self::Options,
-        expression: &Expression,
-    ) -> VortexResult<Option<Expression>> {
-        _ = (options, expression);
         Ok(None)
     }
 
@@ -225,7 +334,7 @@ pub trait ScalarFnVTable: 'static + Sized + Clone + Send + Sync {
 /// A node used for implementing abstract reduction rules over a tree of scalar functions.
 ///
 /// Reduction rules are generic over the node type, so a rule is written once and monomorphized
-/// per reducible tree kind: [`ExpressionReduceNode`] for expression trees and
+/// per reducible tree kind: [`ExpressionReduceNode`] for bound expression trees and
 /// [`ArrayReduceNode`] for array trees. Nodes borrow from the tree being reduced, making
 /// traversal allocation-free, while nodes produced by [`ReduceNode::new_node`] own their
 /// freshly-built subtrees.
@@ -245,38 +354,51 @@ pub trait ReduceNode: Clone {
     /// Create a new node from the given scalar function and children, inheriting this node's
     /// reduction context (e.g. the expression scope, or the array row count).
     fn new_node(&self, scalar_fn: ScalarFnRef, children: &[Self]) -> VortexResult<Self>;
+
+    /// Return a scalar value if this node is constant
+    fn as_constant(&self) -> Option<&Scalar> {
+        None
+    }
+
+    /// Produce a new constant node in the same scope as "self"
+    fn new_constant(&self, value: Scalar) -> Self;
+
+    /// Symbolic validity of this node. Reduced() if you can get from node's
+    /// validity to validity of its children or a constant without evaluating
+    /// node.
+    fn validity(&self) -> VortexResult<ReduceNodeValidity<Self>>
+    where
+        Self: Sized;
 }
 
-/// A [`ReduceNode`] over an expression tree, typed within a scope.
+/// A [`ReduceNode`] over a bound expression tree.
 #[derive(Clone)]
 pub struct ExpressionReduceNode<'a> {
-    expression: Cow<'a, Expression>,
-    scope: &'a DType,
+    expression: Cow<'a, BoundExpression>,
 }
 
 impl<'a> ExpressionReduceNode<'a> {
-    /// Creates a node borrowing the given expression and scope.
-    pub fn new(expression: &'a Expression, scope: &'a DType) -> Self {
+    /// Creates a node borrowing the given bound expression.
+    pub fn new(expression: &'a BoundExpression) -> Self {
         Self {
             expression: Cow::Borrowed(expression),
-            scope,
         }
     }
 
-    /// Returns the expression backing this node.
-    pub fn expression(&self) -> &Expression {
+    /// Returns the bound expression backing this node.
+    pub fn expression(&self) -> &BoundExpression {
         &self.expression
     }
 
-    /// Consumes this node and returns the backing expression.
-    pub fn into_expression(self) -> Expression {
+    /// Consumes this node and returns the backing bound expression.
+    pub fn into_expression(self) -> BoundExpression {
         self.expression.into_owned()
     }
 }
 
 impl ReduceNode for ExpressionReduceNode<'_> {
     fn node_dtype(&self) -> VortexResult<DType> {
-        self.expression.return_dtype(self.scope)
+        Ok(self.expression.dtype().clone())
     }
 
     fn scalar_fn(&self) -> Option<&ScalarFnRef> {
@@ -288,10 +410,7 @@ impl ReduceNode for ExpressionReduceNode<'_> {
             Cow::Borrowed(expression) => Cow::Borrowed(expression.child(idx)),
             Cow::Owned(expression) => Cow::Owned(expression.child(idx).clone()),
         };
-        Self {
-            expression,
-            scope: self.scope,
-        }
+        Self { expression }
     }
 
     fn child_count(&self) -> usize {
@@ -299,17 +418,30 @@ impl ReduceNode for ExpressionReduceNode<'_> {
     }
 
     fn new_node(&self, scalar_fn: ScalarFnRef, children: &[Self]) -> VortexResult<Self> {
-        let expression = Expression::try_new(
+        let expression = BoundExpression::try_new(
             scalar_fn,
-            children
-                .iter()
-                .map(|c| c.expression.as_ref().clone())
-                .collect::<Vec<_>>(),
+            children.iter().map(|c| c.expression.as_ref().clone()),
         )?;
         Ok(Self {
             expression: Cow::Owned(expression),
-            scope: self.scope,
         })
+    }
+
+    fn as_constant(&self) -> Option<&Scalar> {
+        self.expression.as_opt::<Literal>()
+    }
+
+    fn new_constant(&self, value: Scalar) -> Self {
+        Self {
+            expression: Cow::Owned(bound::lit(value)),
+        }
+    }
+
+    fn validity(&self) -> VortexResult<ReduceNodeValidity<Self>> {
+        match self.expression.as_scalar() {
+            Some(scalar_fn) => scalar_fn.validity_expression(self),
+            None => Ok(ReduceNodeValidity::Irreducible),
+        }
     }
 }
 
@@ -353,14 +485,14 @@ impl ReduceNode for ArrayReduceNode<'_> {
         let array = match &self.array {
             Cow::Borrowed(array) => Cow::Borrowed(
                 array
-                    .children_iter()
-                    .nth(idx)
+                    .nth_child(idx)
                     .vortex_expect("child idx out of bounds"),
             ),
             Cow::Owned(array) => Cow::Owned(
                 array
                     .nth_child(idx)
-                    .vortex_expect("child idx out of bounds"),
+                    .vortex_expect("child idx out of bounds")
+                    .clone(),
             ),
         };
         Self { array }
@@ -373,12 +505,38 @@ impl ReduceNode for ArrayReduceNode<'_> {
     fn new_node(&self, scalar_fn: ScalarFnRef, children: &[Self]) -> VortexResult<Self> {
         let array = ScalarFnArray::try_new_with_len(
             scalar_fn,
-            children.iter().map(|c| c.array.as_ref().clone()).collect(),
+            children.iter().map(|c| c.array.as_ref().clone()),
             self.array.len(),
         )?;
         Ok(Self {
             array: Cow::Owned(array.into_array()),
         })
+    }
+
+    fn as_constant(&self) -> Option<&Scalar> {
+        self.array.as_constant()
+    }
+
+    fn new_constant(&self, value: Scalar) -> Self {
+        let array = ConstantArray::new(value, self.array.len());
+        Self {
+            array: Cow::Owned(array.into_array()),
+        }
+    }
+
+    fn validity(&self) -> VortexResult<ReduceNodeValidity<Self>> {
+        if let Some(scalar_fn) = self.array.as_opt::<ScalarFn>() {
+            return scalar_fn.data().scalar_fn().validity_array(self);
+        }
+        Ok(ReduceNodeValidity::Reduced(
+            match self.array.validity()? {
+                Validity::NonNullable | Validity::AllValid => self.new_constant(true.into()),
+                Validity::AllInvalid => self.new_constant(false.into()),
+                Validity::Array(array) => Self {
+                    array: Cow::Owned(array),
+                },
+            },
+        ))
     }
 }
 
@@ -422,14 +580,6 @@ impl Arity {
     }
 }
 
-/// Context for simplification.
-///
-/// Used to lazily compute input data types where simplification requires them.
-pub trait SimplifyCtx {
-    /// Get the data type of the given expression.
-    fn return_dtype(&self, expr: &Expression) -> VortexResult<DType>;
-}
-
 /// Arguments for expression execution.
 pub trait ExecutionArgs {
     /// Returns the input array at the given index.
@@ -440,6 +590,61 @@ pub trait ExecutionArgs {
 
     /// Returns the row count of the execution scope.
     fn row_count(&self) -> usize;
+
+    /// Whether the input at the given index satisfies `predicate`.
+    ///
+    /// Implementations that hold their inputs override this to test the input in place, without
+    /// the clone [`get`](Self::get) makes, since it runs on every scalar function execution step.
+    fn input_matches(&self, index: usize, predicate: fn(&ArrayRef) -> bool) -> VortexResult<bool> {
+        Ok(predicate(&self.get(index)?))
+    }
+}
+
+/// The result of a single [`ScalarFnVTable::execute_step`].
+pub struct ScalarFnExecutionResult(ScalarFnExecutionStep);
+
+/// What the scheduler should do after a [`ScalarFnVTable::execute_step`].
+#[derive(Clone)]
+pub enum ScalarFnExecutionStep {
+    /// Execution finished with this result.
+    Done(ArrayRef),
+    /// Execute the input at this index until the predicate matches, then call
+    /// [`ScalarFnVTable::execute_step`] again.
+    ExecuteInput(usize, DonePredicate),
+}
+
+impl ScalarFnExecutionResult {
+    /// Execution finished with the given result.
+    pub fn done(result: impl IntoArray) -> Self {
+        Self(ScalarFnExecutionStep::Done(result.into_array()))
+    }
+
+    /// Ask the scheduler to execute the input at `input_idx` until it matches `M`, then call
+    /// [`ScalarFnVTable::execute_step`] again.
+    pub fn execute_input<M: Matcher>(input_idx: usize) -> Self {
+        Self(ScalarFnExecutionStep::ExecuteInput(input_idx, M::matches))
+    }
+
+    /// Returns the requested step.
+    pub fn step(&self) -> &ScalarFnExecutionStep {
+        &self.0
+    }
+
+    /// Returns the requested step.
+    pub fn into_step(self) -> ScalarFnExecutionStep {
+        self.0
+    }
+}
+
+impl Debug for ScalarFnExecutionResult {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            ScalarFnExecutionStep::Done(array) => f.debug_tuple("Done").field(array).finish(),
+            ScalarFnExecutionStep::ExecuteInput(idx, _) => {
+                f.debug_tuple("ExecuteInput").field(idx).finish()
+            }
+        }
+    }
 }
 
 /// A concrete [`ExecutionArgs`] backed by a `Vec<ArrayRef>`.
@@ -472,6 +677,17 @@ impl ExecutionArgs for VecExecutionArgs {
 
     fn row_count(&self) -> usize {
         self.row_count
+    }
+
+    fn input_matches(&self, index: usize, predicate: fn(&ArrayRef) -> bool) -> VortexResult<bool> {
+        let input = self.inputs.get(index).ok_or_else(|| {
+            vortex_err!(
+                "Input index {} out of bounds (num_inputs={})",
+                index,
+                self.inputs.len()
+            )
+        })?;
+        Ok(predicate(input))
     }
 }
 

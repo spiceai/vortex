@@ -19,21 +19,26 @@ use std::hash::Hasher;
 use std::sync::Arc;
 
 use vortex_error::VortexResult;
+use vortex_error::vortex_ensure;
 
 use crate::ArrayRef;
 use crate::ExecutionCtx;
+use crate::IntoArray;
+use crate::arrays::ScalarFnArray;
 use crate::dtype::DType;
-use crate::expr::Expression;
+use crate::expr::BoundExpression;
 use crate::expr::display::ExprDisplay;
 use crate::scalar_fn::Arity;
 use crate::scalar_fn::ArrayReduceNode;
 use crate::scalar_fn::ChildName;
 use crate::scalar_fn::ExecutionArgs;
 use crate::scalar_fn::ExpressionReduceNode;
+use crate::scalar_fn::ReduceNodeValidity;
+use crate::scalar_fn::ScalarFnExecutionResult;
+use crate::scalar_fn::ScalarFnExecutionStep;
 use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::ScalarFnRef;
 use crate::scalar_fn::ScalarFnVTable;
-use crate::scalar_fn::SimplifyCtx;
 
 /// A typed scalar function instance, parameterized by a concrete [`ScalarFnVTable`].
 ///
@@ -67,6 +72,32 @@ impl<V: ScalarFnVTable> TypedScalarFnInstance<V> {
     pub fn erased(self) -> ScalarFnRef {
         ScalarFnRef(Arc::new(self))
     }
+
+    fn check_result(&self, args: &dyn ExecutionArgs, result: &ArrayRef) -> VortexResult<()> {
+        assert_eq!(
+            result.len(),
+            args.row_count(),
+            "Expression execution {} returned vector of length {}, but expected {}",
+            self.vtable.id(),
+            result.len(),
+            args.row_count(),
+        );
+
+        if cfg!(debug_assertions) {
+            let args_dtypes: Vec<DType> = (0..args.num_inputs())
+                .map(|i| args.get(i).map(|a| a.dtype().clone()))
+                .collect::<VortexResult<_>>()?;
+            let expected_dtype = V::return_dtype(&self.vtable, &self.options, &args_dtypes)?;
+            vortex_error::vortex_ensure_eq!(
+                result.dtype(),
+                &expected_dtype,
+                "Expression execution {} returned vector of invalid dtype",
+                self.vtable.id(),
+            );
+        }
+
+        Ok(())
+    }
 }
 
 /// An object-safe, sealed trait for bound scalar function dispatch.
@@ -80,7 +111,13 @@ pub(super) trait DynScalarFn: 'static + Send + Sync + super::sealed::Sealed {
 
     // Bound methods — options accessed from self
     fn execute(&self, args: &dyn ExecutionArgs, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef>;
+    fn execute_step(
+        &self,
+        args: &dyn ExecutionArgs,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<ScalarFnExecutionResult>;
     fn return_dtype(&self, arg_types: &[DType]) -> VortexResult<DType>;
+    fn bind_options(&self, arg_types: &[DType]) -> VortexResult<Option<ScalarFnRef>>;
     fn reduce_expression<'a>(
         &self,
         node: &ExpressionReduceNode<'a>,
@@ -96,13 +133,15 @@ pub(super) trait DynScalarFn: 'static + Send + Sync + super::sealed::Sealed {
 
     // Expression methods — take expressions for tree traversal
     fn fmt_sql(&self, expression: &dyn ExprDisplay, f: &mut Formatter<'_>) -> fmt::Result;
-    fn simplify(
+    fn simplify(&self, expression: &BoundExpression) -> VortexResult<Option<BoundExpression>>;
+    fn validity_expression<'a>(
         &self,
-        expression: &Expression,
-        ctx: &dyn SimplifyCtx,
-    ) -> VortexResult<Option<Expression>>;
-    fn simplify_untyped(&self, expression: &Expression) -> VortexResult<Option<Expression>>;
-    fn validity(&self, expression: &Expression) -> VortexResult<Option<Expression>>;
+        node: &ExpressionReduceNode<'a>,
+    ) -> VortexResult<ReduceNodeValidity<ExpressionReduceNode<'a>>>;
+    fn validity_array<'a>(
+        &self,
+        node: &ArrayReduceNode<'a>,
+    ) -> VortexResult<ReduceNodeValidity<ArrayReduceNode<'a>>>;
 
     // Options operations — self-contained
     fn options_serialize(&self) -> VortexResult<Option<Vec<u8>>>;
@@ -130,42 +169,56 @@ impl<V: ScalarFnVTable> DynScalarFn for TypedScalarFnInstance<V> {
     }
 
     fn execute(&self, args: &dyn ExecutionArgs, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
-        let expected_row_count = args.row_count();
-        #[cfg(debug_assertions)]
-        let expected_dtype = {
-            let args_dtypes: Vec<DType> = (0..args.num_inputs())
-                .map(|i| args.get(i).map(|a| a.dtype().clone()))
-                .collect::<VortexResult<_>>()?;
-            V::return_dtype(&self.vtable, &self.options, &args_dtypes)
-        }?;
-
-        let result = V::execute(&self.vtable, &self.options, args, ctx)?;
-
-        assert_eq!(
-            result.len(),
-            expected_row_count,
-            "Expression execution {} returned vector of length {}, but expected {}",
-            self.vtable.id(),
-            result.len(),
-            expected_row_count,
-        );
-
-        #[cfg(debug_assertions)]
-        {
-            vortex_error::vortex_ensure!(
-                result.dtype() == &expected_dtype,
-                "Expression execution {} returned vector of invalid dtype. Expected {}, got {}",
-                self.vtable.id(),
-                expected_dtype,
-                result.dtype(),
-            );
+        match self.execute_step(args, ctx)?.into_step() {
+            ScalarFnExecutionStep::Done(result) => Ok(result),
+            // Take one executor step on the requested input and return this function lazily
+            // over it, leaving the rest of the work to whoever executes the result.
+            ScalarFnExecutionStep::ExecuteInput(idx, _) => {
+                let mut inputs = (0..args.num_inputs())
+                    .map(|i| args.get(i))
+                    .collect::<VortexResult<Vec<_>>>()?;
+                inputs[idx] = inputs[idx].clone().execute::<ArrayRef>(ctx)?;
+                let scalar_fn =
+                    TypedScalarFnInstance::new(self.vtable.clone(), self.options.clone()).erased();
+                let array = ScalarFnArray::try_new_with_len(scalar_fn, inputs, args.row_count())?;
+                Ok(array.into_array())
+            }
         }
+    }
 
+    fn execute_step(
+        &self,
+        args: &dyn ExecutionArgs,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<ScalarFnExecutionResult> {
+        let result = V::execute_step(&self.vtable, &self.options, args, ctx)?;
+        match result.step() {
+            ScalarFnExecutionStep::Done(array) => self.check_result(args, array)?,
+            ScalarFnExecutionStep::ExecuteInput(idx, done) => {
+                vortex_ensure!(
+                    *idx < args.num_inputs(),
+                    "Scalar function {} requested input {idx}, but has {} inputs",
+                    self.vtable.id(),
+                    args.num_inputs(),
+                );
+                // Requesting an input that already matches would loop without progress.
+                vortex_ensure!(
+                    !done(&args.get(*idx)?),
+                    "Scalar function {} requested execution of input {idx}, which is already done",
+                    self.vtable.id(),
+                );
+            }
+        }
         Ok(result)
     }
 
     fn return_dtype(&self, arg_dtypes: &[DType]) -> VortexResult<DType> {
         V::return_dtype(&self.vtable, &self.options, arg_dtypes)
+    }
+
+    fn bind_options(&self, arg_dtypes: &[DType]) -> VortexResult<Option<ScalarFnRef>> {
+        Ok(V::bind_options(&self.vtable, &self.options, arg_dtypes)?
+            .map(|options| TypedScalarFnInstance::new(self.vtable.clone(), options).erased()))
     }
 
     fn reduce_expression<'a>(
@@ -202,20 +255,22 @@ impl<V: ScalarFnVTable> DynScalarFn for TypedScalarFnInstance<V> {
         V::fmt_sql(&self.vtable, &self.options, expression, f)
     }
 
-    fn simplify(
+    fn simplify(&self, expression: &BoundExpression) -> VortexResult<Option<BoundExpression>> {
+        V::simplify(&self.vtable, &self.options, expression)
+    }
+
+    fn validity_expression<'a>(
         &self,
-        expression: &Expression,
-        ctx: &dyn SimplifyCtx,
-    ) -> VortexResult<Option<Expression>> {
-        V::simplify(&self.vtable, &self.options, expression, ctx)
+        node: &ExpressionReduceNode<'a>,
+    ) -> VortexResult<ReduceNodeValidity<ExpressionReduceNode<'a>>> {
+        V::validity(&self.vtable, &self.options, node)
     }
 
-    fn simplify_untyped(&self, expression: &Expression) -> VortexResult<Option<Expression>> {
-        V::simplify_untyped(&self.vtable, &self.options, expression)
-    }
-
-    fn validity(&self, expression: &Expression) -> VortexResult<Option<Expression>> {
-        V::validity(&self.vtable, &self.options, expression)
+    fn validity_array<'a>(
+        &self,
+        node: &ArrayReduceNode<'a>,
+    ) -> VortexResult<ReduceNodeValidity<ArrayReduceNode<'a>>> {
+        V::validity(&self.vtable, &self.options, node)
     }
 
     fn options_serialize(&self) -> VortexResult<Option<Vec<u8>>> {

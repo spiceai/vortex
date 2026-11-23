@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use vortex_buffer::ByteBuffer;
 use vortex_error::VortexResult;
-use vortex_error::vortex_ensure;
+use vortex_error::vortex_ensure_eq;
 use vortex_session::VortexSession;
 
 use crate::ArrayRef;
@@ -26,8 +26,8 @@ pub type ArrayPluginRef = Arc<dyn ArrayPlugin>;
 /// The wire representation produced by an in-memory array's serializer.
 ///
 /// A serializer may reuse the in-memory array's buffers and children with [`Self::from_array`],
-/// or return different parts when an older wire representation requires a lossless structural
-/// downgrade.
+/// or return the wire representation of another encoding. The node must hold the logical values
+/// of the array under the dtype supplied by the containing format.
 #[derive(Clone, Debug)]
 pub struct ArraySerialization {
     /// The concrete array ID to write on the wire.
@@ -101,32 +101,35 @@ impl<'a> ArrayDeserialization<'a> {
 
 /// Registry trait for serializing and deserializing an in-memory array representation.
 ///
-/// A plugin has one [`id`](Self::id) for the in-memory representation and one or more
-/// [`serialized_ids`](Self::serialized_ids) for wire representations. Its serializer chooses the
-/// wire representation, and the serialization context validates that the chosen ID is permitted
-/// before it is written.
+/// A plugin writes one in-memory encoding, identified by [`id`](Self::id). It declares the wire
+/// IDs that it reads and writes separately, so it can write another encoding's wire form without
+/// replacing that encoding's reader. The serialization context validates that the chosen wire ID
+/// is permitted before it is written.
 ///
-/// Every serialized ID is also registered for deserialization. A current plugin may therefore
-/// deserialize several historical IDs into the same in-memory representation. A reader that
-/// predates a newer ID has no registration for it and reports it as unknown instead of silently
-/// interpreting an unsupported representation.
+/// A plugin can retain historical read IDs after it stops writing them. A reader that predates a
+/// newer ID has no registration for it and reports it as unknown.
 pub trait ArrayPlugin: 'static + Send + Sync {
-    /// Returns the ID of the in-memory array representation handled by this plugin.
+    /// Returns the ID of the in-memory encoding that this plugin writes.
     fn id(&self) -> ArrayId;
 
-    /// Returns the serialized array IDs understood by this plugin, ordered oldest to newest.
+    /// Returns the wire IDs that [`deserialize`](Self::deserialize) accepts, oldest to newest.
     ///
-    /// The default uses the in-memory ID as the sole wire ID. Override this for an in-memory array
-    /// that has multiple serialized variants. IDs retained only for reading may also be included;
-    /// the single serializer need not select them.
-    fn serialized_ids(&self) -> Vec<ArrayId> {
-        vec![self.id()]
-    }
+    /// [`ArraySession::register`](crate::session::ArraySession::register) makes this plugin the
+    /// reader of each ID. An ID can stay in this list after the plugin stops writing it, so that
+    /// old files stay readable.
+    fn read_ids(&self) -> Vec<ArrayId>;
+
+    /// Returns the wire IDs that [`serialize`](Self::serialize) may return.
+    ///
+    /// An ID in this list does not have to be in [`read_ids`](Self::read_ids). A plugin can write
+    /// its arrays in the wire form of another encoding. The plugin that owns that form reads it.
+    /// The node must hold the logical values of the array under the dtype of the array.
+    fn write_ids(&self) -> Vec<ArrayId>;
 
     /// Serialize `array` to its wire representation.
     ///
     /// This function is called only for arrays whose in-memory encoding matches [`id`](Self::id).
-    /// The returned ID must be declared by [`serialized_ids`](Self::serialized_ids). Return
+    /// The returned ID must be declared by [`write_ids`](Self::write_ids). Return
     /// `Ok(None)` when the array cannot be serialized.
     fn serialize(
         &self,
@@ -167,16 +170,23 @@ impl<V: VTable> ArrayPlugin for V {
         VTable::id(self)
     }
 
+    fn read_ids(&self) -> Vec<ArrayId> {
+        vec![self.id()]
+    }
+
+    fn write_ids(&self) -> Vec<ArrayId> {
+        vec![self.id()]
+    }
+
     fn serialize(
         &self,
         array: &ArrayRef,
         session: &VortexSession,
     ) -> VortexResult<Option<ArraySerialization>> {
-        vortex_ensure!(
-            self.id() == array.encoding_id(),
-            "array plugin {} cannot serialize in-memory array {}",
+        vortex_ensure_eq!(
             self.id(),
             array.encoding_id(),
+            "array plugin cannot serialize an in-memory array of another encoding",
         );
         Ok(V::serialize(array.as_::<V>(), session)?
             .map(|metadata| ArraySerialization::from_array(self.id(), array, metadata)))
@@ -187,11 +197,10 @@ impl<V: VTable> ArrayPlugin for V {
         parts: ArrayDeserialization<'_>,
         session: &VortexSession,
     ) -> VortexResult<ArrayRef> {
-        vortex_ensure!(
-            self.id() == parts.serialized_id,
-            "array plugin {} does not recognize serialized ID {}",
+        vortex_ensure_eq!(
             self.id(),
             parts.serialized_id,
+            "array plugin does not recognize the serialized ID",
         );
         Ok(Array::<V>::try_from_parts(V::deserialize(
             self,

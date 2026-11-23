@@ -11,6 +11,8 @@ use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
+use vortex_error::vortex_ensure_eq;
+use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
@@ -25,6 +27,7 @@ use crate::array::Array;
 use crate::array::ArrayId;
 use crate::array::ArrayView;
 use crate::array::OperationsVTable;
+use crate::array::ProbeState;
 use crate::array::VTable;
 use crate::array::ValidityVTable;
 use crate::array::with_empty_buffers;
@@ -83,17 +86,15 @@ impl VTable for Slice {
         let child = slots[SliceSlots::CHILD]
             .as_ref()
             .vortex_expect("validated child slot");
-        vortex_ensure!(
-            child.dtype() == dtype,
-            "SliceArray dtype {} does not match outer dtype {}",
+        vortex_ensure_eq!(
             child.dtype(),
-            dtype
+            dtype,
+            "SliceArray dtype does not match outer dtype",
         );
-        vortex_ensure!(
-            data.len() == len,
-            "SliceArray length {} does not match outer length {}",
+        vortex_ensure_eq!(
             data.len(),
-            len
+            len,
+            "SliceArray length does not match outer length",
         );
         vortex_ensure!(
             data.range.end <= child.len(),
@@ -133,7 +134,7 @@ impl VTable for Slice {
         _session: &VortexSession,
     ) -> VortexResult<Option<Vec<u8>>> {
         // TODO(joe): make this configurable
-        vortex_bail!("Slice array is not serializable")
+        Ok(None)
     }
 
     fn deserialize(
@@ -169,12 +170,26 @@ impl VTable for Slice {
     }
 }
 impl OperationsVTable<Slice> for Slice {
+    type ProbeState = ();
+
+    fn probe_scalar(
+        state: &mut ProbeState<'_, Slice>,
+        index: usize,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Scalar> {
+        let child_index = state.array().range.start + index;
+        state
+            .slot(SliceSlots::CHILD)?
+            .ok_or_else(|| vortex_err!("Slice child slot is missing"))?
+            .execute_scalar(child_index, ctx)
+    }
+
     fn scalar_at(
         array: ArrayView<'_, Slice>,
         index: usize,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Scalar> {
-        array.child().execute_scalar(array.range.start + index, ctx)
+        Self::probe_scalar(&mut ProbeState::once(array), index, ctx)
     }
 }
 
@@ -194,18 +209,22 @@ impl Debug for SliceMetadata {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use vortex_error::VortexResult;
+    use vortex_session::VortexSession;
 
     use crate::IntoArray;
     use crate::VortexSessionExecute;
-    use crate::array_session;
     use crate::arrays::PrimitiveArray;
     use crate::arrays::SliceArray;
     use crate::assert_arrays_eq;
 
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
+
     #[test]
     fn test_slice_slice() -> VortexResult<()> {
-        let mut ctx = array_session().create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         // Slice(1..4, Slice(2..8, base)) combines to Slice(3..6, base)
         let arr = PrimitiveArray::from_iter(0i32..10).into_array();
         let inner_slice = SliceArray::new(arr, 2..8).into_array();

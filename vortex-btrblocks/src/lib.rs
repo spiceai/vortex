@@ -30,8 +30,8 @@
 //!
 //! Each `Scheme` implementation declares whether it [`matches`](Scheme::matches) a given
 //! canonical form and, if so, estimates the compression ratio (often by compressing a ~1%
-//! sample). There is no dynamic registry — the set of schemes is fixed at build time via
-//! [`ALL_SCHEMES`].
+//! sample). The available schemes are registered on the session's [`CompressionSession`], and
+//! [`BtrBlocksCompressorBuilder::from_session`] builds a compressor from them.
 //!
 //! Schemes can produce arrays that are themselves further compressed (e.g. FoR then BitPacking),
 //! up to [`MAX_CASCADE`] (3) layers deep. Descendant exclusion rules for of [`SchemeId`] prevents
@@ -40,7 +40,8 @@
 //! # Example
 //!
 //! ```rust
-//! use vortex_array::{IntoArray, VortexSessionExecute, array_session};
+//! use vortex_array::{IntoArray, VortexSessionExecute};
+//! use vortex_session::VortexSession;
 //! use vortex_array::arrays::PrimitiveArray;
 //! use vortex_array::validity::Validity;
 //! use vortex_btrblocks::{BtrBlocksCompressor, BtrBlocksCompressorBuilder, Scheme, SchemeExt};
@@ -48,15 +49,17 @@
 //! use vortex_buffer::buffer;
 //!
 //! # fn example() -> vortex_error::VortexResult<()> {
-//! let session = array_session();
+//! let session = VortexSession::empty();
 //! let array = PrimitiveArray::new(buffer![42u64; 1024], Validity::NonNullable).into_array();
 //!
-//! let compressor = BtrBlocksCompressor::default();
+//! // Only schemes producing encodings the session registers and its enabled editions permit
+//! // are kept, so a session with no enabled editions leaves the array uncompressed.
+//! let compressor = BtrBlocksCompressor::from_session(&session);
 //! let compressed = compressor.compress(&array, &mut session.create_execution_ctx())?;
 //! assert_eq!(compressed.dtype(), array.dtype());
 //!
 //! // Remove specific schemes using the builder.
-//! let compressor = BtrBlocksCompressorBuilder::default()
+//! let compressor = BtrBlocksCompressorBuilder::from_session(&session)
 //!     .exclude_schemes([IntDictScheme.id()])
 //!     .build();
 //! # let _ = compressor;
@@ -66,20 +69,20 @@
 //!
 //! [BtrBlocks]: https://www.cs.cit.tum.de/fileadmin/w00cfj/dis/papers/btrblocks.pdf
 
+mod allowed_ids;
 mod builder;
 mod canonical_compressor;
 /// Compression scheme implementations.
 pub mod schemes;
-#[cfg(test)]
-#[cfg(not(codspeed))]
-mod trace_tests;
+mod session;
 
 // Re-export framework types from vortex-compressor for backwards compatibility.
 // Btrblocks-specific exports.
-pub use builder::ALL_SCHEMES;
 pub use builder::BtrBlocksCompressorBuilder;
 pub use canonical_compressor::BtrBlocksCompressor;
 pub use schemes::patches::compress_patches;
+pub use session::CompressionSession;
+pub use session::CompressionSessionExt;
 pub use vortex_compressor::CascadingCompressor;
 pub use vortex_compressor::CompressionPlan;
 pub use vortex_compressor::scheme::CompressorContext;
@@ -93,3 +96,10 @@ pub use vortex_compressor::stats::FloatStats;
 pub use vortex_compressor::stats::GenerateStatsOptions;
 pub use vortex_compressor::stats::IntegerStats;
 pub use vortex_compressor::stats::StringStats;
+
+#[cfg(test)]
+static SESSION: std::sync::LazyLock<vortex_session::VortexSession> =
+    std::sync::LazyLock::new(vortex_session::VortexSession::empty);
+
+#[cfg(test)]
+mod tests;

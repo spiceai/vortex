@@ -9,18 +9,21 @@ use std::mem::size_of_val;
 use std::ops::Deref;
 use std::sync::Arc;
 
-use cudarc::driver::CudaSlice;
-use cudarc::driver::CudaStream;
-use cudarc::driver::DeviceRepr;
-use cudarc::driver::ValidAsZeroBits;
-use cudarc::driver::result::stream;
+use async_channel::Receiver;
+use async_channel::Sender;
 use futures::future::BoxFuture;
-use kanal::Sender;
 use tracing::warn;
 use vortex::array::buffer::BufferHandle;
 use vortex::error::VortexResult;
 use vortex::error::vortex_ensure;
 use vortex::error::vortex_err;
+use vortex_cuda_driver::CudaSlice;
+use vortex_cuda_driver::CudaStream;
+use vortex_cuda_driver::DeviceRepr;
+use vortex_cuda_driver::ValidAsZeroBits;
+use vortex_cuda_driver::stream;
+use vortex_cuda_driver::sys::CUresult;
+use vortex_cuda_driver::sys::CUstream;
 
 use crate::CudaDeviceBuffer;
 use crate::device_buffer::CUDF_VALIDITY_BUFFER_PADDING;
@@ -61,16 +64,25 @@ impl VortexCudaStream {
         }
     }
 
+    /// Allocates bitmap bytes with cuDF-sized padding, zeroing only the tail.
+    ///
+    /// The producer must initialize `byte_count` bytes on this stream and leave the padding untouched.
+    pub(crate) fn device_alloc_bitmap(&self, byte_count: usize) -> VortexResult<CudaSlice<u8>> {
+        let allocation_len = padded_device_allocation_len::<u8>(byte_count)?;
+        let mut buffer = self.device_alloc::<u8>(allocation_len)?;
+        zero_padding(self, &mut buffer, byte_count)?;
+        Ok(buffer)
+    }
+
     /// Copies host data to the device.
     ///
     /// Allocates device memory, schedules an async copy, and returns a future
-    /// that completes when the copy is finished. The source data is moved into
-    /// the future to ensure it remains valid until the copy completes.
+    /// that completes when the copy is finished.
     ///
-    /// For **pageable** host memory, `memcpy_htod_async` stages the source
-    /// synchronously before returning. For **pinned** host memory the transfer
-    /// is truly async and the source must stay alive until the copy completes
-    /// (guaranteed by the returned future capturing it).
+    /// The copy no longer reads `data` once this returns: the driver stages
+    /// **pageable** host memory, and copies of **pinned** host memory are
+    /// waited for. Dropping the future early therefore cannot free memory that
+    /// the copy still reads.
     ///
     /// The returned [`BufferHandle`] keeps the source byte length, while its
     /// CUDA allocation may include zeroed tail padding for consumers such as cuDF
@@ -102,10 +114,6 @@ impl VortexCudaStream {
 
         Ok(Box::pin(async move {
             await_stream_callback(&stream).await?;
-
-            // Keep source memory alive until copy completes.
-            let _keep_alive = data;
-
             Ok(buffer)
         }))
     }
@@ -116,9 +124,8 @@ impl VortexCudaStream {
     /// returns immediately. The device pointer is valid as soon as this call
     /// returns; the copy completes before any later work on the same stream.
     ///
-    /// For **pageable** host memory (the common case), `memcpy_htod` stages
-    /// the source into a driver-managed pinned buffer before returning, so
-    /// the source data is safe to drop after this call.
+    /// As with [`copy_to_device`](Self::copy_to_device), the copy no longer
+    /// reads `data` once this returns, so the source is safe to drop or modify.
     ///
     /// Like [`copy_to_device`](Self::copy_to_device), this preserves the source
     /// byte length on the returned handle while keeping any tail padding in the
@@ -157,20 +164,21 @@ fn padded_device_allocation_len<T>(byte_count: usize) -> VortexResult<usize> {
     Ok(min_allocation_bytes.div_ceil(element_size))
 }
 
-/// Zeroes the allocation tail after the copied values.
+/// Zeroes the allocation tail after `initialized_count` elements.
 ///
-/// Returned handles are sliced to the copied byte count; the trailing padding
-/// exists so padded mask reads stay within the backing allocation.
-fn zero_padding<T: DeviceRepr + ValidAsZeroBits>(
+/// Copies or kernels must initialize the preceding elements on the same stream.
+/// cuDF reads bitmaps in whole mask words, which can extend past the final logical byte.
+/// Allocations include tail padding for those reads; this zeroes that padding.
+pub(crate) fn zero_padding<T: DeviceRepr + ValidAsZeroBits>(
     stream: &VortexCudaStream,
     cuda_slice: &mut CudaSlice<T>,
-    copied_len: usize,
+    initialized_count: usize,
 ) -> VortexResult<()> {
-    if copied_len >= cuda_slice.len() {
+    if initialized_count >= cuda_slice.len() {
         return Ok(());
     }
 
-    let mut padding = cuda_slice.slice_mut(copied_len..);
+    let mut padding = cuda_slice.slice_mut(initialized_count..);
     stream
         .memset_zeros(&mut padding)
         .map_err(|e| vortex_err!("Failed to zero device buffer padding: {}", e))
@@ -190,47 +198,62 @@ fn zero_padding<T: DeviceRepr + ValidAsZeroBits>(
 ///
 /// # Errors
 ///
-/// Returns an error if registering the stream callback fails or if the callback
-/// channel closes unexpectedly.
+/// Returns an error if registering the stream callback fails, if the preceding work failed on
+/// the device, or if the callback channel closes unexpectedly.
 pub(crate) async fn await_stream_callback(stream: &CudaStream) -> VortexResult<()> {
     let rx = register_stream_callback(stream)?;
 
-    rx.recv()
+    let status = rx
+        .recv()
         .await
-        .map_err(|e| vortex_err!("CUDA stream callback channel closed unexpectedly: {}", e))
+        .map_err(|e| vortex_err!("CUDA stream callback channel closed unexpectedly: {}", e))?;
+    status
+        .result()
+        .map_err(|e| vortex_err!("CUDA stream work failed: {}", e))
 }
 
-/// Registers a host function callback on the stream.
+/// Registers a callback on the stream.
+///
+/// The driver runs the callback exactly once, even after a device error, so the receiver always
+/// gets the status of the preceding work and the sender is always freed.
 ///
 /// # Returns
 ///
-/// An async receiver that receives a message when all preceding work on the
-/// stream completes.
+/// An async receiver that receives the status of all preceding work on the stream once it
+/// completes.
 ///
 /// # Errors
 ///
-/// Returns an error if registering the host callback function fails.
-fn register_stream_callback(stream: &CudaStream) -> VortexResult<kanal::AsyncReceiver<()>> {
-    let (tx, rx) = kanal::bounded::<()>(1);
-
-    let tx_ptr = Box::into_raw(Box::new(tx));
-
+/// Returns an error if registering the callback fails.
+fn register_stream_callback(stream: &CudaStream) -> VortexResult<Receiver<CUresult>> {
+    // Bind before handing the sender to raw ownership, which a failed bind would leak.
     stream
         .context()
         .bind_to_thread()
         .map_err(|e| vortex_err!("Failed to bind CUDA context: {}", e))?;
 
-    /// Called from CUDA driver thread when all preceding work on the stream completes.
-    unsafe extern "C" fn callback(user_data: *mut std::ffi::c_void) {
+    let (tx, rx) = async_channel::bounded::<CUresult>(1);
+    let tx_ptr = Box::into_raw(Box::new(tx));
+
+    /// Called from CUDA driver thread when all preceding work on the stream completes or fails.
+    unsafe extern "C" fn callback(
+        _stream: CUstream,
+        status: CUresult,
+        user_data: *mut std::ffi::c_void,
+    ) {
         // SAFETY: The memory of `tx` is manually managed has not been freed
         // before. We have unique ownership and can therefore free it.
-        let tx = unsafe { Box::from_raw(user_data as *mut Sender<()>) };
+        let tx = unsafe { Box::from_raw(user_data as *mut Sender<CUresult>) };
 
-        // Blocking send as we're in a callback invoked by the CUDA driver.
+        // The callback sends once into an empty capacity-one channel.
         // NOTE: send can fail if the CudaEvent is dropped by the caller, in which case the receiver
         //  is closed and sends will fail.
-        if let Err(_e) = tx.send(()) {
-            warn!(error = ?_e, "register_stream_callback send failed due to error");
+        if let Err(_e) = tx.try_send(status) {
+            warn!(
+                status = status.0,
+                error = ?_e,
+                "CUDA stream callback receiver unavailable"
+            );
         }
     }
 
@@ -239,7 +262,7 @@ fn register_stream_callback(stream: &CudaStream) -> VortexResult<kanal::AsyncRec
     // 2. Valid function pointer with the the correct signature
     // 3. Valid user data pointer which is consumed exactly once
     unsafe {
-        stream::launch_host_function(
+        stream::add_callback(
             stream.cu_stream(),
             callback,
             tx_ptr as *mut std::ffi::c_void,
@@ -252,22 +275,30 @@ fn register_stream_callback(stream: &CudaStream) -> VortexResult<kanal::AsyncRec
         })?;
     }
 
-    Ok(rx.to_async())
+    Ok(rx)
 }
 
 #[cfg(test)]
 mod tests {
     use std::mem::size_of;
+    use std::sync::LazyLock;
 
+    use vortex::array::Canonical;
     use vortex::array::IntoArray;
+    use vortex::array::VortexSessionExecute;
     use vortex::array::arrays::BoolArray;
+    use vortex::array::assert_arrays_eq;
     use vortex::array::validity::Validity;
     use vortex::error::VortexResult;
+    use vortex::session::VortexSession;
 
     use super::padded_device_allocation_len;
+    use crate::CanonicalCudaExt;
     use crate::CudaSession;
     use crate::device_buffer::CUDF_VALIDITY_BUFFER_PADDING;
     use crate::device_buffer::cuda_backing_allocation;
+
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
 
     #[test]
     fn test_padded_device_allocation_len() -> VortexResult<()> {
@@ -344,6 +375,16 @@ mod tests {
 
         assert_eq!(sliced.len(), 9);
         assert!(sliced.buffer_handles()[0].is_on_device());
+        let mut cpu_ctx = SESSION.create_execution_ctx();
+        let host = sliced
+            .execute::<Canonical>(&mut cpu_ctx)?
+            .into_host(&mut cpu_ctx)
+            .await?;
+        assert_arrays_eq!(
+            host.into_array(),
+            BoolArray::from_iter([false, true, false, true, true, false, true, true, false]),
+            &mut cpu_ctx
+        );
         Ok(())
     }
 }

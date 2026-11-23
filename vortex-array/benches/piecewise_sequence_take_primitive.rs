@@ -2,10 +2,6 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 //! Primitive take benchmarks for [`PiecewiseSequenceArray`] length representations.
-//!
-//! The `reify_constant_lengths_then_take` case simulates removing the constant-length
-//! specialization: it starts with constant lengths, materializes them to a dense primitive array,
-//! and then executes the primitive take through the non-constant-length path.
 
 #![allow(clippy::cast_possible_truncation)]
 #![expect(clippy::unwrap_used)]
@@ -14,23 +10,33 @@ use std::sync::LazyLock;
 
 use divan::Bencher;
 use divan::counter::BytesCount;
+use mimalloc::MiMalloc;
 use rand::SeedableRng;
 use rand::prelude::*;
 use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
-use vortex_array::array_session;
 use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::PiecewiseSequenceArray;
 use vortex_array::arrays::PrimitiveArray;
+use vortex_array::memory::MemorySession;
+use vortex_array::optimizer::kernels::KernelSession;
+use vortex_array::test_harness::mark_optimized;
 use vortex_session::VortexSession;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 fn main() {
     LazyLock::force(&SESSION);
     divan::main();
 }
 
-static SESSION: LazyLock<VortexSession> = LazyLock::new(array_session);
+static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
+    VortexSession::empty()
+        .with::<KernelSession>()
+        .with::<MemorySession>()
+});
 
 const SOURCE_LEN: usize = 512 * 1024;
 // Sized to keep CodSpeed simulation under 1ms at run length 1.
@@ -44,6 +50,8 @@ fn optimized_constant_lengths(bencher: Bencher, run_length: usize) {
         run_length,
         lengths_constant(run_length, run_count(run_length)),
     );
+    mark_optimized(&values, &SESSION).unwrap();
+    mark_optimized(&indices, &SESSION).unwrap();
 
     bencher
         .counter(BytesCount::of_many::<i64>(OUTPUT_LEN))
@@ -64,6 +72,8 @@ fn optimized_constant_lengths(bencher: Bencher, run_length: usize) {
 fn prebuilt_dense_lengths(bencher: Bencher, run_length: usize) {
     let values = values();
     let indices = piecewise_indices(run_length, lengths_dense(run_length, run_count(run_length)));
+    mark_optimized(&values, &SESSION).unwrap();
+    mark_optimized(&indices, &SESSION).unwrap();
 
     bencher
         .counter(BytesCount::of_many::<i64>(OUTPUT_LEN))
@@ -73,55 +83,6 @@ fn prebuilt_dense_lengths(bencher: Bencher, run_length: usize) {
                 values
                     .clone()
                     .take(indices.clone())
-                    .unwrap()
-                    .execute::<PrimitiveArray>(ctx)
-                    .unwrap(),
-            );
-        });
-}
-
-#[divan::bench(args = RUN_LENGTHS)]
-fn reify_constant_lengths_then_take(bencher: Bencher, run_length: usize) {
-    let values = values();
-    let run_count = run_count(run_length);
-    let starts = starts(run_count, run_length).into_array();
-    let lengths = lengths_constant(run_length, run_count);
-    let multipliers = ConstantArray::new(1u64, run_count).into_array();
-
-    bencher
-        .counter(BytesCount::of_many::<i64>(OUTPUT_LEN))
-        .with_inputs(|| {
-            (
-                &values,
-                starts.clone(),
-                lengths.clone(),
-                multipliers.clone(),
-                SESSION.create_execution_ctx(),
-            )
-        })
-        .bench_refs(|(values, starts, lengths, multipliers, ctx)| {
-            let lengths = lengths
-                .clone()
-                .execute::<PrimitiveArray>(ctx)
-                .unwrap()
-                .into_array();
-
-            // SAFETY: starts, reified lengths, and unit multipliers have the same run count, are
-            // non-null unsigned integer arrays, and expand to OUTPUT_LEN by construction.
-            let indices = unsafe {
-                PiecewiseSequenceArray::new_unchecked(
-                    starts.clone(),
-                    lengths,
-                    multipliers.clone(),
-                    OUTPUT_LEN,
-                )
-            }
-            .into_array();
-
-            divan::black_box(
-                values
-                    .clone()
-                    .take(indices)
                     .unwrap()
                     .execute::<PrimitiveArray>(ctx)
                     .unwrap(),

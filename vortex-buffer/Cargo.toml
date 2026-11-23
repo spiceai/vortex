@@ -4,11 +4,9 @@ authors = { workspace = true }
 categories = { workspace = true }
 description = "A byte buffer implementation for Vortex"
 edition = { workspace = true }
-homepage = { workspace = true }
 include = { workspace = true }
 keywords = { workspace = true }
 license = { workspace = true }
-readme = "README.md"
 repository = { workspace = true }
 rust-version = { workspace = true }
 version = { workspace = true }
@@ -27,8 +25,11 @@ allocator-api2 = { workspace = true }
 arrow-buffer = { workspace = true }
 bitvec = { workspace = true }
 bytes = { workspace = true }
+fearless_simd = { workspace = true }
+fearless_simd_macros = { workspace = true }
 itertools = { workspace = true }
 memmap2 = { workspace = true, optional = true }
+num-traits = { workspace = true }
 serde = { workspace = true, optional = true }
 simdutf8 = { workspace = true }
 tracing = { workspace = true, optional = true }
@@ -39,7 +40,10 @@ workspace = true
 
 [dev-dependencies]
 divan = { workspace = true }
+hegeltest = { workspace = true }
+mimalloc = { workspace = true }
 num-traits = { workspace = true }
+rand = { workspace = true }
 rstest = { workspace = true }
 vortex-bench-support = { workspace = true }
 
@@ -57,6 +61,10 @@ harness = false
 
 [[bench]]
 name = "collect_bool"
+harness = false
+
+[[bench]]
+name = "take_bits"
 harness = false
 
 [[bench]]

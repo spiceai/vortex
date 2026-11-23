@@ -37,6 +37,7 @@ pub use types::IndexedElementTuple;
 pub use types::InitializedElement;
 pub use types::InitializedRow;
 pub use types::InputElement;
+pub use types::OutputBuffer;
 pub use types::OutputElement;
 pub use types::OutputSink;
 pub use types::Preinitialized;
@@ -44,7 +45,6 @@ pub use types::SinkResult;
 pub use types::UninitElementSink;
 pub use types::Utf8Column;
 pub use types::Utf8Sink;
-pub use types::Utf8View;
 pub use types::Utf8Writer;
 pub use types::ViewLen;
 

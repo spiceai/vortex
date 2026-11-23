@@ -209,6 +209,48 @@ impl Mask {
         }))
     }
 
+    /// Create a new [`Mask`] from a [`BitBuffer`] and the ranges of its set bits, which are cached
+    /// on the mask so they need not be recomputed from the buffer.
+    ///
+    /// `slices` must be sorted, non-overlapping `(start, end)` ranges that cover exactly the set
+    /// bits of `buffer`. This is only checked in debug builds.
+    pub fn from_buffer_with_slices(buffer: BitBuffer, slices: Vec<(usize, usize)>) -> Self {
+        let len = buffer.len();
+        #[cfg(debug_assertions)]
+        {
+            Self::check_slices(len, &slices);
+            for &(start, end) in &slices {
+                assert_eq!(
+                    buffer.count_range(start, end),
+                    end - start,
+                    "Slice ({start}, {end}) is not fully set in the buffer"
+                );
+            }
+        }
+
+        let true_count = slices.iter().map(|(start, end)| end - start).sum();
+        debug_assert_eq!(
+            true_count,
+            buffer.true_count(),
+            "Slices must cover every set bit of the buffer"
+        );
+
+        if true_count == 0 {
+            return Self::AllFalse(len);
+        }
+        if true_count == len {
+            return Self::AllTrue(len);
+        }
+
+        Self::Values(Arc::new(MaskValues {
+            buffer,
+            indices: Default::default(),
+            slices: OnceLock::from(slices),
+            true_count,
+            density: true_count as f64 / len as f64,
+        }))
+    }
+
     /// Create a new [`Mask`] from sorted, unique indices.
     pub fn from_indices(len: usize, indices: impl IntoIterator<Item = usize>) -> Self {
         let indices = indices.into_iter().collect::<Vec<_>>();
@@ -219,7 +261,7 @@ impl Mask {
         );
         let buffer = BitBuffer::from_indices(len, indices.iter().copied());
         debug_assert_eq!(buffer.len(), len);
-        let true_count = buffer.true_count();
+        let true_count = indices.len();
 
         if true_count == 0 {
             return Self::AllFalse(len);
@@ -238,27 +280,28 @@ impl Mask {
     }
 
     /// Create a new [`Mask`] from an [`IntoIterator<Item = usize>`] of indices to be excluded.
+    ///
+    /// Indices may be in any order and duplicates are ignored.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an index is out of bounds.
     pub fn from_excluded_indices(len: usize, indices: impl IntoIterator<Item = usize>) -> Self {
         let mut buf = BitBufferMut::new_set(len);
-
-        let mut false_count: usize = 0;
-        indices.into_iter().for_each(|idx| {
-            buf.unset(idx);
-            false_count += 1;
-        });
-        debug_assert_eq!(buf.len(), len);
-        let true_count = len - false_count;
+        indices.into_iter().for_each(|idx| buf.unset(idx));
+        let buffer = buf.freeze();
+        let true_count = buffer.true_count();
 
         // Return optimized variants when appropriate
-        if false_count == 0 {
+        if true_count == len {
             return Self::AllTrue(len);
         }
-        if false_count == len {
+        if true_count == 0 {
             return Self::AllFalse(len);
         }
 
         Self::Values(Arc::new(MaskValues {
-            buffer: buf.freeze(),
+            buffer,
             indices: Default::default(),
             slices: Default::default(),
             true_count,
@@ -473,7 +516,7 @@ impl Mask {
     /// Returns the last true index in the mask.
     pub fn last(&self) -> Option<usize> {
         match &self {
-            Self::AllTrue(len) => (*len > 0).then_some(*len - 1),
+            Self::AllTrue(len) => len.checked_sub(1),
             Self::AllFalse(_) => None,
             Self::Values(values) => {
                 if let Some(indices) = values.indices.get() {
@@ -483,22 +526,7 @@ impl Mask {
                     return slices.last().map(|(_, end)| end - 1);
                 }
 
-                if values.true_count == 0 {
-                    return None;
-                }
-
-                Some(
-                    values
-                        .buffer
-                        .select(values.true_count - 1)
-                        .unwrap_or_else(|| {
-                            vortex_panic!(
-                                "Rank {} out of bounds for mask with true count {}",
-                                values.true_count - 1,
-                                values.true_count
-                            )
-                        }),
-                )
+                values.buffer.last_set_index()
             }
         }
     }

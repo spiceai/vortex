@@ -8,6 +8,7 @@ use vortex_array::ArrayRef;
 use vortex_array::Columnar;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
+use vortex_array::aggregate_fn::AggregateArgs;
 use vortex_array::aggregate_fn::AggregateFnId;
 use vortex_array::aggregate_fn::AggregateFnRef;
 use vortex_array::aggregate_fn::AggregateFnVTable;
@@ -155,37 +156,57 @@ impl AggregateFnVTable for GeometryAabb {
 
     fn empty_partial(
         &self,
-        _options: &Self::Options,
-        _input_dtype: &DType,
+        _args: AggregateArgs<'_, Self::Options>,
     ) -> VortexResult<Self::Partial> {
         Ok(AabbPartial { rect: None })
     }
 
-    fn combine_partials(&self, partial: &mut Self::Partial, other: Scalar) -> VortexResult<()> {
-        if let Some(rect) = rect_from_storage(&other)? {
-            partial.merge(rect);
-        }
-        Ok(())
-    }
-
-    fn to_scalar(&self, partial: &Self::Partial) -> VortexResult<Scalar> {
-        Ok(match partial.rect {
-            Some(rect) => rect_to_storage(rect),
-            None => Scalar::null(aabb_dtype()),
+    fn partial_from_scalar(
+        &self,
+        _args: AggregateArgs<'_, Self::Options>,
+        scalar: &Scalar,
+    ) -> VortexResult<Self::Partial> {
+        // A null box is an empty group's AABB.
+        Ok(AabbPartial {
+            rect: rect_from_storage(scalar)?,
         })
     }
 
-    fn reset(&self, partial: &mut Self::Partial) {
-        partial.rect = None;
+    fn merge_partials(
+        &self,
+        _args: AggregateArgs<'_, Self::Options>,
+        mut first: Self::Partial,
+        second: Self::Partial,
+    ) -> VortexResult<Self::Partial> {
+        if let Some(rect) = second.rect {
+            first.merge(rect);
+        }
+        Ok(first)
     }
 
-    fn is_saturated(&self, _partial: &Self::Partial) -> bool {
+    fn to_scalar(
+        &self,
+        args: AggregateArgs<'_, Self::Options>,
+        partial: &Self::Partial,
+    ) -> VortexResult<Scalar> {
+        Ok(match partial.rect {
+            Some(rect) => rect_to_storage(rect),
+            None => Scalar::null(args.partial_dtype.clone()),
+        })
+    }
+
+    fn is_saturated(
+        &self,
+        _args: AggregateArgs<'_, Self::Options>,
+        _partial: &Self::Partial,
+    ) -> bool {
         // An AABB can always grow, so it is never saturated.
         false
     }
 
     fn accumulate(
         &self,
+        _args: AggregateArgs<'_, Self::Options>,
         partial: &mut Self::Partial,
         batch: &Columnar,
         ctx: &mut ExecutionCtx,
@@ -217,22 +238,33 @@ impl AggregateFnVTable for GeometryAabb {
         Ok(())
     }
 
-    fn finalize(&self, partials: ArrayRef) -> VortexResult<ArrayRef> {
+    fn finalize(
+        &self,
+        _args: AggregateArgs<'_, Self::Options>,
+        partials: ArrayRef,
+    ) -> VortexResult<ArrayRef> {
         // The stored partial is already the AABB struct, so finalizing is the identity.
         Ok(partials)
     }
 
-    fn finalize_scalar(&self, partial: &Self::Partial) -> VortexResult<Scalar> {
-        self.to_scalar(partial)
+    fn finalize_scalar(
+        &self,
+        args: AggregateArgs<'_, Self::Options>,
+        partial: &Self::Partial,
+    ) -> VortexResult<Scalar> {
+        self.to_scalar(args, partial)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use geo::Rect as SpatialRect;
     use vortex_array::ArrayRef;
     use vortex_array::VortexSessionExecute;
     use vortex_array::aggregate_fn::Accumulator;
+    use vortex_array::aggregate_fn::AggregateDTypes;
     use vortex_array::aggregate_fn::AggregateFnVTable;
     use vortex_array::aggregate_fn::DynAccumulator;
     use vortex_array::aggregate_fn::EmptyOptions;
@@ -242,10 +274,10 @@ mod tests {
     use vortex_array::dtype::PType;
     use vortex_array::scalar::Scalar;
     use vortex_error::VortexResult;
+    use vortex_session::VortexSession;
 
     use super::AabbPartial;
     use super::GeometryAabb;
-    use super::aabb_dtype;
     use super::rect_from_storage;
     use crate::test_harness::linestring_column;
     use crate::test_harness::multilinestring_column;
@@ -255,6 +287,8 @@ mod tests {
     use crate::test_harness::point_column;
     use crate::test_harness::polygon_column;
     use crate::test_harness::spatial_session;
+
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
 
     /// One column of every native geometry type over the same `(x, y)` vertex set.
     fn every_native_column(vertices: &[(f64, f64)]) -> VortexResult<Vec<ArrayRef>> {
@@ -273,7 +307,7 @@ mod tests {
     /// The aggregate must be serializable so the zoned writer can persist its zone-stat descriptor.
     #[test]
     fn serializes_for_zone_storage() -> VortexResult<()> {
-        let session = vortex_array::array_session();
+        let session = VortexSession::empty();
         let metadata = GeometryAabb
             .serialize(&EmptyOptions)?
             .expect("GeometryAabb must be serializable to be stored as a zone statistic");
@@ -290,8 +324,7 @@ mod tests {
     /// The AABB of a Point column is the min/max of its coordinates, accumulated across batches.
     #[test]
     fn point_aabb_across_batches() -> VortexResult<()> {
-        let session = vortex_array::array_session();
-        let mut ctx = session.create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
 
         let dtype = point_column(vec![0.0], vec![0.0])?.dtype().clone();
         let mut acc = Accumulator::try_new(GeometryAabb, EmptyOptions, dtype)?;
@@ -307,8 +340,7 @@ mod tests {
     /// the origin (matching min/max, which skip nulls).
     #[test]
     fn null_rows_do_not_widen_aabb() -> VortexResult<()> {
-        let session = vortex_array::array_session();
-        let mut ctx = session.create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
 
         // The valid points sit far from the origin; the null row's storage placeholder is (0, 0).
         let column = nullable_point_column(vec![Some((5.0, 6.0)), None, Some((7.0, 8.0))])?;
@@ -324,8 +356,7 @@ mod tests {
     /// unwrap, not just the bare Point struct.
     #[test]
     fn polygon_aabb_union_all_vertices() -> VortexResult<()> {
-        let session = vortex_array::array_session();
-        let mut ctx = session.create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
 
         // Two rectangles: (0,0)-(2,3) and (5,5)-(7,8). The chunk AABB is their union: (0,0)-(7,8).
         let polygons = polygon_column(vec![
@@ -344,8 +375,7 @@ mod tests {
     /// covers the whole type family.
     #[test]
     fn aabb_covers_every_native_geometry_type() -> VortexResult<()> {
-        let session = vortex_array::array_session();
-        let mut ctx = session.create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
 
         for column in every_native_column(&[(1.0, 2.0), (-1.0, 5.0), (3.0, 4.0)])? {
             let mut acc = Accumulator::try_new(GeometryAabb, EmptyOptions, column.dtype().clone())?;
@@ -364,8 +394,7 @@ mod tests {
     /// the triple-`List` unwrap.
     #[test]
     fn multipolygon_aabb_union_all_vertices() -> VortexResult<()> {
-        let session = vortex_array::array_session();
-        let mut ctx = session.create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
 
         // Multipolygon 0: squares (0,0)-(1,1) and (4,4)-(5,5); multipolygon 1: square (-3,7)-(-2,9).
         let multipolygons = multipolygon_column(vec![
@@ -388,38 +417,39 @@ mod tests {
         Ok(())
     }
 
-    /// `combine_partials` unions partial boxes - the path the zoned writer takes when a zone's
+    /// `merge_partials` unions partial boxes - the path the zoned writer takes when a zone's
     /// array is chunked.
     #[test]
-    fn combine_partials_unions_boxes() -> VortexResult<()> {
+    fn merge_partials_unions_boxes() -> VortexResult<()> {
+        let dtype = point_column(vec![0.0], vec![0.0])?.dtype().clone();
+        let dtypes = AggregateDTypes::try_new(&GeometryAabb, &EmptyOptions, dtype)?;
         let bbox = |xmin, ymin, xmax, ymax| AabbPartial {
             rect: Some(SpatialRect::new((xmin, ymin), (xmax, ymax))),
         };
-        let mut partial = AabbPartial { rect: None };
-        GeometryAabb.combine_partials(
-            &mut partial,
-            GeometryAabb.to_scalar(&bbox(0.0, 0.0, 1.0, 1.0))?,
-        )?;
-        GeometryAabb.combine_partials(
-            &mut partial,
-            GeometryAabb.to_scalar(&bbox(5.0, -2.0, 7.0, 3.0))?,
+        let reduced = GeometryAabb.merge_partials(
+            dtypes.args(&EmptyOptions),
+            bbox(0.0, 0.0, 1.0, 1.0),
+            bbox(5.0, -2.0, 7.0, 3.0),
         )?;
         assert_eq!(
-            aabb(&GeometryAabb.to_scalar(&partial)?)?,
+            aabb(&GeometryAabb.to_scalar(dtypes.args(&EmptyOptions), &reduced)?)?,
             (0.0, -2.0, 7.0, 3.0)
         );
         Ok(())
     }
 
-    /// A null partial (an empty group's AABB) is a no-op in `combine_partials`.
+    /// An empty partial (an empty group's AABB) is a no-op in `merge_partials`.
     #[test]
-    fn combine_partials_ignores_null() -> VortexResult<()> {
-        let mut partial = AabbPartial {
+    fn merge_partials_ignores_empty() -> VortexResult<()> {
+        let dtype = point_column(vec![0.0], vec![0.0])?.dtype().clone();
+        let dtypes = AggregateDTypes::try_new(&GeometryAabb, &EmptyOptions, dtype)?;
+        let empty = GeometryAabb.empty_partial(dtypes.args(&EmptyOptions))?;
+        let value = AabbPartial {
             rect: Some(SpatialRect::new((0.0, 0.0), (1.0, 1.0))),
         };
-        GeometryAabb.combine_partials(&mut partial, Scalar::null(aabb_dtype()))?;
+        let reduced = GeometryAabb.merge_partials(dtypes.args(&EmptyOptions), value, empty)?;
         assert_eq!(
-            aabb(&GeometryAabb.to_scalar(&partial)?)?,
+            aabb(&GeometryAabb.to_scalar(dtypes.args(&EmptyOptions), &reduced)?)?,
             (0.0, 0.0, 1.0, 1.0)
         );
         Ok(())
@@ -430,15 +460,22 @@ mod tests {
     /// never satisfy `distance <= r` anyway.
     #[test]
     fn all_nan_coordinates_kept() -> VortexResult<()> {
-        let session = vortex_array::array_session();
-        let mut ctx = session.create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
 
         let column = point_column(vec![f64::NAN, f64::NAN], vec![f64::NAN, f64::NAN])?;
         let mut acc = Accumulator::try_new(GeometryAabb, EmptyOptions, column.dtype().clone())?;
         acc.accumulate(&column, &mut ctx)?;
 
         let (xmin, ymin, xmax, ymax) = aabb(&acc.finish()?)?;
-        assert!(xmin <= xmax && ymin <= ymax);
+        assert_eq!(
+            (xmin, ymin, xmax, ymax),
+            (
+                f64::NEG_INFINITY,
+                f64::NEG_INFINITY,
+                f64::INFINITY,
+                f64::INFINITY
+            )
+        );
         Ok(())
     }
 

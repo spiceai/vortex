@@ -8,6 +8,7 @@
 
 use std::iter;
 
+use arbitrary::Error::IncorrectFormat;
 use arbitrary::Result;
 use arbitrary::Unstructured;
 use vortex_buffer::BufferString;
@@ -128,7 +129,7 @@ pub fn random_scalar(u: &mut Unstructured, dtype: &DType) -> Result<Scalar> {
             )
             .vortex_expect("generated union scalar must be valid")
         }
-        DType::Variant(_) => todo!(),
+        DType::Variant(_) => return Err(IncorrectFormat),
         DType::Extension(..) => {
             unreachable!("Can't yet generate arbitrary scalars for ext dtype")
         }
@@ -159,14 +160,11 @@ fn random_pvalue(u: &mut Unstructured, ptype: &PType) -> Result<PValue> {
 /// Returns an error if the underlying arbitrary generation fails.
 pub fn random_decimal(u: &mut Unstructured, decimal_type: &DecimalDType) -> Result<ScalarValue> {
     let precision = decimal_type.precision();
-    let value = match_each_decimal_value_type!(
-        DecimalType::smallest_decimal_value_type(decimal_type),
-        |D| {
-            DecimalValue::from(u.int_in_range(
-                D::MIN_BY_PRECISION[precision as usize]..=D::MAX_BY_PRECISION[precision as usize],
-            )?)
-        }
-    );
+    let value = match_each_decimal_value_type!(decimal_type.canonical_values_type(), |D| {
+        DecimalValue::from(u.int_in_range(
+            D::MIN_BY_PRECISION[precision as usize]..=D::MAX_BY_PRECISION[precision as usize],
+        )?)
+    });
 
     Ok(ScalarValue::Decimal(value))
 }

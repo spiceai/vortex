@@ -13,12 +13,14 @@ use crate::arrays::struct_::StructArrayExt;
 use crate::scalar::Scalar;
 
 impl OperationsVTable<Map> for Map {
+    type ProbeState = ();
+
     fn scalar_at(
         array: ArrayView<'_, Map>,
         index: usize,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Scalar> {
-        let entries = array.entries_at(index)?.execute::<StructArray>(ctx)?;
+        let entries = array.entries_at(index, ctx)?.execute::<StructArray>(ctx)?;
         let keys = entries.unmasked_field(0);
         let values = entries.unmasked_field(1);
         let pairs = (0..entries.len())
