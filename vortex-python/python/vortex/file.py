@@ -38,7 +38,16 @@ if TYPE_CHECKING:
 def open(
     path: str,
     *,
-    store: AzureStore | CosStore | GCSStore | GoosefsStore | HfStore | HTTPStore | LocalStore | MemoryStore | S3Store | None = None,
+    store: AzureStore
+    | CosStore
+    | GCSStore
+    | GoosefsStore
+    | HfStore
+    | HTTPStore
+    | LocalStore
+    | MemoryStore
+    | S3Store
+    | None = None,
     footer: Footer | None = None,
     without_segment_cache: bool = False,
     segment_cache: SegmentCache | None = None,

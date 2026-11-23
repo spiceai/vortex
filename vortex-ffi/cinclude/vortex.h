@@ -1628,7 +1628,9 @@ void vx_session_free(const vx_session *ptr);
 vx_session *vx_session_new(void);
 
 /**
- * Clone a vx_session
+ * Clone a Vortex session, returning an owned copy.
+ *
+ * The caller is responsible for freeing the session with [`vx_session_free`].
  */
 vx_session *vx_session_clone(const vx_session *session);
 

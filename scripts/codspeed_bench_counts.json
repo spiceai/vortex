@@ -80,6 +80,9 @@
   "vortex-arrow": {
     "to_arrow": 131
   },
+  "vortex-btrblocks": {
+    "small_chunk_compress": 0
+  },
   "vortex-buffer": {
     "allocation": 35,
     "collect_bool": 4,
@@ -125,7 +128,9 @@
     "for_encode": 0
   },
   "vortex-file": {
-    "split_collection": 3
+    "scan_mask_paths": 0,
+    "split_collection": 3,
+    "wide_string_cases": 0
   },
   "vortex-fsst": {
     "chunked_dict_fsst_builder": 12,
