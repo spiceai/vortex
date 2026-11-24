@@ -2559,9 +2559,10 @@ async fn file_sum_is_absent_when_a_chunk_overflows() -> VortexResult<()> {
 }
 
 #[tokio::test]
-async fn default_string_stats_are_inexact_bounds_after_reopening() -> VortexResult<()> {
-    // The default string min/max are byte-bounded, and the footer doesn't record whether a bound
-    // was truncated, so even a value within the bound reads back as inexact.
+async fn default_string_stats_are_exact_within_the_bound_after_reopening() -> VortexResult<()> {
+    // The default string min/max are recorded exactly when the value fits the byte bound, and as
+    // the byte-bounded aggregate otherwise, which reads back inexact. Both footer layouts carry
+    // that: the legacy one written by default, and the nested one.
     let long = "x".repeat(100);
     let array = StructArray::from_fields(&[
         (
@@ -2575,33 +2576,48 @@ async fn default_string_stats_are_inexact_bounds_after_reopening() -> VortexResu
     ])?
     .into_array();
 
-    let mut buf = ByteBufferMut::empty();
-    SESSION
-        .write_options()
-        .include_nested_statistics()
-        .write(&mut buf, array.to_array_stream())
-        .await?;
-    let file = SESSION.open_options().open_buffer(ByteBuffer::from(buf))?;
-    let stats = file
-        .file_stats()
-        .expect("file statistics should be present");
+    for nested in [false, true] {
+        let mut buf = ByteBufferMut::empty();
+        let options = SESSION.write_options();
+        let options = if nested {
+            options.include_nested_statistics()
+        } else {
+            options
+        };
+        options.write(&mut buf, array.to_array_stream()).await?;
+        let file = SESSION.open_options().open_buffer(ByteBuffer::from(buf))?;
+        let stats = file
+            .file_stats()
+            .expect("file statistics should be present");
 
-    let (short, _) = stats.get_by_path(&field_path!(short)).expect("short stats");
-    assert_eq!(
-        stat_value(short, Stat::Max),
-        Precision::inexact(ScalarValue::from("banana"))
-    );
-    assert_eq!(
-        stat_value(short, Stat::Min),
-        Precision::inexact(ScalarValue::from("apple"))
-    );
+        let (short, _) = stats.get_by_path(&field_path!(short)).expect("short stats");
+        assert_eq!(
+            stat_value(short, Stat::Max),
+            Precision::exact(ScalarValue::from("banana")),
+            "nested: {nested}"
+        );
+        assert_eq!(
+            stat_value(short, Stat::Min),
+            Precision::exact(ScalarValue::from("apple")),
+            "nested: {nested}"
+        );
 
-    let (long, _) = stats.get_by_path(&field_path!(long)).expect("long stats");
-    assert!(stat_value(long, Stat::Max).as_inexact().is_some());
-    assert_eq!(
-        stat_value(long, Stat::Min),
-        Precision::inexact(ScalarValue::from("a"))
-    );
+        // The bound of the longer value is an upper bound cut to the byte limit.
+        let (long_stats, _) = stats.get_by_path(&field_path!(long)).expect("long stats");
+        let max = stat_value(long_stats, Stat::Max)
+            .as_inexact()
+            .unwrap_or_else(|| panic!("nested: {nested}: the long max is inexact"));
+        let max = max.as_utf8().as_str().to_string();
+        assert!(
+            max.len() < long.len() && max.as_str() > long.as_str(),
+            "nested: {nested}: {max}"
+        );
+        assert_eq!(
+            stat_value(long_stats, Stat::Min),
+            Precision::exact(ScalarValue::from("a")),
+            "nested: {nested}"
+        );
+    }
 
     Ok(())
 }
